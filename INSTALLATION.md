@@ -214,3 +214,20 @@ npm test
 
 Some integration tests require PostgreSQL or local process capabilities. These
 commands do not establish native Windows support or validate live account access.
+
+### Initial publication validation (2026-09-15)
+
+On the development Mac (Node 26.8.1), typecheck, production build, Browser Bridge
+typecheck, and the npm lockfile installation dry-run passed. The standalone
+script/review-extension tests passed (18 tests). The full server test run reached
+PostgreSQL but reported four failures, which remain unresolved in this snapshot:
+
+- `clientFileChanges.test.ts`: Node's test loader cannot import a client CSS file.
+- `promptRunner.test.ts`: the burst-callback test's app-server exit-order assertion.
+- `sessionStore.test.ts`: commentary summary length expectation.
+- `sessionStore.test.ts`: diagnostic event heartbeat expectation.
+
+The build also reports bundle-size and mixed static/dynamic import warnings.
+This is an initial source release, not a claim that the full test suite passes.
+Linux, WSL2, native Windows, and a clean Node 22 installation still require their
+own end-to-end validation.
