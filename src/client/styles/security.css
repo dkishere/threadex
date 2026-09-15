@@ -1,0 +1,7 @@
+.security-login { min-height: 100dvh; display: grid; place-items: center; padding: 24px; }
+.security-login > section { width: min(100%, 420px); padding: 28px; }
+.security-form { display: grid; gap: 16px; max-width: 420px; }
+.security-form label { display: grid; gap: 8px; }
+.security-form input { width: 100%; padding: 10px 12px; border: 1px solid var(--border, #555); border-radius: 8px; background: transparent; color: inherit; font: inherit; }
+.security-form p { margin: 0; }
+.security-form [role="alert"] { color: #e76f6f; }

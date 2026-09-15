@@ -1,0 +1,189 @@
+{
+  "name": "threadex-review",
+  "displayName": "Threadex Review",
+  "description": "Review one Threadex turn as source-level blocks in VS Code.",
+  "version": "0.1.0",
+  "publisher": "threadex",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:threadexReview.filesView"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "configurationDefaults": {
+      "comments.openView": "never"
+    },
+    "commands": [
+      {
+        "command": "threadexReview.focus",
+        "title": "Focus Review",
+        "category": "Threadex Review"
+      },
+      {
+        "command": "threadexReview.explainSelection",
+        "title": "Explain Selection",
+        "category": "Threadex"
+      },
+      {
+        "command": "threadexReview.explainFile",
+        "title": "Explain File",
+        "category": "Threadex"
+      },
+      {
+        "command": "threadexReview.addAnnotation",
+        "title": "Add File Annotation",
+        "category": "Threadex"
+      },
+      {
+        "command": "threadexReview.submitAnnotation",
+        "title": "Send to Source Session",
+        "category": "Threadex"
+      },
+      {
+        "command": "threadexReview.revealExplanation",
+        "title": "Reveal Explanation",
+        "category": "Threadex"
+      },
+      {
+        "command": "threadexReview.openFile",
+        "title": "Open Language-aware Diff",
+        "category": "Threadex Review"
+      },
+      {
+        "command": "threadexReview.openBlock",
+        "title": "Open Review Block",
+        "category": "Threadex Review"
+      },
+      {
+        "command": "threadexReview.openDiff",
+        "title": "Open Language-aware Diff",
+        "category": "Threadex Review"
+      },
+      {
+        "command": "threadexReview.acceptBlock",
+        "title": "Accept Block",
+        "category": "Threadex Review"
+      },
+      {
+        "command": "threadexReview.rejectBlock",
+        "title": "Reject Block",
+        "category": "Threadex Review"
+      },
+      {
+        "command": "threadexReview.acceptFile",
+        "title": "Accept File",
+        "category": "Threadex Review"
+      },
+      {
+        "command": "threadexReview.rejectFile",
+        "title": "Reject File",
+        "category": "Threadex Review"
+      },
+      {
+        "command": "threadexReview.complete",
+        "title": "Complete Review",
+        "category": "Threadex Review"
+      }
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "threadexReview.filesView",
+          "name": "Threadex Review"
+        }
+      ]
+    },
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "threadexReview.explainSelection"
+        },
+        {
+          "command": "threadexReview.explainFile"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "threadexReview.addAnnotation",
+          "when": "resourceScheme == file && threadexReview.canAnnotate",
+          "group": "navigation@19"
+        },
+        {
+          "command": "threadexReview.explainSelection",
+          "when": "editorHasSelection",
+          "group": "navigation@20"
+        }
+      ],
+      "comments/commentThread/context": [
+        {
+          "command": "threadexReview.submitAnnotation",
+          "when": "commentController == threadexAnnotations",
+          "group": "inline@1"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "threadexReview.addAnnotation",
+          "when": "resourceScheme == file && threadexReview.canAnnotate",
+          "group": "navigation@19"
+        },
+        {
+          "command": "threadexReview.explainFile",
+          "when": "resourceScheme == file",
+          "group": "navigation@20"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "threadexReview.addAnnotation",
+          "when": "view == threadexReview.filesView && threadexReview.canAnnotate",
+          "group": "navigation@0"
+        },
+        {
+          "command": "threadexReview.complete",
+          "when": "view == threadexReview.filesView && threadexReview.hasSession",
+          "group": "navigation@1"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "threadexReview.openDiff",
+          "when": "view == threadexReview.filesView && viewItem == threadexReviewFile",
+          "group": "threadex@0"
+        },
+        {
+          "command": "threadexReview.acceptFile",
+          "when": "view == threadexReview.filesView && viewItem == threadexReviewFile && threadexReview.isEditable",
+          "group": "threadex@1"
+        },
+        {
+          "command": "threadexReview.rejectFile",
+          "when": "view == threadexReview.filesView && viewItem == threadexReviewFile && threadexReview.isEditable",
+          "group": "threadex@2"
+        },
+        {
+          "command": "threadexReview.acceptBlock",
+          "when": "view == threadexReview.filesView && viewItem == threadexReviewBlock && threadexReview.isEditable",
+          "group": "inline@1"
+        },
+        {
+          "command": "threadexReview.rejectBlock",
+          "when": "view == threadexReview.filesView && viewItem == threadexReviewBlock && threadexReview.isEditable",
+          "group": "inline@2"
+        },
+        {
+          "command": "threadexReview.explainSelection",
+          "when": "view == threadexReview.filesView && viewItem == threadexWalkthrough",
+          "group": "inline@1"
+        }
+      ]
+    }
+  }
+}

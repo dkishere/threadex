@@ -1,0 +1,4 @@
+interface:
+  display_name: "Session Inspector"
+  short_description: "Search and ask questions about saved sessions"
+  default_prompt: "Use $session-inspector to search saved sessions, inspect filtered turns, or ask a question about session context."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Browser Bridge"
+  short_description: "Control trusted local Chrome through the browser relay"
+  default_prompt: "Use the local Browser Bridge skill to inspect or operate Chrome tabs through the relay."

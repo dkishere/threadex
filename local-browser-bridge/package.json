@@ -1,0 +1,30 @@
+{
+  "name": "local-browser-bridge",
+  "version": "0.1.0",
+  "description": "A local, user-approved bridge from coding agents and websites to your existing Chrome profile.",
+  "type": "module",
+  "files": ["bin", "src", "extension-src", "extension", "examples", "scripts", "dist", "README.md", "LICENSE", "SECURITY.md"],
+  "bin": { "browser-bridge": "./dist/bin/browser-bridge.js" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.extension.json",
+    "prepare": "npm run build",
+    "prepack": "npm run build",
+    "start": "node dist/bin/browser-bridge.js start",
+    "example:website": "node scripts/serve-website-example.mjs",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "check": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.extension.json"
+  },
+  "dependencies": {
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.3",
+    "@types/ws": "^8.18.1",
+    "@types/chrome": "^0.1.37",
+    "typescript": "^6.0.3"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

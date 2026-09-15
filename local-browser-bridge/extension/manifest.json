@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Local Browser Bridge",
+  "description": "User-approved local browser control for coding agents and websites.",
+  "version": "0.1.0",
+  "minimum_chrome_version": "125",
+  "permissions": [
+    "alarms",
+    "bookmarks",
+    "browsingData",
+    "contentSettings",
+    "cookies",
+    "debugger",
+    "downloads",
+    "downloads.open",
+    "history",
+    "management",
+    "scripting",
+    "sessions",
+    "storage",
+    "tabGroups",
+    "tabs",
+    "webNavigation",
+    "webRequest",
+    "windows"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "content_scripts": [{ "matches": ["http://*/*", "https://*/*"], "js": ["content.js"], "run_at": "document_idle" }],
+  "action": { "default_title": "Local Browser Bridge", "default_popup": "popup.html" }
+}

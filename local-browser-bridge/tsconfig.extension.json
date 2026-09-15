@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "rootDir": "extension-src",
+    "outDir": "extension",
+    "sourceMap": false,
+    "declaration": false,
+    "lib": ["DOM", "ES2022"],
+    "types": ["chrome"]
+  },
+  "include": ["extension-src/**/*.ts"]
+}
