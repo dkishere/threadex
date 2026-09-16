@@ -1,5 +1,6 @@
 // @ts-nocheck
 import { useEffect as useReactEffect } from "react";
+import { MarkdownWorkspaceContext } from "./MarkdownContent";
 import { Flame, FolderOpen } from "lucide-react";
 import { TurnGrillPanel, useGrilledTurns } from "./TurnGrillPanel";
 import { FileEditIcon } from "./FileEditIcon";
@@ -1437,7 +1438,7 @@ message.turnStatus === "todo" && (_jsx("span", { className: "turn-status", child
     const commandApprovalModal = pendingCommandApprovals.length > 0 ? (_jsx("div", { className: "modal-backdrop approval-backdrop", role: "presentation", children: _jsxs("section", { className: "approval-modal", role: "dialog", "aria-modal": "true", "aria-labelledby": "approval-modal-title", onMouseDown: (event) => event.stopPropagation(), children: [_jsxs("div", { className: "modal-header", children: [_jsx("h2", { id: "approval-modal-title", children: "Approval required" }), _jsx("span", { children: pendingCommandApprovals.length })] }), _jsx("div", { className: "approval-modal-list", children: pendingCommandApprovals.map((item) => (_jsx(ApprovalEvent, { item: item, onDecisionSubmitted: removePendingApprovalItem }, item.approvalId))) })] }) })) : null;
     const approvalModal = commandApprovalModal;
     const promptDetailsModal = _jsxs(_Fragment, { children: [renderTurnDetailsModal(), _jsx(SessionChangesPopover, { sessionId: sessionId })] });
-    return (_jsx(FileAnnotationComposerContext.Provider, { value: fileAnnotationContextValue, children: _jsxs("main", { className: "shell", "data-session-tab": activeSessionTab, children: [approvalModal, promptDetailsModal, _jsxs("header", { className: "workspace-header", "aria-label": "Workspaces", children: [_jsxs("div", { className: "workspace-tabs", role: "tablist", "aria-label": "Workspaces", children: [workspaceList.length === 0 && (_jsxs("span", { className: "workspace-tab", "data-active": "true", children: [_jsx(Folder, { "aria-hidden": "true" }), _jsx("span", { children: "Default" })] })), workspaceList.map((workspace) => {
+    const shell = (_jsx(FileAnnotationComposerContext.Provider, { value: fileAnnotationContextValue, children: _jsxs("main", { className: "shell", "data-session-tab": activeSessionTab, children: [approvalModal, promptDetailsModal, _jsxs("header", { className: "workspace-header", "aria-label": "Workspaces", children: [_jsxs("div", { className: "workspace-tabs", role: "tablist", "aria-label": "Workspaces", children: [workspaceList.length === 0 && (_jsxs("span", { className: "workspace-tab", "data-active": "true", children: [_jsx(Folder, { "aria-hidden": "true" }), _jsx("span", { children: "Default" })] })), workspaceList.map((workspace) => {
                                     const isActive = workspace.id === activeWorkspace?.id;
                                     const summary = workspaceTabSummaries.get(workspace.id);
                                     return (_jsxs("div", { className: "workspace-tab-wrap", onMouseEnter: (event) => {
@@ -1712,5 +1713,6 @@ _jsxs("div", { ref: messageScrollIndicatorRef, className: "message-scroll-indica
                                                                                 }
                                                                             } }) }), _jsxs("span", { children: [_jsx("strong", { children: account.name }), _jsxs("small", { children: [account.email || account.externalAccountId || account.id, tier ? ` · ${tier}` : ""] })] }), _jsx("span", { children: formatQuotaRemaining(account) }), _jsx("span", { children: formatQuotaReset(account) }), _jsx("span", { children: formatQuotaStatus(account, activeAccount?.id ?? null) }), _jsx("span", { className: "settings-account-actions", children: _jsx("button", { className: "settings-delete-account", type: "button", onClick: () => void deleteAccount(account), disabled: Boolean(deletingAccountId), title: `Delete ${accountIdentityLabel(account)}`, "aria-label": `Delete ${accountIdentityLabel(account)}`, children: deletingAccountId === account.id ? _jsx(Loader2, { className: "spin", "aria-hidden": "true" }) : _jsx(Trash2, { "aria-hidden": "true" }) }) })] }, account.id));
                                                         }), accountList.length === 0 && _jsx("p", { className: "settings-empty", children: "No accounts yet. Add one to get started." })] })] })] }))] })] }))] }) }));
+    return _jsx(MarkdownWorkspaceContext.Provider, { value: { sessionId: sessionId ?? undefined, workspaceId: activeWorkspace?.id ?? undefined }, children: shell });
 
 }

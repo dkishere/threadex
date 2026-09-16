@@ -35,6 +35,7 @@ import {
   commentaryHeadlineContext,
   generateCommentaryHeadlineWithUsage,
   mergeCommentaryIssueTracker,
+  shouldGenerateCommentaryHeadline,
   stopCommentaryHeadlineWorker
 } from "./commentaryHeadline";
 import { runWithSingleRetry } from "./retry";
@@ -261,6 +262,8 @@ async function run() {
   let finalResponse = "";
   let usage: TokenUsage | null = null;
   let appTurnId: string | null = null;
+  let steeringFinished = false;
+  let stopSteerControl: (() => Promise<void>) | undefined;
   let commentaryInjectionActive = false;
   const linkedNativeTurnIds = new Set<string>();
   const startedAt = Date.now();
@@ -274,6 +277,8 @@ async function run() {
   let failTurn: ((error: Error) => void) | null = null;
   let turnCompleted = Promise.resolve();
   const resetTurnCompletion = () => {
+    steeringFinished = false;
+    appTurnId = null;
     turnCompleted = new Promise<void>((resolveTurn, rejectTurn) => {
       completeTurn = resolveTurn;
       failTurn = rejectTurn;
@@ -418,6 +423,7 @@ async function run() {
       const turn = readObject(params?.turn);
       const error = readObject(turn?.error);
       const status = readString(turn?.status);
+      steeringFinished = true;
       commentaryInjectionActive = false;
       const agentMessage = readFinalAgentMessage(turn?.items);
       if (agentMessage) {
@@ -562,7 +568,7 @@ async function run() {
       await appServer.rpc("thread/goal/clear", { threadId });
     }
 
-    const stopSteerControl = startSteerControlLoop(appServer, () => ({ threadId, appTurnId }));
+    stopSteerControl = startSteerControlLoop(appServer, () => ({ threadId, appTurnId, finished: steeringFinished }));
     try {
       let phaseJob = recoveryContextForTurn
         ? { ...job, message: recoveryPrompt(job.message, recoveryContextForTurn) }
@@ -738,7 +744,9 @@ async function run() {
         phase += 1;
       }
     } finally {
-      await stopSteerControl();
+      // Keep answering controls while callbacks drain and the API still sees
+      // a running process, even though generation has already finished.
+      steeringFinished = true;
     }
 
     // Codex persists one writer per thread. Release it immediately after the
@@ -784,6 +792,7 @@ async function run() {
   } catch (error) {
     const message = errorMessage(error);
     const usageLimit = isUsageLimitError(message);
+    steeringFinished = true;
     const loginRequired = isAccountLoginRequiredMessage(message);
     // Error and rate-limit paths must release the thread writer before any
     // potentially delayed callback or account-sync cleanup for the same reason
@@ -819,6 +828,7 @@ async function run() {
     await emitEvent("done", { ok: true }, { waitForCallback: true });
     process.exitCode = 1;
   } finally {
+    await stopSteerControl?.();
     await appServer.stop();
     stopCommentaryHeadlineWorker();
     stopSleepInhibitor(sleepInhibitor);
@@ -838,7 +848,7 @@ async function emitDeveloperInstructionsEvent(target: "thread" | "turn" | "steer
       phase,
       developerInstructions
     },
-    { waitForCallback: true }
+    { waitForCallback: target !== "steer" }
   );
 }
 
@@ -856,13 +866,17 @@ function queueCommentaryHeadline(item: StreamItem) {
     return;
   }
 
+  const detail = item.comment?.detail || item.text;
+  if (isCommentary && !shouldGenerateCommentaryHeadline(detail)) {
+    return;
+  }
+
   const itemKey = JSON.stringify([item.originThreadId ?? "", item.id]);
   if (queuedCommentaryHeadlineItems.has(itemKey)) {
     return;
   }
   queuedCommentaryHeadlineItems.add(itemKey);
 
-  const detail = item.comment?.detail || item.text;
   const fallbackType = item.comment?.extracts[0]?.type ?? (isFinalAnswer ? "answer" : "action");
   const contextKey = item.originThreadId ?? "root";
 
@@ -1424,7 +1438,7 @@ function runnerApprovalSettings(job: RunnerJob) {
 
 function startSteerControlLoop(
   appServer: AppServerClient,
-  activeTurn: () => { threadId: string | undefined; appTurnId: string | null }
+  activeTurn: () => { threadId: string | undefined; appTurnId: string | null; finished: boolean }
 ) {
   let stopped = false;
   const processed = new Set<string>();
@@ -1434,15 +1448,16 @@ function startSteerControlLoop(
         if (processed.has(command.id)) {
           continue;
         }
-        const { threadId, appTurnId } = activeTurn();
+        const { threadId, appTurnId, finished } = activeTurn();
         // Startup can expose the control file before turn/start has returned.
         // Leave the command pending until there is a native turn to steer.
-        if (!threadId || !appTurnId) {
+        if (!finished && (!threadId || !appTurnId)) {
           break;
         }
         processed.add(command.id);
         let result: RunnerSteerResult;
         try {
+          if (finished) throw new Error("The target turn has already finished; steer was not sent.");
           await emitDeveloperInstructionsEvent("steer", 0, command.developerInstructions);
           const response = await appServer.rpc("turn/steer", {
             threadId,

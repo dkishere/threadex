@@ -13,6 +13,7 @@ const DEFAULT_MODEL = "gpt-5.6-luna";
 const DEFAULT_REASONING_EFFORT: AgentCliReasoningEffort = "none";
 const DEFAULT_TIMEOUT_MS = 12_000;
 const MAX_PROMPT_DETAIL_CHARS = 16_000;
+export const COMMENTARY_HEADLINE_MIN_DETAIL_CHARS = 24;
 export const COMMENTARY_HEADLINE_OUTPUT_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -120,6 +121,10 @@ export type CommentaryHeadlineGeneration = {
   model: string;
   usage: ModelTokenUsage | null;
 };
+
+export function shouldGenerateCommentaryHeadline(detail: string) {
+  return [...detail.trim()].length >= COMMENTARY_HEADLINE_MIN_DETAIL_CHARS;
+}
 
 export async function generateCommentaryHeadline(
   input: CommentaryHeadlineInput

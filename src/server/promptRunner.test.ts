@@ -977,7 +977,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 });
 
 for (const duringStartup of [false, true]) {
-test(`prompt runner forwards control messages to Codex turn/steer${duringStartup ? " during startup" : ""}`, async () => {
+test(`prompt runner forwards control messages to Codex turn/steer${duringStartup ? " during startup" : ""}`, async (t) => {
   const root = mkdtempSync(resolve(tmpdir(), "prompt-runner-steer-"));
   const fakeCodexPath = resolve(root, "fake-codex.mjs");
   const jobPath = resolve(root, "job.json");
@@ -990,6 +990,32 @@ test(`prompt runner forwards control messages to Codex turn/steer${duringStartup
   const capturedTurnPath = resolve(root, "captured-turn.json");
   const capturedGoalPath = resolve(root, "captured-goal.json");
   const commandId = "steer-command-1";
+  let releaseSteerCallback!: () => void;
+  let releaseCompletionCallback!: () => void;
+  const steerCallbackGate = new Promise<void>((resolveGate) => { releaseSteerCallback = resolveGate; });
+  const completionCallbackGate = new Promise<void>((resolveGate) => { releaseCompletionCallback = resolveGate; });
+  let completionCallbackWaiting = false;
+  const server = createServer(async (request, response) => {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    const update = body ? JSON.parse(body) : {};
+    if (update.event === "developer_instructions" && update.data?.target === "steer") await steerCallbackGate;
+    if (update.event === "codex" && update.data?.method === "turn/completed") {
+      completionCallbackWaiting = true;
+      await completionCallbackGate;
+    }
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ ok: true }));
+  });
+  await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  t.after(() => {
+    releaseSteerCallback();
+    releaseCompletionCallback();
+    server.closeAllConnections();
+    server.close();
+  });
   const controlMessage = `${JSON.stringify({
     id: commandId,
     message: "focus on the server path",
@@ -1052,6 +1078,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     startupSnapshot: "[STARTUP]\npwd: /tmp/workspace\n[END STARTUP]",
     contextParentSessionId: "local_parent-1",
     executionMode: "goal",
+    serverUrl: `http://127.0.0.1:${address.port}`,
     approvalPolicy: "granular",
     skills: [{ name: "test-skill", path: "/skills/test-skill/SKILL.md" }],
     logPath,
@@ -1076,6 +1103,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     stdio: ["ignore", "pipe", "pipe"]
   });
   let stderr = "";
+  t.after(() => { if (child.exitCode === null) child.kill(); });
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => { stderr += chunk; });
 
@@ -1096,9 +1124,23 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     appTurnId: "app-turn-1"
   });
 
-  await new Promise<void>((resolveExit, rejectExit) => {
+  // A held developer-instructions callback must not block delivery or its ack.
+  releaseSteerCallback();
+  await waitFor(() => completionCallbackWaiting);
+  const lateCommandId = "steer-after-completion";
+  appendFileSync(controlPath, `${JSON.stringify({ id: lateCommandId, message: "late correction" })}\n`);
+  const lateResultPath = resolve(controlResultDir, `${lateCommandId}.json`);
+  await waitFor(() => existsSync(lateResultPath));
+  const lateResult = JSON.parse(readFileSync(lateResultPath, "utf8"));
+  assert.equal(lateResult.ok, false);
+  assert.match(lateResult.error, /already finished/);
+  // This reply must arrive while completion persistence is still blocked.
+  const exit = new Promise<void>((resolveExit, rejectExit) => {
     child.once("exit", (code) => code === 0 ? resolveExit() : rejectExit(new Error(`runner exited ${code}: ${stderr}`)));
   });
+  releaseCompletionCallback();
+
+  await exit;
 
   const steer = JSON.parse(readFileSync(capturedSteerPath, "utf8"));
   assert.equal(steer.threadId, "thread-1");

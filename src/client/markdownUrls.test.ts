@@ -1,6 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isJsonFilePath, isMarkdownFilePath, localFilePathFromMarkdownUrl, threadexNavigationUrl, transformMarkdownUrl, workspaceFilePreviewUrl, workspaceFileReferenceFromUrl, workspaceImagePreviewName } from "./markdownUrls";
+import { isHtmlFilePath, workspaceHtmlPreviewUrl } from "./markdownUrls";
+
+test("HTML routes retain context and directories for dynamic relative assets", () => {
+  const route = workspaceHtmlPreviewUrl("C:\\AI\\head\\outputs\\my report.html", { workspaceId: "default", sessionId: "local_123" });
+  assert.equal(route, "/api/workspaces/html/default/local_123/windows/C%3A/AI/head/outputs/my%20report.html");
+  const asset = new URL("images/hair 1.png", `http://localhost${route}`);
+  assert.equal(asset.pathname, "/api/workspaces/html/default/local_123/windows/C%3A/AI/head/outputs/images/hair%201.png");
+  assert.equal(workspaceHtmlPreviewUrl("/tmp/report.html"), "/api/workspaces/html/active/none/posix/tmp/report.html");
+  assert.equal(isHtmlFilePath("report.HTM"), true);
+  assert.equal(isHtmlFilePath("report.html.txt"), false);
+});
+import { isJsonFilePath, isMarkdownFilePath, localFilePathFromMarkdownUrl, threadexNavigationUrl, transformMarkdownUrl, workspaceFileDownloadUrl, workspaceFilePreviewUrl, workspaceFileReferenceFromUrl, workspaceImagePreviewName } from "./markdownUrls";
 
 test("rewrites absolute workspace paths through the workspace file endpoint", () => {
   const path = "/Volumes/dev/My Project/concept image.png";
@@ -21,6 +32,19 @@ test("keeps a Markdown file-link line number separate from its workspace path", 
   const url = transformMarkdownUrl("/Volumes/dev/My Project/src/App.tsx:42");
   assert.equal(url, `/api/workspaces/file?path=${encodeURIComponent("/Volumes/dev/My Project/src/App.tsx")}&line=42`);
   assert.deepEqual(workspaceFileReferenceFromUrl(url), { path: "/Volumes/dev/My Project/src/App.tsx", line: 42 });
+});
+
+test("keeps the transcript session and workspace on rendered workspace file URLs", () => {
+  const path = "C:/AI/head/outputs/comparison.jpg";
+  assert.equal(
+    transformMarkdownUrl(path, { sessionId: "local_123", workspaceId: "default" }),
+    `/api/workspaces/file?path=${encodeURIComponent(path)}&sessionId=local_123&workspaceId=default`
+  );
+});
+
+test("marks workspace file URLs for an explicit download", () => {
+  const url = transformMarkdownUrl("C:/AI/head/outputs/comparison.jpg", { sessionId: "local_123" });
+  assert.equal(workspaceFileDownloadUrl(url), `${url}&download=1`);
 });
 
 test("uses the transcript session and workspace when loading a workspace file preview", () => {

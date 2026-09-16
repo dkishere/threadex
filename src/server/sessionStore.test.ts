@@ -1607,6 +1607,37 @@ test("session summary refresh does not move old sessions above newer activity", 
   }
 });
 
+test("session navigation resolves empty native imports without hiding real forks or empty sessions", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "session-native-alias-test-"));
+  const store = new SessionStore(resolve(root, "threadex.postgres"));
+  await store.ready();
+  try {
+    await store.upsertSession({ id: "managed", workspaceId: "default" });
+    await store.recordSessionTurn({ id: "managed-turn", sessionId: "managed", userInput: "hello", agentResponse: "done", tokenIn: 0, tokenOut: 0, status: "done" });
+    await store.upsertSession({ id: "local_native", workspaceId: "default", threadId: "native" });
+    await store.upsertSession({ id: "managed", threadId: "native" });
+    // Make the empty import newer than the populated owner.
+    await store.upsertSession({ id: "local_native", title: "native" });
+    await store.upsertSession({ id: "empty", workspaceId: "default" });
+    await store.upsertSession({ id: "fork", workspaceId: "default", parentSessionId: "managed" });
+    await store.upsertSession({ id: "fork", threadId: "native" });
+    assert.equal((await store.getSessionByThreadId("native", "default"))?.id, "managed");
+    assert.equal((await store.resolveSessionAlias("local_native"))?.id, "managed");
+    assert.equal((await store.resolveSessionAlias("fork"))?.id, "fork");
+    assert.equal((await store.resolveSessionAlias("empty"))?.id, "empty");
+    const page = await store.listSessionsPage("default", 0, 20);
+    assert.equal(page.total, 3);
+    assert.deepEqual(new Set(page.sessions.map((session) => session.id)), new Set(["managed", "empty", "fork"]));
+    assert.equal((await store.listSessionsPage("default", 0, 20, "local_native")).total, 0);
+    // If the imported session acquires its own conversation, it is no alias.
+    await store.recordSessionTurn({ id: "native-turn", sessionId: "local_native", userInput: "other", agentResponse: "done", tokenIn: 0, tokenOut: 0, status: "done" });
+    assert.equal((await store.resolveSessionAlias("local_native"))?.id, "local_native");
+    assert.equal((await store.listSessionsPage("default", 0, 20)).total, 4);
+  } finally {
+    await store.close();
+  }
+});
+
 test("session list pages every thread by last updated, including child threads", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "session-tree-page-test-"));
   const store = new SessionStore(resolve(root, "threadex.postgres"));

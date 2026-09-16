@@ -1,4 +1,6 @@
 import {
+  createContext,
+  useContext,
   isValidElement,
   Fragment,
   lazy,
@@ -14,18 +16,21 @@ import {
 import { createPortal } from "react-dom";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Download, FileText, X } from "lucide-react";
+import { Download, ExternalLink, FileText, X } from "lucide-react";
+import { isHtmlFilePath, workspaceHtmlPreviewUrl } from "./markdownUrls";
 import { UrlTagIcon } from "./UrlTagIcon";
+import { isJsonFilePath, isMarkdownFilePath, threadexNavigationUrl, transformMarkdownUrl, workspaceFileDownloadUrl, workspaceFilePreviewUrl, workspaceFileReferenceFromUrl, workspaceImagePreviewName, type WorkspaceFilePreviewContext } from "./markdownUrls";
 import { advanceMarkdownChunks, type MarkdownChunks } from "./markdownChunks";
-import { isJsonFilePath, isMarkdownFilePath, threadexNavigationUrl, transformMarkdownUrl, workspaceFilePreviewUrl, workspaceFileReferenceFromUrl, workspaceImagePreviewName, type WorkspaceFilePreviewContext } from "./markdownUrls";
 
 const MonacoTextEditor = lazy(async () => {
   const module = await import("./MonacoDiffEditor");
   return { default: module.MonacoTextEditor };
 });
 
-// Stable component types keep links, previews and code blocks mounted while
-// the surrounding Markdown receives new streamed text.
+export const MarkdownWorkspaceContext = createContext<WorkspaceFilePreviewContext | null>(null);
+
+// Stable component types preserve open previews and code blocks while the
+// surrounding Markdown receives new streamed text.
 const markdownComponents: Components = {
   a: ({ node: _node, ...props }) => <MarkdownLink {...props} />,
   code: ({ className, children, node: _node, ...props }) => {
@@ -34,7 +39,7 @@ const markdownComponents: Components = {
     return <code className={className} {...props}>{children}</code>;
   },
   pre: ({ children }) => findMermaidChild(children) ?? <pre className="markdown-code-block">{children}</pre>,
-  img: ({ alt, node: _node, ...props }) => <img alt={alt ?? ""} loading="lazy" referrerPolicy="no-referrer" {...props} />
+  img: ({ node: _node, ...props }) => <MarkdownImage {...props} />
 };
 const markdownPlugins = [remarkGfm];
 
@@ -42,44 +47,83 @@ export const MarkdownContent = memo(function MarkdownContent({ children, classNa
   const previous = useRef<MarkdownChunks | null>(null);
   const chunks = advanceMarkdownChunks(previous.current, children);
   previous.current = chunks;
+  const workspaceFileContext = useContext(MarkdownWorkspaceContext) ?? workspaceFilePreviewContextFromPage();
   return (
     <div className={className ? `markdown-content ${className}` : "markdown-content"} id={id}>
-      {[...chunks.frozen, chunks.tail].map((source, index) => <Fragment key={index}>{index > 0 ? "\n" : null}<MarkdownPart source={source} /></Fragment>)}
+      {[...chunks.frozen, chunks.tail].map((source, index) => <Fragment key={index}>{index > 0 ? "\n" : null}<MarkdownPart source={source} context={workspaceFileContext} /></Fragment>)}
     </div>
   );
 });
 
-const MarkdownPart = memo(function MarkdownPart({ source }: { source: string }) {
-  return <ReactMarkdown remarkPlugins={markdownPlugins} components={markdownComponents} urlTransform={transformMarkdownUrl}>{source}</ReactMarkdown>;
+const MarkdownPart = memo(function MarkdownPart({ source, context }: { source: string; context: WorkspaceFilePreviewContext }) {
+  return <ReactMarkdown remarkPlugins={markdownPlugins} components={markdownComponents} urlTransform={(url) => transformMarkdownUrl(url, context)}>{source}</ReactMarkdown>;
 });
+
+function MarkdownImage({ alt, src, ...props }: ComponentPropsWithoutRef<"img">) {
+  const [open, setOpen] = useState(false);
+  const name = alt || "Image";
+  return <>
+    <img {...props} src={src} alt={alt ?? ""} loading="lazy" referrerPolicy="no-referrer"
+      role={src ? "button" : undefined} tabIndex={src ? 0 : undefined}
+      aria-label={src ? `Enlarge ${name}` : undefined}
+      style={{ cursor: src ? "zoom-in" : undefined }}
+      onClick={(event) => {
+        if (!src) return;
+        event.preventDefault();
+        event.stopPropagation();
+        setOpen(true);
+      }}
+      onKeyDown={(event) => {
+        if (!src || (event.key !== "Enter" && event.key !== " ")) return;
+        event.preventDefault();
+        event.stopPropagation();
+        setOpen(true);
+      }} />
+    {open && src && <WorkspaceImagePopup name={name} src={src} onClose={() => setOpen(false)} />}
+  </>;
+}
 
 function MarkdownLink({ href, children, onClick, ...props }: ComponentPropsWithoutRef<"a">) {
   const [previewFailed, setPreviewFailed] = useState(false);
+  const [isImagePreviewOpen, setIsImagePreviewOpen] = useState(false);
   const [isWorkspaceFileOpen, setIsWorkspaceFileOpen] = useState(false);
   const previewName = href ? workspaceImagePreviewName(href) : null;
   const workspaceFile = href ? workspaceFileReferenceFromUrl(href) : null;
   const sessionNavigationUrl = href ? threadexNavigationUrl(href) : null;
-  const workspaceFileContext = workspaceFilePreviewContextFromPage();
+  const workspaceFileContext = useContext(MarkdownWorkspaceContext) ?? workspaceFilePreviewContextFromPage();
 
-  if (previewName && !previewFailed) {
+  if (href && previewName && !previewFailed) {
     return (
-      <a
-        className="markdown-image-preview"
-        href={href}
-        target="_blank"
-        rel="noopener noreferrer"
-        {...props}
-      >
-        <img
-          alt={previewName}
-          decoding="async"
-          loading="lazy"
-          referrerPolicy="no-referrer"
-          src={href}
-          onError={() => setPreviewFailed(true)}
-        />
-        <span>{children}</span>
-      </a>
+      <>
+        <a
+          className="markdown-image-preview"
+          href={href}
+          {...props}
+          onClick={(event) => {
+            onClick?.(event);
+            if (event.defaultPrevented) return;
+            event.preventDefault();
+            setIsImagePreviewOpen(true);
+          }}
+        >
+          <img
+            alt={previewName}
+            decoding="async"
+            loading="lazy"
+            referrerPolicy="no-referrer"
+            src={href}
+            onError={() => setPreviewFailed(true)}
+          />
+          <span>{children}</span>
+        </a>
+        {isImagePreviewOpen && (
+          <WorkspaceImagePopup
+            name={previewName}
+            src={href}
+            onClose={() => setIsImagePreviewOpen(false)}
+          />
+        )}
+      </>
     );
   }
 
@@ -92,7 +136,7 @@ function MarkdownLink({ href, children, onClick, ...props }: ComponentPropsWitho
     );
   }
 
-  if (workspaceFile && href) {
+  if (workspaceFile && href && !previewName) {
     return (
       <>
         <a
@@ -109,6 +153,9 @@ function MarkdownLink({ href, children, onClick, ...props }: ComponentPropsWitho
           <UrlTagIcon url={href} />
           {children}
         </a>
+        {isHtmlFilePath(workspaceFile.path) && (
+          <HtmlPreviewLink path={workspaceFile.path} context={workspaceFileContext} />
+        )}
         {isWorkspaceFileOpen && (
           <WorkspaceFilePopup
             line={workspaceFile.line}
@@ -126,6 +173,100 @@ function MarkdownLink({ href, children, onClick, ...props }: ComponentPropsWitho
       <UrlTagIcon url={href} />
       {children}
     </a>
+  );
+}
+
+function HtmlPreviewLink({ path, context }: { path: string; context: WorkspaceFilePreviewContext }) {
+  const [error, setError] = useState<string | null>(null);
+  const [readyUrl, setReadyUrl] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const entryUrl = workspaceHtmlPreviewUrl(path, context);
+  return <>
+    <a href={readyUrl ?? entryUrl} target="_blank" rel="noopener noreferrer" className="icon-button" aria-label="Open HTML preview in new tab" title="Open HTML preview in new tab" aria-busy={loading}
+      onClick={async (event) => {
+        event.preventDefault();
+        if (loading) return;
+        // Authenticate in the app before handing off to a PWA's external window.
+        const popup = window.open("about:blank", "_blank");
+        if (popup) popup.opener = null;
+        setLoading(true);
+        setError(null);
+        try {
+          const response = await fetch(`${entryUrl}?format=json`, { credentials: "same-origin" });
+          const payload = await response.json() as { url?: string; error?: string };
+          if (!response.ok || !payload.url?.startsWith("/api/workspaces/html-content/")) {
+            throw new Error(payload.error || "Could not open HTML preview.");
+          }
+          if (popup && !popup.closed) popup.location.replace(payload.url);
+          else setReadyUrl(payload.url);
+        } catch (cause) {
+          popup?.close();
+          setError(cause instanceof Error ? cause.message : "Could not open HTML preview.");
+        } finally {
+          setLoading(false);
+        }
+      }}>
+      <ExternalLink size={14} aria-hidden="true" />
+    </a>
+    {readyUrl && <a href={readyUrl} target="_blank" rel="noopener noreferrer">Open prepared preview</a>}
+    {error && <span role="alert">{error}</span>}
+  </>;
+}
+
+function WorkspaceImagePopup({ name, src, onClose }: { name: string; src: string; onClose: () => void }) {
+  const [originalSize, setOriginalSize] = useState(false);
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
+  return createPortal(
+    <div className="attachment-preview-backdrop" role="presentation" onMouseDown={onClose}>
+      <section
+        className="attachment-preview-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Preview ${name}`}
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <header className="attachment-preview-header">
+          <div>
+            <strong>{name}</strong>
+            <span>Image preview</span>
+          </div>
+          <div className="attachment-preview-actions">
+            <a
+              className="attachment-preview-download"
+              href={workspaceFileDownloadUrl(src)}
+              download={name}
+              title={`Download ${name}`}
+              aria-label={`Download ${name}`}
+            >
+              <Download aria-hidden="true" />
+            </a>
+            <button type="button" onClick={onClose} aria-label={`Close preview for ${name}`}>
+              <X aria-hidden="true" />
+            </button>
+          </div>
+        </header>
+        <div className="attachment-preview-image-wrap" style={originalSize ? { placeItems: "start" } : undefined}>
+          <img src={src} alt={name} role="button" tabIndex={0}
+            aria-label={originalSize ? "Fit image to window" : "View image at original size"}
+            aria-pressed={originalSize}
+            style={{ cursor: originalSize ? "zoom-out" : "zoom-in", ...(originalSize ? { maxWidth: "none", maxHeight: "none", flexShrink: 0 } : {}) }}
+            onClick={() => setOriginalSize((value) => !value)}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter" && event.key !== " ") return;
+              event.preventDefault();
+              setOriginalSize((value) => !value);
+            }} />
+        </div>
+      </section>
+    </div>,
+    document.body
   );
 }
 
@@ -187,6 +328,9 @@ function WorkspaceFilePopup({ path, line, context, onClose }: { path: string; li
             </div>
           </div>
           <div className="workspace-file-actions">
+            {isHtmlFilePath(path) && (
+              <HtmlPreviewLink path={path} context={context} />
+            )}
             <button className="icon-button" type="button" onClick={downloadFile} disabled={content === null} aria-label={`Download ${fileName}`} title={`Download ${fileName}`}>
               <Download aria-hidden="true" />
             </button>

@@ -2,6 +2,7 @@ import express, { type Request, type Response } from "express";
 import { createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync } from "node:fs";
 import { dirname } from "node:path";
+import { clearHtmlPreviewGrants, isHtmlPreviewRequest } from "./htmlPreview";
 
 const COOKIE = "threadex_session";
 const TTL = 30 * 24 * 60 * 60 * 1000;
@@ -29,6 +30,7 @@ export function createSecurity(file: string) {
   if (password && !password.signingKey) persist();
   const active = new Set<Response>();
   const revoke = () => {
+    clearHtmlPreviewGrants();
     signingKey = randomBytes(32);
     persist();
     for (const response of active) response.end();
@@ -57,6 +59,7 @@ export function createSecurity(file: string) {
   router.use((req, res, next) => {
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("X-Content-Type-Options", "nosniff");
+    if (isHtmlPreviewRequest(req)) { next(); return; }
     if (req.headers["sec-fetch-site"] === "cross-site") { res.status(403).json({ error: "Cross-site requests are blocked." }); return; }
     if (req.headers.origin) {
       try { if (new URL(req.headers.origin).host !== req.headers.host) throw new Error(); }
@@ -101,6 +104,7 @@ export function createSecurity(file: string) {
       res.on("close", () => { clearTimeout(timer); active.delete(res); });
       next(); return;
     }
+    if (isHtmlPreviewRequest(req)) { next(); return; }
     if (directLocal(req) && !req.headers.origin && !req.headers["sec-fetch-site"] && req.headers["sec-fetch-mode"] !== "navigate") { next(); return; }
     res.status(401).json({ error: "Sign in to Threadex.", code: "AUTH_REQUIRED" });
   });

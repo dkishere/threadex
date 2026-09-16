@@ -1,6 +1,7 @@
 import { Cog } from "lucide-react";
 import { useEffect, useRef, useState, type DragEvent, type ReactNode } from "react";
 import type { ModelReasoningEffort } from "./appTypes";
+import { COMPACT_FILE_DROP_QUERY } from "./globalFileDrop";
 
 export type ComposerGearProfile = {
   model: string;
@@ -61,8 +62,21 @@ export function ComposerFrame({ children }: ComposerFrameProps) {
   return <div className="composer-layout">{children}</div>;
 }
 
-export function ComposerSurface({ children, onDropFiles }: ComposerSurfaceProps) {
+export function ComposerSurface({ children, onDropFiles: onDesktopDropFiles }: ComposerSurfaceProps) {
   const [isDragActive, setIsDragActive] = useState(false);
+  const [compact, setCompact] = useState(() => typeof window !== "undefined" && window.matchMedia(COMPACT_FILE_DROP_QUERY).matches);
+  const onDropFiles = compact ? undefined : onDesktopDropFiles;
+
+  useEffect(() => {
+    const media = window.matchMedia(COMPACT_FILE_DROP_QUERY);
+    const update = () => {
+      setCompact(media.matches);
+      setIsDragActive(false);
+    };
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
 
   function isFileDrag(event: DragEvent<HTMLDivElement>) {
     return Array.from(event.dataTransfer.types).includes("Files");

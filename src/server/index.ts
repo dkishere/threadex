@@ -9,6 +9,7 @@ import { reviseOutcomePlan } from "./lightweightTodo";
 import express from "express";
 import { createSecurity } from "./security";
 import { createQuickChatRouter } from "./quickChatRoute";
+import { createHtmlPreviewRouter, createHtmlPreviewUrl } from "./htmlPreview";
 import type { Request, Response } from "express";
 import { buildCodexReference } from "../codexReference.js";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
@@ -22,6 +23,7 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   readSync,
   renameSync,
   rmSync,
@@ -782,6 +784,9 @@ let webVsCodeWalkthroughService: WebVsCodeWalkthroughService | null = null;
 const codexHookQueuePath = resolve(process.env.SESSION_CODEX_HOOK_QUEUE_PATH ?? resolve(dataDir, "codex-hook-queue.ndjson"));
 const uploadDir = resolve(dataDir, "uploads");
 const stagedAttachmentDir = resolve(uploadDir, "staged");
+const runnerTemporaryFileRoot = resolve(
+  process.env.THREADEX_MCP_TMPDIR ?? (process.platform === "darwin" ? "/private/tmp" : tmpdir())
+);
 const accountPoolDir = resolve(dataDir, "account-pool");
 mirrorProcessOutputToFile(supervisorLogPath("server"));
 const processMonitor = new ProcessMonitorService(sessionStore, {
@@ -826,6 +831,7 @@ let accountQuotaRefreshInFlight = false;
 let shuttingDown = false;
 
 app.use("/api", createSecurity(resolve(dataDir, "security.json")));
+app.use("/api", createHtmlPreviewRouter());
 app.use(express.json({ limit: "32mb" }));
 app.use("/api/settings/auto-model", createAutoModelSettingsRouter(autoModelSettings));
 app.use("/api/quick-chat", createQuickChatRouter(resolve(dataDir, "quick-chat-sessions.json")));
@@ -1630,7 +1636,7 @@ app.get("/api/link-preview", async (req, res) => {
 
 app.get("/api/sessions/:sessionId/snapshot", async (req: Request<{ sessionId: string }>, res: Response) => {
   try {
-    const session = await sessionStore.getSession(req.params.sessionId.trim());
+    const session = await sessionStore.resolveSessionAlias(req.params.sessionId.trim());
     if (!session) {
       res.status(404).json({ error: "Session not found." });
       return;
@@ -2400,17 +2406,65 @@ app.post("/api/sessions/:sessionId/web-vscode-walkthrough", async (req, res) => 
   }
 });
 
+// A hierarchical URL preserves relative assets, including URLs assigned by scripts.
+app.get("/api/workspaces/html/:workspaceId/:sessionId/:kind/*filePath", async (req, res) => {
+  try {
+    const workspace = await getRequestedOrActiveWorkspace(req.params.workspaceId === "active" ? undefined : req.params.workspaceId);
+    const session = req.params.sessionId === "none" ? null : await sessionStore.getSession(req.params.sessionId);
+    if (req.params.sessionId !== "none" && (!session || session.workspaceId !== workspace.id)) {
+      res.status(404).send("Session not found in the requested workspace.");
+      return;
+    }
+    const segments = req.params.filePath as unknown as string[];
+    const requestedPath = (req.params.kind === "posix" ? "/" : "") + segments.join("/");
+    const root = session?.cwd ?? workspace.cwd;
+    const filePath = resolveWorkspaceFilePath(root, requestedPath, [runnerTemporaryFileRoot]);
+    if (!filePath) {
+      res.status(403).send("Path must stay inside the project or runner temporary files.");
+      return;
+    }
+    if (!existsSync(filePath) || !statSync(filePath).isFile()) {
+      res.status(404).send("File not found.");
+      return;
+    }
+    const realPath = realpathSync(filePath);
+    if (!resolveWorkspaceFilePath(realpathSync(root), realPath, [realpathSync(runnerTemporaryFileRoot)])) {
+      res.status(403).send("File resolves outside the allowed directories.");
+      return;
+    }
+    const previewUrl = createHtmlPreviewUrl(realPath);
+    if (req.query.format === "json") {
+      res.json({ url: previewUrl });
+      return;
+    }
+    res.redirect(302, previewUrl);
+  } catch (error) {
+    res.status(500).json({ error: errorMessage(error) });
+  }
+});
+
 app.get("/api/workspaces/file", async (req, res) => {
   const requestedPath = typeof req.query.path === "string" ? req.query.path.trim() : "";
+  const requestedSessionId = typeof req.query.sessionId === "string" ? req.query.sessionId.trim() : "";
   if (!requestedPath) {
     res.status(400).json({ error: "path is required." });
     return;
   }
 
   try {
-    const workspace = await sessionStore.getActiveWorkspace();
-    // Match preview access: workspace cwd only supplies the relative-path base.
-    const filePath = resolve(workspace.cwd, requestedPath);
+    const requestedWorkspaceId = typeof req.query.workspaceId === "string" ? req.query.workspaceId : undefined;
+    const workspace = await getRequestedOrActiveWorkspace(requestedWorkspaceId);
+    const session = requestedSessionId ? await sessionStore.getSession(requestedSessionId) : null;
+    if (requestedSessionId && (!session || session.workspaceId !== workspace.id)) {
+      res.status(404).json({ error: "Session not found in the requested workspace." });
+      return;
+    }
+
+    const filePath = resolveWorkspaceFilePath(session?.cwd ?? workspace.cwd, requestedPath, [runnerTemporaryFileRoot]);
+    if (!filePath) {
+      res.status(400).json({ error: `path must stay inside the ${session ? "session project" : "active workspace"} or runner temporary files.` });
+      return;
+    }
 
     if (!existsSync(filePath)) {
       res.status(404).json({ error: "File not found." });
@@ -2423,7 +2477,7 @@ app.get("/api/workspaces/file", async (req, res) => {
       return;
     }
 
-    const disposition = canInlineWorkspaceFile(filePath) ? "inline" : "attachment";
+    const disposition = req.query.download === "1" ? "attachment" : canInlineWorkspaceFile(filePath) ? "inline" : "attachment";
     const fileName = safeFileName(basename(filePath)).replace(/"/g, "_");
     res.setHeader("Content-Disposition", `${disposition}; filename="${fileName}"`);
     res.setHeader("Content-Security-Policy", "default-src 'none'; sandbox");
@@ -6645,12 +6699,12 @@ async function getSessionAccount(input: {
 }
 
 async function getSessionForRequestedId(requestedSessionId: string) {
-  const direct = await sessionStore.getSession(requestedSessionId);
+  const direct = await sessionStore.resolveSessionAlias(requestedSessionId);
   if (direct || requestedSessionId.startsWith("local_")) {
     return direct;
   }
 
-  return sessionStore.getSession(`local_${requestedSessionId}`);
+  return sessionStore.resolveSessionAlias(`local_${requestedSessionId}`);
 }
 
 function isSafeTranscriptIdentifier(value: string) {

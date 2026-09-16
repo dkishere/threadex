@@ -27,12 +27,27 @@ export type WorkspaceFilePreviewContext = {
  * Agent replies use absolute filesystem paths for clickable workspace files.
  * Browsers otherwise treat those paths as routes on the Threadex origin.
  */
-export function transformMarkdownUrl(url: string) {
+export function transformMarkdownUrl(url: string, context: WorkspaceFilePreviewContext = {}) {
   const filePath = localFilePathFromMarkdownUrl(url);
   if (!filePath) return url;
   const reference = splitWorkspaceFileReference(filePath);
-  const lineQuery = reference.line ? `&line=${reference.line}` : "";
-  return `${WORKSPACE_FILE_ENDPOINT}?path=${encodeURIComponent(reference.path)}${lineQuery}`;
+  const params = new URLSearchParams();
+  if (reference.line) params.set("line", String(reference.line));
+  if (context.sessionId) params.set("sessionId", context.sessionId);
+  if (context.workspaceId) params.set("workspaceId", context.workspaceId);
+  const suffix = params.toString();
+  return `${WORKSPACE_FILE_ENDPOINT}?path=${encodeURIComponent(reference.path)}${suffix ? `&${suffix}` : ""}`;
+}
+
+export function workspaceFileDownloadUrl(url: string) {
+  try {
+    const parsed = new URL(url, "http://threadex.local");
+    if (parsed.pathname !== WORKSPACE_FILE_ENDPOINT) return url;
+    parsed.searchParams.set("download", "1");
+    return `${parsed.pathname}?${parsed.searchParams}`;
+  } catch {
+    return url;
+  }
 }
 
 export function workspaceFileReferenceFromUrl(url: string): WorkspaceFileReference | null {
@@ -69,6 +84,17 @@ export function isMarkdownFilePath(path: string) {
 export function isJsonFilePath(path: string) {
   const normalizedPath = path.split(/[?#]/, 1)[0] ?? "";
   return /\.json$/i.test(normalizedPath);
+}
+
+export function isHtmlFilePath(path: string) {
+  return /\.html?$/i.test(path);
+}
+
+export function workspaceHtmlPreviewUrl(path: string, context: WorkspaceFilePreviewContext = {}) {
+  const normalized = path.replaceAll("\\", "/");
+  const kind = /^[a-z]:\//i.test(normalized) ? "windows" : "posix";
+  const parts = normalized.replace(/^\/+/, "").split("/").map(encodeURIComponent).join("/");
+  return `/api/workspaces/html/${encodeURIComponent(context.workspaceId || "active")}/${encodeURIComponent(context.sessionId || "none")}/${kind}/${parts}`;
 }
 
 /**

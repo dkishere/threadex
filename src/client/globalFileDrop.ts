@@ -1,5 +1,7 @@
 type FileDropHandler = (files: FileList) => void | Promise<void>;
 
+export const COMPACT_FILE_DROP_QUERY = "(width < 1080px)";
+
 function hasFiles(event: DragEvent) {
   return Array.from(event.dataTransfer?.types ?? []).includes("Files");
 }
@@ -14,6 +16,16 @@ function isComposerDropTarget(target: EventTarget | null) {
  */
 export function installGlobalFileDrop(onFiles: FileDropHandler) {
   let dragDepth = 0;
+  const compact = window.matchMedia(COMPACT_FILE_DROP_QUERY);
+
+  function blockCompactDrop(event: DragEvent) {
+    if (!compact.matches) return false;
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "none";
+    clearDragState();
+    return true;
+  }
 
   function clearDragState() {
     dragDepth = 0;
@@ -22,6 +34,7 @@ export function installGlobalFileDrop(onFiles: FileDropHandler) {
 
   function handleDragEnter(event: DragEvent) {
     if (!hasFiles(event)) return;
+    if (blockCompactDrop(event)) return;
     event.preventDefault();
     dragDepth += 1;
     document.body.setAttribute("data-file-drag-active", "true");
@@ -30,6 +43,7 @@ export function installGlobalFileDrop(onFiles: FileDropHandler) {
   function handleDragOver(event: DragEvent) {
     const dataTransfer = event.dataTransfer;
     if (!dataTransfer || !hasFiles(event)) return;
+    if (blockCompactDrop(event)) return;
     event.preventDefault();
     dataTransfer.dropEffect = "copy";
   }
@@ -43,6 +57,7 @@ export function installGlobalFileDrop(onFiles: FileDropHandler) {
   function handleDrop(event: DragEvent) {
     const dataTransfer = event.dataTransfer;
     if (!dataTransfer || !hasFiles(event)) return;
+    if (blockCompactDrop(event)) return;
     event.preventDefault();
     clearDragState();
     if (isComposerDropTarget(event.target)) return;
@@ -52,12 +67,14 @@ export function installGlobalFileDrop(onFiles: FileDropHandler) {
     }
   }
 
+  compact.addEventListener("change", clearDragState);
   window.addEventListener("dragenter", handleDragEnter, true);
   window.addEventListener("dragover", handleDragOver, true);
   window.addEventListener("dragleave", handleDragLeave, true);
   window.addEventListener("drop", handleDrop, true);
   return () => {
     clearDragState();
+    compact.removeEventListener("change", clearDragState);
     window.removeEventListener("dragenter", handleDragEnter, true);
     window.removeEventListener("dragover", handleDragOver, true);
     window.removeEventListener("dragleave", handleDragLeave, true);

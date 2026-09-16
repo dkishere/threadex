@@ -12,6 +12,22 @@ import { fileChangesFromTurnDiff, normalizeStructuredAgentComment } from "./code
 import { stripContextForkOperationalSuffix } from "../contextFork";
 
 export type KeywordWeights = Record<string, number>;
+
+// The file poller can discover a native rollout before its managed session
+// adopts the thread ID. Keep the resulting empty import out of navigation.
+const emptyNativeSessionAliasSql = `(
+  sessions.thread_id IS NOT NULL
+  AND sessions.id = 'local_' || sessions.thread_id
+  AND sessions.parent_session_id IS NULL
+  AND NOT EXISTS (SELECT 1 FROM session_turn WHERE session_id = sessions.id)
+  AND EXISTS (
+    SELECT 1 FROM sessions AS owner
+    WHERE owner.thread_id = sessions.thread_id
+      AND owner.workspace_id = sessions.workspace_id
+      AND owner.id <> sessions.id
+      AND EXISTS (SELECT 1 FROM session_turn WHERE session_id = owner.id)
+  )
+)`;
 export type SessionTitleSource = "initial" | "summarizer" | "user";
 
 export type ComposerSuggestionKeywordRecord = {
@@ -1795,6 +1811,7 @@ export class SessionStore {
             AND achieved_at IS NULL
             ${projectSql}
             ${searchSql}
+            AND NOT ${emptyNativeSessionAliasSql}
           ORDER BY ${relevanceSql} created DESC, id DESC
           LIMIT $limitPlusOne OFFSET $offset
         `,
@@ -1814,6 +1831,7 @@ export class SessionStore {
             AND achieved_at IS NULL
             ${projectSql}
             ${searchSql}
+            AND NOT ${emptyNativeSessionAliasSql}
         `,
         {
           workspaceId,
@@ -1840,6 +1858,7 @@ export class SessionStore {
           FROM sessions
           WHERE workspace_id = $workspaceId
             AND achieved_at IS NULL
+            AND NOT ${emptyNativeSessionAliasSql}
           GROUP BY cwd
           ORDER BY latest_updated DESC, cwd ASC
         `,
@@ -3327,6 +3346,19 @@ export class SessionStore {
 
   async getSession(id: string): Promise<SessionRecord | null> {
     return this.read(async (connection) => this.getSessionWithConnection(connection, id));
+  }
+
+  async resolveSessionAlias(id: string): Promise<SessionRecord | null> {
+    return this.read(async (connection) => {
+      const session = await this.getSessionWithConnection(connection, id);
+      if (!session?.threadId) return session;
+      const aliases = await connection.run(
+        `SELECT id FROM sessions WHERE id = $id AND ${emptyNativeSessionAliasSql}`,
+        { id }
+      );
+      if ((await aliases.getRowObjectsJS()).length === 0) return session;
+      return await this.getSessionByThreadIdWithConnection(connection, session.threadId, session.workspaceId) ?? session;
+    });
   }
 
   async getSessionModelPreferences(sessionId: string): Promise<SessionModelPreferences> {
@@ -7972,7 +8004,8 @@ export class SessionStore {
         FROM sessions
         WHERE thread_id = $threadId
           ${workspacePredicate}
-        ORDER BY updated DESC, created DESC, id DESC
+        ORDER BY EXISTS (SELECT 1 FROM session_turn WHERE session_id = sessions.id) DESC,
+          updated DESC, created DESC, id DESC
         LIMIT 1
       `,
       workspaceId ? { threadId, workspaceId } : { threadId }

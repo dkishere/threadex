@@ -2,7 +2,22 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { JsonFileViewer, MarkdownContent } from "./MarkdownContent";
+import { JsonFileViewer, MarkdownContent, MarkdownWorkspaceContext } from "./MarkdownContent";
+
+test("file links use the displayed session context without URL query parameters", () => {
+  const render = (sessionId: string) => renderToStaticMarkup(React.createElement(
+    MarkdownWorkspaceContext.Provider,
+    { value: { sessionId, workspaceId: "default" } },
+    React.createElement(MarkdownContent, { children: "[report](C:/AI/head/report.html) [image](C:/AI/head/image.png)" })
+  ));
+  const html = render("local_project");
+  assert.match(html, /html\/default\/local_project\/windows/);
+  assert.match(html, /sessionId=local_project&amp;workspaceId=default/);
+  assert.doesNotMatch(html, /html\/active\/none/);
+  const switched = render("local_other");
+  assert.match(switched, /html\/default\/local_other\/windows/);
+  assert.doesNotMatch(switched, /local_project/);
+});
 
 test("renders an absolute workspace image link as an inline preview", () => {
   const path = "/Volumes/dev/tools/session-manager/concept image.png";
@@ -15,6 +30,14 @@ test("renders an absolute workspace image link as an inline preview", () => {
   assert.ok(html.includes(`href="${fileUrl}"`));
   assert.ok(html.includes(`src="${fileUrl}"`));
   assert.match(html, /<span>concept<\/span>/);
+});
+
+test("HTML links offer a separate new-tab preview icon", () => {
+  const html = renderToStaticMarkup(React.createElement(MarkdownContent, { children: "[report](C:/AI/head/report.html)" }));
+  assert.match(html, /data-workspace-file-link="true"/);
+  assert.match(html, /aria-label="Open HTML preview in new tab"/);
+  assert.match(html, /href="\/api\/workspaces\/html\/active\/none\/windows\/C%3A\/AI\/head\/report.html"/);
+  assert.match(html, /target="_blank"/);
 });
 
 test("renders non-image workspace links as popup triggers", () => {
