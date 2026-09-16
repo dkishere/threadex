@@ -42,6 +42,7 @@ type CompletedTurnComponent = (props: {
 type SideChatPanelProps = {
   codexSessionId?: string;
   sessionId: string;
+  sessionReady: boolean;
   workspaceId?: string;
   CompletedTurn: CompletedTurnComponent;
   annotation?: ResponseAnnotation | null;
@@ -57,7 +58,7 @@ async function readApiError(response: Response, fallback: string) {
   }
 }
 
-export function SideChatPanel({ codexSessionId, sessionId, workspaceId, CompletedTurn, annotation, onClearAnnotation }: SideChatPanelProps) {
+export function SideChatPanel({ codexSessionId, sessionId, sessionReady, workspaceId, CompletedTurn, annotation, onClearAnnotation }: SideChatPanelProps) {
   const [messages, setMessages] = useState<SessionSideChat[]>([]);
   const [input, setInput] = useState("");
   const [pendingQuestion, setPendingQuestion] = useState("");
@@ -97,6 +98,9 @@ export function SideChatPanel({ codexSessionId, sessionId, workspaceId, Complete
     setPendingQuestion("");
     setError(null);
     setIsLoading(true);
+    if (!sessionReady) {
+      return () => controller.abort();
+    }
     void fetch("/api/session-inspector/session", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -120,7 +124,7 @@ export function SideChatPanel({ codexSessionId, sessionId, workspaceId, Complete
       if (!controller.signal.aborted) setIsLoading(false);
     });
     return () => controller.abort();
-  }, [sessionId]);
+  }, [sessionId, sessionReady]);
 
   useEffect(() => {
     const element = scrollRef.current;
@@ -130,7 +134,7 @@ export function SideChatPanel({ codexSessionId, sessionId, workspaceId, Complete
   async function submit(event?: FormEvent) {
     event?.preventDefault();
     const question = annotation ? formatResponseAnnotationsPrompt([annotation], input.trim()) : input.trim();
-    if (!question || isSending) return;
+    if (!question || isSending || !sessionReady) return;
     setInput("");
     setPendingQuestion(question);
     setError(null);
@@ -171,7 +175,7 @@ export function SideChatPanel({ codexSessionId, sessionId, workspaceId, Complete
     <aside className="side-chat-panel" aria-label="Read-only side chat">
       <div ref={scrollRef} className="side-chat-messages messages" aria-live="polite">
         {isLoading ? (
-          <div className="side-chat-state"><Loader2 className="spin" aria-hidden="true" /> Loading side chat…</div>
+          <div className="side-chat-state"><Loader2 className="spin" aria-hidden="true" /> {sessionReady ? "Loading side chat…" : "Preparing session…"}</div>
         ) : messages.length === 0 ? (
           <div className="side-chat-empty">
             <LockKeyhole aria-hidden="true" />
@@ -223,7 +227,7 @@ export function SideChatPanel({ codexSessionId, sessionId, workspaceId, Complete
             onActivateGear={setActiveGearIndex}
             onModelChange={(index, model) => updateGearProfile(index, { model })}
             onEffortChange={(index, effort) => updateGearProfile(index, { effort })}
-            disabled={isSending}
+            disabled={isSending || !sessionReady}
             className="side-chat-gears"
           />
           <ComposerSurface>
@@ -254,7 +258,7 @@ export function SideChatPanel({ codexSessionId, sessionId, workspaceId, Complete
               <button className="composer-icon" type="button" onClick={() => { setInput(""); onClearAnnotation?.(); }} disabled={!input && !annotation} title="Clear" aria-label="Clear">
                 <X aria-hidden="true" />
               </button>
-              <button className="send-button" type="submit" disabled={(!input.trim() && !annotation) || isSending} title="Send" aria-label="Send">
+              <button className="send-button" type="submit" disabled={(!input.trim() && !annotation) || isSending || !sessionReady} title="Send" aria-label="Send">
                 {isSending ? <Loader2 className="spin" aria-hidden="true" /> : <Send aria-hidden="true" />}
               </button>
             </ComposerToolbar>
