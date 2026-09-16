@@ -1,5 +1,6 @@
 import {
   isValidElement,
+  Fragment,
   lazy,
   memo,
   Suspense,
@@ -11,10 +12,11 @@ import {
   type ReactNode
 } from "react";
 import { createPortal } from "react-dom";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Download, FileText, X } from "lucide-react";
 import { UrlTagIcon } from "./UrlTagIcon";
+import { advanceMarkdownChunks, type MarkdownChunks } from "./markdownChunks";
 import { isJsonFilePath, isMarkdownFilePath, threadexNavigationUrl, transformMarkdownUrl, workspaceFilePreviewUrl, workspaceFileReferenceFromUrl, workspaceImagePreviewName, type WorkspaceFilePreviewContext } from "./markdownUrls";
 
 const MonacoTextEditor = lazy(async () => {
@@ -22,40 +24,33 @@ const MonacoTextEditor = lazy(async () => {
   return { default: module.MonacoTextEditor };
 });
 
+// Stable component types keep links, previews and code blocks mounted while
+// the surrounding Markdown receives new streamed text.
+const markdownComponents: Components = {
+  a: ({ node: _node, ...props }) => <MarkdownLink {...props} />,
+  code: ({ className, children, node: _node, ...props }) => {
+    const language = /language-([\w-]+)/.exec(className ?? "")?.[1];
+    if (language === "mermaid") return <MermaidBlock source={String(children).replace(/\n$/, "")} />;
+    return <code className={className} {...props}>{children}</code>;
+  },
+  pre: ({ children }) => findMermaidChild(children) ?? <pre className="markdown-code-block">{children}</pre>,
+  img: ({ alt, node: _node, ...props }) => <img alt={alt ?? ""} loading="lazy" referrerPolicy="no-referrer" {...props} />
+};
+const markdownPlugins = [remarkGfm];
+
 export const MarkdownContent = memo(function MarkdownContent({ children, className, id }: { children: string; className?: string; id?: string }) {
+  const previous = useRef<MarkdownChunks | null>(null);
+  const chunks = advanceMarkdownChunks(previous.current, children);
+  previous.current = chunks;
   return (
     <div className={className ? `markdown-content ${className}` : "markdown-content"} id={id}>
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          a: ({ node: _node, ...props }) => <MarkdownLink {...props} />,
-          code: ({ className: codeClassName, children: codeChildren, node: _node, ...props }) => {
-            const language = /language-([\w-]+)/.exec(codeClassName ?? "")?.[1];
-            const source = String(codeChildren).replace(/\n$/, "");
-            if (language === "mermaid") {
-              return <MermaidBlock source={source} />;
-            }
-            return (
-              <code className={codeClassName} {...props}>
-                {codeChildren}
-              </code>
-            );
-          },
-          pre: ({ children: preChildren }) => {
-            const mermaidChild = findMermaidChild(preChildren);
-            if (mermaidChild) {
-              return mermaidChild;
-            }
-            return <pre className="markdown-code-block">{preChildren}</pre>;
-          },
-          img: ({ alt, node: _node, ...props }) => <img alt={alt ?? ""} loading="lazy" referrerPolicy="no-referrer" {...props} />
-        }}
-        urlTransform={transformMarkdownUrl}
-      >
-        {children}
-      </ReactMarkdown>
+      {[...chunks.frozen, chunks.tail].map((source, index) => <Fragment key={index}>{index > 0 ? "\n" : null}<MarkdownPart source={source} /></Fragment>)}
     </div>
   );
+});
+
+const MarkdownPart = memo(function MarkdownPart({ source }: { source: string }) {
+  return <ReactMarkdown remarkPlugins={markdownPlugins} components={markdownComponents} urlTransform={transformMarkdownUrl}>{source}</ReactMarkdown>;
 });
 
 function MarkdownLink({ href, children, onClick, ...props }: ComponentPropsWithoutRef<"a">) {

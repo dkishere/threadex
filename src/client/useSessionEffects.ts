@@ -1,5 +1,6 @@
 // @ts-nocheck
 import { useEffect, useLayoutEffect } from "react";
+import { deferSnapshotWrite } from "./deferredSnapshot";
 
 export function useSessionEffects(ctx) {
   const { accountPopoverRef, activeGearIndex, activePromptTurnIds, activeTurnId, activeTurnIdRef, activeWorkspace, approvalPolicy, backendConnection, backendConnectionRef, bumpViewKey, composerDraftSessionIdRef, currentModelPreferences, currentRunningTurnId, currentSessionIsRunning, currentSessionIsStopping, didBootReconnectRef, effectiveParentSessionId, escStopArmedRef, escStopTimerRef, eventStore, executionMode, explicitNewSessionRef, findAssistantMessageId, forcePlanNextPrompt, forkNextPrompt, gearProfiles, handleDurableEvent, hasRunningTurn, inlinePromptEditor, inlinePromptEditorRef, isAccountLoginOpen, isAccountPopoverOpen, isBootstrapped, isLikelyBackendDisconnect, isSessionSearchOpen, isSettingsOpen, latestMessagesRef, loadContext, loadSessionSearchPage, loadSessionsTimerRef, loadWorkspaceSnapshot, messageIndicatorMarks, messageScrollIndicatorRef, messageScrollTopRef, messages, messagesRef, modelPreferencesEditRevisionRef, navigationTargetRef, noteBackendDisconnect, noteBackendRequestSucceeded, patchStoredComposerDraft, persistModelPreferences, profileAccountId, profileWorkspaceId, promptTurns, promptTurnsScrollRef, queuedModelPreferencesRevisionRef, queuedPrompts, queuedPromptsBySession, queuedPromptsRef, readNavigationTarget, reconnectRunner, reconnectingTurnIdsRef, refreshSelectedSessionSnapshot, resetAccountLoginDialog, resetEscStopPrompt, resizeEditor, responseQuotePopover, restoreBackendConnection, resumeThreadId, runQueuedPrompt, runningSessionCount, selectedEffort, selectedModel, sessionExecutionStatusesRef, sessionId, sessionIdRef, sessionSearchQuery, setActivePromptTurnIds, setClockNow, setComposerResponseQuote, setIsAccountPopoverOpen, setIsLoadingProfileAnalytics, setIsLoadingSkills, setIsSettingsOpen, setParentSessionTodo, setPendingApprovalSessionIds, setProfileAnalytics, setProfileAnalyticsError, setProfileWorkspaceId, setResponseQuotePopover, setSelectedSkills, setSessionExecutionStatuses, setSkillSuggestions, setSlashSuggestionIndex, setStatus, setsEqual, settingsSection, showToast, skillSuggestions, slashTrigger, status, stickToMessageBottomRef, stopCurrentTurn, switchingSessionTitle, threadId, toastTimerRef, updateMessageIndicatorPositions, updateMessageViewportIndicator, useLoadBalanceInWorkspace, viewKeyRef, writeStoredSession } = ctx;
@@ -50,7 +51,7 @@ useEffect(() => {
         };
     }, [isSessionSearchOpen, sessionSearchQuery]);
 useEffect(() => {
-        writeStoredSession({
+        return deferSnapshotWrite(() => writeStoredSession({
             version: 1,
             messages,
             queuedPrompts,
@@ -67,7 +68,7 @@ useEffect(() => {
             gearProfiles,
             activeGearIndex,
             useLoadBalanceInWorkspace
-        });
+        }));
     }, [
         activeTurnId,
         activeGearIndex,

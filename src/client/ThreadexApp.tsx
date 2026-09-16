@@ -9,6 +9,8 @@ import { eventStore, useEventStore } from "./eventStore";
 import { MonacoDiffEditor } from "./MonacoDiffEditor";
 import { FileEditIcon } from "./FileEditIcon";
 import { MarkdownContent } from "./MarkdownContent";
+import { DeferredDetails } from "./DeferredDetails";
+import { sameTimelineItems } from "./timelineMemo";
 import { InlineLinkComposer } from "./InlineLinkComposer";
 import { SessionTodoPanel } from "./SessionTodoPanel";
 import { formatResponseAnnotationsPrompt, parseResponseAnnotations } from "./responseAnnotations";
@@ -102,7 +104,14 @@ function summarizeCommand(value) { return sessionHelpers01.summarizeCommand({  }
 function elementForSelectionNode(node) { return sessionHelpers01.elementForSelectionNode({  }, node); }
 function shouldRenderMessageTimeline(message) { return sessionHelpers01.shouldRenderMessageTimeline({ isDisplayableMessageSegment }, message); }
 const LiveEventList = memo(function LiveEventList({ items, anchorPrefix, sessionId: providedSessionId }) { return sessionHelpers01.LiveEventList({ FileAnnotationComposerContext, TimelineEntries, _jsx, compactTimelineEntries, isDisplayableLiveItem, liveItemKey, useContext }, { items, anchorPrefix, sessionId: providedSessionId }); });
-const MessageTimeline = memo(function MessageTimeline({ segments, anchorPrefix, completed = false, running = false, statusText, codexSessionId, sessionId: providedSessionId, turnId, workspaceId }) { return sessionHelpers01.MessageTimeline({ FileAnnotationComposerContext, TimelineEntries, TurnIssueTracker, _jsx, _jsxs, compactTimelineEntries, finalizePendingReasoningSegments, isDisplayableMessageSegment, latestTurnIssueTracker, useContext, withTurnLevelStatus }, { segments, anchorPrefix, completed, running, statusText, codexSessionId, sessionId: providedSessionId, turnId, workspaceId }); });
+export const MessageTimeline = memo(function MessageTimeline(props) {
+    const annotationContext = useContext(FileAnnotationComposerContext);
+    if (props.message) return sessionHelpers01.CompletedTurn({ MarkdownContent, TimelineEntries, TurnChangeList, TurnIssueTracker, _Fragment, _jsx, _jsxs, appendSteerSegment, collectFileChanges, compactTimelineEntries, compareSteerMessages, isDisplayableLiveItem, isDisplayableMessageSegment, latestTurnIssueTracker, liveItemKey, removeLastTextSegment, withTurnLevelStatus }, props);
+    return sessionHelpers01.MessageTimeline({ annotationContext, TimelineEntries, TurnIssueTracker, _jsx, _jsxs, compactTimelineEntries, finalizePendingReasoningSegments, isDisplayableMessageSegment, latestTurnIssueTracker, withTurnLevelStatus }, props);
+}, (previous, next) => {
+    if (previous.message && next.message) return previous.message === next.message && previous.codexSessionId === next.codexSessionId && previous.sessionId === next.sessionId && previous.workspaceId === next.workspaceId && previous.steerMessages.length === next.steerMessages.length && previous.steerMessages.every((message, index) => message === next.steerMessages[index]);
+    return Object.keys(previous).length === Object.keys(next).length && Object.keys(previous).every((key) => Object.is(previous[key], next[key]));
+});
 function TimelineEntries({ entries, anchorPrefix, groupPlanSteps = true, completed = false, sessionId }) { return sessionHelpers01.TimelineEntries({ ActionGroup, LiveEvent, MarkdownContent, PlanStepTimeline, SteerEvent, StructuredCommentEvent, _Fragment, _jsx, attachCommentaryActivities, groupTimelineEntriesByPlanSteps, timelineAnchorId }, { entries, anchorPrefix, groupPlanSteps, completed, sessionId }); }
 function groupTimelineEntriesByPlanSteps(entries, completed) { return sessionHelpers01.groupTimelineEntriesByPlanSteps({ groupTimelineEntriesByTextStepMarkers, groupTimelineEntriesByTodoList }, entries, completed); }
 function groupTimelineEntriesByTodoList(entries) { return sessionHelpers01.groupTimelineEntriesByTodoList({ nextActivePlanStepIndex, syncPlanSteps, todoListItemFromEntry }, entries); }
@@ -119,12 +128,13 @@ function TodoPanel({ todo, ...props }) { return sessionHelpers01.TodoPanel({ Ses
 function timelineAnchorId(messageId, entryId) { return sessionHelpers01.timelineAnchorId({  }, messageId, entryId); }
 function compactTimelineEntries(segments) { return sessionHelpers01.compactTimelineEntries({ compactLiveItemGroup }, segments); }
 function removeLastTextSegment(segments) { return sessionHelpers01.removeLastTextSegment({  }, segments); }
-function ActionGroup({ id, groupType, items, sessionId }) { return sessionHelpers01.ActionGroup({ ChevronRight, FileEditIcon, LiveEvent, Search, TerminalSquare, UserPlus, _jsx, _jsxs, actionGroupTitle }, { id, groupType, items, sessionId }); }
+const ActionGroup = memo(function ActionGroup({ id, groupType, items, sessionId }) { return sessionHelpers01.ActionGroup({ ChevronRight, FileEditIcon, LiveEvent, Search, TerminalSquare, UserPlus, _jsx, _jsxs, actionGroupTitle }, { id, groupType, items, sessionId }); }, (previous, next) => previous.id === next.id && previous.groupType === next.groupType && previous.sessionId === next.sessionId && sameTimelineItems(previous.items, next.items));
 function SteerEvent({ id, text, attachments, forcePlan }) { return sessionHelpers01.SteerEvent({ AttachmentList, MarkdownContent, User, _jsx, _jsxs }, { id, text, attachments, forcePlan }); }
 function isCommandLiveItem(item) { return sessionHelpers01.isCommandLiveItem({  }, item); }
 function compactLiveItemGroup(item) { return sessionHelpers01.compactLiveItemGroup({ isCommandLiveItem }, item); }
 function actionGroupTitle(items, groupType) { return sessionHelpers01.actionGroupTitle({ collectFileChanges, subagentNames }, items, groupType); }
-function CompletedTurn({ message, steerMessages, codexSessionId, sessionId, workspaceId }) { return sessionHelpers01.CompletedTurn({ MarkdownContent, TimelineEntries, TurnChangeList, TurnIssueTracker, _Fragment, _jsx, _jsxs, appendSteerSegment, collectFileChanges, compactTimelineEntries, compareSteerMessages, isDisplayableLiveItem, isDisplayableMessageSegment, latestTurnIssueTracker, liveItemKey, removeLastTextSegment, withTurnLevelStatus }, { message, steerMessages, codexSessionId, sessionId, workspaceId }); }
+// Use the same React component through the running -> completed transition.
+export const CompletedTurn = MessageTimeline;
 function latestTurnIssueTracker(values) { return sessionHelpers01.latestTurnIssueTracker({  }, values); }
 function TurnIssueTracker({ tracker, codexSessionId, sessionId, turnId, workspaceId }) { return sessionHelpers01.TurnIssueTracker({ Copy, _jsx, _jsxs, serializeTurnIssueCopy, useState }, { tracker, codexSessionId, sessionId, turnId, workspaceId }); }
 function ServerPrefixPanels({ startupSnapshot, developerInstructions, showStartup = true }) {
@@ -142,8 +152,8 @@ function serverPrefixMetadata(text, source) { return sessionHelpers02.serverPref
 function TurnChangeList({ changes, sessionId, turnId }) { return sessionHelpers02.TurnChangeList({ FileEditIcon, FileChangeList, Folder, openProjectFiles, _jsx, _jsxs }, { changes, sessionId, turnId }); }
 function FileChangeList({ changes }) { return sessionHelpers02.FileChangeList({ FileEditIcon, FileChangeDiffPopup, _Fragment, _jsx, _jsxs, compactFilePath, fileChangeLabel, fileChangeTone, useState }, { changes }); }
 function hasVisibleTodoPlan(todo) { return sessionHelpers02.hasVisibleTodoPlan({  }, todo); }
-function LiveEvent({ item, sessionId }) { return sessionHelpers02.LiveEvent({ ApprovalEvent, CheckSquare2, ChevronRight, Circle, FileChangeEvent, Loader2, MarkdownContent, MessageSquare, Shrink, StatusUpdateIndicator, StructuredCommentEvent, SubagentEvent, _jsx, _jsxs, commandStatus, fileChangeItemFromPatchCommand }, { item, sessionId }); }
-function StructuredCommentEvent({ item, activities = [], id, sessionId }) { return sessionHelpers02.StructuredCommentEvent({ ChevronRight, FileEditIcon, LiveEvent, MarkdownContent, Search, TerminalSquare, _jsx, _jsxs, commentaryActivityCounts, commentaryTypeForActivities, structuredCommentIcon, structuredCommentType }, { item, activities, id, sessionId }); }
+const LiveEvent = memo(function LiveEvent({ item, sessionId }) { return sessionHelpers02.LiveEvent({ ApprovalEvent, CheckSquare2, ChevronRight, Circle, DeferredDetails, FileChangeEvent, Loader2, MarkdownContent, MessageSquare, Shrink, StatusUpdateIndicator, StructuredCommentEvent, SubagentEvent, _jsx, _jsxs, commandStatus, fileChangeItemFromPatchCommand }, { item, sessionId }); });
+const StructuredCommentEvent = memo(function StructuredCommentEvent({ item, activities = [], id, sessionId }) { return sessionHelpers02.StructuredCommentEvent({ ChevronRight, DeferredDetails, FileEditIcon, LiveEvent, MarkdownContent, Search, TerminalSquare, _jsx, _jsxs, commentaryActivityCounts, commentaryTypeForActivities, structuredCommentIcon, structuredCommentType }, { item, activities, id, sessionId }); }, (previous, next) => previous.item === next.item && previous.id === next.id && previous.sessionId === next.sessionId && sameTimelineItems(previous.activities ?? [], next.activities ?? []));
 function structuredCommentType(type) { return sessionHelpers02.structuredCommentType({  }, type); }
 function structuredCommentIcon(type) { return sessionHelpers02.structuredCommentIcon({ CheckCircle2, Lightbulb, MessageSquare, Pencil, Search, TriangleAlert }, type); }
 function StatusUpdateIndicator({ text, spinning = true, completedIcon }) { return sessionHelpers02.StatusUpdateIndicator({ CheckCircle2, Loader2, _jsx, _jsxs }, { text, spinning, completedIcon }); }

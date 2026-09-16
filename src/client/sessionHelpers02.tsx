@@ -222,7 +222,7 @@ export function hasVisibleTodoPlan(ctx, todo) {
 }
 
 export function LiveEvent(ctx, { item, sessionId }) {
-    const { ApprovalEvent, CheckSquare2, ChevronRight, Circle, FileChangeEvent, Loader2, MarkdownContent, MessageSquare, Shrink, StatusUpdateIndicator, StructuredCommentEvent, SubagentEvent, _jsx, _jsxs, commandStatus, fileChangeItemFromPatchCommand } = ctx;
+    const { ApprovalEvent, CheckSquare2, ChevronRight, Circle, DeferredDetails, FileChangeEvent, Loader2, MarkdownContent, MessageSquare, Shrink, StatusUpdateIndicator, StructuredCommentEvent, SubagentEvent, _jsx, _jsxs, commandStatus, fileChangeItemFromPatchCommand } = ctx;
     if (item.itemType === "agent_message") {
         if (item.delivery === "async" && item.questions?.length) return null;
         if (item.comment) {
@@ -244,7 +244,7 @@ export function LiveEvent(ctx, { item, sessionId }) {
         }
         const status = commandStatus(item);
         const hasOutput = item.aggregatedOutput.trim().length > 0;
-        return (_jsxs("details", { className: `command-card ${status.tone}`, children: [_jsxs("summary", { className: "command-row", children: [_jsx(ChevronRight, { className: "command-chevron", "aria-hidden": "true" }), _jsx("code", { className: "command-label", children: item.command || "(command)" }), _jsx("span", { className: "command-status", children: status.label })] }), _jsxs("div", { className: "command-output-wrap", children: [_jsx("div", { className: "command-full-command", children: _jsx("code", { children: item.command || "(command)" }) }), _jsx("pre", { className: "command-output", children: hasOutput ? item.aggregatedOutput : "(no output yet)" })] })] }));
+        return (_jsx(DeferredDetails, { className: `command-card ${status.tone}`, summary: _jsxs("summary", { className: "command-row", children: [_jsx(ChevronRight, { className: "command-chevron", "aria-hidden": "true" }), _jsx("code", { className: "command-label", children: item.command || "(command)" }), _jsx("span", { className: "command-status", children: status.label })] }), children: _jsxs("div", { className: "command-output-wrap", children: [_jsx("div", { className: "command-full-command", children: _jsx("code", { children: item.command || "(command)" }) }), _jsx("pre", { className: "command-output", children: hasOutput ? item.aggregatedOutput : "(no output yet)" })] }) }));
     }
     if (item.itemType === "file_change") {
         return _jsx(FileChangeEvent, { item: item });
@@ -266,7 +266,7 @@ export function LiveEvent(ctx, { item, sessionId }) {
 }
 
 export function StructuredCommentEvent(ctx, { item, activities = [], id, sessionId }) {
-    const { ChevronRight, FileEditIcon, LiveEvent, MarkdownContent, Search, TerminalSquare, _jsx, _jsxs, commentaryActivityCounts, commentaryTypeForActivities, structuredCommentIcon, structuredCommentType } = ctx;
+    const { ChevronRight, DeferredDetails, FileEditIcon, LiveEvent, MarkdownContent, Search, TerminalSquare, _jsx, _jsxs, commentaryActivityCounts, commentaryTypeForActivities, structuredCommentIcon, structuredCommentType } = ctx;
     const extracts = (item.comment.extracts ?? []).filter((extract) => !["trouble", "blocker", "error", "diagnosis"].includes(extract.type));
     if (extracts.length === 0 && activities.length === 0) return null;
     const displayExtracts = extracts.map((extract) => {
@@ -300,7 +300,7 @@ export function StructuredCommentEvent(ctx, { item, activities = [], id, session
     if (!expandable) {
         return (_jsx("section", { className: "live-item structured-comment structured-comment-static", "data-comment-type": primaryType, id: id, children: summary }));
     }
-    return (_jsxs("details", { className: "live-item structured-comment", "data-comment-type": primaryType, id: id, children: [_jsx("summary", { children: summary }), showDetail && _jsx(MarkdownContent, { className: "structured-comment-detail", children: item.comment.detail }), activities.length > 0 && (_jsx("div", { className: "structured-comment-activity-details", children: activities.map((activity) => (_jsx(LiveEvent, { item: activity.item, sessionId: sessionId }, `${activity.groupType}:${activity.id}`))) }))] }));
+    return (_jsxs(DeferredDetails, { className: "live-item structured-comment", "data-comment-type": primaryType, id: id, summary: _jsx("summary", { children: summary }), children: [showDetail && _jsx(MarkdownContent, { className: "structured-comment-detail", children: item.comment.detail }), activities.length > 0 && (_jsx("div", { className: "structured-comment-activity-details", children: activities.map((activity) => (_jsx(LiveEvent, { item: activity.item, sessionId: sessionId }, `${activity.groupType}:${activity.id}`))) }))] }));
 
 }
 

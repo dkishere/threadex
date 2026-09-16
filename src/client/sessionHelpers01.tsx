@@ -388,15 +388,14 @@ export function LiveEventList(ctx, { items, anchorPrefix, sessionId: providedSes
 }
 
 export function MessageTimeline(ctx, { segments, anchorPrefix, completed = false, running = false, statusText, codexSessionId, sessionId: providedSessionId, turnId, workspaceId: providedWorkspaceId }) {
-    const { FileAnnotationComposerContext, TimelineEntries, TurnIssueTracker, _jsx, _jsxs, compactTimelineEntries, finalizePendingReasoningSegments, isDisplayableMessageSegment, latestTurnIssueTracker, useContext, withTurnLevelStatus } = ctx;
-    const annotationContext = useContext(FileAnnotationComposerContext);
+    const { annotationContext, TimelineEntries, TurnIssueTracker, _jsx, _jsxs, compactTimelineEntries, finalizePendingReasoningSegments, isDisplayableMessageSegment, latestTurnIssueTracker, withTurnLevelStatus } = ctx;
     const contextualSessionId = annotationContext?.sessionId;
     const sessionId = providedSessionId ?? contextualSessionId;
     const workspaceId = providedWorkspaceId ?? annotationContext?.workspaceId;
     const terminalSegments = completed ? finalizePendingReasoningSegments(segments) : segments;
     const displaySegments = withTurnLevelStatus(terminalSegments, running, statusText).filter(isDisplayableMessageSegment);
     const issueTracker = latestTurnIssueTracker(terminalSegments);
-    return (_jsxs("div", { className: "message-timeline", children: [issueTracker && _jsx(TurnIssueTracker, { tracker: issueTracker, codexSessionId: codexSessionId, sessionId: sessionId, turnId: turnId, workspaceId: workspaceId }), _jsx(TimelineEntries, { anchorPrefix: anchorPrefix, completed: completed, entries: compactTimelineEntries(displaySegments), sessionId: sessionId })] }));
+    return (_jsxs("div", { className: "message-timeline", children: [issueTracker && _jsx(TurnIssueTracker, { tracker: issueTracker, codexSessionId: codexSessionId, sessionId: sessionId, turnId: turnId, workspaceId: workspaceId }, "issues"), _jsx("div", { style: { display: "contents" }, children: _jsx(TimelineEntries, { anchorPrefix: anchorPrefix, completed: completed, entries: compactTimelineEntries(displaySegments), sessionId: sessionId }) }, "steps")] }));
 
 }
 
@@ -768,7 +767,7 @@ export function CompletedTurn(ctx, { message, steerMessages, codexSessionId, ses
     const stepSegments = withTurnLevelStatus(removeLastTextSegment(segments), false).filter(isDisplayableMessageSegment);
     const changes = collectFileChanges(message.liveItems ?? []);
     const issueTracker = latestTurnIssueTracker([segments, message.liveItems ?? []]);
-    return (_jsxs(_Fragment, { children: [stepSegments.length > 0 && (_jsx("div", { className: "completed-turn-steps", "aria-label": "Completed turn steps", children: _jsx(TimelineEntries, { anchorPrefix: message.id, completed: true, entries: compactTimelineEntries(stepSegments), sessionId: sessionId }) })), conclusion ? _jsx(MarkdownContent, { className: "turn-conclusion", children: conclusion }) : _jsx(MarkdownContent, { className: "turn-conclusion", children: "Turn completed without a final agent message." }), issueTracker && _jsx(TurnIssueTracker, { tracker: issueTracker, codexSessionId: codexSessionId, sessionId: sessionId, turnId: message.turnId, workspaceId: workspaceId }), changes.length > 0 && _jsx(TurnChangeList, { changes: changes, sessionId: sessionId, turnId: message.turnId })] }));
+    return (_jsxs("div", { style: { display: "contents" }, children: [_jsx("div", { className: stepSegments.length > 0 ? "completed-turn-steps" : undefined, "aria-label": "Completed turn steps", children: _jsx(TimelineEntries, { anchorPrefix: message.id, completed: true, entries: compactTimelineEntries(stepSegments), sessionId: sessionId }) }, "steps"), _jsx(MarkdownContent, { className: "turn-conclusion", children: conclusion || "Turn completed without a final agent message." }, "conclusion"), issueTracker && _jsx(TurnIssueTracker, { tracker: issueTracker, codexSessionId: codexSessionId, sessionId: sessionId, turnId: message.turnId, workspaceId: workspaceId }, "issues"), changes.length > 0 && _jsx(TurnChangeList, { changes: changes, sessionId: sessionId, turnId: message.turnId }, "changes")] }));
 
 }
 
