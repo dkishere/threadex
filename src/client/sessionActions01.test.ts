@@ -1,7 +1,65 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { currentWorkspaceId, loadSessions, selectedSessionReferences, submit } from "./sessionActions01";
+import { currentWorkspaceId, loadSessions, selectedSessionReferences, steerPrompt, submit } from "./sessionActions01";
 import { toSessionPageState } from "./sessionUtils";
+
+function steerTestContext(t: import("node:test").TestContext) {
+  const windowDescriptor = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { matchMedia: () => ({ matches: false }) } });
+  t.after(() => {
+    if (windowDescriptor) Object.defineProperty(globalThis, "window", windowDescriptor);
+    else Reflect.deleteProperty(globalThis, "window");
+  });
+  const state = { input: "correct direction", queued: [] as unknown[][], sent: [] as unknown[][], status: "", steering: false };
+  const ctx = {
+    currentRunningTurnId: "original-turn", sessionIdRef: { current: "session-1" }, isSteering: false,
+    executionMode: "default",
+    enqueuePrompt: (...args: unknown[]) => state.queued.push(args),
+    addSteerMessage: (...args: unknown[]) => state.sent.push(args),
+    clearComposerInputDraft: () => { state.input = ""; },
+    clearComposerSessionLinks() {}, setAttachments() {}, setComposerResponseQuote() {},
+    setResponseQuotePopover() {}, setSelectedSkills() {}, setSlashTrigger() {},
+    setComposerForcePlanNextPrompt() {},
+    setComposerInput: (update: (input: string) => string) => { state.input = update(state.input); },
+    setIsSteering: (value: boolean) => { state.steering = value; },
+    setStatus: (value: string) => { state.status = value; },
+    showToast() {}, noteBackendRequestSucceeded() {}, noteBackendDisconnect() {},
+    isLikelyBackendDisconnect: () => false, parseResponseAnnotations: () => null,
+    isInactiveSteerResponse: (status: number) => status === 409,
+    async refreshSelectedSessionSnapshot() {}
+  };
+  return { ctx, state };
+}
+
+test("outcome tracking sends a steer to the current turn without queuing", async (t) => {
+  const { ctx, state } = steerTestContext(t);
+  let body: Record<string, unknown> = {};
+  t.mock.method(globalThis, "fetch", async (_url: string, options: RequestInit) => {
+    body = JSON.parse(String(options.body));
+    return Response.json({ commandId: "steer-1", attachments: [] });
+  });
+  assert.equal(await steerPrompt(ctx, state.input, [], true, [], true), "sent");
+  assert.equal(body.turnId, "original-turn");
+  assert.equal(body.forcePlan, true);
+  assert.equal(state.queued.length, 0);
+  assert.equal(state.sent.length, 1);
+  assert.equal(state.steering, false);
+});
+
+test("a rejected steer stays a draft when stop and send have already started another turn", async (t) => {
+  const { ctx, state } = steerTestContext(t);
+  let finishRequest!: (response: Response) => void;
+  t.mock.method(globalThis, "fetch", () => new Promise<Response>((resolve) => { finishRequest = resolve; }));
+  const pending = steerPrompt(ctx, state.input, [], true, [], false);
+  ctx.currentRunningTurnId = "next-turn";
+  finishRequest(Response.json({ error: "Agent is not running." }, { status: 409 }));
+  assert.equal(await pending, false);
+  assert.equal(state.input, "correct direction");
+  assert.equal(state.queued.length, 0);
+  assert.equal(state.sent.length, 0);
+  assert.match(state.status, /target turn has stopped or finished/);
+  assert.equal(state.steering, false);
+});
 
 test("uses the live workspace ref instead of a stale rendered workspace", () => {
   assert.equal(

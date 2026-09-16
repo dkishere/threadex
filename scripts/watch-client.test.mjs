@@ -16,4 +16,5 @@ test("dev client owns Web VS Code's process group and reclaims prior orphans", (
   assert.match(source, /process\.kill\(-childProcess\.pid, signal\)/);
   assert.match(source, /reclaimOrphanedWebVsCodeDevServer\(launch\)/);
   assert.match(source, /Restarting is paused to avoid an EADDRINUSE loop/);
+  assert.match(source, /startup skipped: \$\{launch\.command\} was not found/);
 });

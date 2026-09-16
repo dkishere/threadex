@@ -8314,19 +8314,7 @@ export class SessionStore {
           item_id,
           item_type,
           event_type,
-          json_extract_string(payload, '$.text') AS text,
-          json_extract_string(payload, '$.command') AS command,
-          json_extract_string(payload, '$.status') AS status,
-          CAST(json_extract(payload, '$.exitCode') AS INTEGER) AS exit_code,
-          json_extract_string(payload, '$.query') AS query,
-          json_extract_string(payload, '$.message') AS message,
           CAST(payload AS VARCHAR) AS payload_json,
-          CAST(json_extract(payload, '$.changes') AS VARCHAR) AS changes_json,
-          CAST(json_extract(payload, '$.items') AS VARCHAR) AS items_json,
-          CAST(json_extract(payload, '$.aggregatedOutputLength') AS BIGINT) AS aggregated_output_length,
-          json_extract_string(payload, '$.aggregatedOutput') AS aggregated_output_tail,
-          CAST(json_extract(payload, '$.outputTruncated') AS BOOLEAN) AS output_truncated,
-          CAST(json_extract(payload, '$.omittedOutputChars') AS BIGINT) AS omitted_output_chars,
           CAST(created AS VARCHAR) AS created
         FROM session_live_item
         WHERE session_id = $sessionId
@@ -8355,14 +8343,13 @@ export class SessionStore {
         SELECT
           id AS event_id,
           turn_id,
-          json_extract_string(payload, '$.params.turnId') AS native_turn_id,
-          json_extract_string(payload, '$.params.diff') AS diff,
+          CAST(payload AS VARCHAR) AS payload_json,
           CAST(created AS VARCHAR) AS created
         FROM session_turn_event
         WHERE session_id = $sessionId
           ${turnFilter}
           AND event_name = 'codex'
-          AND json_extract_string(payload, '$.method') = 'turn/diff/updated'
+          AND contains(CAST(payload AS VARCHAR), 'turn/diff/updated')
         ORDER BY created ASC, id ASC
       `,
       queryParams
@@ -8370,9 +8357,14 @@ export class SessionStore {
     const latestTurnDiffByTurn = new Map<string, Record<string, unknown>>();
     const rejectedEmptyDiffTurns = new Set<string>();
     for (const row of await turnDiffResult.getRowObjectsJS()) {
+      // Decode in JavaScript: PostgreSQL JSON extraction rejects escaped NULs
+      // in tool output, even when extracting an unrelated field such as method.
+      const event = recordValue(parseJsonObject(row.payload_json));
+      if (event?.method !== "turn/diff/updated") continue;
+      const params = recordValue(event.params);
       const turnId = stringValue((row as { turn_id?: unknown }).turn_id);
       if (!turnId) continue;
-      const diffRow = row as Record<string, unknown>;
+      const diffRow: Record<string, unknown> = { ...row, native_turn_id: params?.turnId, diff: params?.diff };
       const diffTime = Date.parse(stringValue(diffRow.created));
       const lastEdit = (itemsByTurn[turnId] ?? [])
         .map(recordValue)
@@ -11416,6 +11408,24 @@ function stringifyStoredJsonFallback(json: string, originalJsonBytes: number) {
 
 function sessionLiveItemFromRow(row: Record<string, unknown>): unknown | null {
   const storedPayload = parseJsonObject(row.payload_json);
+  // Keep raw JSON intact in storage; JavaScript supports escaped NULs in output.
+  if (isPlainObject(storedPayload)) {
+    row = {
+      ...row,
+      text: storedPayload.text,
+      command: storedPayload.command,
+      status: storedPayload.status,
+      exit_code: storedPayload.exitCode,
+      query: storedPayload.query,
+      message: storedPayload.message,
+      changes_json: JSON.stringify(storedPayload.changes ?? null),
+      items_json: JSON.stringify(storedPayload.items ?? null),
+      aggregated_output_length: storedPayload.aggregatedOutputLength,
+      aggregated_output_tail: storedPayload.aggregatedOutput,
+      output_truncated: storedPayload.outputTruncated,
+      omitted_output_chars: storedPayload.omittedOutputChars
+    };
+  }
   const id = isPlainObject(storedPayload)
     ? stringValue(storedPayload.id, stringValue(row.item_id))
     : stringValue(row.item_id);

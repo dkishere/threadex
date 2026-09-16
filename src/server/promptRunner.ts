@@ -1434,13 +1434,15 @@ function startSteerControlLoop(
         if (processed.has(command.id)) {
           continue;
         }
-        processed.add(command.id);
         const { threadId, appTurnId } = activeTurn();
+        // Startup can expose the control file before turn/start has returned.
+        // Leave the command pending until there is a native turn to steer.
+        if (!threadId || !appTurnId) {
+          break;
+        }
+        processed.add(command.id);
         let result: RunnerSteerResult;
         try {
-          if (!threadId || !appTurnId) {
-            throw new Error("The Codex turn is not ready to accept steering.");
-          }
           await emitDeveloperInstructionsEvent("steer", 0, command.developerInstructions);
           const response = await appServer.rpc("turn/steer", {
             threadId,

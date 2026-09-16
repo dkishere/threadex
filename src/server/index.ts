@@ -3,6 +3,7 @@ import { isAutoModel, isAutoEffort } from "../autoModelCatalog";
 import { buildAutoModelState, selectAutoModel } from "./autoModelSelector";
 import { AutoModelSettings, createAutoModelSettingsRouter } from "./autoModelSettings";
 import { RunnerProcessRegistry } from "./runnerProcessRegistry";
+import { clientLayoutInstructions } from "./clientLayoutInstructions";
 import { createTurnGrillHandler } from "./turnGrillRoute";
 import { reviseOutcomePlan } from "./lightweightTodo";
 import express from "express";
@@ -28,6 +29,7 @@ import {
   utimesSync,
   writeFileSync
 } from "node:fs";
+import { rm } from "node:fs/promises";
 import type { Server } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, resolve, sep } from "node:path";
@@ -108,7 +110,7 @@ import {
 import { DEFAULT_TURN_RING_MAX_BYTES, TurnRingLog } from "./turnRingLog";
 import { EventRingLog, type RingEvent } from "./eventRingLog";
 import { canInlineWorkspaceFile, resolveWorkspaceFilePath } from "./workspaceFiles";
-import { captureTurnGitBaseline } from "./turnGitPatch";
+import { captureTurnGitBaseline, compactTurnGitBaseline } from "./turnGitPatch";
 import { runnerStartupIsWithinGrace } from "./runnerWatchdog";
 import {
   collectSessionReviewChanges,
@@ -124,6 +126,7 @@ import {
   WebVsCodeWalkthroughService
 } from "./webVsCodeWalkthrough";
 import { installBundledWebVsCodeReviewExtension, shouldAutoStartWebVsCodeServer } from "./webVsCodeExtension";
+import { resolveWebVsCodeUrl, setWebVsCodePaths } from "./webVsCodeUrl";
 import { listCodexProjects, resolveCodexProjectCwd } from "./codexProjects";
 import {
   normalizeSubagentTranscript,
@@ -146,6 +149,7 @@ import {
 import { MAX_PATH_ATTACHMENT_BYTES } from "../attachmentLimits";
 
 type ChatRequest = {
+  clientLayout?: "mobile" | "tablet" | "desktop";
   grillOrigin?: { turnId: string; observedVersion: number };
   message?: string;
   sessionId?: string;
@@ -493,6 +497,7 @@ type RunnerStopRequest = {
 };
 
 type RunnerSteerRequest = {
+  clientLayout?: "mobile" | "tablet" | "desktop";
   turnId?: string;
   sessionId?: string;
   message?: string;
@@ -2226,8 +2231,8 @@ app.get("/api/sessions/:sessionId/web-vscode-url", async (req, res) => {
     }
 
     const defaultPort = Number(process.env.WEB_VSCODE_PORT ?? 8790);
-    const targetUrl = new URL(process.env.WEB_VSCODE_URL?.trim() || `http://127.0.0.1:${defaultPort}/`);
-    targetUrl.searchParams.set("folder", session.cwd);
+    const targetUrl = resolveWebVsCodeUrl(req, { defaultPort, projectRoot });
+    setWebVsCodePaths(targetUrl, session.cwd);
     createWebVsCodeAnnotationSession({
       dataDir,
       sessionId: session.id,
@@ -2241,10 +2246,7 @@ app.get("/api/sessions/:sessionId/web-vscode-url", async (req, res) => {
         res.status(400).json({ error: "path must stay inside the session project." });
         return;
       }
-      targetUrl.searchParams.set("payload", JSON.stringify([
-        ["gotoLineMode", "true"],
-        ["openFile", `vscode-remote://${targetUrl.host}${filePath}`]
-      ]));
+      setWebVsCodePaths(targetUrl, session.cwd, filePath);
     }
     res.json({ url: targetUrl.toString() });
   } catch (error) {
@@ -2354,15 +2356,12 @@ app.post("/api/sessions/:sessionId/web-vscode-review", async (req, res) => {
     }
 
     const defaultPort = Number(process.env.WEB_VSCODE_PORT ?? 8790);
-    const targetUrl = new URL(process.env.WEB_VSCODE_URL?.trim() || `http://127.0.0.1:${defaultPort}/`);
-    targetUrl.searchParams.set("folder", review.workspacePath);
+    const targetUrl = resolveWebVsCodeUrl(req, { defaultPort, projectRoot });
+    setWebVsCodePaths(targetUrl, review.workspacePath);
     if (review.firstOpenPath) {
       const firstOpenFile = resolveWorkspaceFilePath(review.workspacePath, review.firstOpenPath);
       if (firstOpenFile) {
-        targetUrl.searchParams.set("payload", JSON.stringify([
-          ["gotoLineMode", "true"],
-          ["openFile", `vscode-remote://${targetUrl.host}${firstOpenFile}`]
-        ]));
+        setWebVsCodePaths(targetUrl, review.workspacePath, firstOpenFile);
       }
     }
     res.json({
@@ -2390,7 +2389,7 @@ app.post("/api/sessions/:sessionId/web-vscode-walkthrough", async (req, res) => 
       returnUrl: normalizeThreadexReturnUrl(req.body?.returnUrl, req)
     });
     const defaultPort = Number(process.env.WEB_VSCODE_PORT ?? 8790);
-    const targetUrl = new URL(process.env.WEB_VSCODE_URL?.trim() || `http://127.0.0.1:${defaultPort}/`);
+    const targetUrl = resolveWebVsCodeUrl(req, { defaultPort, projectRoot });
     targetUrl.searchParams.set("folder", session.cwd);
     res.json({
       url: targetUrl.toString(),
@@ -4437,6 +4436,7 @@ app.post("/api/runner/steer", async (req: Request<object, object, RunnerSteerReq
     const command: RunnerSteerCommand = {
       id: commandId,
       message,
+      developerInstructions: clientLayoutInstructions(req.body.clientLayout),
       attachments: saveUploadedAttachments(uploadDir, `steer-${commandId}`, req.body.attachments),
       skills: resolveRequestedSkills(req.body.skills, session?.workspaceId ?? "")
     };
@@ -4457,6 +4457,7 @@ app.post("/api/runner/steer", async (req: Request<object, object, RunnerSteerReq
       res.status(409).json({ error: result.error || "The runner rejected the steer.", ...result });
       return;
     }
+    if (req.body.forcePlan === true) await enableOutcomeTracking(turn.sessionId);
 
     const attachmentPayload = command.attachments.map((attachment) => ({
       id: attachment.id,
@@ -5303,7 +5304,10 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
     }
     const startupSnapshot = session.threadId ? undefined : buildStartupSnapshot(session.cwd);
     // Composer Todo opts into the persistent lightweight harness. Explicit Plan mode remains separate.
-    const runnerDeveloperInstructions = chatRequest.developerInstructions;
+    const runnerDeveloperInstructions = [
+      chatRequest.developerInstructions,
+      clientLayoutInstructions(chatRequest.clientLayout)
+    ].filter(Boolean).join("\n\n") || undefined;
     const job: RunnerJob = {
       sessionId: session.id,
       turnId,
@@ -8323,6 +8327,21 @@ async function applyRunnerUpdate(
   }
 
   if (update.event === "result") {
+    // Capture original review content before releasing this turn's writer slot.
+    try {
+      const turn = await sessionStore.getSessionTurn(update.turnId);
+      const session = await sessionStore.getSession(update.sessionId);
+      if (turn?.status === "running" && session && (!update.logPath || turn.runnerLogPath === update.logPath)) {
+        const items = await sessionStore.listSessionLiveItems(update.sessionId);
+        const paths = collectTurnReviewChanges(items[update.turnId] ?? []).flatMap((change) => {
+          const path = readObject(change)?.path;
+          return typeof path === "string" ? [path] : [];
+        });
+        compactTurnGitBaseline(dataDir, update.turnId, session.cwd, paths);
+      }
+    } catch (error) {
+      console.warn(`Retaining turn baseline ${update.turnId}: ${errorMessage(error)}`);
+    }
     const completed = await sessionStore.updateSessionTurn({
       id: update.turnId,
       agentResponse: objectString(update.data, "reply") ?? "Turn completed without a final agent message.",
@@ -8829,6 +8848,10 @@ async function callWithTemporaryCodexHome<T>(
     env: { ...process.env, CODEX_HOME: tempCodexHome },
     stdio: ["pipe", "pipe", "pipe"]
   });
+  // Register before any RPCs so an early exit (or spawn failure) is also observed.
+  const childClosed = new Promise<void>((resolveClosed) => {
+    child.once("close", () => resolveClosed());
+  });
 
   let nextId = 1;
   let buffer = "";
@@ -8906,7 +8929,13 @@ async function callWithTemporaryCodexHome<T>(
     rejectAll(new Error("codex app-server stopped"));
     child.stdin.end();
     child.kill("SIGTERM");
-    rmSync(tempCodexHome, { recursive: true, force: true });
+    try {
+      await withTimeout(childClosed, 5000, "Temporary codex app-server did not close");
+      await rm(tempCodexHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    } catch (cleanupError) {
+      // Cleanup must not replace a successful quota response or the original RPC error.
+      console.warn(`Failed to clean temporary Codex home ${tempCodexHome}: ${errorMessage(cleanupError)}`);
+    }
   }
 }
 

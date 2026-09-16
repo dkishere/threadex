@@ -7,7 +7,10 @@
 .layout-controls button:hover { background: #e2e8f0; }
 .layout-controls button:focus-visible { outline: 2px solid #2563eb; outline-offset: -3px; }
 .layout-controls svg { width: 20px; height: 20px; }
+.layout-controls .layout-menu-toggle { position: relative; }
+.layout-menu-count { position: absolute; top: 1px; right: 1px; display: grid; place-items: center; min-width: 16px; height: 16px; padding: 0 4px; border: 2px solid #f8fafc; border-radius: 999px; background: #e11d48; color: #ffffff; font-size: 9px; font-weight: 800; line-height: 1; }
 .layout-controls .layout-menu-toggle { display: none; }
+.session-sessions-tab { display: none; }
 .responsive-layout .chat { height: calc(100dvh - var(--workspace-header-height)); }
 .responsive-layout[data-middle-open="false"] .chat[data-session-tab] { grid-template-columns: minmax(0, 1fr); grid-template-rows: var(--chat-header-height) 0 minmax(0, 1fr) auto; }
 .responsive-layout[data-middle-open="false"] .session-view-tabs,
@@ -30,8 +33,10 @@
 }
 
 @media (width < 1080px) {
-  .responsive-layout { --sidebar-width: 0px; }
-  .responsive-layout .shell { min-height: 100dvh; }
+  html:has(.responsive-layout), body:has(.responsive-layout) { height: 100%; min-height: 0; overflow: hidden; }
+  .responsive-layout { --sidebar-width: 0px; position: fixed; inset: 0 0 auto; height: var(--app-height, 100dvh); overflow: hidden; transform: translateY(var(--app-top, 0px)); }
+  .responsive-layout .shell { height: 100%; min-height: 0; }
+  .responsive-layout .chat { height: calc(var(--app-height, 100dvh) - var(--workspace-header-height)); }
   .responsive-layout[data-left-open="true"] .sidebar { display: flex; width: min(320px, 90vw); height: calc(100dvh - var(--workspace-header-height)); z-index: 30; box-shadow: 8px 0 24px rgb(15 23 42 / 15%); }
   .responsive-layout .chat { margin-left: 0; }
   .responsive-layout .settings-page { left: 0; }
@@ -42,18 +47,127 @@
   .responsive-layout .layout-controls { width: auto; height: var(--chat-header-height); left: 4px; background: transparent; border-bottom: 0; }
   .responsive-layout .layout-controls button { background: transparent; }
   .responsive-layout .layout-controls button:hover { background: #e2e8f0; }
-  .responsive-layout .workspace-header { top: var(--chat-header-height); max-height: calc(100dvh - var(--chat-header-height)); }
+  .responsive-layout .workspace-header { top: var(--chat-header-height); max-height: calc(var(--app-height, 100dvh) - var(--chat-header-height)); }
   .responsive-layout .layout-backdrop { top: var(--chat-header-height); }
-  .responsive-layout[data-left-open="true"] .sidebar { top: var(--chat-header-height); height: calc(100dvh - var(--chat-header-height)); }
+  .responsive-layout[data-left-open="true"] .sidebar { top: var(--chat-header-height); height: calc(var(--app-height, 100dvh) - var(--chat-header-height)); }
   .responsive-layout .content-header { padding: 0 10px 0 142px; gap: 6px; }
 }
 
-@media (width < 768px) {
-  .responsive-layout[data-middle-open="true"] .chat[data-session-tab] { grid-template-columns: minmax(0, 1fr); grid-template-rows: var(--chat-header-height) auto minmax(0, 1fr) auto; }
-  .responsive-layout[data-middle-open="true"] .chat > .messages-pane > .messages,
-  .responsive-layout[data-middle-open="true"] .chat > .composer { display: none; }
+@media (width < 1080px) {
+  .responsive-layout { --tab-panel-width: max(280px, 38%); }
+  .responsive-layout[data-middle-open="true"] .chat[data-session-tab] { grid-template-columns: var(--tab-panel-width) minmax(0, 1fr); grid-template-rows: var(--chat-header-height) 40px minmax(0, 1fr) auto; }
+  .responsive-layout[data-middle-open="true"] .shell[data-session-tab="sessions"] .sidebar {
+    position: fixed;
+    inset: calc(var(--chat-header-height) + 40px) auto 0 0;
+    display: flex;
+    width: var(--tab-panel-width);
+    height: auto;
+    padding: 14px;
+    border-top: 1px solid #cbd5e1;
+    border-right: 0;
+    box-shadow: none;
+    z-index: 12;
+  }
+  .responsive-layout[data-middle-open="false"] .shell .sidebar,
+  .responsive-layout .shell:not([data-session-tab="sessions"]) .sidebar { display: none; }
+  .responsive-layout .session-sessions-tab { display: inline-flex; }
+  .responsive-layout .session-view-tabs { height: 40px; min-height: 40px; }
+  .responsive-layout .session-view-tabs button { min-height: 40px; padding: 9px 8px; }
+  .responsive-layout .content-header { padding-left: 96px; }
   .responsive-layout .content-header-actions { max-width: 35%; }
+  .responsive-layout .messages .message.assistant,
+  .responsive-layout .chat[data-side-chat-open="true"] > .messages-pane > .messages .message.assistant {
+    padding-left: 2em;
+    transition: none;
+  }
+  .responsive-layout .messages .message.assistant .agent-turn-prompt,
+  .responsive-layout .chat[data-side-chat-open="true"] > .messages-pane > .messages .message.assistant .agent-turn-prompt {
+    width: calc(100% + 2em + var(--agent-content-right-padding, 10px));
+    margin-left: -2em;
+  }
   .responsive-layout .composer { min-width: 0; }
   .responsive-layout .settings-tabs { overflow-x: auto; flex-shrink: 0; }
   .responsive-layout .settings-account-table { overflow-x: auto; }
+}
+
+@media (width < 768px) {
+  .responsive-layout { --tab-panel-width: 100%; }
+  .responsive-layout[data-middle-open="true"] .chat[data-session-tab] { grid-template-columns: minmax(0, 1fr); }
+  .responsive-layout[data-middle-open="true"] .chat > .messages-pane > .messages,
+  .responsive-layout[data-middle-open="true"] .chat > .composer { display: none; }
+
+  /* Keep the queued prompts with the agent composer on phones. The prompt-turn
+     rail is hidden in the agent view, so its duplicate queue is not useful here. */
+  .responsive-layout .composer > .queued-prompts {
+    display: grid;
+    box-sizing: border-box;
+    width: 100%;
+    margin: 0;
+    padding: 0 8px 8px;
+  }
+
+  .responsive-layout .prompt-turns .prompt-turn-queue {
+    display: none;
+  }
+
+  /* Give the narrow composer toolbar back its horizontal space. Gear selection
+     remains available through the settings popover. */
+  .responsive-layout .composer-layout,
+  .responsive-layout .chat[data-side-chat-open="true"] > .composer .composer-layout,
+  .responsive-layout .chat[data-side-chat-open="true"] .side-chat-composer .composer-layout {
+    --composer-gear-width: 32px;
+    --composer-gear-bottom-offset: 0px;
+  }
+
+  .responsive-layout .composer-gear-controls {
+    grid-template-columns: 32px;
+  }
+
+  .responsive-layout .composer-gear-settings {
+    grid-template-rows: 14px minmax(0, 1fr);
+    gap: 1px;
+  }
+
+  .responsive-layout .composer-gear-settings svg {
+    width: 12px;
+    height: 12px;
+    transform: translateY(1px);
+  }
+
+  .responsive-layout .composer-gear-mobile-summary {
+    display: grid;
+    grid-template-rows: repeat(2, minmax(0, 1fr));
+    width: 100%;
+    min-width: 0;
+    color: #e2e8f0;
+    font-size: 7px;
+    font-weight: 650;
+    line-height: 1;
+    text-align: center;
+  }
+
+  .responsive-layout .composer-gear-mobile-summary span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .responsive-layout .composer-gear-mobile-summary span:first-child {
+    margin-top: -1px;
+  }
+
+  .responsive-layout .composer-shell {
+    border-bottom: 0;
+  }
+
+  .responsive-layout .composer-gear-radios {
+    display: none;
+  }
+
+  .responsive-layout .composer-gear-menu {
+    width: min(440px, calc(100vw - 24px));
+    max-height: min(360px, calc(var(--app-height, 100dvh) - var(--chat-header-height) - 24px));
+    overflow-y: auto;
+  }
 }

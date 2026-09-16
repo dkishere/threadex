@@ -90,6 +90,7 @@ async function startWebVsCode() {
     const child = spawn(launch.command, launch.args, {
       cwd: rootDir,
       env: launch.env,
+      shell: process.platform === "win32" && /\.(?:cmd|bat)$/i.test(launch.command),
       detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"]
     });
@@ -116,6 +117,10 @@ async function startWebVsCode() {
       }
       if (portConflict) {
         console.error(`Web VS Code stopped: port ${launch.port} became occupied. Restarting is paused to avoid an EADDRINUSE loop.`);
+        return;
+      }
+      if (isMissingExecutableError(description)) {
+        console.error(`Web VS Code startup skipped: ${launch.command} was not found. Install code-server or set CODE_SERVER_COMMAND.`);
         return;
       }
       console.error(`Web VS Code exited (${description}). Retrying in 1 second.`);
@@ -233,4 +238,8 @@ function mirrorChildOutput(childProcess, label) {
     process.stderr.write(message);
     appendFileSync(supervisorLogPath, message);
   });
+}
+
+function isMissingExecutableError(description) {
+  return typeof description === "string" && /(?:spawn|ENOENT)/i.test(description) && /ENOENT/i.test(description);
 }

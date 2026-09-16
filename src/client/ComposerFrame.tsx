@@ -138,6 +138,11 @@ export function ComposerGearSelector({
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const rootRef = useRef<HTMLElement | null>(null);
   const menuId = `${idPrefix}-menu`;
+  const activeGear = gears[activeGearIndex] ?? gears[0];
+  const activeGearIsAuto = activeGear && autoModelValue !== undefined && activeGear.model === autoModelValue;
+  const activeGearEffort = activeGear
+    ? activeGearIsAuto && autoEffort ? autoEffort : activeGear.effort
+    : undefined;
 
   useEffect(() => {
     if (!isMenuOpen) return;
@@ -171,6 +176,12 @@ export function ComposerGearSelector({
           onClick={() => setIsMenuOpen((open) => !open)}
         >
           <Cog aria-hidden="true" />
+          {activeGear && activeGearEffort && (
+            <span className="composer-gear-mobile-summary" aria-hidden="true">
+              <span>{compactModelLabel(activeGear.model, modelOptionLabel(activeGear.model), Boolean(activeGearIsAuto))}</span>
+              <span>{COMPACT_EFFORT_LABELS[activeGearEffort]}</span>
+            </span>
+          )}
         </button>
         <div className="composer-gear-radios" role="radiogroup" aria-label={label}>
           {gears.map((gear, index) => {

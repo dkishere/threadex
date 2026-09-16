@@ -4,6 +4,7 @@ import { appendFileSync, chmodSync, existsSync, mkdtempSync, readFileSync, rmSyn
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { CONTEXT_FORK_USER_SUFFIX } from "../contextFork";
 import {
@@ -975,7 +976,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   );
 });
 
-test("prompt runner forwards control messages to Codex turn/steer", async () => {
+for (const duringStartup of [false, true]) {
+test(`prompt runner forwards control messages to Codex turn/steer${duringStartup ? " during startup" : ""}`, async () => {
   const root = mkdtempSync(resolve(tmpdir(), "prompt-runner-steer-"));
   const fakeCodexPath = resolve(root, "fake-codex.mjs");
   const jobPath = resolve(root, "job.json");
@@ -988,6 +990,25 @@ test("prompt runner forwards control messages to Codex turn/steer", async () => 
   const capturedTurnPath = resolve(root, "captured-turn.json");
   const capturedGoalPath = resolve(root, "captured-goal.json");
   const commandId = "steer-command-1";
+  const controlMessage = `${JSON.stringify({
+    id: commandId,
+    message: "focus on the server path",
+    developerInstructions: "Force plan steps for this steer.",
+    attachments: []
+  })}\n`;
+  if (duringStartup) appendFileSync(controlPath, controlMessage);
+  const spawnShimPath = resolve(root, "spawn-shim.mjs");
+  writeFileSync(spawnShimPath, `
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+const originalSpawn = childProcess.spawn;
+childProcess.spawn = function (command, args, options) {
+  return command === process.env.CODEX_PATH
+    ? originalSpawn(process.execPath, [command, ...args], options)
+    : originalSpawn(command, args, options);
+};
+syncBuiltinESMExports();
+`, "utf8");
 
   writeFileSync(fakeCodexPath, `#!/usr/bin/env node
 import { createInterface } from "node:readline";
@@ -1012,7 +1033,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   }
   if (request.method === "turn/start") {
     writeFileSync(capturedTurnPath, JSON.stringify(request.params));
-    send({ id: request.id, result: { turn: { id: "app-turn-1" } } });
+    setTimeout(() => send({ id: request.id, result: { turn: { id: "app-turn-1" } } }), ${duringStartup ? 400 : 0});
   }
   if (request.method === "turn/steer") {
     writeFileSync(capturedPath, JSON.stringify(request.params));
@@ -1040,7 +1061,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     cwd: projectRoot
   }), "utf8");
 
-  const child = spawn(process.execPath, ["--import", "tsx", runnerPath, jobPath], {
+  const child = spawn(process.execPath, ["--import", "tsx", "--import", pathToFileURL(spawnShimPath).href, runnerPath, jobPath], {
     cwd: projectRoot,
     env: {
       ...process.env,
@@ -1063,12 +1084,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     5_000,
     () => stderr
   );
-  appendFileSync(controlPath, `${JSON.stringify({
-    id: commandId,
-    message: "focus on the server path",
-    developerInstructions: "Force plan steps for this steer.",
-    attachments: []
-  })}\n`);
+  if (!duringStartup) appendFileSync(controlPath, controlMessage);
 
   const resultPath = resolve(controlResultDir, `${commandId}.json`);
   await waitFor(() => existsSync(resultPath));
@@ -1119,6 +1135,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.equal(developerEvents.filter((entry) => entry.data.target === "steer").length, 1);
   assert.match(logText, /\[STARTUP\]/);
 });
+}
 
 test("goal mode writes overlong objectives to temp file context", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "prompt-runner-long-goal-"));

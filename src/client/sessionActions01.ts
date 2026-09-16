@@ -1,4 +1,9 @@
 // @ts-nocheck
+function currentClientLayout() {
+    return window.matchMedia("(width < 768px)").matches ? "mobile"
+        : window.matchMedia("(width < 1080px)").matches ? "tablet" : "desktop";
+}
+
 export function showToast(ctx, message) {
     const { setToastMessage, toastTimerRef } = ctx;
         setToastMessage(message);
@@ -383,6 +388,7 @@ export async function startChatTurn(ctx, message, turnAttachments, turnExecution
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                     message,
+                    clientLayout: currentClientLayout(),
                     turnId,
                     grillOrigin,
                     model: selectedModel === AUTO_MODEL_VALUE ? "gpt-5.6-luna" : selectedModel,
@@ -447,11 +453,6 @@ export function queuePrompt(ctx, message, mode, skills, forcePlan) {
 
 export async function steerPrompt(ctx, message, steerAttachments, clearComposer, steerSkills, forcePlan) {
     const { addSteerMessage, clearComposerInputDraft, clearComposerSessionLinks, currentRunningTurnId, enqueuePrompt, executionMode, isInactiveSteerResponse, isLikelyBackendDisconnect, isSteering, noteBackendDisconnect, noteBackendRequestSucceeded, parseResponseAnnotations, refreshSelectedSessionSnapshot, sessionIdRef, setAttachments, setComposerForcePlanNextPrompt, setComposerInput, setComposerResponseQuote, setIsSteering, setResponseQuotePopover, setSelectedSkills, setSlashTrigger, setStatus, showToast } = ctx;
-        if (forcePlan) {
-            enqueuePrompt(message, "queue", executionMode, steerSkills, steerAttachments, false, true, clearComposer);
-            setStatus("Queued with outcome tracking for the next turn");
-            return true;
-        }
         const turnId = currentRunningTurnId;
         const targetSessionId = sessionIdRef.current;
         if (!turnId || !targetSessionId || isSteering) {
@@ -480,6 +481,7 @@ export async function steerPrompt(ctx, message, steerAttachments, clearComposer,
                     turnId,
                     sessionId: targetSessionId,
                     message,
+                    clientLayout: currentClientLayout(),
                     forcePlan,
                     skills: steerSkills.map(({ name, path }) => ({ name, path })),
                     attachments: steerAttachments
@@ -490,13 +492,8 @@ export async function steerPrompt(ctx, message, steerAttachments, clearComposer,
                 const detail = typeof payload?.error === "string" ? payload.error : `API returned ${response.status}`;
                 if (isInactiveSteerResponse(response.status, detail)) {
                     noteBackendRequestSucceeded();
-                    if (clearComposer) {
-                        enqueuePrompt(message, "steer", executionMode, steerSkills, steerAttachments, false, forcePlan);
-                    }
                     await refreshSelectedSessionSnapshot(targetSessionId, turnId);
-                    setStatus("Agent finished; steer queued as the next prompt.");
-                    showToast("Agent finished; steer queued as the next prompt.");
-                    return "queued";
+                    throw new Error("The target turn has stopped or finished. Steer was not sent; resend it as a new prompt.");
                 }
                 throw new Error(detail);
             }

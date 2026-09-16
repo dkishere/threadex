@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
-import { buildTurnGitPatch } from "./turnGitPatch";
+import { buildTurnGitPatch, readCompactTurnBaseline } from "./turnGitPatch";
 import { buildWebVsCodeReview } from "./webVsCodeReview";
 import { resolveWorkspaceFilePath } from "./workspaceFiles";
 
@@ -54,7 +54,19 @@ export function createWebVsCodeReviewSession(input: {
     const absolutePath = resolveWorkspaceFilePath(workspacePath, normalizedPath);
     if (!absolutePath) continue;
     let patch = "";
-    if (input.turnId && workspacePath === resolve(input.cwd)) {
+    const compactBefore = input.turnId && workspacePath === resolve(input.cwd)
+      ? readCompactTurnBaseline(input.dataDir, input.turnId, workspacePath, normalizedPath)
+      : undefined;
+    if (compactBefore !== undefined) {
+      const after = existsSync(absolutePath) ? readFileSync(absolutePath, "utf8") : "";
+      if ((compactBefore ?? "") === after) continue;
+      patch = buildWebVsCodeReview([{
+        path: normalizedPath,
+        kind: compactBefore === null ? "add" : existsSync(absolutePath) ? "update" : "delete",
+        before: compactBefore ?? "", after
+      }], workspacePath);
+    }
+    if (compactBefore === undefined && input.turnId && workspacePath === resolve(input.cwd)) {
       try {
         patch = buildTurnGitPatch(input.dataDir, input.turnId, workspacePath, [normalizedPath]) ?? "";
       } catch {}
@@ -65,7 +77,7 @@ export function createWebVsCodeReviewSession(input: {
     const currentText = existsSync(absolutePath) && statSync(absolutePath).isFile()
       ? readFileSync(absolutePath, "utf8")
       : "";
-    const baselineText = reconstructBaseline(currentText, parseUnifiedDiff(patch));
+    const baselineText = compactBefore !== undefined ? compactBefore ?? "" : reconstructBaseline(currentText, parseUnifiedDiff(patch));
     totalBytes += Buffer.byteLength(patch, "utf8") + Buffer.byteLength(baselineText, "utf8");
     if (totalBytes > MAX_REVIEW_BYTES) {
       throw new Error("The combined review is larger than 16 MB.");

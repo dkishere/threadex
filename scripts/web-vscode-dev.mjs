@@ -60,6 +60,7 @@ export function prepareWebVsCodeDevLaunch(rootDir, env = process.env) {
   const launch = resolveWebVsCodeDevLaunch(rootDir, env);
   if (!launch.enabled) return launch;
 
+  launch.command = resolveCommandForSpawn(launch.command, env);
   mkdirSync(launch.userDataDir, { recursive: true });
   mkdirSync(launch.extensionsDir, { recursive: true });
   mkdirSync(launch.reviewRequestDirectory, { recursive: true });
@@ -68,6 +69,27 @@ export function prepareWebVsCodeDevLaunch(rootDir, env = process.env) {
   mkdirSync(launch.supervisorDir, { recursive: true });
   installBundledReviewExtension(launch.bundledReviewExtension, launch.extensionsDir);
   return launch;
+}
+
+/**
+ * Windows' command lookup can find extensionless Unix shims and PowerShell
+ * scripts, but Node's spawn() cannot execute either without a shell. Prefer
+ * the generated .cmd launcher when a bare command resolves to one.
+ */
+function resolveCommandForSpawn(command, env) {
+  if (process.platform !== "win32" || /[\\/]/.test(command) || !/^[\w.-]+$/.test(command)) {
+    return command;
+  }
+
+  const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path");
+  const pathEntries = pathKey ? String(env[pathKey] ?? "").split(";").filter(Boolean) : [];
+  for (const directory of pathEntries) {
+    for (const extension of [".cmd", ".bat", ".exe", ".com"]) {
+      const candidate = resolve(directory, `${command}${extension}`);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  return command;
 }
 
 /**

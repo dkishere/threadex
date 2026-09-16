@@ -467,6 +467,33 @@ test("live items upsert by replay order without item event history", async () =>
   }
 });
 
+test("session snapshots preserve escaped NULs in command output and raw Codex events", async () => {
+  const store = await createStore();
+  try {
+    const output = "before\u0000after";
+    await store.recordSessionTurnEvent({
+      id: "nul-command", turnId: "turn-1", sessionId: "session-1", eventName: "item",
+      payload: {
+        id: "command-nul", itemType: "command_execution", eventType: "item.completed",
+        command: "read binary output", aggregatedOutput: output,
+        aggregatedOutputLength: output.length, exitCode: 0, status: "completed"
+      }
+    });
+    await store.recordSessionTurnEvent({
+      id: "nul-raw", turnId: "turn-1", sessionId: "session-1", eventName: "codex",
+      payload: { method: "item/completed", params: { output } }
+    });
+    const inspected = await store.inspectSession({ sessionId: "session-1", includeLiveItems: true });
+    const items = inspected?.turns[0]?.liveItems as Array<Record<string, unknown>>;
+    const command = items.find((item) => item.id === "command-nul");
+    assert.equal(command?.aggregatedOutput, output);
+    assert.equal(command?.exitCode, 0);
+    assert.equal(command?.command, "read binary output");
+  } finally {
+    await store.close();
+  }
+});
+
 test("context compaction live items survive session snapshot storage", async () => {
   const store = await createStore();
   try {

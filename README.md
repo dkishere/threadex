@@ -159,6 +159,7 @@ WEB_VSCODE_PORT=8790
 WEB_VSCODE_AUTOSTART=true
 # WEB_VSCODE_REVIEW_EXCLUDES=.git/,node_modules/,data/,dist/,build/
 # WEB_VSCODE_URL=https://existing-code-server.example/
+# WEB_VSCODE_TUNNEL_CONFIG=cloudflared/config.yml
 # CODE_SERVER_COMMAND=/path/to/code-server
 AGENT_CLI_PROVIDER=codex
 AGENT_CLI_PATH=/Applications/Codex.app/Contents/Resources/codex
@@ -250,6 +251,14 @@ its restart/shutdown lifecycle alongside Vite. Outside the development watcher,
 the API server starts it by default. Runtime state lives under `data/code-server`.
 `WEB_VSCODE_REVIEW_EXCLUDES` accepts a comma-separated override for directories
 excluded from shadow baselines.
+After a managed turn reports a successful result, Threadex compacts its shadow
+baseline into a verified gzip archive containing original text for changed and
+review-listed files, then removes that turn's Git object store. Reviews use the
+saved original text against the current workspace, including later edits; this
+is not a frozen end-of-turn after snapshot. Unsupported binary/special files,
+archives above the 16 MB uncompressed text limit, and compaction failures retain
+the Git baseline. Failed/interrupted turns and existing historical baselines
+are not automatically deleted by this compaction path.
 The bundled Web VS Code process receives private local action/result directory
 paths automatically. If `WEB_VSCODE_URL` points at an externally managed
 code-server, configure equivalent `THREADEX_WALKTHROUGH_ACTION_DIR` and

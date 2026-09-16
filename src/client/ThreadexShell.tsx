@@ -20,6 +20,7 @@ import { consumeVsCodeAnnotation } from "./vscodeAnnotationBridge";
 import { collectFileChanges, formatTurnDuration } from "./sessionHelpers02";
 import { turnDurationMs } from "./sessionHelpers03";
 import { installGlobalFileDrop } from "./globalFileDrop";
+import { useCloseMiddlePanel, useCompactLayout, useSetRunningSessionCount } from "./ResponsiveLayout";
 
 function sessionPopoverPosition(bounds, width) {
     const gap = 4;
@@ -53,6 +54,9 @@ function formatPromptExecutionDuration(durationMs, isRunning) {
 }
 
 export function ThreadexShell(ctx) {
+    const setRunningSessionCount = useSetRunningSessionCount();
+    const compactLayout = useCompactLayout();
+    const closeMiddlePanel = useCloseMiddlePanel();
   const { APPROVAL_POLICY_OPTIONS, AUTO_MODEL_VALUE, Activity, ApprovalEvent, ArrowDown, ArrowLeft, ArrowUp, BetweenHorizontalStart, AttachmentList, CONTEXT_FORK_TAG_LABEL, CheckCircle2, CheckSquare2, ChevronDown, ChevronRight, Circle, Clock3, CompletedTurn, Copy, Cpu, Database, Diff, EFFORT_OPTIONS, ExternalLink, FileAnnotationComposerContext, FileText, Folder, FORCE_PLAN_TAG_LABEL, GOAL_MODE_TAG_LABEL, GitFork, InlineLinkComposer, ListChecks, LiveEventList, Loader2, MAX_ATTACHMENTS, MESSAGE_BOTTOM_THRESHOLD, MODEL_OPTIONS, MarkdownContent, MessageTimeline, Pencil, Plus, ProfileSettingsPanel, Quote, ResponseAnnotationList, RotateCcw, Search, Send, ServerPrefixPanels, Settings, ShieldCheck, Square, StatusUpdateIndicator, Target, TerminalSquare, TodoPanel, Trash2, ULTRA_EFFORT_OPTIONS, User, UserPlus, X, _Fragment, _jsx, _jsxs, accountIdentityLabel, accountNeedsLogin, accountResetCredits, annotationLabel, appActions01, appActions02, appActions03, appActions04, appActions05, appActions06, approvalEventToLiveItem, browserBridgeContextAttachmentName, buildCodexReference, buildMessageIndicatorMarks, capitalize, compareSessionRecordsByUpdated, createSystemMessage, displaySessionTitle, earliestExpiringResetCredit, fileChangeItemFromPatchCommand, findSlashTrigger, formatAccountSelectLabel, formatBytes, formatLoadBalanceAccountLabel, formatQuotaPercent, formatQuotaRemaining, formatQuotaReset, formatQuotaStatus, formatResetCreditExpiry, formatTimestamp, formatTimestampShort, formatTokenCount, getSessionExecutionStatus, getWorkspaceTabSummary, groupSessionsByBaseDir, groupTranscriptByStepMarkers, hasVisibleTodoPlan, highlightSessionSearchText, isTodoPlanAwaitingClarification, latestTurnIssueTracker, messageIndicatorMarkTop, messageTimingLabel, modelOptionLabel, movePendingModelPreferences, moveStoredComposerDraft, normalizeComposerDraft, normalizeSessionModelPreferences, normalizeStoredApprovalPolicy, parseBrowserBridgeContext, parseResponseAnnotations, patchStoredComposerDraft, pendingPromptForSubscription, promptDisplayMetadata, queuedPromptSessionKey, quotaWindowsByDuration, readOptionalNavigationTarget, readPendingModelPreferences, readStoredComposerDraft, readStoredModelSelector, readStoredSession, removePendingModelPreferencesIfMatches, sessionExecutionStatusLabel, shortId, shouldRenderMessageTimeline, summarizeTitle, supportsUltraEffort, useCallback, useEventStore, useMemo, useRef, useSessionEffects, useState, writeStoredSession, writePendingModelPreferences, appendSteerSegment, appendTextSegment, applyLiveItemToMessage, approvalDecisionLabel, approvalRecordToLiveItem, cleanLoginUrlValue, composerLinkToken, describeCodexEvent, describeStreamItem, developerInstructionRecordFromPayload, developerInstructionsIndicateForcePlan, elementForSelectionNode, eventStore, finalizeTerminalAssistantMessage, findAssistantMessageId, findUserMessageForTurn, formatComposerLinkMarkdown, formatResponseAnnotationsPrompt, getCodexEventName, isAccountLoginRequiredMessage, isApprovalLiveItem, isCodexTurnCompletedEvent, isInactiveSteerResponse, isLikelyBackendDisconnect, isNoRolloutFoundMessage, itemEventRank, liveItemKey, mergeDeveloperInstructionRecords, moveQueuedPromptInList, moveQueuedPromptToTarget, navigationUrl, nextPastedTextFileName, parseCodexReference, parsePastedHttpUrl, pendingAssistantMessages, promoteQueuedPromptToSteer, readApiError, readAttachment, readEventStream, readNavigationTarget, readRecord, readStringField, reorderPendingTurnMessages, replaceComposerLinkTokens, resetOutcomeLabel, resizeEditor, sessionTurnsToMessages, setsEqual, shouldCompactPastedText, sleep, slugify, toSessionPageState, upsertPendingApprovalItem } = ctx;
     function renderPromptTags(prompt, className = "") {
         const metadata = promptDisplayMetadata(prompt?.rawContent ?? prompt?.content);
@@ -88,8 +92,12 @@ export function ThreadexShell(ctx) {
     const [sessionAutoModel, setSessionAutoModel] = useState(null);
     const [attachments, setAttachments] = useState([]);
     const [composerResponseQuote, setComposerResponseQuote] = useState(null);
-    const [sessionTab, setSessionTab] = useState({ sessionId: null, value: "turns" });
-    useReactEffect(() => { setSessionTab({ sessionId, value: "turns" }); }, [sessionId]);
+    const [sessionTab, setSessionTab] = useState(() => ({ sessionId: null, value: compactLayout ? "sessions" : "turns" }));
+    useReactEffect(() => { setSessionTab((current) => ({ sessionId, value: current.value === "sessions" ? "sessions" : "turns" })); }, [sessionId]);
+    useReactEffect(() => {
+        if (!compactLayout) return;
+        setSessionTab((current) => current.value === "sessions" ? current : { ...current, value: "sessions" });
+    }, [compactLayout]);
     const [responseQuotePopover, setResponseQuotePopover] = useState(null);
     const [sideChatAnnotation, setSideChatAnnotation] = useState(null);
     useReactEffect(() => setSideChatAnnotation(null), [sessionId]);
@@ -197,6 +205,7 @@ export function ThreadexShell(ctx) {
     const [hoveredProcessMonitor, setHoveredProcessMonitor] = useState(null);
     const [hoveredWorkspace, setHoveredWorkspace] = useState(null);
     const hoveredSessionCloseTimerRef = useRef(null);
+    const sessionLongPressRef = useRef(null);
     const hoveredProcessMonitorCloseTimerRef = useRef(null);
     const [bindAccountId, setBindAccountId] = useState("");
     const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -533,7 +542,7 @@ export function ThreadexShell(ctx) {
         : null;
     const visibleSessionTodo = sessionTodo?.sessionId === sessionId ? sessionTodo : null;
     const hasPlanTab = Boolean(sessionId && hasVisibleTodoPlan(visibleSessionTodo));
-    const activeSessionTab = sessionTab.sessionId === sessionId && (sessionTab.value !== "plan" || hasPlanTab) ? sessionTab.value : "turns";
+    const activeSessionTab = compactLayout && sessionTab.value === "sessions" ? "sessions" : sessionTab.value !== "sessions" && sessionTab.sessionId === sessionId && (sessionTab.value !== "plan" || hasPlanTab) ? sessionTab.value : "turns";
     const visibleParentSessionTodo = parentSessionTodo?.sessionId === effectiveParentSessionId ? parentSessionTodo : null;
     const childSessions = sessionId
         ? sessionList.filter((record) => record.parentSessionId === sessionId)
@@ -545,6 +554,14 @@ export function ThreadexShell(ctx) {
         const backgroundSessionIds = new Set(centralState.statusMonitor.flatMap((workspace) => workspace.active_sessions.map((backgroundSession) => backgroundSession.id)));
         return new Set(pendingApprovalSessionIds.filter((pendingSessionId) => !backgroundSessionIds.has(pendingSessionId)));
     }, [centralState.statusMonitor, pendingApprovalSessionIds]);
+    const workspaceTabSummaries = useMemo(() => new Map(workspaceList.map((workspace) => {
+        const isActive = workspace.id === activeWorkspace?.id;
+        return [workspace.id, getWorkspaceTabSummary(workspace.id, isActive, workspaceStatusById, sessionList, sessionExecutionStatuses, isActive ? activeWorkspacePendingApprovalSessionIdSet : pendingApprovalSessionIdSet)];
+    })), [activeWorkspace?.id, activeWorkspacePendingApprovalSessionIdSet, getWorkspaceTabSummary, pendingApprovalSessionIdSet, sessionExecutionStatuses, sessionList, workspaceList, workspaceStatusById]);
+    const workspaceTabRunningSessionCount = useMemo(() => [...workspaceTabSummaries.values()].reduce((total, summary) => total + summary.sessions.length, 0), [workspaceTabSummaries]);
+    useReactEffect(() => {
+        setRunningSessionCount(workspaceTabRunningSessionCount);
+    }, [setRunningSessionCount, workspaceTabRunningSessionCount]);
     const activeWorkspaceBackgroundSessions = useMemo(() => {
         const currentSessionId = sessionId ?? activeSessionId;
         const ids = new Set([
@@ -874,7 +891,7 @@ export function ThreadexShell(ctx) {
     async function bindAccount(accountId = bindAccountId) { return appActions03.bindAccount({ activeWorkspace, applyAccountPayload, setBindAccountId, setStatus }, accountId); }
     async function unbindAccount(accountId) { return appActions03.unbindAccount({ activeWorkspace, applyAccountPayload, setStatus }, accountId); }
     async function deleteAccount(account) { return appActions03.deleteAccount({ accountIdentityLabel, applyAccountPayload, deletingAccountId, setBindAccountId, setDeletingAccountId, setProfileAccountId, setStatus, showToast }, account); }
-    async function switchSession(record, options = {}) { return appActions03.switchSession({ applyComposerDraftState, applySelectedSessionSnapshot, bumpViewKey, clearTodoPanelState, currentComposerDraft, displaySessionTitle, executionMode, explicitNewSessionRef, forcePlanNextPrompt, forkNextPrompt, input, isCurrentViewKey, isLikelyBackendDisconnect, messages, noteBackendDisconnect, noteBackendRequestSucceeded, parentSessionTodo, reconnectRunner, replaceComposerDraftForSession, scheduleLoadSessions, sessionIdRef, sessionTodo, setMessages, setParentSessionTodo, setSessionTodo, setStatus, setSwitchingSessionTitle, stickToMessageBottomRef, updateNavigationUrl, viewKeyRef }, record, options); }
+    async function switchSession(record, options = {}) { closeMiddlePanel(); return appActions03.switchSession({ applyComposerDraftState, applySelectedSessionSnapshot, bumpViewKey, clearTodoPanelState, currentComposerDraft, displaySessionTitle, executionMode, explicitNewSessionRef, forcePlanNextPrompt, forkNextPrompt, input, isCurrentViewKey, isLikelyBackendDisconnect, messages, noteBackendDisconnect, noteBackendRequestSucceeded, parentSessionTodo, reconnectRunner, replaceComposerDraftForSession, scheduleLoadSessions, sessionIdRef, sessionTodo, setMessages, setParentSessionTodo, setSessionTodo, setStatus, setSwitchingSessionTitle, stickToMessageBottomRef, updateNavigationUrl, viewKeyRef }, record, options); }
     async function openLinkedSession(record) { return appActions04.openLinkedSession({ activeWorkspace, switchSession, switchWorkspace }, record); }
     async function switchToSessionById(targetSessionId, options = {}) { return appActions04.switchToSessionById({ isCurrentViewKey, sessionList, setStatus, showToast, switchSession, viewKeyRef }, targetSessionId, options); }
     async function switchToParentSession(parentSessionId) { return appActions04.switchToParentSession({ switchToSessionById }, parentSessionId); }
@@ -890,7 +907,7 @@ export function ThreadexShell(ctx) {
     function applyStreamItem(target, item) { return appActions04.applyStreamItem({ appendAssistantMessage, describeStreamItem, isTargetVisible, liveItemKey, readAgentMessageAppendText, setStatus, threadIdRef, upsertLiveItem }, target, item); }
     function upsertLiveItem(target, item) { return appActions04.upsertLiveItem({ applyLiveItemToMessage, isTargetVisible, itemEventRank, liveItemKey, setMessages }, target, item); }
     function removePendingApprovalItem(approvalId) { return appActions04.removePendingApprovalItem({ refreshApprovalState, setPendingApprovalItems }, approvalId); }
-    async function newSession(project = null, baseSessionId = null) { return appActions04.newSession({ activeWorkspace, applyComposerDraftState, bumpViewKey, clearTodoPanelState, createSystemMessage, currentComposerDraft, eventStore, executionMode, explicitNewSessionRef, forcePlanNextPrompt, forkNextPrompt, input, isCurrentViewKey, isLikelyBackendDisconnect, navigationRequestIdRef, newSessionBaseSessionIdRef, newSessionProjectRef, newSessionRequestInFlightRef, noteBackendDisconnect, noteBackendRequestSucceeded, parentSessionTodo, prepareNewLocalModelPreferences, replaceComposerDraftForSession, sessionIdRef, sessionTodo, setActiveSessionId, setActiveTurnId, setComposerInput, setIsBootstrapped, setMessages, setNewSessionProjectId, setNewSessionProjectName, setParentSessionTodo, setPendingApprovalItems, setQueuedPrompts, setResumeThreadId, setSessionAutoModel, setSessionId, setSessionTodo, setStatus, setThreadId, updateNavigationUrl, viewKeyRef }, project, baseSessionId); }
+    async function newSession(project = null, baseSessionId = null) { closeMiddlePanel(); return appActions04.newSession({ activeWorkspace, applyComposerDraftState, bumpViewKey, clearTodoPanelState, createSystemMessage, currentComposerDraft, eventStore, executionMode, explicitNewSessionRef, forcePlanNextPrompt, forkNextPrompt, input, isCurrentViewKey, isLikelyBackendDisconnect, navigationRequestIdRef, newSessionBaseSessionIdRef, newSessionProjectRef, newSessionRequestInFlightRef, noteBackendDisconnect, noteBackendRequestSucceeded, parentSessionTodo, prepareNewLocalModelPreferences, replaceComposerDraftForSession, sessionIdRef, sessionTodo, setActiveSessionId, setActiveTurnId, setComposerInput, setIsBootstrapped, setMessages, setNewSessionProjectId, setNewSessionProjectName, setParentSessionTodo, setPendingApprovalItems, setQueuedPrompts, setResumeThreadId, setSessionAutoModel, setSessionId, setSessionTodo, setStatus, setThreadId, updateNavigationUrl, viewKeyRef }, project, baseSessionId); }
     function focusComposer() { window.requestAnimationFrame(() => inputEditorRef.current?.focus()); }
     function editQueuedPrompt(promptId) { return appActions04.editQueuedPrompt({ focusComposer, input, queuedPromptEditRef, queuedPromptsRef, setComposerInput, setQueuedPrompts, setStatus }, promptId); }
     function commitQueuedPromptEdit(content) { return appActions04.commitQueuedPromptEdit({ focusComposer, queuedPromptEditRef, setComposerInput, setQueuedPrompts, setStatus }, content); }
@@ -1086,6 +1103,60 @@ export function ThreadexShell(ctx) {
     function selectSlashSuggestion(suggestion) { return appActions06.selectSlashSuggestion({ capitalize, executionMode, input, inputEditorRef, setComposerExecutionMode, setComposerInput, setSelectedSkills, setSlashTrigger, setStatus, slashTrigger }, suggestion); }
     function selectComposerSuggestion(suggestion) { return appActions06.selectComposerSuggestion({ composerSuggestionTrigger, input, inputEditorRef, setComposerInput, setComposerSuggestionTrigger }, suggestion); }
     function clearInput() { return appActions06.clearInput({ clearComposerInputDraft, inputEditorRef, setComposerResponseQuote, setResponseQuotePopover, setSelectedSkills, setSlashTrigger, setComposerSuggestionTrigger }); }
+    function canUseSessionHover() {
+        return window.matchMedia("(min-width: 768px) and (hover: hover)").matches;
+    }
+    function showSessionDetails(record, element) {
+        cancelHoveredSessionClose();
+        const bounds = element.getBoundingClientRect();
+        setHoveredSession({
+            id: record.id,
+            position: sessionPopoverPosition(bounds, pendingApprovalItems.some((item) => item.sessionId === record.id && item.method === "item/tool/requestUserInput") ? 420 : 360)
+        });
+    }
+    function cancelSessionLongPress() {
+        const pending = sessionLongPressRef.current;
+        if (pending?.timer !== null && pending?.timer !== undefined) {
+            window.clearTimeout(pending.timer);
+        }
+        sessionLongPressRef.current = null;
+    }
+    function startSessionLongPress(record, event) {
+        if (event.pointerType === "mouse" || !event.isPrimary ||
+            (event.target !== event.currentTarget && !event.target?.closest?.(".session-row"))) {
+            return;
+        }
+        cancelSessionLongPress();
+        setHoveredSession(null);
+        const element = event.currentTarget;
+        const pointerId = event.pointerId;
+        const startX = event.clientX;
+        const startY = event.clientY;
+        const timer = window.setTimeout(() => {
+            sessionLongPressRef.current = { id: record.id, pointerId, timer: null, triggered: true };
+            showSessionDetails(record, element);
+        }, 500);
+        sessionLongPressRef.current = { id: record.id, pointerId, startX, startY, timer, triggered: false };
+    }
+    function moveSessionLongPress(record, event) {
+        const pending = sessionLongPressRef.current;
+        if (!pending || pending.id !== record.id || pending.pointerId !== event.pointerId || pending.triggered)
+            return;
+        if (Math.hypot(event.clientX - pending.startX, event.clientY - pending.startY) > 10) {
+            cancelSessionLongPress();
+        }
+    }
+    function endSessionLongPress(record, event) {
+        const pending = sessionLongPressRef.current;
+        if (!pending || pending.id !== record.id || pending.pointerId !== event.pointerId || pending.triggered)
+            return;
+        cancelSessionLongPress();
+    }
+    function handleSessionFocus(record, event) {
+        if (!canUseSessionHover())
+            return;
+        showSessionDetails(record, event.currentTarget);
+    }
     function cancelHoveredSessionClose() { return appActions06.cancelHoveredSessionClose({ hoveredSessionCloseTimerRef }); }
     function scheduleHoveredSessionClose() { return appActions06.scheduleHoveredSessionClose({ cancelHoveredSessionClose, hoveredSessionCloseTimerRef, setHoveredSession }); }
     function cancelHoveredProcessMonitorClose() { return appActions06.cancelHoveredProcessMonitorClose({ hoveredProcessMonitorCloseTimerRef }); }
@@ -1157,7 +1228,7 @@ export function ThreadexShell(ctx) {
         const turnPromptPadding = promptTurnIndex >= 0
             ? isFeaturedPromptTurn ? "16px" : "calc(16px + 4em)"
             : undefined;
-        return (_jsx("article", { className: `message ${message.role}`, style: turnAccent ? { "--turn-accent": turnAccent, "--turn-prompt-padding": turnPromptPadding } : undefined, onClick: (event) => {
+        return (_jsx("article", { className: `message ${message.role}`, "data-featured": isFeaturedPromptTurn ? "true" : undefined, style: turnAccent ? { "--turn-accent": turnAccent, "--turn-prompt-padding": turnPromptPadding } : undefined, onClick: (event) => {
                 if (!event.target.closest("summary")) {
                     return;
                 }
@@ -1200,19 +1271,21 @@ message.turnStatus === "todo" && (_jsx("span", { className: "turn-status", child
         const isAchievingGoal = achievingSessionIds.has(record.id);
         const canAchieveGoal = Boolean(record.threadId) && executionStatus === "completed" && !isAchievingGoal;
         return (_jsxs("div", { className: "session-tree-node", "data-depth": node.depth, style: { "--session-tree-depth": node.depth }, children: [_jsxs("div", { className: "session-list-item", onMouseEnter: (event) => {
-                        cancelHoveredSessionClose();
-                        const bounds = event.currentTarget.getBoundingClientRect();
-                        setHoveredSession({
-                            id: record.id,
-                            position: sessionPopoverPosition(bounds, sessionApprovals.some((item) => item.method === "item/tool/requestUserInput") ? 420 : 360)
-                        });
-                    }, onMouseLeave: scheduleHoveredSessionClose, children: [_jsx("input", { className: "session-selection-checkbox", type: "checkbox", checked: selectedSessionIds.has(record.id), onChange: () => toggleSessionSelection(record.id), "aria-label": `Select ${displaySessionTitle(record.title)}` }), _jsxs("button", { className: "session-row", "data-session-id": record.id, "data-grill-await-ack": pendingGrillSessions.has(record.id) || undefined, title: pendingGrillSessions.has(record.id) ? "Grill: Await ack" : undefined, type: "button", onClick: () => void switchSession(record), onFocus: (event) => {
-                                cancelHoveredSessionClose();
-                                const bounds = event.currentTarget.getBoundingClientRect();
-                                setHoveredSession({
-                                    id: record.id,
-                                    position: sessionPopoverPosition(bounds, sessionApprovals.some((item) => item.method === "item/tool/requestUserInput") ? 420 : 360)
-                                });
+                        if (!canUseSessionHover())
+                            return;
+                        showSessionDetails(record, event.currentTarget);
+                    }, onMouseLeave: scheduleHoveredSessionClose, onPointerDown: (event) => startSessionLongPress(record, event), onPointerMove: (event) => moveSessionLongPress(record, event), onPointerUp: (event) => endSessionLongPress(record, event), onPointerLeave: (event) => endSessionLongPress(record, event), onPointerCancel: () => cancelSessionLongPress(), onContextMenu: (event) => {
+                        if (!canUseSessionHover())
+                            event.preventDefault();
+                    }, onClickCapture: (event) => {
+                        const pending = sessionLongPressRef.current;
+                        if (pending?.id === record.id && pending.triggered) {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            cancelSessionLongPress();
+                        }
+                    }, children: [_jsx("input", { className: "session-selection-checkbox", type: "checkbox", checked: selectedSessionIds.has(record.id), onChange: () => toggleSessionSelection(record.id), "aria-label": `Select ${displaySessionTitle(record.title)}` }), _jsxs("button", { className: "session-row", "data-session-id": record.id, "data-grill-await-ack": pendingGrillSessions.has(record.id) || undefined, title: pendingGrillSessions.has(record.id) ? "Grill: Await ack" : undefined, type: "button", onClick: () => void switchSession(record), onFocus: (event) => {
+                                 handleSessionFocus(record, event);
                             }, onBlur: (event) => {
                                 if (!event.currentTarget.parentElement?.contains(event.relatedTarget)) {
                                     scheduleHoveredSessionClose();
@@ -1364,9 +1437,9 @@ message.turnStatus === "todo" && (_jsx("span", { className: "turn-status", child
     const commandApprovalModal = pendingCommandApprovals.length > 0 ? (_jsx("div", { className: "modal-backdrop approval-backdrop", role: "presentation", children: _jsxs("section", { className: "approval-modal", role: "dialog", "aria-modal": "true", "aria-labelledby": "approval-modal-title", onMouseDown: (event) => event.stopPropagation(), children: [_jsxs("div", { className: "modal-header", children: [_jsx("h2", { id: "approval-modal-title", children: "Approval required" }), _jsx("span", { children: pendingCommandApprovals.length })] }), _jsx("div", { className: "approval-modal-list", children: pendingCommandApprovals.map((item) => (_jsx(ApprovalEvent, { item: item, onDecisionSubmitted: removePendingApprovalItem }, item.approvalId))) })] }) })) : null;
     const approvalModal = commandApprovalModal;
     const promptDetailsModal = _jsxs(_Fragment, { children: [renderTurnDetailsModal(), _jsx(SessionChangesPopover, { sessionId: sessionId })] });
-    return (_jsx(FileAnnotationComposerContext.Provider, { value: fileAnnotationContextValue, children: _jsxs("main", { className: "shell", children: [approvalModal, promptDetailsModal, _jsxs("header", { className: "workspace-header", "aria-label": "Workspaces", children: [_jsxs("div", { className: "workspace-tabs", role: "tablist", "aria-label": "Workspaces", children: [workspaceList.length === 0 && (_jsxs("span", { className: "workspace-tab", "data-active": "true", children: [_jsx(Folder, { "aria-hidden": "true" }), _jsx("span", { children: "Default" })] })), workspaceList.map((workspace) => {
+    return (_jsx(FileAnnotationComposerContext.Provider, { value: fileAnnotationContextValue, children: _jsxs("main", { className: "shell", "data-session-tab": activeSessionTab, children: [approvalModal, promptDetailsModal, _jsxs("header", { className: "workspace-header", "aria-label": "Workspaces", children: [_jsxs("div", { className: "workspace-tabs", role: "tablist", "aria-label": "Workspaces", children: [workspaceList.length === 0 && (_jsxs("span", { className: "workspace-tab", "data-active": "true", children: [_jsx(Folder, { "aria-hidden": "true" }), _jsx("span", { children: "Default" })] })), workspaceList.map((workspace) => {
                                     const isActive = workspace.id === activeWorkspace?.id;
-                                    const summary = getWorkspaceTabSummary(workspace.id, isActive, workspaceStatusById, sessionList, sessionExecutionStatuses, isActive ? activeWorkspacePendingApprovalSessionIdSet : pendingApprovalSessionIdSet);
+                                    const summary = workspaceTabSummaries.get(workspace.id);
                                     return (_jsxs("div", { className: "workspace-tab-wrap", onMouseEnter: (event) => {
                                             if (isActive || summary.sessions.length === 0)
                                                 return;
@@ -1387,7 +1460,7 @@ message.turnStatus === "todo" && (_jsx("span", { className: "turn-status", child
                                                             const selected = workspaceAccountIds.includes(account.id) || (!useLoadBalanceInWorkspace && activeAccount?.id === account.id);
                                                             const resetting = resettingAccountId === account.id;
                                                             return (_jsxs("article", { className: "account-popover-card", "data-selected": selected, children: [_jsxs("button", { className: "account-popover-select", type: "button", onClick: () => void switchAccount(account.id), children: [_jsxs("span", { className: "account-popover-identity", children: [_jsx("strong", { children: accountIdentityLabel(account) }), _jsxs("small", { children: [account.email || account.externalAccountId || account.id, tier ? ` · ${tier}` : ""] })] }), _jsxs("span", { className: "account-popover-quota", children: [windows.fiveHour && _jsxs("span", { children: ["5hr ", _jsx("strong", { children: formatQuotaPercent(windows.fiveHour) }), _jsxs("small", { children: ["Auto reset: ", formatQuotaWindowReset(windows.fiveHour, "relative")] })] }), windows.weekly && _jsxs("span", { children: ["Weekly ", _jsx("strong", { children: formatQuotaPercent(windows.weekly) }), _jsxs("small", { children: ["Reset: ", formatQuotaWindowReset(windows.weekly, "dateTime")] })] }), !windows.fiveHour && !windows.weekly && _jsx("span", { children: "Usage unavailable" })] })] }), _jsxs("div", { className: "account-popover-reset", children: [_jsxs("span", { children: [_jsx("strong", { children: resetCredits.availableCount }), " reset", resetCredits.availableCount === 1 ? "" : "s", _jsxs("small", { children: ["Earliest expiry: ", formatResetCreditExpiry(earliestCredit, resetCredits.availableCount)] })] }), _jsxs("button", { type: "button", onClick: () => void resetAccountRateLimit(account), disabled: resetCredits.availableCount <= 0 || Boolean(resettingAccountId) || accountNeedsLogin(account), title: resetCredits.availableCount > 0 ? "Use one rate-limit reset" : "No reset available", children: [_jsx(RotateCcw, { className: resetting ? "spin" : undefined, "aria-hidden": "true" }), resetting ? "Resetting" : "Use reset"] })] }), account.quotaError && (_jsxs("div", { className: "account-popover-error-row", children: [_jsx("small", { className: "account-popover-error", children: account.quotaError }), accountNeedsLogin(account) && (_jsx("button", { className: "account-popover-login", type: "button", onClick: () => beginAccountRelogin(account), children: "Relogin" }))] }))] }, account.id));
-                }), accountList.length === 0 && _jsx("p", { className: "account-popover-empty", children: "No accounts" })] })] }))] }), _jsx("button", { className: "ghost-icon header-settings", type: "button", "data-active": isSettingsOpen, onClick: () => setIsSettingsOpen((open) => !open), title: "Settings", "aria-label": "Settings", children: _jsx(Settings, { "aria-hidden": "true" }) })] })] }), _jsxs("aside", { className: "sidebar", "aria-label": "Sessions", children: [_jsxs("div", { className: "sidebar-toolbar", children: [_jsx("button", { className: "ghost-icon", type: "button", onClick: () => {
+                }), accountList.length === 0 && _jsx("p", { className: "account-popover-empty", children: "No accounts" })] })] }))] }), _jsx("button", { className: "ghost-icon header-settings", type: "button", "data-active": isSettingsOpen, onClick: () => setIsSettingsOpen((open) => !open), title: "Settings", "aria-label": "Settings", children: _jsx(Settings, { "aria-hidden": "true" }) })] })] }), _jsxs("aside", { className: "sidebar", id: "session-panel-sessions", role: "tabpanel", "aria-labelledby": "session-tab-sessions", "aria-label": "Sessions", children: [_jsxs("div", { className: "sidebar-toolbar", children: [_jsx("button", { className: "ghost-icon", type: "button", onClick: () => {
                                         setSessionSearchQuery("");
                                         setSessionSearchResults([]);
                                         setSessionSearchPage({ offset: 0, limit: 20, hasMore: false, nextOffset: null, total: 0 });
@@ -1469,8 +1542,9 @@ message.turnStatus === "todo" && (_jsx("span", { className: "turn-status", child
                                                         ? displaySessionTitle(parentSession.title)
                                                         : "Main agent" })] }), _jsx("h1", { children: threadTitle })] })) : (_jsx("h1", { children: threadTitle }))] }), _jsxs("div", { className: "content-header-actions", children: [childSessions.length > 0 && (_jsxs("button", { className: "parent-session-link", type: "button", onClick: () => void switchSession(childSessions[0]), title: `Open latest child task: ${displaySessionTitle(childSessions[0].title)}`, children: [_jsx(GitFork, { "aria-hidden": "true" }), _jsxs("span", { children: [childSessions.length, " child task", childSessions.length === 1 ? "" : "s"] })] }))] })] }),
 _jsx("div", { className: "session-view-tabs", role: "tablist", "aria-label": "Session views", children: [
-    ["turns", "Turns"], ...(sessionId ? [["side-chat", "Side chat"]] : []), ["quick-chat", "Quick Chat"], ...(hasPlanTab ? [["plan", "Plan"]] : [])
+    ...(compactLayout ? [["sessions", "Sessions"]] : []), ["turns", "Turns"], ...(sessionId ? [["side-chat", "Side chat"]] : []), ["quick-chat", "Quick Chat"], ...(hasPlanTab ? [["plan", "Plan"]] : [])
 ].map(([value, label]) => _jsx("button", {
+    className: value === "sessions" ? "session-sessions-tab" : undefined,
     type: "button", role: "tab", id: `session-tab-${value}`, "aria-selected": activeSessionTab === value,
     "aria-controls": `session-panel-${value}`, tabIndex: activeSessionTab === value ? 0 : -1,
     onClick: () => setSessionTab({ sessionId, value }),
@@ -1489,11 +1563,12 @@ _jsxs("aside", { className: "prompt-turns", id: "session-panel-turns", role: "ta
                                             const accent = `var(--turn-accent-${(index % 6) + 1})`;
                                             const isRunning = response?.turnStatus === "running";
                                             const isEditing = inlinePromptEditor?.messageId === prompt.id;
-                                            const openTurn = () => {
-                                                    setActivePromptTurnIds(new Set([prompt.turnId]));
-                                                    setFeaturedPromptTurnId(prompt.turnId);
-                                                    messagesRef.current?.querySelector(`.message.assistant[data-turn-id="${prompt.turnId}"]`)?.scrollIntoView({ behavior: "smooth", block: "start" });
-                                            };
+                                             const openTurn = () => {
+                                                     setActivePromptTurnIds(new Set([prompt.turnId]));
+                                                     setFeaturedPromptTurnId(prompt.turnId);
+                                                     closeMiddlePanel();
+                                                     window.requestAnimationFrame(() => messagesRef.current?.querySelector(`.message.assistant[data-turn-id="${prompt.turnId}"]`)?.scrollIntoView({ behavior: "smooth", block: "start" }));
+                                             };
                                             const promptMetadata = promptDisplayMetadata(prompt.rawContent ?? prompt.content);
                                             const promptText = parseResponseAnnotations(promptMetadata.visible)?.content || promptMetadata.visible || "Attachment prompt";
                                             const copyPrompt = (event) => {

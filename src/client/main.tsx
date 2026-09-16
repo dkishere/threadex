@@ -14,6 +14,18 @@ import "./styles/app-09.css";
 import "./styles/app-10.css";
 import "./styles/app-11.css";
 
+function registerServiceWorker() {
+  if (!import.meta.env.PROD || !("serviceWorker" in navigator)) return;
+
+  window.addEventListener("load", () => {
+    void navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch((error: unknown) => {
+      console.warn("Threadex could not register its service worker.", error);
+    });
+  });
+}
+
+registerServiceWorker();
+
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <SecurityGate><App /></SecurityGate>

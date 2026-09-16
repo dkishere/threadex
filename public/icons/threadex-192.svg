@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" role="img" aria-labelledby="title">
+  <title id="title">Threadex</title>
+  <rect width="192" height="192" rx="42" fill="#0b1020"/>
+  <path d="M42 48h108v24H42z" fill="#8b5cf6"/>
+  <path d="M84 72h24v72H84z" fill="#22d3ee"/>
+  <path d="M51 120h90v24H51z" fill="#f8fafc"/>
+  <circle cx="48" cy="60" r="7" fill="#f8fafc"/>
+  <circle cx="144" cy="60" r="7" fill="#22d3ee"/>
+</svg>

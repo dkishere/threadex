@@ -669,6 +669,8 @@
 
 .composer-layout {
   --composer-gear-width: min(40%, 280px);
+  --composer-toolbar-height: 40px;
+  --composer-gear-bottom-offset: 1px;
   position: relative;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -683,13 +685,13 @@
   box-sizing: border-box;
   position: absolute;
   z-index: 3;
-  bottom: 0;
+  bottom: var(--composer-gear-bottom-offset);
   left: 0;
   display: grid;
   width: var(--composer-gear-width);
-  height: 40px;
+  height: var(--composer-toolbar-height);
   min-width: 0;
-  min-height: 40px;
+  min-height: var(--composer-toolbar-height);
   overflow: visible;
   border-top: 1px solid #4b5262;
   border-radius: 0;
@@ -723,6 +725,10 @@
 .composer-gear-settings svg {
   width: 15px;
   height: 15px;
+}
+
+.composer-gear-mobile-summary {
+  display: none;
 }
 
 .composer-gear-settings:focus-visible,

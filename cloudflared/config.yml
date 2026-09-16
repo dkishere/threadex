@@ -1,0 +1,8 @@
+tunnel: 39b30f2a-bffd-48cf-a4cf-35ee2eedd68f
+credentials-file: C:\Users\dkish\.cloudflared\39b30f2a-bffd-48cf-a4cf-35ee2eedd68f.json
+ingress:
+  - hostname: threadex.dimbreak.com
+    service: http://127.0.0.1:5173
+  - hostname: threadex-code.dimbreak.com
+    service: http://127.0.0.1:8790
+  - service: http_status:404

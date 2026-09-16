@@ -58,6 +58,21 @@ test("development startup installs the bundled review extension", () => {
   }
 });
 
+test("development startup resolves a Windows command shim for Node", () => {
+  if (process.platform !== "win32") return;
+  const root = mkdtempSync(resolve(tmpdir(), "threadex-web-vscode-command-test-"));
+  try {
+    const launch = prepareWebVsCodeDevLaunch("/workspace/threadex", {
+      ...process.env,
+      SESSION_DATA_DIR: resolve(root, "data"),
+      CODE_SERVER_COMMAND: "code-server"
+    });
+    assert.match(launch.command, /code-server\.(?:cmd|bat)$/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("the bundled walkthrough keeps native comments inline by default", () => {
   const manifest = JSON.parse(readFileSync(resolve("extensions", "threadex-review", "package.json"), "utf8"));
   assert.equal(manifest.contributes?.configurationDefaults?.["comments.openView"], "never");

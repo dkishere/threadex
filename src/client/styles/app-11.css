@@ -303,8 +303,8 @@
 .composer > .composer-layout .composer-bar,
 .side-chat-composer > .composer-layout .composer-bar {
   box-sizing: border-box;
-  height: 40px;
-  min-height: 40px;
+  height: var(--composer-toolbar-height);
+  min-height: var(--composer-toolbar-height);
   margin: 0 -12px 0 calc(var(--composer-gear-width) - 12px);
   padding: 0 10px;
   border-top: 1px solid #d4d4d8;
@@ -625,6 +625,10 @@
   border-bottom: 0;
   border-left: 0;
   border-radius: 0;
+}
+
+.side-chat-composer .composer-layout {
+  --composer-gear-bottom-offset: 0px;
 }
 
 .chat[data-side-chat-open="true"] > .composer .composer-layout,

@@ -1,9 +1,13 @@
 ---
 name: browser-bridge
-description: Control the trusted local Chrome browser through the authenticated Local Browser Bridge daemon without MCP. Use when a task needs real Chrome tabs, windows, DOM inspection, JavaScript evaluation, clicks, typing, screenshots, CDP, cookies, downloads, or browser debugging.
+description: Control the trusted local Chrome browser through the authenticated Local Browser Bridge daemon without MCP. Not for mobile/tablet mode. Use when a task needs real Chrome tabs, windows, DOM inspection, JavaScript evaluation, clicks, typing, screenshots, CDP, cookies, downloads, or browser debugging.
 ---
 
 # Browser Bridge
+
+Not for mobile/tablet: when the current Threadex client mode is `mobile` or
+`tablet`, Browser Bridge is unavailable. Do not invoke this skill or its CLI
+in those modes, including for attached Browser Bridge context.
 
 Use the Local Browser Bridge CLI to control the user's trusted Chrome profile.
 The CLI calls the standalone authenticated daemon and
