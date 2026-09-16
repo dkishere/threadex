@@ -210,7 +210,7 @@ export type TurnIssueCopyPayload = {
   solution: string | null;
   blocker?: string;
 };
-export type LiveItemOrigin = { originThreadId?: string; originTurnId?: string };
+export type LiveItemOrigin = { originThreadId?: string; originTurnId?: string; sortCreated?: string };
 
 export type LiveItem = LiveItemOrigin & (
   | {
@@ -317,6 +317,7 @@ export type MessageSegment =
       id: string;
       type: "text";
       sourceId?: string;
+      createdAt?: string;
       text: string;
     }
   | {

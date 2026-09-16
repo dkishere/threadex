@@ -1,9 +1,17 @@
 // @ts-nocheck
 export function appendSteerSegment(ctx, segments, message) {
     const { steerSegmentFromMessage } = ctx;
+    const steer = steerSegmentFromMessage(message);
+    if (segments.some((segment) => segment.id === steer.id)) return segments;
+    const time = Date.parse(message.createdAt ?? "");
+    const index = Number.isFinite(time) ? segments.findIndex((segment) =>
+        Date.parse(segment.createdAt ?? segment.item?.sortCreated ?? "") > time) : -1;
+    if (index !== -1) {
+        return [...segments.slice(0, index), steer, ...segments.slice(index)];
+    }
     return [
         ...segments,
-        steerSegmentFromMessage(message)
+        steer
     ];
 
 }
@@ -55,7 +63,7 @@ export function mergeSnapshotSegmentsWithLocalSteers(ctx, snapshotSegments, exis
     const consumedTextSources = new Set();
     const textOffsetBySource = new Map();
     const textSeenBySource = new Map();
-    const merged = [];
+    let merged = [];
     for (const segment of displayExisting) {
         if (segment.type === "steer") {
             const steer = steerBySegmentId.get(segment.id);
@@ -116,7 +124,7 @@ export function mergeSnapshotSegmentsWithLocalSteers(ctx, snapshotSegments, exis
         const segment = steerSegmentFromMessage(steer);
         if (!consumedSteerSegmentIds.has(segment.id)) {
             consumedSteerSegmentIds.add(segment.id);
-            merged.push(segment);
+            merged = appendSteerSegment(merged, steer);
         }
     }
     return normalizeMessageSegments(merged);
@@ -248,6 +256,12 @@ export function streamItemsToSegments(ctx, items, rootThreadId) {
             const appendText = incoming.startsWith(previous) ? incoming.slice(previous.length) : incoming;
             textByItemId[itemKey] = incoming.startsWith(previous) ? incoming : `${previous}${incoming}`;
             segments = appendTextSegment(segments, `agent:${itemKey}`, appendText);
+            // Retain the stored event time when restoring plain text, so steers
+            // can be interleaved with text as well as tool/commentary events.
+            const last = segments.at(-1);
+            if (last?.type === "text" && !last.createdAt && item.sortCreated) {
+                segments = [...segments.slice(0, -1), { ...last, createdAt: item.sortCreated }];
+            }
             continue;
         }
         segments = upsertLiveSegment(segments, item);
