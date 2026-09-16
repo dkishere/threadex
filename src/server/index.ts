@@ -3085,8 +3085,8 @@ async function getWorkspaceSnapshot() {
     getAccountResponseFields(activeWorkspace.id),
     listProcessMonitors(activeWorkspace),
     getWorkspaceStatusMonitor(activeWorkspace.id, { releaseDeadRunningTurns: false }),
-    sessionStore.listWaitEvents({ workspaceId: activeWorkspace.id }),
-    sessionStore.listWaitSubscriptions({ workspaceId: activeWorkspace.id }),
+    sessionStore.listWaitEvents({ workspaceId: activeWorkspace.id, activeSubscriptionsOnly: true }),
+    sessionStore.listWaitSubscriptions({ workspaceId: activeWorkspace.id, activeOnly: true }),
     sessionStore.getWorkspaceModelPreferences(activeWorkspace.id)
   ]);
   const activeSession = activeSessionId ? await sessionStore.getSession(activeSessionId) : null;

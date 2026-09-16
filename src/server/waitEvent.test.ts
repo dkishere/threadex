@@ -7,6 +7,35 @@ import { ProcessMonitorService } from "./processMonitor.js";
 import { SessionStore } from "./sessionStore.js";
 import { WaitEventService } from "./waitEvent.js";
 
+test("workspace wait snapshot excludes history but retains fired events with active subscriptions", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "wait-snapshot-test-"));
+  const store = new SessionStore(resolve(root, "sessions.postgres"));
+  try {
+    await store.ready();
+    const activeIds: string[] = [];
+    for (const status of ["waiting", "dispatching", "error", "done", "cancelled"] as const) {
+      const event = await store.ensureWaitEvent({ workspaceId: "default", topic: "quota.available", subjectKey: status });
+      const subscription = await store.createWaitSubscription({
+        eventId: event.id, workspaceId: "default", sessionId: "session-a", actionType: "retry_turn"
+      });
+      if (status === "dispatching") await store.claimWaitSubscription(subscription.id);
+      if (status === "error") await store.failWaitSubscription(subscription.id, "retry needed");
+      if (status === "done") await store.completeWaitSubscription(subscription.id);
+      if (status === "cancelled") await store.cancelWaitSubscription(subscription.id);
+      if (status !== "waiting") await store.fireWaitEvent(event.id, {});
+      if (status === "waiting" || status === "dispatching" || status === "error") activeIds.push(event.id);
+    }
+    await store.ensureWaitEvent({ workspaceId: "default", topic: "quota.available", subjectKey: "unsubscribed" });
+    assert.deepEqual(new Set((await store.listWaitEvents({ workspaceId: "default", activeSubscriptionsOnly: true })).map((event) => event.id)), new Set(activeIds));
+    assert.deepEqual(new Set((await store.listWaitSubscriptions({ workspaceId: "default", activeOnly: true })).map((subscription) => subscription.eventId)), new Set(activeIds));
+    assert.equal((await store.listWaitEvents({ workspaceId: "default" })).length, 6);
+    assert.equal((await store.listWaitSubscriptions({ workspaceId: "default" })).length, 5);
+    assert.deepEqual(await store.listWaitEvents({ workspaceId: "other", activeSubscriptionsOnly: true }), []);
+  } finally {
+    await store.close();
+  }
+});
+
 test("one durable event dispatches subscriptions for multiple sessions", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "wait-event-test-"));
   const store = new SessionStore(resolve(root, "sessions.postgres"));

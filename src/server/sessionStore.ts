@@ -2806,7 +2806,7 @@ export class SessionStore {
     return this.read((connection) => this.getWaitEventWithConnection(connection, id));
   }
 
-  async listWaitEvents(input: { workspaceId?: string | null; status?: WaitEventStatus | null } = {}): Promise<WaitEventRecord[]> {
+  async listWaitEvents(input: { workspaceId?: string | null; status?: WaitEventStatus | null; activeSubscriptionsOnly?: boolean } = {}): Promise<WaitEventRecord[]> {
     return this.read(async (connection) => {
       const conditions: string[] = [];
       const params: Record<string, SessionDbValue> = {};
@@ -2817,6 +2817,14 @@ export class SessionStore {
       if (input.status) {
         conditions.push("status = $status");
         params.status = input.status;
+      }
+      if (input.activeSubscriptionsOnly) {
+        conditions.push(`EXISTS (
+          SELECT 1 FROM wait_subscription
+          WHERE wait_subscription.event_id = wait_event.id
+            AND wait_subscription.workspace_id = wait_event.workspace_id
+            AND wait_subscription.status IN ('waiting', 'dispatching', 'error')
+        )`);
       }
       const result = await connection.run(
         `

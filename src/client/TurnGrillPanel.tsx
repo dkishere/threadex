@@ -37,8 +37,10 @@ export function TurnGrillPanel({ sessionId, turnId, latest, mainBusy, onImplemen
   onGrilled?: (sessionId: string, turnId: string) => void;
 }) {
   const [review, setReview] = useState<TurnGrill | null>(null);
-  const { grillSummaries } = useEventStore();
-  const remoteRevision = grillSummaries.find((item) => item.sessionId === sessionId && item.turnId === turnId)?.revision ?? 0;
+  const { grillSummaries, workspaceSnapshot } = useEventStore();
+  const remoteSummary = grillSummaries.find((item) => item.sessionId === sessionId && item.turnId === turnId);
+  const remoteRevision = remoteSummary?.revision ?? 0;
+  const knownAbsent = workspaceSnapshot !== null && !remoteSummary;
   const [issues, setIssues] = useState<GrillIssue[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -120,6 +122,12 @@ export function TurnGrillPanel({ sessionId, turnId, latest, mainBusy, onImplemen
   useEffect(() => () => { clearTimeout(saveTimer.current); void flushChanges(); }, [flushChanges]);
   useEffect(() => { if (review) { onGrilled?.(sessionId, turnId); eventStore.reportGrill(sessionId, turnId, review); } }, [review, sessionId, turnId, onGrilled]);
   useEffect(() => {
+    // The workspace snapshot already lists every saved review. Avoid a request
+    // per completed turn just to discover that most turns have no review.
+    if (knownAbsent && !reviewRef.current) {
+      setLoading(false);
+      return;
+    }
     let disposed = false;
     let timer: ReturnType<typeof setTimeout>;
     async function load() {
@@ -149,7 +157,7 @@ export function TurnGrillPanel({ sessionId, turnId, latest, mainBusy, onImplemen
     }
     if (!reviewRef.current || remoteRevision > reviewRef.current.revision || reviewRef.current.status === "running") void load();
     return () => { disposed = true; clearTimeout(timer); };
-  }, [url, review?.status === "running", remoteRevision]);
+  }, [url, review?.status === "running", remoteRevision, knownAbsent]);
 
   async function act(action: "start" | "respond" | "followup", roundPrompt = "") {
     const observedVersion = grillContentVersion(reviewRef.current);
