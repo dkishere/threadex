@@ -772,9 +772,6 @@ let webVsCodeWalkthroughService: WebVsCodeWalkthroughService | null = null;
 const codexHookQueuePath = resolve(process.env.SESSION_CODEX_HOOK_QUEUE_PATH ?? resolve(dataDir, "codex-hook-queue.ndjson"));
 const uploadDir = resolve(dataDir, "uploads");
 const stagedAttachmentDir = resolve(uploadDir, "staged");
-const runnerTemporaryFileRoot = resolve(
-  process.env.THREADEX_MCP_TMPDIR ?? (process.platform === "darwin" ? "/private/tmp" : tmpdir())
-);
 const accountPoolDir = resolve(dataDir, "account-pool");
 mirrorProcessOutputToFile(supervisorLogPath("server"));
 const processMonitor = new ProcessMonitorService(sessionStore, {
@@ -2185,11 +2182,8 @@ app.get("/api/workspaces/file-preview", async (req, res) => {
       return;
     }
 
-    const filePath = resolveWorkspaceFilePath(session?.cwd ?? workspace.cwd, requestedPath, [runnerTemporaryFileRoot]);
-    if (!filePath) {
-      res.status(400).json({ error: `path must stay inside the ${session ? "session project" : "active workspace"} or runner temporary directory.` });
-      return;
-    }
+    // User file links can point anywhere the server's OS account can read.
+    const filePath = resolve(session?.cwd ?? workspace.cwd, requestedPath);
 
     if (!existsSync(filePath)) {
       res.json({ path: requestedPath, exists: false, text: "" });
@@ -2202,7 +2196,7 @@ app.get("/api/workspaces/file-preview", async (req, res) => {
       return;
     }
 
-    const maxPreviewBytes = 256 * 1024;
+    const maxPreviewBytes = 8 * 1024 * 1024;
     if (stats.size > maxPreviewBytes) {
       res.status(413).json({ error: "file is too large to preview." });
       return;
@@ -2408,11 +2402,8 @@ app.get("/api/workspaces/file", async (req, res) => {
 
   try {
     const workspace = await sessionStore.getActiveWorkspace();
-    const filePath = resolveWorkspaceFilePath(workspace.cwd, requestedPath, [runnerTemporaryFileRoot]);
-    if (!filePath) {
-      res.status(400).json({ error: "path must stay inside the active workspace or runner temporary files." });
-      return;
-    }
+    // Match preview access: workspace cwd only supplies the relative-path base.
+    const filePath = resolve(workspace.cwd, requestedPath);
 
     if (!existsSync(filePath)) {
       res.status(404).json({ error: "File not found." });

@@ -5,3 +5,10 @@
 .security-form input { width: 100%; padding: 10px 12px; border: 1px solid var(--border, #555); border-radius: 8px; background: transparent; color: inherit; font: inherit; }
 .security-form p { margin: 0; }
 .security-form [role="alert"] { color: #e76f6f; }
+.security-error-bar { position: fixed; inset: auto 12px max(12px, env(safe-area-inset-bottom)); z-index: 10000; display: flex; align-items: center; gap: 12px; padding: 10px 14px; border: 1px solid #ad5555; border-radius: 10px; background: #362225; color: #ffe3e3; box-shadow: 0 4px 20px #0004; font-size: 13px; }
+.security-error-bar span { flex: 1; min-width: 0; overflow-wrap: anywhere; max-height: 5em; overflow: auto; }
+.security-error-bar button { flex-shrink: 0; }
+.security-error-dialog { width: min(420px, calc(100vw - 32px)); padding: 24px; border: 1px solid #ad5555; border-radius: 12px; background: #362225; color: #ffe3e3; overflow-wrap: anywhere; }
+.security-error-dialog::backdrop { background: #0007; }
+.security-error-dialog h2 { margin-top: 0; }
+.security-error-dialog > div { display: flex; gap: 12px; justify-content: flex-end; }

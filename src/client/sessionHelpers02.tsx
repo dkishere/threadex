@@ -231,9 +231,6 @@ export function LiveEvent(ctx, { item, sessionId }) {
         return (_jsxs("section", { className: "live-item live-item-message", children: [_jsxs("div", { className: "live-item-header", children: [_jsx(MessageSquare, { "aria-hidden": "true" }), _jsx("span", { children: "Message" })] }), item.text && _jsx(MarkdownContent, { children: item.text })] }));
     }
     if (item.itemType === "approval") {
-        if (item.method === "item/tool/requestUserInput") {
-            return null;
-        }
         return _jsx(ApprovalEvent, { item: item });
     }
     if (item.itemType === "reasoning") {

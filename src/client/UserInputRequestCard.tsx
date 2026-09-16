@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import { MessageCircle, Check, Loader2 } from "lucide-react";
 import { inputQuestions, inputResponse } from "../userInputRequest";
 import type { LiveItem } from "./appTypes";
@@ -9,6 +9,7 @@ export function UserInputRequestCard({ item, onDecisionSubmitted }: {
   onDecisionSubmitted?: (id: string) => void;
 }) {
   const questions = inputQuestions(item.params);
+  const instanceId = useId();
   const [values, setValues] = useState<Record<string, string>>({});
   const [custom, setCustom] = useState<Record<string, boolean>>({});
   const [busy, setBusy] = useState(false);
@@ -32,17 +33,17 @@ export function UserInputRequestCard({ item, onDecisionSubmitted }: {
     } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
     finally { setBusy(false); }
   }
-  return <section className="user-input-card" aria-label="Agent questions">
+  return <section className="user-input-card" data-approval-id={item.approvalId} aria-label="Agent questions">
     <header><MessageCircle size={17} /><strong>Your input</strong><span>{resolved ? saved || submitted ? "Answered" : "Closed" : blocking ? "Waiting for you" : "Agent is continuing"}</span></header>
     {questions.map((q, index) => <fieldset key={q.id} disabled={busy || resolved}>
       <legend><small>{index + 1} · {q.header}</small><span>{q.question}</span></legend>
       {resolved ? <p className="user-input-answer">{q.isSecret ? "••••••••" : saved?.answers[q.id]?.answers.join(", ") || (submitted ? values[q.id] : "No answer submitted")}</p> : <>
         {q.options?.map((option, optionIndex) => <label className="user-input-option" key={optionIndex}>
-          <input type="radio" name={`${item.approvalId}-${q.id}`} checked={!custom[q.id] && values[q.id] === option.label}
+          <input type="radio" name={`${instanceId}-${q.id}`} checked={!custom[q.id] && values[q.id] === option.label}
             onChange={() => { setCustom((v) => ({ ...v, [q.id]: false })); setValues((v) => ({ ...v, [q.id]: option.label })); }} />
           <span><strong>{option.label}</strong><small>{option.description}</small></span>
         </label>)}
-        {q.isOther && !!q.options?.length && <label className="user-input-option"><input type="radio" name={`${item.approvalId}-${q.id}`} checked={!!custom[q.id]}
+        {q.isOther && !!q.options?.length && <label className="user-input-option"><input type="radio" name={`${instanceId}-${q.id}`} checked={!!custom[q.id]}
           onChange={() => { setCustom((v) => ({ ...v, [q.id]: true })); setValues((v) => ({ ...v, [q.id]: "" })); }} /><span>Write my own answer</span></label>}
         {(!q.options?.length || custom[q.id]) && <input className="user-input-text" type={q.isSecret ? "password" : "text"} aria-label={`Answer: ${q.header}`} placeholder="Your answer…" value={values[q.id] ?? ""}
           onChange={(event) => setValues((v) => ({ ...v, [q.id]: event.target.value }))} />}

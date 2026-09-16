@@ -19,6 +19,20 @@ import { collectFileChanges, formatTurnDuration } from "./sessionHelpers02";
 import { turnDurationMs } from "./sessionHelpers03";
 import { installGlobalFileDrop } from "./globalFileDrop";
 
+function sessionPopoverPosition(bounds, width) {
+    const gap = 4;
+    if (bounds.right + gap + width <= window.innerWidth - 16) {
+        const top = Math.max(16, Math.min(bounds.top, window.innerHeight - 240));
+        return { top, left: bounds.right + gap, maxHeight: window.innerHeight - top - 16 };
+    }
+    const left = Math.max(16, Math.min(bounds.left, window.innerWidth - width - 16));
+    const below = window.innerHeight - bounds.bottom - gap - 16;
+    const above = bounds.top - gap - 16;
+    return below >= above
+        ? { top: bounds.bottom + gap, left, maxHeight: Math.max(0, below) }
+        : { bottom: window.innerHeight - bounds.top + gap, left, maxHeight: Math.max(0, above) };
+}
+
 function shortReasoningEffort(effort) {
   const normalized = typeof effort === "string" ? effort.trim().toLowerCase() : "";
   if (normalized === "ultra") return "U";
@@ -1184,22 +1198,20 @@ message.turnStatus === "todo" && (_jsx("span", { className: "turn-status", child
                         const bounds = event.currentTarget.getBoundingClientRect();
                         setHoveredSession({
                             id: record.id,
-                            top: bounds.top,
-                            left: Math.max(16, Math.min(bounds.right - 2, window.innerWidth - 376))
+                            position: sessionPopoverPosition(bounds, sessionApprovals.some((item) => item.method === "item/tool/requestUserInput") ? 420 : 360)
                         });
                     }, onMouseLeave: scheduleHoveredSessionClose, children: [_jsx("input", { className: "session-selection-checkbox", type: "checkbox", checked: selectedSessionIds.has(record.id), onChange: () => toggleSessionSelection(record.id), "aria-label": `Select ${displaySessionTitle(record.title)}` }), _jsxs("button", { className: "session-row", "data-session-id": record.id, "data-grill-await-ack": pendingGrillSessions.has(record.id) || undefined, title: pendingGrillSessions.has(record.id) ? "Grill: Await ack" : undefined, type: "button", onClick: () => void switchSession(record), onFocus: (event) => {
                                 cancelHoveredSessionClose();
                                 const bounds = event.currentTarget.getBoundingClientRect();
                                 setHoveredSession({
                                     id: record.id,
-                                    top: bounds.top,
-                                    left: Math.max(16, Math.min(bounds.right - 2, window.innerWidth - 376))
+                                    position: sessionPopoverPosition(bounds, sessionApprovals.some((item) => item.method === "item/tool/requestUserInput") ? 420 : 360)
                                 });
                             }, onBlur: (event) => {
                                 if (!event.currentTarget.parentElement?.contains(event.relatedTarget)) {
                                     scheduleHoveredSessionClose();
                                 }
-                            }, disabled: record.id === sessionId, "data-active": record.id === sessionId || record.id === activeSessionId, "data-child-session": node.depth > 0 ? "true" : undefined, children: [_jsx("span", { className: "session-status-indicator", "data-status": executionStatus, "aria-hidden": "true", children: executionStatus === "running" ? _jsx(Loader2, { className: "spin" }) : _jsx(Circle, {}) }), _jsx("span", { className: "session-title", children: displaySessionTitle(record.title) }), _jsx("span", { className: "thread-time", children: formatTimestampShort(record.updated) })] }), hoveredSession?.id === record.id && sessionApprovals.length > 0 ? (_jsx("div", { className: `approval-mini-popover${sessionApprovals.some((item) => item.method === "item/tool/requestUserInput") ? " user-input-mini-popover" : ""}`, role: "dialog", "aria-label": "Session action requested", style: { top: hoveredSession.top, left: hoveredSession.left }, onMouseEnter: cancelHoveredSessionClose, children: sessionApprovals.map((item) => (_jsx(ApprovalEvent, { compact: true, item: item, onDecisionSubmitted: removePendingApprovalItem }, item.approvalId))) })) : hoveredSession?.id === record.id ? (_jsxs("section", { className: "thread-status-popover", role: "dialog", "aria-label": "Session details", style: { top: hoveredSession.top, left: hoveredSession.left }, onMouseEnter: cancelHoveredSessionClose, children: [_jsxs("div", { className: "thread-status-popover-header", children: [_jsx("span", { className: "session-status-indicator", "data-status": executionStatus, "aria-hidden": "true", children: executionStatus === "running" ? _jsx(Loader2, { className: "spin" }) : _jsx(Circle, {}) }), _jsx("strong", { children: sessionExecutionStatusLabel(executionStatus) }), _jsx("button", { className: "thread-status-achieve", type: "button", title: canAchieveGoal ? "Achieve session" : record.threadId ? "Goal can be achieved when the session is idle" : "Session has no Codex thread", "aria-label": "Achieve session", disabled: !canAchieveGoal, onClick: (event) => {
+}, disabled: record.id === sessionId, "data-active": record.id === sessionId || record.id === activeSessionId, "data-child-session": node.depth > 0 ? "true" : undefined, children: [_jsx("span", { className: "session-status-indicator", "data-status": executionStatus, "aria-hidden": "true", children: executionStatus === "running" ? _jsx(Loader2, { className: "spin" }) : _jsx(Circle, {}) }), _jsx("span", { className: "session-title", children: displaySessionTitle(record.title) }), _jsx("span", { className: "thread-time", children: formatTimestampShort(record.updated) })] }), hoveredSession?.id === record.id && sessionApprovals.length > 0 ? (_jsx("div", { className: `approval-mini-popover${sessionApprovals.some((item) => item.method === "item/tool/requestUserInput") ? " user-input-mini-popover" : ""}`, role: "dialog", "aria-label": "Session action requested", style: { ...hoveredSession.position, overflowY: "auto" }, onMouseEnter: cancelHoveredSessionClose, children: sessionApprovals.map((item) => (_jsx(ApprovalEvent, { compact: true, item: item, onDecisionSubmitted: removePendingApprovalItem }, item.approvalId))) })) : hoveredSession?.id === record.id ? (_jsxs("section", { className: "thread-status-popover", role: "dialog", "aria-label": "Session details", style: { ...hoveredSession.position, overflowY: "auto" }, onMouseEnter: cancelHoveredSessionClose, children: [_jsxs("div", { className: "thread-status-popover-header", children: [_jsx("span", { className: "session-status-indicator", "data-status": executionStatus, "aria-hidden": "true", children: executionStatus === "running" ? _jsx(Loader2, { className: "spin" }) : _jsx(Circle, {}) }), _jsx("strong", { children: sessionExecutionStatusLabel(executionStatus) }), _jsx("button", { className: "thread-status-achieve", type: "button", title: canAchieveGoal ? "Achieve session" : record.threadId ? "Goal can be achieved when the session is idle" : "Session has no Codex thread", "aria-label": "Achieve session", disabled: !canAchieveGoal, onClick: (event) => {
                                                     event.preventDefault();
                                                     event.stopPropagation();
                                                     void achieveSessionGoal(record);

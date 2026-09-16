@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode, type FormEvent } from "react";
 import "./styles/security.css";
 
 const TOKEN_KEY = "threadex.rememberedToken";
@@ -11,7 +11,7 @@ function rememberedToken(value?: string | null): string | null {
 }
 
 async function securityRequest(path: string, body?: object) {
-  const response = await fetch(`/api/security/${path}`, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : undefined);
+  const response = await fetch(`/api/security/${path}`, { signal: AbortSignal.timeout(10_000), ...(body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}) });
   const data = await response.json();
   if (!response.ok) {
     if (path === "restore" && response.status === 401) rememberedToken(null);
@@ -47,10 +47,33 @@ function PasswordForm({ setup = false, change = false, onSuccess }: { setup?: bo
   </form>;
 }
 
+function SecurityError({ error, retry }: { error: string; retry: () => void }) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    const timer = window.setTimeout(() => dialog.current?.showModal(), 60_000);
+    return () => window.clearTimeout(timer);
+  }, []);
+  return <>
+    <div className="security-error-bar" role="status">
+      <span>Connection error. Retrying automatically… {error}</span>
+      <button className="secondary" onClick={retry}>Retry now</button>
+    </div>
+    <dialog ref={dialog} className="security-error-dialog" aria-labelledby="security-error-title" aria-describedby="security-error-description">
+      <h2 id="security-error-title">Unable to reconnect</h2>
+      <p id="security-error-description">Threadex has been unable to check your connection for one minute. Retrying automatically…</p>
+      <p>{error}</p>
+      <div><button className="secondary" onClick={retry}>Retry now</button><button className="secondary" onClick={() => dialog.current?.close()}>Dismiss</button></div>
+    </dialog>
+  </>;
+}
+
 export function SecurityGate({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<{ configured: boolean; authenticated: boolean; canSetup: boolean } | null>(null);
   const [error, setError] = useState("");
-  const refresh = async () => {
+  const pending = useRef(false);
+  const refresh = useCallback(async () => {
+    if (pending.current) return;
+    pending.current = true;
     try {
       let value = await securityRequest("status");
       const saved = rememberedToken();
@@ -59,21 +82,27 @@ export function SecurityGate({ children }: { children: ReactNode }) {
         catch (error) { if (rememberedToken()) throw error; }
       }
       setStatus(value); setError("");
-    } catch (error) { setStatus(null); setError(error instanceof Error ? error.message : "Request failed."); }
-  };
+    } catch (error) { setError(error instanceof Error ? error.message : "Request failed."); }
+    finally { pending.current = false; }
+  }, []);
   useEffect(() => {
     void refresh();
-    const timer = window.setInterval(() => void refresh(), 30_000);
     const focus = () => void refresh();
     window.addEventListener("focus", focus);
-    return () => { clearInterval(timer); window.removeEventListener("focus", focus); };
-  }, []);
-  if (status?.authenticated) return children;
-  return <main className="security-login"><section className="settings-card">
+    return () => window.removeEventListener("focus", focus);
+  }, [refresh]);
+  const hasError = Boolean(error);
+  useEffect(() => {
+    const timer = window.setInterval(() => void refresh(), hasError ? 5_000 : 30_000);
+    return () => window.clearInterval(timer);
+  }, [refresh, hasError]);
+  return <>{status?.authenticated ? children : <main className="security-login"><section className="settings-card">
     <h1>Threadex</h1>
     <h2>{status?.canSetup ? "Set your password" : "Sign in"}</h2>
-    {error ? <><p role="alert">{error}</p><button onClick={() => void refresh()}>Retry</button></> : !status ? <p>Loading…</p> : status.configured || status.canSetup ? <PasswordForm setup={status.canSetup} onSuccess={() => void refresh()} /> : <p>Open Threadex on localhost to set the initial password before remote access.</p>}
-  </section></main>;
+    {!status ? <p>{error ? "Waiting for connection…" : "Loading…"}</p> : status.configured || status.canSetup ? <PasswordForm setup={status.canSetup} onSuccess={() => void refresh()} /> : <p>Open Threadex on localhost to set the initial password before remote access.</p>}
+  </section></main>}
+    {error && <SecurityError error={error} retry={() => void refresh()} />}
+  </>;
 }
 
 export function SecuritySettingsPanel() {
