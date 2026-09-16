@@ -92,7 +92,7 @@ function MarkdownLink({ href, children, onClick, ...props }: ComponentPropsWitho
   const sessionNavigationUrl = href ? threadexNavigationUrl(href) : null;
   const workspaceFileContext = useContext(MarkdownWorkspaceContext) ?? workspaceFilePreviewContextFromPage();
 
-  if (href && previewName && !previewFailed) {
+  if (href && previewName) {
     return (
       <>
         <a
@@ -106,14 +106,14 @@ function MarkdownLink({ href, children, onClick, ...props }: ComponentPropsWitho
             setIsImagePreviewOpen(true);
           }}
         >
-          <img
+          {!previewFailed && <img
             alt={previewName}
             decoding="async"
             loading="lazy"
             referrerPolicy="no-referrer"
             src={href}
             onError={() => setPreviewFailed(true)}
-          />
+          />}
           <span>{children}</span>
         </a>
         {isImagePreviewOpen && (

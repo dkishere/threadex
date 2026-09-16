@@ -158,11 +158,13 @@ export function localFilePathFromMarkdownUrl(url: string): string | null {
 }
 
 function decodePath(value: string) {
+  let decoded = value;
   try {
-    return decodeURIComponent(value);
+    decoded = decodeURIComponent(value);
   } catch {
-    return value;
+    // Keep malformed percent escapes as literal filename characters.
   }
+  return decoded.replace(/^\/([a-zA-Z]:[\\/])/, "$1");
 }
 
 function splitWorkspaceFileReference(value: string): WorkspaceFileReference {

@@ -13,7 +13,8 @@ const SAFE_INLINE_IMAGE_EXTENSIONS = new Set([
 
 export function resolveWorkspaceFilePath(workspaceCwd: string, requestedPath: string, additionalRoots: string[] = []) {
   const workspaceRoot = resolve(workspaceCwd);
-  const filePath = resolve(workspaceRoot, requestedPath);
+  const normalizedPath = process.platform === "win32" ? requestedPath.replace(/^\/([a-zA-Z]:[\\/])/, "$1") : requestedPath;
+  const filePath = resolve(workspaceRoot, normalizedPath);
   const allowedRoots = [workspaceRoot, ...additionalRoots.map((root) => resolve(root))];
   if (!allowedRoots.some((root) => filePath === root || filePath.startsWith(`${root}${sep}`))) {
     return null;

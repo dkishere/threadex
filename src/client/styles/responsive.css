@@ -110,8 +110,10 @@
     display: none;
   }
 
-  /* Give the narrow composer toolbar back its horizontal space. Gear selection
-     remains available through the settings popover. */
+}
+
+@media (width < 768px) {
+  /* Keep the gear control compact on phones; tablets use the desktop gear layout. */
   .responsive-layout .composer-layout,
   .responsive-layout .chat[data-side-chat-open="true"] > .composer .composer-layout,
   .responsive-layout .chat[data-side-chat-open="true"] .side-chat-composer .composer-layout {

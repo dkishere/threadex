@@ -1,5 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+
+test("normalizes slash-prefixed Windows output links and file URIs", () => {
+  const path = "C:/AI/head/outputs/comparison_0.jpg";
+  for (const input of ["/" + path, "file:///" + path, "/C%3A/AI/head/outputs/comparison_0.jpg"]) {
+    assert.equal(localFilePathFromMarkdownUrl(input), path);
+    assert.equal(transformMarkdownUrl(input, { sessionId: "local_report", workspaceId: "default" }),
+      `/api/workspaces/file?path=${encodeURIComponent(path)}&sessionId=local_report&workspaceId=default`);
+  }
+});
 import { isHtmlFilePath, workspaceHtmlPreviewUrl } from "./markdownUrls";
 
 test("HTML routes retain context and directories for dynamic relative assets", () => {

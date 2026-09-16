@@ -152,6 +152,15 @@ export function ComposerGearSelector({
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const rootRef = useRef<HTMLElement | null>(null);
   const menuId = `${idPrefix}-menu`;
+  const [isPhone, setIsPhone] = useState(() => typeof window !== "undefined" && window.matchMedia("(width < 768px)").matches);
+
+  useEffect(() => {
+    const media = window.matchMedia("(width < 768px)");
+    const update = () => setIsPhone(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
   const activeGear = gears[activeGearIndex] ?? gears[0];
   const activeGearIsAuto = activeGear && autoModelValue !== undefined && activeGear.model === autoModelValue;
   const activeGearEffort = activeGear
@@ -190,7 +199,7 @@ export function ComposerGearSelector({
           onClick={() => setIsMenuOpen((open) => !open)}
         >
           <Cog aria-hidden="true" />
-          {activeGear && activeGearEffort && (
+          {isPhone && activeGear && activeGearEffort && (
             <span className="composer-gear-mobile-summary" aria-hidden="true">
               <span>{compactModelLabel(activeGear.model, modelOptionLabel(activeGear.model), Boolean(activeGearIsAuto))}</span>
               <span>{COMPACT_EFFORT_LABELS[activeGearEffort]}</span>

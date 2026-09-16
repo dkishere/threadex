@@ -2,6 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+
+test("slash-prefixed Windows report output renders as an in-app image preview", () => {
+  const html = renderToStaticMarkup(React.createElement(MarkdownWorkspaceContext.Provider,
+    { value: { sessionId: "local_report", workspaceId: "default" } },
+    React.createElement(MarkdownContent, { children: "[畫面對照](/C:/AI/head/outputs/comparison_0.jpg)" })));
+  assert.match(html, /class="markdown-image-preview"/);
+  assert.match(html, /path=C%3A%2FAI%2Fhead%2Foutputs%2Fcomparison_0.jpg/);
+  assert.match(html, /sessionId=local_report/);
+  assert.doesNotMatch(html, /target="_blank"/);
+});
 import { JsonFileViewer, MarkdownContent, MarkdownWorkspaceContext } from "./MarkdownContent";
 
 test("file links use the displayed session context without URL query parameters", () => {
