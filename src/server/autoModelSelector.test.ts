@@ -52,6 +52,27 @@ test("Jev choice uses the documented authenticated endpoint and validates both a
   assert.equal(selection.provider, "typesafe");
 });
 
+test("custom rules restrict model choices and set effort for the selected model", async () => {
+  const custom = "Use for database work in this environment.";
+  const selection = await selectAutoModel({
+    state: "bounded state",
+    apiKey: "test-key",
+    customRulesEnabled: true,
+    customRules: {
+      "gpt-5.6-luna": { enabled: false, efforts: ["high"], condition: "" },
+      "gpt-5.6-terra": { enabled: true, efforts: ["high", "xhigh"], condition: custom }
+    },
+    fetch: async (_url, init) => {
+    const body = JSON.parse(String(init?.body));
+    assert.deepEqual(body.questions.model.criteria, { "gpt-5.6-terra": custom });
+    assert.equal(body.questions.effort, undefined);
+    assert.deepEqual(Object.keys(body.questions["effort_gpt-5.6-terra"].criteria), ["high", "xhigh"]);
+    return Response.json({ answers: { model: { choice: "gpt-5.6-terra", confidence: 0.9 }, "effort_gpt-5.6-terra": { choice: "xhigh", confidence: 0.9 } } });
+  } });
+  assert.equal(selection.model, "gpt-5.6-terra");
+  assert.equal(selection.effort, "xhigh");
+});
+
 test("non-Astra selections have a hard high effort floor while Astra retains its selected effort", async () => {
   for (const model of ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra"]) {
     for (const effort of ["low", "medium", "high", "xhigh", "ultra"]) {

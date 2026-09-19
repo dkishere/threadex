@@ -145,6 +145,7 @@ export class WaitEventService {
     try {
       const claimed = await this.store.claimWaitSubscription(subscription.id);
       if (!claimed) return;
+      if ((await this.store.getWaitSubscription(subscription.id))?.status !== "dispatching") return;
       if (!this.options.onDispatch) throw new Error("Wait event dispatch is not configured.");
       await this.options.onDispatch(claimed, event);
       await this.store.completeWaitSubscription(claimed.id);

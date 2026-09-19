@@ -300,7 +300,12 @@ test("removing an already-dispatching subscription is idempotent", async () => {
 
     const subscription = await service.cancelSubscription("dispatching-subscription");
 
-    assert.equal(subscription.status, "dispatching");
+    assert.equal(subscription.status, "cancelled");
+    assert.equal((await service.cancelSubscription(subscription.id)).status, "cancelled");
+    assert.equal((await store.completeWaitSubscription(subscription.id))?.status, "cancelled");
+    assert.equal((await store.failWaitSubscription(subscription.id, "late failure"))?.status, "cancelled");
+    assert.equal((await store.retryWaitSubscription(subscription.id))?.status, "cancelled");
+    assert.equal(await store.claimWaitSubscription(subscription.id), null);
   } finally {
     service.stop();
     await store.close();

@@ -25,6 +25,8 @@ let restartTimer = null;
 let restarting = false;
 let restartPending = false;
 let shuttingDown = false;
+let buildChild = null;
+let rebuildRequested = false;
 
 mkdirSync(supervisorDir, { recursive: true });
 writeFileSync(supervisorPidPath, `${process.pid}\n`, "utf8");
@@ -46,7 +48,10 @@ const watcherInterval = setInterval(() => {
 
 process.once("SIGINT", () => void shutdown(0));
 process.once("SIGTERM", () => void shutdown(0));
-process.on("SIGUSR1", () => scheduleRestart("restart request"));
+process.on("SIGUSR1", () => {
+  rebuildRequested = true;
+  scheduleRestart("restart request");
+});
 
 const defaultDatabaseUrl = ensureLocalPostgres();
 startServer();
@@ -123,13 +128,29 @@ async function restartServer(filename) {
   if (shuttingDown) {
     return;
   }
-  if (restarting) {
+  if (restarting || buildChild) {
     restartPending = true;
     return;
+  }
+  if (rebuildRequested) {
+    rebuildRequested = false;
+    console.log("Restart requested; building TypeScript and frontend before restarting server.");
+    const built = await buildBeforeRestart();
+    if (shuttingDown) return;
+    if (!built) {
+      restartPending = false;
+      console.error("Build failed; server restart cancelled. Fix the build error and request Restart again.");
+      if (rebuildRequested) scheduleRestart("queued restart request");
+      return;
+    }
   }
   if (!child) {
     console.log(`Change in ${filename}; starting server.`);
     startServer();
+    if (restartPending || rebuildRequested) {
+      restartPending = false;
+      scheduleRestart("queued restart request");
+    }
     return;
   }
 
@@ -142,6 +163,25 @@ async function restartServer(filename) {
       console.warn("Server shutdown is taking longer than 15 seconds; still waiting to protect database state.");
     }
   }, 15_000).unref();
+}
+
+function buildBeforeRestart() {
+  return new Promise((resolveBuild) => {
+    const npmCli = process.env.npm_execpath;
+    const builder = spawn(npmCli ? process.execPath : "npm", npmCli ? [npmCli, "run", "build"] : ["run", "build"], {
+      cwd: rootDir,
+      env: process.env,
+      detached: process.platform !== "win32",
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    buildChild = builder;
+    mirrorChildOutput(builder);
+    builder.once("error", (error) => console.error(`Failed to launch build: ${error.message}`));
+    builder.once("close", (code) => {
+      buildChild = null;
+      resolveBuild(code === 0);
+    });
+  });
 }
 
 function scheduleRestart(reason) {
@@ -174,6 +214,15 @@ async function shutdown(code) {
   clearInterval(watcherInterval);
   if (restartTimer) {
     clearTimeout(restartTimer);
+  }
+
+  if (buildChild) {
+    try {
+      if (process.platform !== "win32") process.kill(-buildChild.pid, "SIGTERM");
+      else buildChild.kill("SIGTERM");
+    } catch (error) {
+      if (error.code !== "ESRCH") console.error(`Failed to stop build: ${error.message}`);
+    }
   }
 
   if (!child) {

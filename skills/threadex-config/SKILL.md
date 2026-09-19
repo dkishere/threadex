@@ -42,8 +42,10 @@ list before a destructive replacement, and report the workspace affected.
 The TypeSafe Jev credential is a server-wide setting shared by workspaces.
 Use `/api/settings/auto-model` rather than writing the credential file directly:
 
-- `GET` returns `{ "apiKeyConfigured": boolean, "selectorModel": "jev-latest" }`; it never returns the key.
+- `GET` returns `{ "apiKeyConfigured": boolean, "selectorModel": "jev-latest", "customRulesEnabled": boolean, "customRules": object }`; it never returns the key. Disabled custom rules mean the built-in model and effort selection is active.
 - `PUT` with `{ "apiKey": "..." }` saves or replaces the key.
+- `PUT` with `{ "customRulesEnabled": true, "customRules": { "gpt-5.6-sol": { "enabled": true, "efforts": ["high", "xhigh"], "condition": "..." } } }` enables per-model Jev rules. Jev chooses among enabled models and each model's allowed effort levels. Each effort list must be nonempty; only Astra permits low/medium. A blank condition retains that model's built-in condition. Low-confidence upgrades use the next enabled model and its allowed effort levels.
+- Send `{ "customRulesEnabled": false, "customRules": {} }` to restore all built-in rules. Threadex still enforces its effort floor, low-confidence upgrade, and API fallback in code.
 - `DELETE` clears the key and restores the original Auto upgrade logic.
 
 Do not print the key or include it in source files. When configured, Auto sends a

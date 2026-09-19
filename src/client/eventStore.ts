@@ -171,6 +171,7 @@ export class EventStore {
   private cursorListeners = new Set<() => void>();
   private eventListeners = new Map<string, Set<EventListener>>();
   private pollPromise: Promise<boolean> | null = null;
+  private waitSubscriptionUpdates = new Map<string, WaitSubscription>();
 
   getState = () => this.state;
   getCursor = () => this.state.cursor;
@@ -227,7 +228,7 @@ export class EventStore {
       statusMonitor: readArrayField<WorkspaceStatusMonitor>(workspaceSnapshot, "statusMonitor"),
       processMonitors: readProcessMonitors(workspaceSnapshot),
       waitEvents: readArrayField<WaitEvent>(workspaceSnapshot, "waitEvents"),
-      waitSubscriptions: readArrayField<WaitSubscription>(workspaceSnapshot, "waitSubscriptions"),
+      waitSubscriptions: this.reconcileWaitSubscriptions(readArrayField<WaitSubscription>(workspaceSnapshot, "waitSubscriptions")),
       cursor: normalizeCursor(cursor)
     };
     persistCursor(this.state.cursor);
@@ -275,6 +276,26 @@ export class EventStore {
     this.emitChange();
   }
 
+  applyWaitSubscription(subscription: WaitSubscription) {
+    this.waitSubscriptionUpdates.set(subscription.id, subscription);
+    // Only update an existing row: the user may have switched workspaces
+    // while the DELETE was in flight.
+    const waitSubscriptions = this.reconcileWaitSubscriptions(this.state.waitSubscriptions);
+    this.state = { ...this.state, waitSubscriptions };
+    this.emitChange();
+  }
+
+  private reconcileWaitSubscriptions(subscriptions: WaitSubscription[]) {
+    return subscriptions.flatMap((subscription) => {
+      const local = this.waitSubscriptionUpdates.get(subscription.id);
+      // A cancelled ID cannot be reused by createWaitSubscription. Keep its
+      // acknowledgement even when an older in-flight snapshot arrives later.
+      if (local?.status === "cancelled") return [];
+      const latest = local && Date.parse(local.updated) >= Date.parse(subscription.updated) ? local : subscription;
+      return latest.status === "done" || latest.status === "cancelled" ? [] : [latest];
+    });
+  }
+
   async poll() {
     if (this.pollPromise) return this.pollPromise;
     this.pollPromise = this.pollOnce().finally(() => {
@@ -306,7 +327,7 @@ export class EventStore {
     }) ?? this.state.grillSummaries);
     const nextProcessMonitors = Array.isArray(payload.processMonitors) ? payload.processMonitors : [];
     const nextWaitEvents = Array.isArray(payload.waitEvents) ? payload.waitEvents : this.state.waitEvents;
-    const nextWaitSubscriptions = Array.isArray(payload.waitSubscriptions) ? payload.waitSubscriptions : this.state.waitSubscriptions;
+    const nextWaitSubscriptions = this.reconcileWaitSubscriptions(Array.isArray(payload.waitSubscriptions) ? payload.waitSubscriptions : this.state.waitSubscriptions);
     const statusMonitor = reuseJsonValue(this.state.statusMonitor, nextStatusMonitor);
     const processMonitors = reuseJsonValue(this.state.processMonitors, nextProcessMonitors);
     const waitEvents = reuseJsonValue(this.state.waitEvents, nextWaitEvents);

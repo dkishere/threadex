@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { parseBrowserBridgeContext } from "./browserBridgeContext";
-import { handleEditorKeyDown, handleEditorPaste } from "./sessionActions05";
+import { handleEditorKeyDown, handleEditorPaste, removeWaitSubscription } from "./sessionActions05";
+import { EventStore, type WaitSubscription } from "./eventStore";
 import { buildTurnIssueCopyPayload, parseTurnIssueContext } from "./turnIssueCopy";
 
 const context = {
@@ -12,6 +13,53 @@ const context = {
   selector: "main > button",
   "extension-context-key": "codex-browser-bridge:context:42:test"
 };
+
+for (const outcome of ["cancelled", "dispatching", "done", "invalid", "error"] as const) {
+  test(`removing a wait applies ${outcome} response without waiting for background sync`, async (t) => {
+    const store = new EventStore();
+    const subscription = {
+      id: "rate_limit:test", workspaceId: "default", status: outcome === "cancelled" ? "dispatching" : "waiting", actionType: "retry_turn",
+      updated: "2026-09-19T10:00:00.000Z"
+    } as WaitSubscription;
+    store.setWorkspaceSnapshot({ waitSubscriptions: [subscription] }, store.getState().sessionPage, null, 0);
+    const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+    Object.defineProperty(globalThis, "window", { configurable: true, value: { confirm: () => true } });
+    t.after(() => {
+      if (originalWindow) Object.defineProperty(globalThis, "window", originalWindow);
+      else Reflect.deleteProperty(globalThis, "window");
+    });
+    t.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify(
+      outcome === "invalid" ? {} : {
+        cancelled: outcome === "cancelled",
+        subscription: { ...subscription, status: outcome, updated: "2026-09-19T10:01:00.000Z" }
+      }
+    ), { status: outcome === "error" ? 500 : 200 }));
+    let finishPoll!: (value: boolean) => void;
+    const background = new Promise<boolean>((resolve) => { finishPoll = resolve; });
+    t.mock.method(store, "poll", () => background);
+    const toasts: string[] = [];
+    const actions: unknown[] = [];
+    try {
+      await removeWaitSubscription({
+        eventStore: store, isLikelyBackendDisconnect: () => false,
+        noteBackendDisconnect: () => assert.fail("not a connection error"),
+        noteBackendRequestSucceeded: () => undefined, readApiError: async () => "Server error",
+        setWaitSubscriptionAction: (action: unknown) => actions.push(action),
+        showToast: (message: string) => toasts.push(message)
+      }, subscription);
+      assert.equal(actions.at(-1), null, "UI is unlocked while background poll is pending");
+      if (outcome === "cancelled" || outcome === "done") {
+        assert.equal(store.getState().waitSubscriptions.length, 0);
+        assert.equal(toasts[0], outcome === "cancelled" ? "Pending wait removed" : "Wait already completed");
+      } else {
+        assert.equal(store.getState().waitSubscriptions[0].status, outcome === "dispatching" ? "dispatching" : "waiting");
+        assert.match(toasts[0], outcome === "dispatching" ? /could not be cancelled/ : /Remove failed/);
+      }
+    } finally {
+      finishPoll(false);
+    }
+  });
+}
 
 test("pasting a browser bridge context creates an annotation attachment instead of editor text", () => {
   let prevented = false;

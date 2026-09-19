@@ -390,7 +390,10 @@ supervisor. Its built-in monitor exposes Restart whenever a supervisor or restar
 control is available; the action is data-driven by monitor metadata rather than the
 display label, and it cannot remove or stop the built-in server directly.
 `npm run dev:server` uses `scripts/watch-server.mjs`, and its built-in read-only
-record uses the current process PID. The optional Vite development client is not
+record uses the current process PID. Process Monitor's Restart runs `npm run build`
+before replacing the server; a failed build cancels the restart. Build output is
+captured in the server monitor log. After updating the watcher script, restart
+`npm run serve` once to load the new supervisor code. The optional Vite development client is not
 listed as a built-in process monitor.
 Docker monitors run as `docker run --rm <dockerImage> ...` and remain restartable;
 `dockerRunArgs` can supply Docker flags before the image, while `args` are passed

@@ -1,6 +1,23 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { EventStore, jsonValuesEqual } from "./eventStore";
+import { EventStore, jsonValuesEqual, type WaitSubscription } from "./eventStore";
+
+test("confirmed wait cancellation survives stale snapshots and in-flight polls", async (t) => {
+  const store = new EventStore();
+  const waiting = { id: "cancel-me", status: "waiting", updated: "2026-09-19T10:00:00Z" } as WaitSubscription;
+  const snapshot = { waitSubscriptions: [waiting, { ...waiting, id: "keep-me" }] };
+  const page = store.getState().sessionPage;
+  store.setWorkspaceSnapshot(snapshot, page, null, 0);
+  let finishPoll!: (response: Response) => void;
+  t.mock.method(globalThis, "fetch", () => new Promise<Response>((resolve) => { finishPoll = resolve; }));
+  const pendingPoll = store.poll();
+  store.applyWaitSubscription({ ...waiting, status: "cancelled", updated: "2026-09-19T10:01:00Z" });
+  store.setWorkspaceSnapshot(snapshot, page, null, 0);
+  assert.deepEqual(store.getState().waitSubscriptions.map((item) => item.id), ["keep-me"]);
+  finishPoll(new Response(JSON.stringify(snapshot)));
+  await pendingPoll;
+  assert.deepEqual(store.getState().waitSubscriptions.map((item) => item.id), ["keep-me"]);
+});
 
 test("Grill summaries update background sessions without clearing sibling turns or accepting stale polls", async () => {
   const store = new EventStore();

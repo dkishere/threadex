@@ -5222,6 +5222,7 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
           liveItemsByTurn: await sessionStore.listSessionLiveItems(session.id)
         }),
         apiKey: typeSafeApiKey,
+        ...autoModelSettings.customRules(),
         fallback: autoModel
       });
       if (selection.provider === "typesafe") {

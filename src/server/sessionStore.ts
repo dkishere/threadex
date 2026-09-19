@@ -3042,7 +3042,7 @@ export class SessionStore {
     return this.write(async (connection) => {
       const existing = await this.getWaitSubscriptionWithConnection(connection, id);
       if (!existing) throw new Error(`Wait subscription not found: ${id}`);
-      if (existing.status !== "waiting" && existing.status !== "error") {
+      if (existing.status === "done" || existing.status === "cancelled") {
         // Cancellation is intentionally idempotent. A client can render a
         // waiting subscription just before the dispatcher claims it.
         return existing;
@@ -3051,7 +3051,7 @@ export class SessionStore {
         `
           UPDATE wait_subscription
           SET status = 'cancelled', updated = now()
-          WHERE id = $id AND status IN ('waiting', 'error')
+          WHERE id = $id AND status IN ('waiting', 'error', 'dispatching')
         `,
         { id }
       );
@@ -3317,7 +3317,7 @@ export class SessionStore {
           SET status = $status, error = $error,
             delivered_at = CASE WHEN $delivered THEN now() ELSE delivered_at END,
             updated = now()
-          WHERE id = $id
+          WHERE id = $id AND status <> 'cancelled'
         `,
         { id, status, error, delivered }
       );

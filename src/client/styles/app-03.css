@@ -734,6 +734,96 @@
   font-size: 12px;
 }
 
+.auto-model-settings-card .auto-model-routing-form {
+  margin-top: 4px;
+  padding-top: 16px;
+  border-top: 1px solid #e2e8f0;
+}
+
+.auto-model-routing-form .auto-model-custom-toggle,
+.auto-model-rule-header > label:first-child {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.auto-model-routing-form input[type="checkbox"] {
+  width: 15px;
+  min-width: 15px;
+  height: 15px;
+  min-height: 15px;
+  margin: 0;
+  padding: 0;
+  accent-color: #2563eb;
+}
+
+.auto-model-rules {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.auto-model-efforts { display: flex; flex-wrap: wrap; gap: 12px; border: 0; padding: 0; margin: 0; min-width: 0; }
+.auto-model-efforts legend { font-size: 12px; margin-bottom: 6px; }
+.auto-model-efforts label { display: flex; align-items: center; gap: 5px; }
+
+.auto-model-rule {
+  display: grid;
+  min-width: 0;
+  gap: 9px;
+  margin: 0;
+  border: 1px solid #dbe1e8;
+  border-radius: 8px;
+  padding: 11px;
+  background: #f8fafc;
+}
+
+.auto-model-rule-header {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.auto-model-rule-header > label:last-child {
+  display: grid;
+  gap: 4px;
+  min-width: 92px;
+}
+
+.auto-model-rule select {
+  min-height: 31px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  padding: 0 7px;
+  background: #ffffff;
+  color: #27272a;
+  font-size: 12px;
+}
+
+.auto-model-routing-form textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 100px;
+  resize: vertical;
+  border: 1px solid #cbd5e1;
+  border-radius: 7px;
+  padding: 9px 10px;
+  background: #ffffff;
+  color: #27272a;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-weight: 400;
+}
+
+.auto-model-routing-form textarea:focus {
+  outline: 2px solid #bfdbfe;
+  outline-offset: 1px;
+}
+
+@media (max-width: 760px) {
+  .auto-model-rules { grid-template-columns: minmax(0, 1fr); }
+}
+
 .auto-model-settings-card .account-login-actions {
   justify-content: flex-start;
   padding-top: 2px;

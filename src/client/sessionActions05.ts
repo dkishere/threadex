@@ -132,12 +132,10 @@ export function editWaitSubscription(ctx, subscription) {
 
 export async function removeWaitSubscription(ctx, subscription) {
     const { eventStore, isLikelyBackendDisconnect, noteBackendDisconnect, noteBackendRequestSucceeded, readApiError, setWaitSubscriptionAction, showToast } = ctx;
-        if (subscription.status === "dispatching")
-            return;
         const detail = subscription.actionType === "retry_turn"
             ? " The queued turn will remain in the session, but it will no longer auto-resume for this event."
             : "";
-        if (!window.confirm(`Remove this pending wait?${detail}`))
+        if (!window.confirm(`Remove this pending wait?${detail} Any task already started will not be stopped.`))
             return;
         setWaitSubscriptionAction(`remove:${subscription.id}`);
         try {
@@ -146,13 +144,22 @@ export async function removeWaitSubscription(ctx, subscription) {
             });
             if (!response.ok)
                 throw new Error(await readApiError(response));
-            const payload = await response.json().catch(() => null);
+            const payload = await response.json();
+            const updated = payload?.subscription;
+            if (!updated || updated.id !== subscription.id ||
+                !["waiting", "error", "dispatching", "done", "cancelled"].includes(updated.status) ||
+                (updated.status === "cancelled" && payload.cancelled !== true))
+                throw new Error("Server did not confirm the wait status. Please refresh and try again.");
             noteBackendRequestSucceeded();
-            eventStore.removeWaitSubscription(subscription.id);
+            eventStore.applyWaitSubscription(updated);
             void eventStore.poll().catch(() => undefined);
-            showToast(payload?.cancelled === false
-                ? "Pending wait had already started dispatching"
-                : "Pending wait removed");
+            showToast(updated.status === "cancelled" && payload.cancelled === true
+                ? "Pending wait removed"
+                : updated.status === "done"
+                    ? "Wait already completed"
+                    : updated.status === "dispatching"
+                        ? "Wait has already started and could not be cancelled"
+                        : "Wait was not cancelled. Please try again.");
         }
         catch (error) {
             if (isLikelyBackendDisconnect(error)) {
