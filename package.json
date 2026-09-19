@@ -8,7 +8,7 @@
   },
   "scripts": {
     "dev": "node node_modules/concurrently/dist/bin/concurrently.js -k -n server,client -c green,cyan \"npm:dev:server\" \"npm:dev:client\"",
-    "serve": "npm run build && PORT=5173 npm run dev:server",
+    "serve": "npm run build && node scripts/serve.mjs",
     "dev:client": "node scripts/watch-client.mjs",
     "dev:server": "node scripts/watch-server.mjs",
     "dev:server:plain": "node scripts/watch-server.mjs --no-pg-dev",

@@ -61,7 +61,7 @@ import { ProcessMonitorService, type AdoptProcessMonitorInput, type MonitorProce
 import { WaitEventService } from "./waitEvent";
 import { chooseLoadBalancedAccount } from "./accountPicker";
 import { shouldChooseAccountForNewLoadBalancedThread } from "./loadBalanceRouting";
-import { createEphemeralAgentHome, defaultAgentHomeCandidates, runAgentCliExec, trimAgentCliOutput } from "./agentCli";
+import { agentCliExecutable, createEphemeralAgentHome, defaultAgentHomeCandidates, runAgentCliExec, trimAgentCliOutput } from "./agentCli";
 import { normalizeModelTokenUsage, type ModelTokenUsage } from "./modelTokenUsage";
 import { embedSessionText, SessionSummarizer } from "./sessionSummarizer";
 import {
@@ -8923,8 +8923,7 @@ function buildAppServerArgs() {
 }
 
 function codexExecutable() {
-  const bundledMacCodexPath = "/Applications/Codex.app/Contents/Resources/codex";
-  return process.env.CODEX_PATH || (existsSync(bundledMacCodexPath) ? bundledMacCodexPath : "codex");
+  return agentCliExecutable();
 }
 
 function handleJsonRpcLine(line: string, pending: Map<number, JsonRpcRequest>) {

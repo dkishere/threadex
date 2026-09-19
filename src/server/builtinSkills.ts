@@ -22,7 +22,8 @@ function injectSkill(workspace: WorkspaceRecord, sourceRoot: string, skillName: 
   } catch (error) {
     if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
   }
-  symlinkSync(source, destination, "dir");
+  // Junctions link directories on Windows without requiring symlink privileges.
+  symlinkSync(source, destination, process.platform === "win32" ? "junction" : "dir");
   return destination;
 }
 

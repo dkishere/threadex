@@ -10,7 +10,7 @@ history, detached runners, and optional browser/editor integrations.
 | macOS | Primary development environment. |
 | Linux | Expected to work with the dependencies below; not yet certified by a clean Linux integration run. |
 | Windows with WSL2 | Recommended Windows route: run Node, Codex, Git and Threadex inside the same Linux distribution. Not yet integration-tested here. |
-| Native Windows | Experimental. Unix process controls, directory symlinks, CLI launchers and cross-drive paths still need work. Do not rely on restart/stop/recovery behavior. |
+| Native Windows | Experimental. Built-in skills use directory junctions and `npm run serve` uses portable environment setup, but Unix process controls, CLI launchers and cross-drive paths still need work. Do not rely on restart/stop/recovery behavior. |
 
 ## Prerequisites
 
@@ -197,7 +197,7 @@ Cross-OS history migration requires a separately reviewed path mapping.
   and Codex authentication in that same environment.
 - **API startup mentions a missing skill or symlink permission:** retain the
   repository's `skills/` directory and use a writable data directory. Native
-  Windows directory symlinks can require additional OS permissions.
+  Built-in skills use directory junctions on Windows to avoid symlink privilege requirements.
 - **Editor launch errors:** set `WEB_VSCODE_AUTOSTART=false` or install code-server.
 - **New machine shows stale paths:** follow the migration section; a database
   restore does not translate filesystem paths automatically.
