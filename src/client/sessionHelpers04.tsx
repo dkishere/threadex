@@ -183,7 +183,8 @@ export function normalizeGearProfiles(ctx, value, fallbackModel, fallbackEffort)
         { model: "gpt-5.6-luna", effort: "high" },
         { model: "gpt-5.6-sol", effort: "xhigh" }
     ];
-    if (!Array.isArray(value) || (value.length !== 3 && value.length !== 6)) {
+    // Trim the briefly supported seventh Auto slot without losing manual presets.
+    if (!Array.isArray(value) || ![3, 6, 7].includes(value.length)) {
         return defaults;
     }
     return defaults.map((_, index) => {
@@ -258,6 +259,9 @@ export function toChatMessage(ctx, value) {
         content,
         rawContent: typeof candidate.rawContent === "string" ? candidate.rawContent : undefined,
         turnId: typeof candidate.turnId === "string" ? candidate.turnId : undefined,
+        cachedInputTokens: typeof candidate.cachedInputTokens === "number" && Number.isFinite(candidate.cachedInputTokens)
+            ? candidate.cachedInputTokens
+            : undefined,
         kind: candidate.kind === "steer" ? "steer" : undefined,
         pending: candidate.pending,
         liveItems: Array.isArray(candidate.liveItems) ? normalizeLiveItems(candidate.liveItems.filter(isLiveItem)) : undefined,

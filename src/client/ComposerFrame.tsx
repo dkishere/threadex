@@ -177,8 +177,8 @@ export function ComposerGearSelector({
             const isActive = activeGearIndex === index;
             const isAuto = autoModelValue !== undefined && gear.model === autoModelValue;
             const selectedEffort = isAuto && autoEffort ? autoEffort : gear.effort;
-            const gearTitle = `Gear ${index + 1}: ${isAuto ? "Auto" : modelOptionLabel(gear.model)} · ${effortOptionLabel(selectedEffort)}`;
-            const gearLabel = `${compactModelLabel(gear.model, modelOptionLabel(gear.model), isAuto)}·${COMPACT_EFFORT_LABELS[selectedEffort]}`;
+            const gearTitle = isAuto ? "Auto: Jev selects each turn when configured in Settings; otherwise uses automatic upgrades" : `Gear ${index + 1}: ${modelOptionLabel(gear.model)} · ${effortOptionLabel(selectedEffort)}`;
+            const gearLabel = isAuto ? "Auto" : `${compactModelLabel(gear.model, modelOptionLabel(gear.model), isAuto)}·${COMPACT_EFFORT_LABELS[selectedEffort]}`;
 
             return (
               <label className="composer-gear-radio" data-active={isActive ? "true" : undefined} title={gearTitle} key={index}>
@@ -212,7 +212,7 @@ export function ComposerGearSelector({
 
               return (
                 <div className="composer-gear-config" data-active={isActive ? "true" : undefined} key={index}>
-                  <button type="button" onClick={() => onActivateGear(index)} aria-label={`Activate gear ${index + 1}`}>
+                  <button type="button" disabled={disabled} onClick={() => onActivateGear(index)} aria-label={`Activate gear ${index + 1}`}>
                     Gear {index + 1}
                   </button>
                   <select
@@ -230,7 +230,7 @@ export function ComposerGearSelector({
                     onChange={(event) => onEffortChange(index, event.target.value as ModelReasoningEffort)}
                     aria-label={`Gear ${index + 1} effort`}
                   >
-                    {(supportsUltraEffort(gear.model) ? ultraEffortOptions : effortOptions).map((effort) => (
+                    {(isAuto || supportsUltraEffort(gear.model) ? ultraEffortOptions : effortOptions).map((effort) => (
                       <option value={effort} key={effort}>
                         {effortOptionLabel(effort)}{isAuto && effort === autoEffort ? " (current)" : ""}
                       </option>

@@ -212,6 +212,60 @@ test("explicit log files survive launch-spec changes and capture the restarted c
   }
 });
 
+test("metric probes persist their name, command, and latest value for externally attached processes", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "process-monitor-metric-test-"));
+  const store = new SessionStore(resolve(root, "sessions.postgres"));
+  const service = new ProcessMonitorService(store);
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 10000)"], { stdio: "ignore" });
+  try {
+    await store.ready();
+    const workspace = await store.getActiveWorkspace();
+    assert.ok(child.pid);
+    const monitor = await service.monitor(workspace, {
+      label: "external-with-progress",
+      pid: child.pid,
+      metrics: [{ name: "Import progress", command: "printf '3/5 files'", nameSuffix: true }]
+    });
+    assert.deepEqual(monitor.metricMonitors, [{ name: "Import progress", command: "printf '3/5 files'", nameSuffix: true }]);
+    assert.deepEqual(monitor.metricReadings, [{
+      name: "Import progress",
+      command: "printf '3/5 files'",
+      nameSuffix: true,
+      value: "3/5 files",
+      status: "ok",
+      updatedAt: monitor.metricReadings[0]?.updatedAt ?? null,
+      error: null
+    }]);
+    assert.ok(monitor.metricReadings[0]?.updatedAt);
+  } finally {
+    service.stop();
+    try { child.kill("SIGTERM"); } catch {}
+    await store.close();
+  }
+});
+
+test("metric probes require distinct names and commands", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "process-monitor-metric-validation-test-"));
+  const store = new SessionStore(resolve(root, "sessions.postgres"));
+  const service = new ProcessMonitorService(store);
+  try {
+    await store.ready();
+    const workspace = await store.getActiveWorkspace();
+    await assert.rejects(
+      () => service.monitor(workspace, {
+        label: "invalid-metrics",
+        exe: process.execPath,
+        args: ["-e", "setTimeout(() => {}, 10000)"],
+        metrics: [{ name: "progress", command: "echo one" }, { name: "progress", command: "echo two" }]
+      }),
+      /Metric names must be unique/
+    );
+  } finally {
+    service.stop();
+    await store.close();
+  }
+});
+
 test("bare Node executable monitors are rejected instead of immediately appearing exited", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "process-monitor-test-"));
   const store = new SessionStore(resolve(root, "sessions.postgres"));

@@ -1,4 +1,5 @@
 import type { LightweightTodo } from "../lightweightTodo";
+import { AUTO_MODEL_CHOICES, AUTO_EFFORT_CHOICES, isAutoModel, isAutoEffort } from "../autoModelCatalog";
 import { acknowledgeGrill, type GrillSummary, type TurnGrill } from "../turnGrill";
 import { openPostgresSessionConnection, postgresSchemaFromStoreId, type SessionDbConnection, type SessionDbValue } from "./sessionDb";
 import { createHash } from "node:crypto";
@@ -115,6 +116,22 @@ export type WorkspaceMonitorSessionRecord = {
 
 export type ProcessMonitorStatus = "starting" | "running" | "exited" | "stopped" | "error";
 export type ProcessMonitorWakeStatus = "none" | "pending" | "sent" | "done" | "error";
+export type ProcessMetricStatus = "idle" | "ok" | "error";
+
+/** A small command probe used when a process's own output is unavailable. */
+export type ProcessMetricMonitor = {
+  name: string;
+  command: string;
+  /** Append the latest successful value to the monitor name in the sidebar. */
+  nameSuffix?: boolean;
+};
+
+export type ProcessMetricReading = ProcessMetricMonitor & {
+  value: string | null;
+  status: ProcessMetricStatus;
+  updatedAt: string | null;
+  error: string | null;
+};
 
 export type WaitEventStatus = "pending" | "fired" | "cancelled";
 export type WaitSubscriptionStatus = "waiting" | "dispatching" | "done" | "error" | "cancelled";
@@ -350,6 +367,8 @@ export type ProcessMonitorRecord = {
   args: string[];
   logFile: string | null;
   entryPoints: string[];
+  metricMonitors: ProcessMetricMonitor[];
+  metricReadings: ProcessMetricReading[];
   cwd: string;
   pid: number | null;
   status: ProcessMonitorStatus;
@@ -386,6 +405,8 @@ export type CreateProcessMonitorInput = {
   args?: string[];
   logFile?: string | null;
   entryPoints?: string[];
+  metricMonitors?: ProcessMetricMonitor[];
+  metricReadings?: ProcessMetricReading[];
   cwd: string;
   pid?: number | null;
   status?: ProcessMonitorStatus;
@@ -466,6 +487,8 @@ export type SessionTurnEventRecord = {
   payload: unknown;
   created: string;
 };
+
+export type SessionAutoModelProvider = "typesafe" | "fallback";
 
 export type SessionSideChatRecord = {
   id: string;
@@ -1237,6 +1260,8 @@ type ProcessMonitorRow = {
   args_json?: unknown;
   log_file?: unknown;
   entry_points_json?: unknown;
+  metric_monitors_json?: unknown;
+  metric_readings_json?: unknown;
   entry_point?: unknown;
   cwd?: unknown;
   pid?: unknown;
@@ -1973,6 +1998,8 @@ export class SessionStore {
                 CAST(args AS VARCHAR) AS args_json,
                 log_file,
                 CAST(entry_points AS VARCHAR) AS entry_points_json,
+                CAST(metric_monitors AS VARCHAR) AS metric_monitors_json,
+                CAST(metric_readings AS VARCHAR) AS metric_readings_json,
                 entry_point,
                 cwd,
                 pid,
@@ -2010,6 +2037,8 @@ export class SessionStore {
               CAST(args AS VARCHAR) AS args_json,
               log_file,
               CAST(entry_points AS VARCHAR) AS entry_points_json,
+              CAST(metric_monitors AS VARCHAR) AS metric_monitors_json,
+              CAST(metric_readings AS VARCHAR) AS metric_readings_json,
               entry_point,
               cwd,
               pid,
@@ -2047,11 +2076,11 @@ export class SessionStore {
       await connection.run(
         `
           INSERT INTO process_monitor (
-            id, workspace_id, label, command, executable, docker_image, docker_run_args, args, log_file, entry_points, cwd, pid, status, managed, remove_on_exit,
+            id, workspace_id, label, command, executable, docker_image, docker_run_args, args, log_file, entry_points, metric_monitors, metric_readings, cwd, pid, status, managed, remove_on_exit,
             wake_prompt, wake_session_id, wake_thread_id, timeout_at,
             wake_status, wake_error, woken_at, started_at, last_exit_code, last_signal, error, created, updated
           ) VALUES (
-            $id, $workspaceId, $label, $command, $executable, $dockerImage, $dockerRunArgs::JSON, $args::JSON, $logFile, $entryPoints::JSON, $cwd, $pid, $status, $managed, $removeOnExit,
+            $id, $workspaceId, $label, $command, $executable, $dockerImage, $dockerRunArgs::JSON, $args::JSON, $logFile, $entryPoints::JSON, $metricMonitors::JSON, $metricReadings::JSON, $cwd, $pid, $status, $managed, $removeOnExit,
             $wakePrompt, $wakeSessionId, $wakeThreadId, $timeoutAt,
             $wakeStatus, $wakeError, $wokenAt, $startedAt, $lastExitCode, $lastSignal, $error, now(), now()
           )
@@ -2067,6 +2096,8 @@ export class SessionStore {
           args: JSON.stringify(input.args ?? []),
           logFile: input.logFile ?? null,
           entryPoints: JSON.stringify(input.entryPoints ?? []),
+          metricMonitors: JSON.stringify(input.metricMonitors ?? []),
+          metricReadings: JSON.stringify(input.metricReadings ?? []),
           cwd: input.cwd,
           pid: input.pid ?? null,
           status: input.status ?? "starting",
@@ -2098,6 +2129,8 @@ export class SessionStore {
             CAST(args AS VARCHAR) AS args_json,
             log_file,
             CAST(entry_points AS VARCHAR) AS entry_points_json,
+            CAST(metric_monitors AS VARCHAR) AS metric_monitors_json,
+            CAST(metric_readings AS VARCHAR) AS metric_readings_json,
             entry_point,
             cwd,
             pid,
@@ -2141,6 +2174,8 @@ export class SessionStore {
         ["args", "args"],
         ["logFile", "log_file"],
         ["entryPoints", "entry_points"],
+        ["metricMonitors", "metric_monitors"],
+        ["metricReadings", "metric_readings"],
         ["cwd", "cwd"],
         ["pid", "pid"],
         ["status", "status"],
@@ -2161,7 +2196,7 @@ export class SessionStore {
       for (const [inputKey, column] of fields) {
         if (inputKey in input) {
           const parameter = `value_${String(inputKey)}`;
-          const isJson = inputKey === "args" || inputKey === "entryPoints" || inputKey === "dockerRunArgs";
+          const isJson = inputKey === "args" || inputKey === "entryPoints" || inputKey === "dockerRunArgs" || inputKey === "metricMonitors" || inputKey === "metricReadings";
           assignments.push(`${column} = $${parameter}${isJson ? "::JSON" : ""}`);
           params[parameter] = (isJson ? JSON.stringify(input[inputKey] ?? []) : input[inputKey]) as SessionDbValue;
         }
@@ -2189,6 +2224,8 @@ export class SessionStore {
             CAST(args AS VARCHAR) AS args_json,
             log_file,
             CAST(entry_points AS VARCHAR) AS entry_points_json,
+            CAST(metric_monitors AS VARCHAR) AS metric_monitors_json,
+            CAST(metric_readings AS VARCHAR) AS metric_readings_json,
             entry_point,
             cwd,
             pid,
@@ -3006,7 +3043,9 @@ export class SessionStore {
       const existing = await this.getWaitSubscriptionWithConnection(connection, id);
       if (!existing) throw new Error(`Wait subscription not found: ${id}`);
       if (existing.status !== "waiting" && existing.status !== "error") {
-        throw new Error("Only waiting or failed subscriptions can be removed.");
+        // Cancellation is intentionally idempotent. A client can render a
+        // waiting subscription just before the dispatcher claims it.
+        return existing;
       }
       await connection.run(
         `
@@ -3480,6 +3519,22 @@ export class SessionStore {
     });
   }
 
+  /** A fresh turn may choose a cheaper model; within-turn upgrades remain monotonic. */
+  async selectSessionAutoModel(input: { sessionId: string; model: string; effort: string }): Promise<SessionAutoModelConfig> {
+    if (!isAutoModel(input.model) || !isAutoEffort(input.effort)) throw new Error("Invalid Auto model selection.");
+    return this.write(async (connection) => {
+      const current = await this.getSessionAutoModelWithConnection(connection, input.sessionId);
+      if (!current.enabled) throw new Error("Auto model is not enabled for this session.");
+      await connection.run(
+        `UPDATE session_auto_model
+         SET model = $model, effort = $effort, revision = revision + 1, updated = now()
+         WHERE session_id = $sessionId AND enabled = true`,
+        input
+      );
+      return this.getSessionAutoModelWithConnection(connection, input.sessionId);
+    });
+  }
+
   async upgradeSessionAutoModel(input: {
     sessionId: string;
     model: string;
@@ -3490,14 +3545,14 @@ export class SessionStore {
       if (!current.enabled) {
         throw new Error("Auto model is not enabled for this session.");
       }
-      const modelOrder = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"];
-      const effortOrder = ["low", "medium", "high", "xhigh"];
+      const modelOrder = Object.keys(AUTO_MODEL_CHOICES);
+      const effortOrder = Object.keys(AUTO_EFFORT_CHOICES);
       const currentModelRank = modelOrder.indexOf(current.model);
       const requestedModelRank = modelOrder.indexOf(input.model);
       const currentEffortRank = effortOrder.indexOf(current.effort);
       const requestedEffortRank = effortOrder.indexOf(input.effort);
       if (requestedModelRank < 0 || requestedEffortRank < 0) {
-        throw new Error("Auto model upgrades support Luna, Terra, or Sol with low, medium, high, or xhigh effort.");
+        throw new Error("Auto model upgrades support Luna, Terra, Sol, or Astra with low through ultra effort.");
       }
       if (requestedModelRank < currentModelRank || requestedEffortRank < currentEffortRank) {
         throw new Error(`Auto model cannot downgrade from ${current.model} ${current.effort}.`);
@@ -4025,6 +4080,10 @@ export class SessionStore {
 
   async listSessionSteerMessages(sessionId: string): Promise<Record<string, SessionSteerMessageRecord[]>> {
     return this.read(async (connection) => this.listSessionSteerMessagesWithConnection(connection, sessionId));
+  }
+
+  async listSessionAutoModelProviders(sessionId: string): Promise<Record<string, SessionAutoModelProvider>> {
+    return this.read(async (connection) => this.listSessionAutoModelProvidersWithConnection(connection, sessionId));
   }
 
   async getNextTodoTurn(sessionId: string): Promise<SessionTurnRecord | null> {
@@ -6840,6 +6899,8 @@ export class SessionStore {
         args JSON NOT NULL DEFAULT '[]'::JSON,
         log_file VARCHAR,
         entry_points JSON NOT NULL DEFAULT '[]'::JSON,
+        metric_monitors JSON NOT NULL DEFAULT '[]'::JSON,
+        metric_readings JSON NOT NULL DEFAULT '[]'::JSON,
         entry_point VARCHAR,
         cwd VARCHAR NOT NULL,
         pid BIGINT,
@@ -6913,6 +6974,8 @@ export class SessionStore {
       ["args", "JSON DEFAULT '[]'::JSON"],
       ["log_file", "VARCHAR"],
       ["entry_points", "JSON DEFAULT '[]'::JSON"],
+      ["metric_monitors", "JSON DEFAULT '[]'::JSON"],
+      ["metric_readings", "JSON DEFAULT '[]'::JSON"],
       ["entry_point", "VARCHAR"],
       ["remove_on_exit", "BOOLEAN DEFAULT false"],
       ["wake_prompt", "VARCHAR"],
@@ -8440,6 +8503,32 @@ export class SessionStore {
       });
     }
     return recordsByTurn;
+  }
+
+  private async listSessionAutoModelProvidersWithConnection(
+    connection: SessionDbConnection,
+    sessionId: string
+  ): Promise<Record<string, SessionAutoModelProvider>> {
+    const result = await connection.run(
+      `
+        SELECT turn_id, CAST(payload AS VARCHAR) AS payload_json
+        FROM session_turn_event
+        WHERE session_id = $sessionId
+          AND event_name = 'auto_model.selected'
+        ORDER BY created ASC, id ASC
+      `,
+      { sessionId }
+    );
+    const providers: Record<string, SessionAutoModelProvider> = {};
+    for (const row of await result.getRowObjectsJS()) {
+      const turnId = stringValue((row as { turn_id?: unknown }).turn_id);
+      const payload = parseJsonObject((row as { payload_json?: unknown }).payload_json);
+      const provider = (payload as Record<string, unknown> | null)?.provider;
+      if (turnId && (provider === "typesafe" || provider === "fallback")) {
+        providers[turnId] = provider;
+      }
+    }
+    return providers;
   }
 
   private async listSessionSteerMessagesWithConnection(
@@ -11106,7 +11195,8 @@ function normalizeSessionModelPreferences(
     (profile, index) => fallback.gearProfiles[index] ?? profile
   );
   const inputProfiles = input.gearProfiles;
-  const profiles = Array.isArray(inputProfiles) && (inputProfiles.length === 3 || inputProfiles.length === 6)
+  // Preserve the first six presets if a client saved the temporary seventh Auto slot.
+  const profiles = Array.isArray(inputProfiles) && [3, 6, 7].includes(inputProfiles.length)
     ? fallbackProfiles.map((fallbackProfile, index) => {
       const profile = inputProfiles[index];
       return {
@@ -11727,6 +11817,8 @@ function toProcessMonitorRecord(row: ProcessMonitorRow): ProcessMonitorRecord {
   const entryPoints = storedEntryPoints.length > 0
     ? storedEntryPoints
     : legacyEntryPoint ? [legacyEntryPoint] : [];
+  const metricMonitors = parseProcessMetricMonitors(row.metric_monitors_json);
+  const metricReadings = parseProcessMetricReadings(row.metric_readings_json, metricMonitors);
   return {
     id: stringValue(row.id),
     workspaceId: stringValue(row.workspace_id, "default"),
@@ -11738,6 +11830,8 @@ function toProcessMonitorRecord(row: ProcessMonitorRow): ProcessMonitorRecord {
     args,
     logFile: nullableString(row.log_file),
     entryPoints,
+    metricMonitors,
+    metricReadings,
     cwd: stringValue(row.cwd),
     pid: nullableNumber(row.pid),
     status: isProcessMonitorStatus(status) ? status : "error",
@@ -11757,6 +11851,49 @@ function toProcessMonitorRecord(row: ProcessMonitorRow): ProcessMonitorRecord {
     created: stringValue(row.created),
     updated: stringValue(row.updated)
   };
+}
+
+function parseProcessMetricMonitors(value: unknown): ProcessMetricMonitor[] {
+  const rawMetrics = parseJsonObject(value);
+  if (!Array.isArray(rawMetrics)) return [];
+  return rawMetrics.flatMap((metric) => {
+    if (!metric || typeof metric !== "object") return [];
+    const name = nullableString((metric as Record<string, unknown>).name);
+    const command = nullableString((metric as Record<string, unknown>).command);
+    return name && command ? [{ name, command, nameSuffix: (metric as Record<string, unknown>).nameSuffix === true }] : [];
+  });
+}
+
+function parseProcessMetricReadings(value: unknown, metricMonitors: ProcessMetricMonitor[]): ProcessMetricReading[] {
+  const rawReadings = parseJsonObject(value);
+  if (!Array.isArray(rawReadings)) {
+    return metricMonitors.map((metric) => ({ ...metric, value: null, status: "idle", updatedAt: null, error: null }));
+  }
+  const readingsByKey = new Map<string, ProcessMetricReading>();
+  for (const reading of rawReadings) {
+    if (!reading || typeof reading !== "object") continue;
+    const record = reading as Record<string, unknown>;
+    const name = nullableString(record.name);
+    const command = nullableString(record.command);
+    if (!name || !command) continue;
+    const status = record.status === "ok" || record.status === "error" || record.status === "idle" ? record.status : "idle";
+    readingsByKey.set(`${name}\u0000${command}`, {
+      name,
+      command,
+      nameSuffix: record.nameSuffix === true,
+      value: nullableString(record.value),
+      status,
+      updatedAt: nullableString(record.updatedAt),
+      error: nullableString(record.error)
+    });
+  }
+  return metricMonitors.map((metric) => readingsByKey.get(`${metric.name}\u0000${metric.command}`) ?? {
+    ...metric,
+    value: null,
+    status: "idle",
+    updatedAt: null,
+    error: null
+  });
 }
 
 function isProcessMonitorStatus(value: string): value is ProcessMonitorStatus {

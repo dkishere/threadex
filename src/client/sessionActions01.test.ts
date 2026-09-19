@@ -96,6 +96,42 @@ test("does not consume goal mode for an empty submission", async () => {
   assert.deepEqual(executionModeUpdates, []);
 });
 
+test("direct steer submission bypasses the queue even when queue mode is active", async () => {
+  const queued: string[] = [];
+  const steered: string[] = [];
+
+  await submit(
+    {
+      attachments: [],
+      composerLinkToken: (id: string) => id,
+      composerMode: "queue",
+      composerResponseQuote: null,
+      composerSessionLinks: [],
+      composerTodoPlanModeEnabled: false,
+      currentSessionIsRunning: true,
+      enqueuePrompt(message: string) { queued.push(message); },
+      executionMode: "default",
+      forkNextPrompt: false,
+      formatComposerLinkMarkdown() { return ""; },
+      formatResponseAnnotationsPrompt() { return ""; },
+      input: "Change direction",
+      queuePrompt(message: string) { queued.push(message); },
+      replaceComposerLinkTokens(value: string) { return value; },
+      selectedSkills: [],
+      sessionIdRef: { current: "session-1" },
+      setComposerExecutionMode() {},
+      setComposerForkNextPrompt() {},
+      async startChatTurn() {},
+      async steerPrompt(message: string) { steered.push(message); }
+    },
+    undefined,
+    "steer"
+  );
+
+  assert.deepEqual(queued, []);
+  assert.deepEqual(steered, ["Change direction"]);
+});
+
 test("submitting a queued prompt edit commits it without starting a new turn", async () => {
   const editRef = { current: { promptId: "queued-1" } };
   let committed = "";

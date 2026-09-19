@@ -278,6 +278,35 @@ test("editing and removing an enqueue subscription changes then cancels the pend
   }
 });
 
+test("removing an already-dispatching subscription is idempotent", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "wait-event-idempotent-cancel-test-"));
+  const store = new SessionStore(resolve(root, "sessions.postgres"));
+  const service = new WaitEventService(store, { onDispatch: async () => undefined });
+  try {
+    await store.ready();
+    const event = await service.ensureEvent({
+      workspaceId: "default",
+      topic: "process.exited",
+      subjectKey: "idempotent-cancel"
+    });
+    await service.subscribe({
+      id: "dispatching-subscription",
+      eventId: event.id,
+      workspaceId: "default",
+      sessionId: "session-dispatching",
+      actionType: "notify"
+    });
+    await store.claimWaitSubscription("dispatching-subscription");
+
+    const subscription = await service.cancelSubscription("dispatching-subscription");
+
+    assert.equal(subscription.status, "dispatching");
+  } finally {
+    service.stop();
+    await store.close();
+  }
+});
+
 test("cancelling a wait event cancels all undelivered subscriptions", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "wait-event-cancel-test-"));
   const store = new SessionStore(resolve(root, "sessions.postgres"));

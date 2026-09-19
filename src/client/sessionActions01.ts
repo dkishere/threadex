@@ -241,9 +241,9 @@ export function askAboutResponseQuote(ctx, quote) {
     
 }
 
-export async function submit(ctx, event) {
+export async function submit(ctx, event, modeOverride?: string) {
     const { attachments, commitQueuedPromptEdit, composerLinkToken, composerMode, composerResponseQuote, composerSessionLinks, composerTodoPlanModeEnabled, currentSessionIsRunning, enqueuePrompt, executionMode, forkNextPrompt, formatComposerLinkMarkdown, formatResponseAnnotationsPrompt, input, queuePrompt, queuedPromptEditRef, replaceComposerLinkTokens, selectedSkills, sessionIdRef, setComposerExecutionMode, setComposerForkNextPrompt, startChatTurn, steerPrompt } = ctx;
-        event.preventDefault();
+        event?.preventDefault();
         if (queuedPromptEditRef?.current) {
             const editedMessage = input.trim();
             if (editedMessage) {
@@ -276,7 +276,8 @@ export async function submit(ctx, event) {
         if (executionMode === "goal") {
             setComposerExecutionMode("default");
         }
-        if (forkNextPrompt && sessionIdRef.current) {
+        const submissionMode = modeOverride ?? composerMode;
+        if (forkNextPrompt && submissionMode !== "steer" && sessionIdRef.current) {
             setComposerForkNextPrompt(false);
             if (currentSessionIsRunning) {
                 enqueuePrompt(message, "queue", executionMode, turnSkills, attachments, true, forcePlan);
@@ -287,7 +288,7 @@ export async function submit(ctx, event) {
             return;
         }
         if (currentSessionIsRunning) {
-            if (composerMode === "steer") {
+            if (submissionMode === "steer") {
                 await steerPrompt(message, attachments, true, turnSkills, forcePlan);
             }
             else {
@@ -354,6 +355,7 @@ export async function startChatTurn(ctx, message, turnAttachments, turnExecution
             turnId,
             model: turnModel,
             reasoningEffort: turnReasoningEffort,
+            autoModel: selectedModel === AUTO_MODEL_VALUE,
             createdAt: new Date().toISOString(),
             attachments: turnAttachments,
             forcePlan,

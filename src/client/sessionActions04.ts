@@ -303,6 +303,17 @@ export function handleStreamEvent(ctx, event, target) {
             }
             return;
         }
+        if (event.type === "auto_model.selected") {
+            setMessages((current) => current.map((message) => message.role === "user" && message.turnId === (event.data.turnId ?? target.turnId)
+                ? { ...message, autoModel: true, autoModelProvider: event.data.provider }
+                : message));
+            if (isTargetVisible(target)) {
+                setSessionAutoModel(event.data);
+                const fallback = event.data.provider === "fallback" ? ` (fallback: ${event.data.reason})` : "";
+                setStatus(`Auto selected ${modelOptionLabel(event.data.model)} ${capitalize(event.data.effort)}${fallback}`);
+            }
+            return;
+        }
         if (event.type === "auto_model.phase_transition") {
             if (isTargetVisible(target)) {
                 setSessionAutoModel(event.data.to);

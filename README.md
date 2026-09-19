@@ -12,7 +12,7 @@ Use this section first when you come back to the repo and want to avoid a blind
 
 | Need | Start here |
 | --- | --- |
-| Run the app | `npm run dev`, then open `http://localhost:5173` |
+| Run the app | `npm run serve`, then open `http://localhost:5173` |
 | Backend routes, runner lifecycle, approvals | `src/server/index.ts` |
 | Detached Codex app-server worker | `src/server/promptRunner.ts` |
 | PostgreSQL schema and persistence helpers | `src/server/sessionStore.ts` |
@@ -93,10 +93,10 @@ accepted as a compatibility fallback for the current Codex adapter.
 
 ```bash
 npm install
-npm run dev
+npm run serve
 ```
 
-Open:
+Open the unified server:
 
 ```text
 http://localhost:5173
@@ -122,7 +122,7 @@ The first extension install pairs automatically. Use
 an extension that was paired previously. See `local-browser-bridge/README.md` for
 the CLI, page context, and security model.
 
-The Vite client proxies `/api` to the Express server on:
+When using the optional Vite development client, it proxies `/api` to the Express server on:
 
 ```text
 http://localhost:8787
@@ -133,6 +133,7 @@ Useful scripts:
 | Command | What it does |
 | --- | --- |
 | `npm run dev` | Starts the protected local PostgreSQL container, Express watcher, and Vite client |
+| `npm run serve` | Rebuilds TypeScript and the production client, then starts the unified Express server and local Web VS Code on port 5173 |
 | `npm run dev:server` | Starts the protected local PostgreSQL container and Express API watcher |
 | `npm run dev:server:plain` | Starts only the Express API watcher; requires an existing PostgreSQL URL |
 | `npm run dev:client` | Starts Vite on port 5173 and local Web VS Code on port 8790 |
@@ -384,16 +385,13 @@ process. PID-only monitors are temporary, store no launch args, cannot restart,
 and disappear when that exact PID exits. Pair a live PID with exactly one launch
 spec (`exe` plus `args`, `dockerImage`, or `command`) to retain it after exit and
 make it restartable without interrupting it; `adopt` provides the same upgrade path
-for an existing PID-only monitor. The Threadex API
-server itself and the Vite client use external supervisors. Their built-in monitors
-expose Restart whenever a supervisor or restart control is available; the action is
-data-driven by monitor metadata rather than the display label, and it cannot remove
-or stop either built-in directly. `npm run dev:server` uses `scripts/watch-server.mjs`
-and `npm run dev:client` uses `scripts/watch-client.mjs`; the client supervisor
-also owns the development code-server process. Both supervisors are always
-included in monitor listings as built-in read-only health records: the server
-record uses its current process PID, while the client record probes Vite on port
-5173 so an externally managed restart cannot leave a stale `exited` PID record.
+for an existing PID-only monitor. The Threadex API server uses an external
+supervisor. Its built-in monitor exposes Restart whenever a supervisor or restart
+control is available; the action is data-driven by monitor metadata rather than the
+display label, and it cannot remove or stop the built-in server directly.
+`npm run dev:server` uses `scripts/watch-server.mjs`, and its built-in read-only
+record uses the current process PID. The optional Vite development client is not
+listed as a built-in process monitor.
 Docker monitors run as `docker run --rm <dockerImage> ...` and remain restartable;
 `dockerRunArgs` can supply Docker flags before the image, while `args` are passed
 as the container command. For example, a web monitor can use
@@ -402,9 +400,15 @@ Monitors started or restarted by Threadex combine stdout and stderr in their cap
 a workspace-relative path to write to a specific file; the setting is persisted and
 preserved when an existing PID is adopted with a new command or when the monitor is
 restarted. Without `logFile`, logs are kept in the server data directory. Attached
-processes cannot capture output that was already sent elsewhere, but their live PID
-can be stopped directly. Attached PIDs are signalled individually; processes launched
-by Threadex are stopped as their own process groups.
+processes and externally supervised processes may not expose output, including output
+already sent elsewhere. Add up to eight `metrics`, each as `{ name, command, nameSuffix? }`, when
+creating or adopting a monitor to sample an independent progress value; the latest
+value, command, update time, and probe error appear in the detail panel. Metrics run
+periodically with a short timeout and do not depend on the target process's stdout.
+Set `nameSuffix: true` to append the latest successful metric value to the monitor's
+sidebar name.
+Attached PIDs can still be stopped directly. Attached PIDs are signalled individually;
+processes launched by Threadex are stopped as their own process groups.
 
 `/api/chat` accepts:
 

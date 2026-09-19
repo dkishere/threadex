@@ -800,6 +800,32 @@
   text-transform: none;
   white-space: nowrap;
 }
+.prompt-turn-auto-prefix { color: #1d4ed8; font-weight: 850; }
+.prompt-turn-auto-prefix[data-provider="typesafe"] { color: #dc2626; }
+.prompt-turn-toolbar-model-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.prompt-turn-auto-badge {
+  display: inline-grid;
+  place-items: center;
+  width: 15px;
+  height: 15px;
+  border: 1px solid #93c5fd;
+  border-radius: 4px;
+  background: #dbeafe;
+  color: #1d4ed8;
+  font-size: 9px;
+  font-weight: 850;
+  line-height: 1;
+}
+.prompt-turn-auto-badge[data-provider="typesafe"] {
+  border-color: #fca5a5;
+  background: #fee2e2;
+  color: #dc2626;
+}
 .prompt-turn-spinner { color: var(--turn-accent); }
 .prompt-turn-issues { color: #be123c; font-variant-numeric: tabular-nums; }
 .prompt-turn-issues[data-resolved="true"] { color: #15803d; }

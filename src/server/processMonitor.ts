@@ -3,6 +3,8 @@ import { closeSync, existsSync, mkdirSync, openSync, readSync, rmSync, statSync 
 import { resolve, sep } from "node:path";
 import type {
   CreateProcessMonitorInput,
+  ProcessMetricMonitor,
+  ProcessMetricReading,
   ProcessMonitorRecord,
   ProcessMonitorStatus,
   SessionStore,
@@ -24,6 +26,8 @@ export type MonitorProcessInput = {
   entryPoints?: string[] | null;
   /** Legacy single-value input retained for API compatibility. */
   entryPoint?: string | null;
+  /** Commands sampled independently of the monitored process's stdout/stderr. */
+  metrics?: ProcessMetricMonitor[] | null;
   pid?: number | null;
   cwd?: string | null;
   wakePrompt?: string | null;
@@ -61,10 +65,14 @@ export type ProcessMonitorLog = {
 };
 
 const monitorPollMs = Number(process.env.PROCESS_MONITOR_POLL_MS ?? 2_000);
+const metricRefreshMs = Number(process.env.PROCESS_METRIC_REFRESH_MS ?? 5_000);
+const metricCommandTimeoutMs = Number(process.env.PROCESS_METRIC_TIMEOUT_MS ?? 5_000);
+const maxMetricOutputChars = 4_000;
 
 export class ProcessMonitorService {
   private timer: NodeJS.Timeout | null = null;
   private children = new Map<string, ChildProcess>();
+  private metricRefreshes = new Map<string, Promise<ProcessMonitorRecord>>();
 
   constructor(
     private readonly store: SessionStore,
@@ -108,6 +116,7 @@ export class ProcessMonitorService {
     const args = normalizeArgs(input.args);
     const logFile = normalizeLogFile(workspace, input.logFile);
     const entryPoints = normalizeEntryPoints(input.entryPoints, input.entryPoint);
+    const metricMonitors = normalizeMetricMonitors(input.metrics);
     const pid = normalizePid(input.pid);
     const wakePrompt = normalizeWakePrompt(input.wakePrompt);
     const wakeSessionId = normalizeOptionalString(input.wakeSessionId);
@@ -134,7 +143,7 @@ export class ProcessMonitorService {
     const cwd = normalizeCwd(workspace, input.cwd);
     if (pid !== null) {
       if (!isProcessAlive(pid)) throw new Error(`Process ${pid} is not running.`);
-      return this.store.createProcessMonitor({
+      const attached = await this.store.createProcessMonitor({
         workspaceId: workspace.id,
         label,
         command,
@@ -144,6 +153,8 @@ export class ProcessMonitorService {
         args,
         logFile,
         entryPoints,
+        metricMonitors,
+        metricReadings: emptyMetricReadings(metricMonitors),
         cwd,
         pid,
         status: "running",
@@ -154,6 +165,7 @@ export class ProcessMonitorService {
         ...monitorOptions,
         startedAt: new Date().toISOString()
       });
+      return this.refreshMetrics(attached, true);
     }
 
     const record = await this.store.createProcessMonitor({
@@ -166,6 +178,8 @@ export class ProcessMonitorService {
       args,
       logFile,
       entryPoints,
+      metricMonitors,
+      metricReadings: emptyMetricReadings(metricMonitors),
       cwd,
       status: "starting",
       managed: true,
@@ -174,7 +188,7 @@ export class ProcessMonitorService {
     });
     try {
       await this.startProcess(record);
-      return (await this.store.getProcessMonitor(record.id)) ?? record;
+      return this.refreshMetrics((await this.store.getProcessMonitor(record.id)) ?? record, true);
     } catch (error) {
       await this.store.updateProcessMonitor({ id: record.id, status: "error", error: errorMessage(error) });
       throw error;
@@ -189,7 +203,7 @@ export class ProcessMonitorService {
     validateExecutableArgs(record.executable, record.args);
     await this.terminate(record);
     await this.startProcess(record);
-    return (await this.store.getProcessMonitor(record.id)) ?? record;
+    return this.refreshMetrics((await this.store.getProcessMonitor(record.id)) ?? record, true);
   }
 
   async adopt(workspace: WorkspaceRecord, id: string, input: AdoptProcessMonitorInput) {
@@ -216,10 +230,13 @@ export class ProcessMonitorService {
     const entryPoints = input.entryPoints === undefined && input.entryPoint === undefined
       ? record.entryPoints
       : normalizeEntryPoints(input.entryPoints, input.entryPoint);
+    const metricMonitors = input.metrics === undefined
+      ? record.metricMonitors
+      : normalizeMetricMonitors(input.metrics);
     const logFile = input.logFile === undefined ? record.logFile : normalizeLogFile(workspace, input.logFile);
     const cwd = normalizeCwd(workspace, input.cwd ?? record.cwd);
     this.children.delete(record.id);
-    return (await this.store.updateProcessMonitor({
+    const adopted = (await this.store.updateProcessMonitor({
       id: record.id,
       label,
       command,
@@ -229,6 +246,8 @@ export class ProcessMonitorService {
       args,
       logFile,
       entryPoints,
+      metricMonitors,
+      metricReadings: emptyMetricReadings(metricMonitors),
       cwd,
       pid,
       status: "running",
@@ -239,6 +258,7 @@ export class ProcessMonitorService {
       lastSignal: null,
       error: null
     })) ?? record;
+    return this.refreshMetrics(adopted, true);
   }
 
   async remove(workspaceId: string, id: string) {
@@ -299,6 +319,7 @@ export class ProcessMonitorService {
     if (record.status !== "running" && record.status !== "starting") {
       return record;
     }
+    record = await this.refreshMetrics(record);
     if (record.pid === null) {
       if (record.status !== "starting") return record;
       return (await this.store.updateProcessMonitor({
@@ -371,6 +392,29 @@ export class ProcessMonitorService {
       void this.markChildExited(record.id, pid, code, signal);
     });
     child.unref();
+  }
+
+  private async refreshMetrics(record: ProcessMonitorRecord, force = false): Promise<ProcessMonitorRecord> {
+    if (record.metricMonitors.length === 0) return record;
+    if (!force && !shouldRefreshMetrics(record.metricReadings)) return record;
+    const running = this.metricRefreshes.get(record.id);
+    if (running) return running;
+    const refresh = Promise.all(record.metricMonitors.map(async (metric) => {
+      const result = await runMetricCommand(metric.command, record.cwd);
+      return {
+        ...metric,
+        value: result.value,
+        status: result.error ? "error" as const : "ok" as const,
+        updatedAt: new Date().toISOString(),
+        error: result.error
+      };
+    })).then(async (metricReadings) => (
+      (await this.store.updateProcessMonitor({ id: record.id, metricReadings })) ?? record
+    )).finally(() => {
+      this.metricRefreshes.delete(record.id);
+    });
+    this.metricRefreshes.set(record.id, refresh);
+    return refresh;
   }
 
   private async markChildFailed(id: string, pid: number, error: string) {
@@ -605,6 +649,80 @@ function normalizeEntryPoints(value: unknown, legacyValue: unknown) {
     }
   });
   return [...new Set(entryPoints)];
+}
+
+function normalizeMetricMonitors(value: unknown): ProcessMetricMonitor[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value) || value.length > 8) {
+    throw new Error("metrics must be an array of at most 8 name-and-command probes.");
+  }
+  const seenNames = new Set<string>();
+  return value.map((metric) => {
+    if (!metric || typeof metric !== "object") {
+      throw new Error("Each metric must provide a name and command.");
+    }
+    const { name, command, nameSuffix } = metric as { name?: unknown; command?: unknown; nameSuffix?: unknown };
+    const normalizedName = typeof name === "string" ? name.trim().slice(0, 100) : "";
+    const normalizedCommand = typeof command === "string" ? command.trim().slice(0, 4_000) : "";
+    if (!normalizedName || !normalizedCommand) {
+      throw new Error("Each metric must provide a name and command.");
+    }
+    if (seenNames.has(normalizedName)) {
+      throw new Error("Metric names must be unique within a process monitor.");
+    }
+    seenNames.add(normalizedName);
+    return { name: normalizedName, command: normalizedCommand, nameSuffix: nameSuffix === true };
+  });
+}
+
+function emptyMetricReadings(metrics: ProcessMetricMonitor[]): ProcessMetricReading[] {
+  return metrics.map((metric) => ({ ...metric, value: null, status: "idle", updatedAt: null, error: null }));
+}
+
+function shouldRefreshMetrics(readings: ProcessMetricReading[]) {
+  const newestReading = readings.reduce<number>((newest, reading) => {
+    const updatedAt = reading.updatedAt ? Date.parse(reading.updatedAt) : Number.NaN;
+    return Number.isFinite(updatedAt) ? Math.max(newest, updatedAt) : newest;
+  }, 0);
+  return newestReading === 0 || Date.now() - newestReading >= metricRefreshMs;
+}
+
+function runMetricCommand(command: string, cwd: string): Promise<{ value: string | null; error: string | null }> {
+  return new Promise((resolveResult) => {
+    let settled = false;
+    let stdout = "";
+    let stderr = "";
+    let timeout: NodeJS.Timeout | null = null;
+    const finish = (value: string | null, error: string | null) => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      resolveResult({ value, error });
+    };
+    let child: ChildProcess;
+    try {
+      child = spawn(command, { cwd, shell: true, stdio: ["ignore", "pipe", "pipe"] });
+    } catch (error) {
+      finish(null, errorMessage(error));
+      return;
+    }
+    timeout = setTimeout(() => {
+      try { child.kill("SIGTERM"); } catch {}
+      finish(null, `Metric command timed out after ${metricCommandTimeoutMs} ms.`);
+    }, metricCommandTimeoutMs);
+    child.stdout?.on("data", (chunk: Buffer | string) => {
+      if (stdout.length < maxMetricOutputChars) stdout += String(chunk).slice(0, maxMetricOutputChars - stdout.length);
+    });
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      if (stderr.length < maxMetricOutputChars) stderr += String(chunk).slice(0, maxMetricOutputChars - stderr.length);
+    });
+    child.once("error", (error) => finish(null, errorMessage(error)));
+    child.once("exit", (code, signal) => {
+      const value = stdout.trim() || null;
+      if (code === 0 && !signal) finish(value, null);
+      else finish(value, (stderr.trim() || `Metric command exited with ${signal ?? `code ${code ?? "unknown"}`}.`).slice(0, maxMetricOutputChars));
+    });
+  });
 }
 
 function normalizeArgs(value: unknown) {

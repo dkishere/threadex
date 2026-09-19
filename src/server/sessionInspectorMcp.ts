@@ -303,7 +303,7 @@ const tools: ToolSpec[] = [
   },
   {
     name: "monitor_process",
-    description: "Start a durable, restartable process from a complete launch spec, temporarily observe one existing PID, or attach an existing PID with a complete launch spec for later restart. Labels are display text only and never discover a process. PID-only monitors store no executable/args, cannot restart, and disappear when that PID exits. A PID paired with exe plus complete args, dockerImage, or command keeps that launch spec: it can be restarted into a Threadex-owned, captured process. Never launch a bare interpreter such as node, sh, bash, or python. Do not create duplicate built-in monitors. When list_processes marks a built-in read-only record restartable, restart_process_monitor delegates to its external supervisor.",
+    description: "Start a durable, restartable process from a complete launch spec, temporarily observe one existing PID, or attach an existing PID with a complete launch spec for later restart. Labels are display text only and never discover a process. PID-only monitors store no executable/args, cannot restart, and disappear when that PID exits. A PID paired with exe plus complete args, dockerImage, or command keeps that launch spec: it can be restarted into a Threadex-owned, captured process. Threadex captures logs only for commands it launches; external attachments and supervisor-managed processes may have no readable output. Add metrics when output may be unavailable: each name-and-command probe reports its latest value in the monitor detail panel. Never launch a bare interpreter such as node, sh, bash, or python. Do not create duplicate built-in monitors. When list_processes marks a built-in read-only record restartable, restart_process_monitor delegates to its external supervisor.",
     inputSchema: {
       type: "object",
       required: ["label"],
@@ -322,6 +322,21 @@ const tools: ToolSpec[] = [
           description: "Optional arguments passed to docker run before the image, such as -p 8080:80."
         },
         logFile: { type: "string", maxLength: 2000, description: "Optional output file path inside the active workspace. Combined stdout/stderr is captured here and remains available in the log popup across restarts." },
+        metrics: {
+          type: "array",
+          maxItems: 8,
+          description: "Optional progress probes. Each runs periodically and shows its latest stdout value in the detail panel; use when external process logs cannot be captured.",
+          items: {
+            type: "object",
+            required: ["name", "command"],
+            properties: {
+              name: { type: "string", minLength: 1, maxLength: 100 },
+              command: { type: "string", minLength: 1, maxLength: 4000 },
+              nameSuffix: { type: "boolean", description: "Append this metric's latest successful value to the process-monitor name in the sidebar." }
+            },
+            additionalProperties: false
+          }
+        },
         entryPoints: {
           type: "array",
           maxItems: 16,
@@ -337,7 +352,7 @@ const tools: ToolSpec[] = [
   },
   {
     name: "adopt_process_monitor",
-    description: "Attach a complete durable restart launch spec to an already-running PID without restarting it. Use this to convert a temporary PID monitor. The attached process remains external and is only signalled by its exact PID; after its first restart, the new process is launched and captured by Threadex. Requires the monitor id, live pid, and exactly one of exe plus complete args, dockerImage, or command.",
+    description: "Attach a complete durable restart launch spec to an already-running PID without restarting it. Use this to convert a temporary PID monitor. The attached process remains external and is only signalled by its exact PID; after its first restart, the new process is launched and captured by Threadex. External process logs may be unavailable; optional metrics provide independently sampled progress values. Requires the monitor id, live pid, and exactly one of exe plus complete args, dockerImage, or command.",
     inputSchema: {
       type: "object",
       required: ["id", "pid"],
@@ -352,6 +367,20 @@ const tools: ToolSpec[] = [
         image: { type: "string", maxLength: 500 },
         dockerRunArgs: { type: "array", maxItems: 64, items: { type: "string", maxLength: 4000 } },
         logFile: { type: "string", maxLength: 2000, description: "Optional output file path inside the active workspace; preserved when this monitor is restarted or its launch command is changed." },
+        metrics: {
+          type: "array",
+          maxItems: 8,
+          items: {
+            type: "object",
+            required: ["name", "command"],
+            properties: {
+              name: { type: "string", minLength: 1, maxLength: 100 },
+              command: { type: "string", minLength: 1, maxLength: 4000 },
+              nameSuffix: { type: "boolean", description: "Append this metric's latest successful value to the process-monitor name in the sidebar." }
+            },
+            additionalProperties: false
+          }
+        },
         entryPoints: { type: "array", maxItems: 16, items: { type: "string", format: "uri", maxLength: 2000 } },
         cwd: { type: "string" }
       },
@@ -626,13 +655,13 @@ if (autoModelEnabled) {
   tools.push({
     name: "upgrade_model",
     description:
-      "Upgrade this Auto session to a stronger GPT-5.6 model and/or reasoning effort. Jumps are allowed. Downgrades are rejected. Call only after inexpensive context gathering is complete and immediately before substantive technical or business judgment is required.",
+      "Upgrade this Auto session to a stronger model and/or reasoning effort. Jumps are allowed. Downgrades within a turn are rejected. Call only immediately before substantive technical or business judgment requires a stronger setting.",
     inputSchema: {
       type: "object",
       required: ["model", "effort", "reason"],
       properties: {
-        model: { type: "string", enum: ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"] },
-        effort: { type: "string", enum: ["low", "medium", "high", "xhigh"] },
+        model: { type: "string", enum: ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra"] },
+        effort: { type: "string", enum: ["low", "medium", "high", "xhigh", "ultra"] },
         reason: {
           type: "string",
           minLength: 10,

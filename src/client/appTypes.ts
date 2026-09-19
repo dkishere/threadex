@@ -36,8 +36,14 @@ export type ChatMessage = {
   model?: string;
   /** The reasoning effort actually selected when this turn started. */
   reasoningEffort?: string;
+  /** True when the turn was submitted through the Auto gear. */
+  autoModel?: boolean;
+  /** Provider that selected an Auto turn's model. */
+  autoModelProvider?: "typesafe" | "fallback";
   /** Token usage recorded for this turn, when the runner reports it. */
   tokenIn?: number;
+  /** Cached portion of the input-token usage, when the runner reports it. */
+  cachedInputTokens?: number;
   tokenOut?: number;
   kind?: "steer";
   pending?: boolean;
@@ -172,6 +178,10 @@ export type StreamEvent =
   | { type: "delta"; data: { text: string } }
   | { type: "approval.requested"; data: ApprovalEventData }
   | { type: "approval.resolved"; data: ApprovalEventData & { decision?: unknown; error?: string } }
+  | {
+      type: "auto_model.selected";
+      data: SessionAutoModelConfig & { turnId: string; provider: "typesafe" | "fallback"; reason: string; confidence?: number };
+    }
   | {
       type: "auto_model.phase_transition";
       data: { to: SessionAutoModelConfig; from?: { model?: string; effort?: string; revision?: number } };

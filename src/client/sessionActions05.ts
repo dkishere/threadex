@@ -146,9 +146,13 @@ export async function removeWaitSubscription(ctx, subscription) {
             });
             if (!response.ok)
                 throw new Error(await readApiError(response));
+            const payload = await response.json().catch(() => null);
             noteBackendRequestSucceeded();
-            await eventStore.poll();
-            showToast("Pending wait removed");
+            eventStore.removeWaitSubscription(subscription.id);
+            void eventStore.poll().catch(() => undefined);
+            showToast(payload?.cancelled === false
+                ? "Pending wait had already started dispatching"
+                : "Pending wait removed");
         }
         catch (error) {
             if (isLikelyBackendDisconnect(error)) {
@@ -755,7 +759,14 @@ export function handleEditorPaste(ctx, event) {
 }
 
 export function handleEditorKeyDown(ctx, event) {
-    const { canSend, composerSuggestionIndex, composerSuggestionTrigger, selectComposerSuggestion, selectSlashSuggestion, setComposerSuggestionIndex, setComposerSuggestionTrigger, setSlashSuggestionIndex, setSlashTrigger, slashSuggestionIndex, slashTrigger, visibleComposerSuggestions, visibleSlashSuggestions } = ctx;
+    const { canSend, composerSuggestionIndex, composerSuggestionTrigger, currentSessionIsRunning, selectComposerSuggestion, selectSlashSuggestion, setComposerSuggestionIndex, setComposerSuggestionTrigger, setSlashSuggestionIndex, setSlashTrigger, slashSuggestionIndex, slashTrigger, submitSteer, visibleComposerSuggestions, visibleSlashSuggestions } = ctx;
+        if (event.key === "Enter" && (event.ctrlKey || event.metaKey) && !event.nativeEvent.isComposing) {
+            event.preventDefault();
+            if (canSend && currentSessionIsRunning) {
+                void submitSteer();
+            }
+            return;
+        }
         if (slashTrigger && visibleSlashSuggestions.length > 0) {
             if (event.key === "ArrowDown" || event.key === "ArrowUp") {
                 event.preventDefault();

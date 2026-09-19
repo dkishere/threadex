@@ -37,6 +37,18 @@ one use the active workspace.
 Use the smallest mutation that satisfies the user's request. Read the current
 list before a destructive replacement, and report the workspace affected.
 
+## Auto Model Selection
+
+The TypeSafe Jev credential is a server-wide setting shared by workspaces.
+Use `/api/settings/auto-model` rather than writing the credential file directly:
+
+- `GET` returns `{ "apiKeyConfigured": boolean, "selectorModel": "jev-latest" }`; it never returns the key.
+- `PUT` with `{ "apiKey": "..." }` saves or replaces the key.
+- `DELETE` clears the key and restores the original Auto upgrade logic.
+
+Do not print the key or include it in source files. When configured, Auto sends a
+bounded user prompt and summarized conversation to TypeSafe before each turn.
+
 ## Maintaining This Skill
 
 Keep future Threadex-client configuration contracts here when they affect how

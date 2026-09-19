@@ -217,7 +217,12 @@ export function sessionTurnsToMessages(ctx, turns, title, existingMessages = [],
                 turnId: turn.id,
                 model: turn.model ?? existingUserMessage?.model,
                 reasoningEffort: turn.reasoningEffort ?? existingUserMessage?.reasoningEffort,
+                autoModel: turn.autoModelProvider === "typesafe" || turn.autoModelProvider === "fallback" || existingUserMessage?.autoModel,
+                autoModelProvider: turn.autoModelProvider ?? existingUserMessage?.autoModelProvider,
                 tokenIn: Number.isFinite(turn.tokenIn) ? turn.tokenIn : existingUserMessage?.tokenIn,
+                cachedInputTokens: Number.isFinite(turn.usageSample?.cachedInputTokens)
+                    ? turn.usageSample.cachedInputTokens
+                    : existingUserMessage?.cachedInputTokens,
                 tokenOut: Number.isFinite(turn.tokenOut) ? turn.tokenOut : existingUserMessage?.tokenOut,
                 executionDurationMs: turnDurationMs(turn),
                 turnStatus: turn.status,

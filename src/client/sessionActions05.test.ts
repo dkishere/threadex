@@ -88,6 +88,7 @@ function suggestionKeyContext(overrides: Record<string, unknown> = {}) {
     canSend: true,
     composerSuggestionIndex: -1,
     composerSuggestionTrigger: { start: 0, end: 3, query: "dep" },
+    currentSessionIsRunning: false,
     selectComposerSuggestion: () => assert.fail("suggestion should not be accepted"),
     selectSlashSuggestion: () => undefined,
     setComposerSuggestionIndex: () => undefined,
@@ -96,6 +97,7 @@ function suggestionKeyContext(overrides: Record<string, unknown> = {}) {
     setSlashTrigger: () => undefined,
     slashSuggestionIndex: 0,
     slashTrigger: null,
+    submitSteer: () => undefined,
     visibleComposerSuggestions: suggestions,
     visibleSlashSuggestions: [],
     ...overrides
@@ -117,6 +119,21 @@ function keyEvent(key: string, overrides: Record<string, unknown> = {}) {
     prevented: () => prevented,
     submitted: () => submitted
   };
+}
+
+for (const modifier of ["ctrlKey", "metaKey"] as const) {
+  test(`${modifier === "ctrlKey" ? "Ctrl" : "Cmd"}+Enter steers the running session directly`, () => {
+    let steered = false;
+    const input = keyEvent("Enter", { [modifier]: true });
+    handleEditorKeyDown(suggestionKeyContext({
+      currentSessionIsRunning: true,
+      submitSteer: () => { steered = true; }
+    }), input.event);
+
+    assert.equal(input.prevented(), true);
+    assert.equal(input.submitted(), false);
+    assert.equal(steered, true);
+  });
 }
 
 test("Tab accepts the first composer suggestion without arrow-key navigation", () => {

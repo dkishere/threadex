@@ -119,6 +119,23 @@ export function TurnGrillPanel({ sessionId, turnId, latest, mainBusy, onImplemen
     if (delay) saveTimer.current = setTimeout(() => void flushChanges(), delay);
     else void flushChanges();
   };
+  const acknowledge = useCallback(async () => {
+    if (!grillAwaitingAck(reviewRef.current)) return;
+    setBusy(true);
+    try {
+      const saved = await flushChanges();
+      if (!saved || !grillAwaitingAck(saved)) return;
+      const observedVersion = grillContentVersion(saved);
+      const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "ack", observedVersion }) });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not acknowledge Grill.");
+      if (reviewRef.current && data.grill.revision < reviewRef.current.revision) return;
+      const merged = mergeGrillEdits(reviewRef.current?.issues ?? [], issuesRef.current, data.grill.issues);
+      reviewRef.current = data.grill; setReview(data.grill); issuesRef.current = merged.issues; setIssues(merged.issues);
+      if (merged.conflicts.length) { conflictRef.current = true; setConflicts(merged.conflicts); setSaveError("Another editor changed the same fields. Choose how to merge your edits."); }
+    } catch (err) { setError(String(err)); }
+    finally { setBusy(false); }
+  }, [flushChanges, url]);
   useEffect(() => () => { clearTimeout(saveTimer.current); void flushChanges(); }, [flushChanges]);
   useEffect(() => { if (review) { onGrilled?.(sessionId, turnId); eventStore.reportGrill(sessionId, turnId, review); } }, [review, sessionId, turnId, onGrilled]);
   useEffect(() => {
@@ -253,7 +270,7 @@ export function TurnGrillPanel({ sessionId, turnId, latest, mainBusy, onImplemen
       <div className="grill-list-toolbar">
         <label><input type="checkbox" aria-label="Select all questions" checked={activeCount > 0 && selectedCount === activeCount} disabled={locked || !activeCount}
           ref={(element) => { if (element) element.indeterminate = selectedCount > 0 && selectedCount < activeCount; }}
-          onChange={(event) => queueIssues(issuesRef.current.map((issue) => ({ ...issue, selected: !issue.dropped && event.target.checked })))} />
+          onChange={(event) => { queueIssues(issuesRef.current.map((issue) => ({ ...issue, selected: !issue.dropped && event.target.checked }))); void acknowledge(); }} />
           <span>{selectedCount} of {activeCount} selected</span>
         </label>
         <span className="grill-saved" role="status">{saving || (dirty && !saveError) ? <><Loader2 className="spin" size={12} aria-hidden="true" /> Saving…</> : saveError ? "Not saved" : <><Check size={12} aria-hidden="true" /> Saved</>}</span>
@@ -264,7 +281,7 @@ export function TurnGrillPanel({ sessionId, turnId, latest, mainBusy, onImplemen
           const replies = questionRounds.filter((round) => round === [...questionRounds].reverse().find((candidate) => candidate.action === round.action));
           return <article key={issue.id} className="grill-issue" data-dropped={issue.dropped ? "true" : undefined}>
           <input className="grill-question-select" type="checkbox" aria-label={`Question ${index + 1}`} checked={issue.selected && !issue.dropped} disabled={locked || issue.dropped}
-            onChange={(event) => queueIssues(issuesRef.current.map((candidate) => candidate.id === issue.id ? { ...candidate, selected: event.target.checked } : candidate))} />
+            onChange={(event) => { queueIssues(issuesRef.current.map((candidate) => candidate.id === issue.id ? { ...candidate, selected: event.target.checked } : candidate)); void acknowledge(); }} />
           <div className="grill-issue-body">
             <div className="grill-issue-label"><span>{String(index + 1).padStart(2, "0")}</span>{issue.dropped ? <span>Dropped</span> : issue.status === "resolved" ? <span className="grill-resolved"><Check size={11} aria-hidden="true" /> Satisfied</span> : null}</div>
             {editing?.id === issue.id ? <div className="grill-edit">
@@ -304,19 +321,7 @@ export function TurnGrillPanel({ sessionId, turnId, latest, mainBusy, onImplemen
       <textarea id={promptId} value={prompt} maxLength={8000} disabled={locked} rows={2} placeholder="Add context, ask a question, or give instructions for the next turn…" onChange={(event) => setPrompt(event.target.value)} />
       <div className="grill-compose-actions">
         <div>
-      {grillAwaitingAck(review) && <button type="button" disabled={busy || saving} onClick={async () => {
-        const observedVersion = grillContentVersion(reviewRef.current);
-        setBusy(true);
-        try {
-          const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "ack", observedVersion }) });
-          const data = await response.json();
-          if (!response.ok) throw new Error(data.error || "Could not acknowledge Grill.");
-          if (reviewRef.current && data.grill.revision < reviewRef.current.revision) return;
-          const merged = mergeGrillEdits(reviewRef.current?.issues ?? [], issuesRef.current, data.grill.issues);
-          reviewRef.current = data.grill; setReview(data.grill); issuesRef.current = merged.issues; setIssues(merged.issues);
-          if (merged.conflicts.length) { conflictRef.current = true; setConflicts(merged.conflicts); setSaveError("Another editor changed the same fields. Choose how to merge your edits."); }
-        } catch (err) { setError(String(err)); } finally { setBusy(false); }
-      }}><Eye size={13} aria-hidden="true" /> Ack</button>}
+      {grillAwaitingAck(review) && <button type="button" disabled={busy || saving} onClick={() => void acknowledge()}><Eye size={13} aria-hidden="true" /> Ack</button>}
           <button className="grill-button-primary" type="button" disabled={locked || !selectedCount || !!editing} onClick={() => void act("respond", prompt)}><Send size={13} aria-hidden="true" /> Ask thread</button>
           {canFollowUp && <button type="button" disabled={locked || !!editing || !!conflicts.length} onClick={() => void act("followup", prompt)}><Flame size={13} aria-hidden="true" /> Re-grill</button>}
         </div>

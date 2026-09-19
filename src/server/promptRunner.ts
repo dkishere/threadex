@@ -1824,9 +1824,9 @@ function serverContextDeveloperInstructions(job: RunnerJob, includeStartupSnapsh
 function autoModelDeveloperInstructions(job: RunnerJob) {
   if (!job.autoModelEnabled || !job.autoModelPromptFullVersion) return undefined;
   return [
-    "Automatic model selection is enabled for this Threadex session. Start by preparing context at the current setting.",
+    "Automatic model selection is enabled for this Threadex session. Threadex selects the initial model and effort for each turn using the user prompt and summarized context. Start work at the current setting.",
     "If the task is difficult or complex, or one or two attempts have not produced a good result, consider a higher reasoning effort or a stronger model.",
-    "Available upgrades are gpt-5.6-luna, gpt-5.6-terra, or gpt-5.6-sol with low, medium, high, or xhigh effort. Use the session_inspector.upgrade_model tool with model, effort, and a concise reason; direct jumps are allowed, but downgrades are not.",
+    "Available upgrades are gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, or gpt-6-astra with low, medium, high, xhigh, or ultra effort. Use the session_inspector.upgrade_model tool with model, effort, and a concise reason; direct jumps are allowed, but downgrades within a turn are not.",
     "Call upgrade_model only immediately before a substantive technical or business decision that benefits materially from the stronger setting.",
     "After upgrade_model succeeds, do not make the decision or continue implementation in this phase. End the phase immediately with a terse handoff; Threadex will automatically continue the same user request in the same thread at the upgraded setting.",
     "Do not upgrade for mechanical edits, straightforward verification, summarization, or merely because a task is long."

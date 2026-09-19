@@ -59,6 +59,16 @@ export type ProcessMonitor = {
   args: string[];
   logFile: string | null;
   entryPoints: string[];
+  metricMonitors: Array<{ name: string; command: string; nameSuffix?: boolean }>;
+  metricReadings: Array<{
+    name: string;
+    command: string;
+    nameSuffix?: boolean;
+    value: string | null;
+    status: "idle" | "ok" | "error";
+    updatedAt: string | null;
+    error: string | null;
+  }>;
   cwd: string;
   pid: number | null;
   status: "starting" | "running" | "exited" | "stopped" | "error";
@@ -255,6 +265,13 @@ export class EventStore {
 
   setSelectedSessionSnapshot(selectedSessionSnapshot: unknown | null) {
     this.state = { ...this.state, selectedSessionSnapshot };
+    this.emitChange();
+  }
+
+  removeWaitSubscription(subscriptionId: string) {
+    const waitSubscriptions = this.state.waitSubscriptions.filter((subscription) => subscription.id !== subscriptionId);
+    if (waitSubscriptions.length === this.state.waitSubscriptions.length) return;
+    this.state = { ...this.state, waitSubscriptions };
     this.emitChange();
   }
 

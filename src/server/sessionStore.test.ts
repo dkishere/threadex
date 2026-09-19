@@ -2116,6 +2116,15 @@ test("auto model starts at Luna high, allows jumps, and rejects downgrades", asy
       /cannot downgrade/i
     );
 
+    const astra = await store.upgradeSessionAutoModel({ sessionId: "session-1", model: "gpt-6-astra", effort: "ultra" });
+    assert.equal(astra.model, "gpt-6-astra");
+    await assert.rejects(store.upgradeSessionAutoModel({ sessionId: "session-1", model: "gpt-5.6-sol", effort: "ultra" }), /cannot downgrade/i);
+    const nextTurn = await store.selectSessionAutoModel({ sessionId: "session-1", model: "gpt-5.6-luna", effort: "low" });
+    assert.equal(nextTurn.model, "gpt-5.6-luna");
+    assert.equal(nextTurn.effort, "low");
+    assert.equal(nextTurn.revision, astra.revision + 1);
+    await assert.rejects(store.selectSessionAutoModel({ sessionId: "session-1", model: "unknown", effort: "low" }), /Invalid/);
+
     await store.setSessionAutoModelEnabled("session-1", false);
     const restarted = await store.setSessionAutoModelEnabled("session-1", true);
     assert.equal(restarted.model, "gpt-5.6-luna");
@@ -2183,6 +2192,17 @@ test("session model preferences persist the selected gear state", async () => {
     assert.deepEqual(restored.gearProfiles, sixGears);
     assert.equal(restored.selectedModel, "gpt-5.6-luna");
     assert.equal(restored.selectedEffort, "low");
+    const auto = await store.setSessionModelPreferences("session-1", {
+      gearProfiles: sixGears.map((profile, index) => index === 5 ? { model: "auto", effort: "high" } : profile),
+      activeGearIndex: 5
+    });
+    assert.equal(auto.gearProfiles.length, 6);
+    assert.equal(auto.activeGearIndex, 5);
+    assert.equal(auto.selectedModel, "auto");
+    const migrated = await store.setSessionModelPreferences("session-1", {
+      gearProfiles: [...sixGears, { model: "auto", effort: "high" }]
+    });
+    assert.deepEqual(migrated.gearProfiles, sixGears);
   } finally {
     await store.close();
   }

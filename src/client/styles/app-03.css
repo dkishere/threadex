@@ -698,6 +698,73 @@
   box-shadow: 0 1px 2px rgb(15 23 42 / 4%);
 }
 
+.auto-model-settings {
+  width: 100%;
+  max-width: 920px;
+  margin: 0 auto;
+}
+
+.auto-model-settings-card {
+  display: grid;
+  gap: 12px;
+  padding: 20px 22px 22px;
+  color: #475569;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.auto-model-settings-card h3 {
+  margin: 0;
+  color: #18181b;
+  font-size: 16px;
+  line-height: 1.3;
+}
+
+.auto-model-settings-card p {
+  margin: 0;
+}
+
+.auto-model-settings-card .account-login-form {
+  gap: 10px;
+  padding: 4px 0 0;
+}
+
+.auto-model-settings-card .account-login-form > p {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.auto-model-settings-card .account-login-actions {
+  justify-content: flex-start;
+  padding-top: 2px;
+}
+
+.auto-model-settings-card .account-login-actions .secondary {
+  width: auto;
+  min-width: 104px;
+  padding: 0 14px;
+}
+
+.auto-model-settings-card .account-login-actions .primary {
+  min-width: 104px;
+}
+
+.auto-model-settings-card [role="alert"] {
+  border: 1px solid #fecaca;
+  border-radius: 7px;
+  padding: 9px 11px;
+  background: #fff7f7;
+  color: #b91c1c;
+}
+
+.auto-model-settings-card [role="status"] {
+  border: 1px solid #bbf7d0;
+  border-radius: 7px;
+  padding: 9px 11px;
+  background: #f0fdf4;
+  color: #166534;
+}
+
 .settings-card-header {
   min-height: 68px;
   border-bottom: 1px solid #e4e4e7;

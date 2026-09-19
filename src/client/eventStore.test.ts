@@ -95,3 +95,14 @@ test("identical session pages do not notify full-state subscribers", () => {
   store.setSessionPage({ ...page, sessions: [{ id: "session-one", title: "One" }] });
   assert.equal(stateNotifications, 1);
 });
+
+test("removing a wait subscription updates the local view without a poll", () => {
+  const store = new EventStore();
+  store.setWorkspaceSnapshot({ waitSubscriptions: [{ id: "remove-now" }, { id: "keep" }] }, {
+    sessions: [], offset: 0, limit: 20, hasMore: false, nextOffset: null, projects: []
+  }, null, 0);
+
+  store.removeWaitSubscription("remove-now");
+
+  assert.deepEqual(store.getState().waitSubscriptions.map((subscription) => subscription.id), ["keep"]);
+});

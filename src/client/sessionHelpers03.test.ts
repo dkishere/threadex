@@ -73,7 +73,9 @@ test("session snapshots carry per-turn run metadata onto the prompt", () => {
     model: "gpt-5.6-terra",
     reasoningEffort: "xhigh",
     tokenIn: 1_250,
+    usageSample: { cachedInputTokens: 900 },
     tokenOut: 375,
+    autoModelProvider: "typesafe",
     status: "done",
     created: "2026-08-25T10:00:00.000Z"
   }], "Run metadata", [], undefined);
@@ -83,16 +85,22 @@ test("session snapshots carry per-turn run metadata onto the prompt", () => {
     model: prompt?.model,
     reasoningEffort: prompt?.reasoningEffort,
     tokenIn: prompt?.tokenIn,
+    cachedInputTokens: prompt?.cachedInputTokens,
     tokenOut: prompt?.tokenOut,
     executionDurationMs: prompt?.executionDurationMs,
-    turnStatus: prompt?.turnStatus
+    turnStatus: prompt?.turnStatus,
+    autoModel: prompt?.autoModel,
+    autoModelProvider: prompt?.autoModelProvider
   }, {
     model: "gpt-5.6-terra",
     reasoningEffort: "xhigh",
     tokenIn: 1_250,
+    cachedInputTokens: 900,
     tokenOut: 375,
     executionDurationMs: 3_750,
-    turnStatus: "done"
+    turnStatus: "done",
+    autoModel: true,
+    autoModelProvider: "typesafe"
   });
 });
 

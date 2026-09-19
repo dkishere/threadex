@@ -1,8 +1,13 @@
 import { USER_INPUT_METHOD, inputResponse } from "../userInputRequest";
+import { isAutoModel, isAutoEffort } from "../autoModelCatalog";
+import { buildAutoModelState, selectAutoModel } from "./autoModelSelector";
+import { AutoModelSettings, createAutoModelSettingsRouter } from "./autoModelSettings";
+import { RunnerProcessRegistry } from "./runnerProcessRegistry";
 import { createTurnGrillHandler } from "./turnGrillRoute";
 import { reviseOutcomePlan } from "./lightweightTodo";
 import express from "express";
 import { createSecurity } from "./security";
+import { createQuickChatRouter } from "./quickChatRoute";
 import type { Request, Response } from "express";
 import { buildCodexReference } from "../codexReference.js";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
@@ -704,7 +709,6 @@ const pendingAccountLogins = new Map<string, PendingAccountLogin>();
 const runnerSwitchReplayAttempts = new Map<string, number>();
 const backgroundRunningTurnDiagnostics = new Set<string>();
 const port = Number(process.env.PORT ?? 8787);
-const clientPort = Number(process.env.CLIENT_PORT ?? 5173);
 const serverMonitorStartedAt = new Date().toISOString();
 const serverUrl = process.env.RUNNER_SERVER_URL ?? `http://127.0.0.1:${port}`;
 const runnerPollMs = Number(process.env.RUNNER_LOG_POLL_MS ?? 250);
@@ -752,6 +756,7 @@ const duckDbUiPort = parsePort(process.env.DUCKDB_UI_PORT, 4213);
 const serverDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(serverDir, "../..");
 const dataDir = resolve(process.env.SESSION_DATA_DIR ?? resolve(projectRoot, "data"));
+const autoModelSettings = new AutoModelSettings(resolve(dataDir, "typesafe-api-key"));
 const runnerPath = resolve(serverDir, "promptRunner.ts");
 const tsxPath = resolve(projectRoot, "node_modules/tsx/dist/cli.mjs");
 const runnerJobDir = resolve(dataDir, "runner-jobs");
@@ -790,6 +795,7 @@ const sessionSummarizerEnabled = !["0", "false"].includes(
 );
 const autoLoadBalanceWorkspaceIds = new Set<string>();
 const pendingTurnTimers = new Map<string, NodeJS.Timeout>();
+const runnerProcesses = new RunnerProcessRegistry(terminateRunnerProcess);
 const pendingTurnRuns = new Set<string>();
 const pendingRetryFallbackMs = parseDurationMs(
   process.env.PENDING_RETRY_FALLBACK_MS,
@@ -816,6 +822,8 @@ let shuttingDown = false;
 
 app.use("/api", createSecurity(resolve(dataDir, "security.json")));
 app.use(express.json({ limit: "32mb" }));
+app.use("/api/settings/auto-model", createAutoModelSettingsRouter(autoModelSettings));
+app.use("/api/quick-chat", createQuickChatRouter(resolve(dataDir, "quick-chat-sessions.json")));
 app.use(express.static(resolve(projectRoot, "dist"), { index: "index.html" }));
 
 app.get("/api/browser-context/value-mappings", async (req, res) => {
@@ -1054,7 +1062,7 @@ app.delete("/api/wait-subscriptions/:subscriptionId", async (
       return;
     }
     const subscription = await waitEvents.cancelSubscription(subscriptionId);
-    res.json({ ok: true, subscription });
+    res.json({ ok: true, cancelled: subscription.status === "cancelled", subscription });
   } catch (error) {
     res.status(400).json({ error: errorMessage(error) });
   }
@@ -1126,7 +1134,7 @@ app.post(
       res.status(201).json({ monitor, waitEvent });
     } catch (error) {
       const message = errorMessage(error);
-      res.status(message.includes("required") || message.includes("requires") || message.includes("exactly one") || message.includes("inside") || message.includes("between") || message.includes("session") || message.includes("entryPoint") || message.includes("dockerImage") || message.includes("Docker image") || message.includes("logFile") ? 400 : 500).json({ error: message });
+      res.status(message.includes("required") || message.includes("requires") || message.includes("exactly one") || message.includes("inside") || message.includes("between") || message.includes("session") || message.includes("entryPoint") || message.includes("dockerImage") || message.includes("Docker image") || message.includes("logFile") || message.includes("metrics") || message.includes("Metric") ? 400 : 500).json({ error: message });
     }
   }
 );
@@ -3023,11 +3031,12 @@ async function getSessionSnapshot(session: SessionRecord, replayRunningTurns = f
       }
     }
   }
-  const [liveItemsByTurn, approvalLiveItemsByTurn, developerInstructionsByTurn, steerMessagesByTurn, autoModel, modelPreferences] = await Promise.all([
+  const [liveItemsByTurn, approvalLiveItemsByTurn, developerInstructionsByTurn, steerMessagesByTurn, autoModelProvidersByTurn, autoModel, modelPreferences] = await Promise.all([
     sessionStore.listSessionLiveItems(session.id),
     sessionStore.listSessionApprovalLiveItems(session.id),
     sessionStore.listSessionDeveloperInstructions(session.id),
     sessionStore.listSessionSteerMessages(session.id),
+    sessionStore.listSessionAutoModelProviders(session.id),
     sessionStore.getSessionAutoModel(session.id),
     sessionStore.getWorkspaceModelPreferences(session.workspaceId)
   ]);
@@ -3046,7 +3055,8 @@ async function getSessionSnapshot(session: SessionRecord, replayRunningTurns = f
         ...(pendingApprovalItemsByTurn[turn.id] ?? [])
       ]),
       developerInstructions: developerInstructionsByTurn[turn.id] ?? [],
-      steerMessages: steerMessagesByTurn[turn.id] ?? []
+      steerMessages: steerMessagesByTurn[turn.id] ?? [],
+      autoModelProvider: autoModelProvidersByTurn[turn.id]
     }))
   };
 }
@@ -3142,15 +3152,10 @@ async function isThreadexProcessWorkspace(workspace: WorkspaceRecord) {
 
 async function virtualProcessMonitors(workspace: WorkspaceRecord): Promise<VirtualProcessMonitor[]> {
   const serverAction = serverRestartAction();
-  const clientAction = clientRestartAction();
   return [
     {
       monitor: readOnlyServerProcessMonitor(workspace, serverAction !== null),
       restartAction: serverAction
-    },
-    {
-      monitor: await readOnlyClientProcessMonitor(workspace, clientAction !== null),
-      restartAction: clientAction
     }
   ];
 }
@@ -3167,6 +3172,8 @@ function readOnlyServerProcessMonitor(workspace: WorkspaceRecord, restartable: b
     args: [...process.execArgv, ...process.argv.slice(1)],
     logFile: supervisorLogPath("server"),
     entryPoints: [`http://localhost:${port}/`],
+    metricMonitors: [],
+    metricReadings: [],
     cwd: process.cwd(),
     pid: process.pid,
     status: "running",
@@ -3200,50 +3207,7 @@ function serverRestartAction(): VirtualProcessRestartAction | null {
   return null;
 }
 
-function clientRestartAction(): VirtualProcessRestartAction | null {
-  const vitePid = listeningProcessPid(clientPort);
-  // The PID file is only a fallback for a client that is already down. While
-  // Vite is listening, its direct parent and command line identify the one
-  // supervisor that actually owns this instance. This avoids signaling a
-  // stale but still-live watcher left over from an earlier dev session.
-  const supervisorPid = vitePid === null
-    ? readClientSupervisorPid()
-    : clientSupervisorPidForVite(vitePid);
-  if (supervisorPid !== null) {
-    writeSupervisorPid("client", supervisorPid);
-    return { kind: "signal", pid: supervisorPid, signal: "SIGUSR1" };
-  }
-  if (vitePid === null) return null;
-  return {
-    kind: "command",
-    executable: process.execPath,
-    args: [resolve(projectRoot, "scripts/watch-client.mjs")],
-    cwd: projectRoot,
-    stopPid: vitePid
-  };
-}
-
-function clientSupervisorPidForVite(vitePid: number) {
-  const parentPid = processParentPid(vitePid);
-  return isClientSupervisor(parentPid) ? parentPid : null;
-}
-
-function readClientSupervisorPid() {
-  const pid = readSupervisorPid("client");
-  return isClientSupervisor(pid) ? pid : null;
-}
-
-function isClientSupervisor(pid: number | null) {
-  if (pid === null) return false;
-  const command = processCommand(pid);
-  if (command === null) return false;
-  const [executable, script, ...extraArgs] = command.trim().split(/\s+/);
-  return extraArgs.length === 0
-    && basename(executable) === "node"
-    && resolve(projectRoot, script) === resolve(projectRoot, "scripts/watch-client.mjs");
-}
-
-function readSupervisorPid(key: "server" | "client") {
+function readSupervisorPid(key: "server") {
   const path = resolve(dataDir, "process-supervisors", `${key}.pid`);
   try {
     const pid = Number(readFileSync(path, "utf8").trim());
@@ -3253,13 +3217,13 @@ function readSupervisorPid(key: "server" | "client") {
   }
 }
 
-function writeSupervisorPid(key: "server" | "client", pid: number) {
+function writeSupervisorPid(key: "server", pid: number) {
   const path = resolve(dataDir, "process-supervisors", `${key}.pid`);
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, `${pid}\n`, "utf8");
 }
 
-function supervisorLogPath(key: "server" | "client") {
+function supervisorLogPath(key: "server") {
   return resolve(dataDir, "process-supervisors", `${key}.log`);
 }
 
@@ -3284,31 +3248,6 @@ function legacyWatchServerParentPid() {
 
 function serverEntryPath() {
   return resolve(projectRoot, "src/server/index.ts");
-}
-
-function listeningProcessPid(port: number) {
-  try {
-    const output = execFileSync("lsof", ["-nP", "-ti", `TCP:${port}`, "-sTCP:LISTEN"], {
-      encoding: "utf8",
-      timeout: 1_000
-    });
-    const pid = Number(output.split(/\s+/).find(Boolean));
-    return isLiveProcess(pid) ? pid : null;
-  } catch {
-    return null;
-  }
-}
-
-function processParentPid(pid: number) {
-  try {
-    const parentPid = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], {
-      encoding: "utf8",
-      timeout: 1_000
-    }).trim());
-    return isLiveProcess(parentPid) ? parentPid : null;
-  } catch {
-    return null;
-  }
 }
 
 function processCommand(pid: number) {
@@ -3386,64 +3325,6 @@ function isLiveProcess(pid: number) {
   } catch {
     return false;
   }
-}
-
-async function readOnlyClientProcessMonitor(workspace: WorkspaceRecord, restartable: boolean): Promise<ProcessMonitorRecord> {
-  const running = await isViteClientRunning();
-  const checkedAt = new Date().toISOString();
-  return {
-    id: "builtin_threadex-client",
-    workspaceId: workspace.id,
-    label: "threadex-client",
-    command: null,
-    executable: "node",
-    dockerImage: null,
-    dockerRunArgs: [],
-    args: ["node_modules/vite/bin/vite.js", "--host", "0.0.0.0", "--port", String(clientPort)],
-    logFile: supervisorLogPath("client"),
-    entryPoints: [`http://localhost:${clientPort}/`],
-    cwd: workspace.cwd,
-    pid: null,
-    status: running ? "running" : "exited",
-    managed: false,
-    readOnly: true,
-    restartable,
-    removeOnExit: false,
-    wakePrompt: null,
-    wakeSessionId: null,
-    wakeThreadId: null,
-    timeoutAt: null,
-    wakeStatus: "none",
-    wakeError: null,
-    wokenAt: null,
-    startedAt: null,
-    lastExitCode: null,
-    lastSignal: null,
-    error: running ? null : `Vite client is not responding on port ${clientPort}.`,
-    created: serverMonitorStartedAt,
-    updated: checkedAt
-  };
-}
-
-let viteClientHealth: { checkedAt: number; running: boolean } | null = null;
-
-async function isViteClientRunning() {
-  const now = Date.now();
-  if (viteClientHealth && now - viteClientHealth.checkedAt < 1_000) {
-    return viteClientHealth.running;
-  }
-  let running = false;
-  try {
-    const response = await fetch(`http://127.0.0.1:${clientPort}/@vite/client`, {
-      method: "HEAD",
-      signal: AbortSignal.timeout(500)
-    });
-    running = response.ok && response.headers.get("content-type")?.includes("javascript") === true;
-  } catch {
-    running = false;
-  }
-  viteClientHealth = { checkedAt: now, running };
-  return running;
 }
 
 app.post("/api/sessions/switch", async (req: Request<object, object, SwitchSessionRequest>, res: Response) => {
@@ -4491,9 +4372,10 @@ app.post("/api/runner/stop", async (req: Request<object, object, RunnerStopReque
       : buildRunnerStopEntries(turn, message);
     // A cancellation result schedules the next Todo, so signal this runner
     // first and release the session only afterwards.
-    const killedBeforeUpdate = cancellingStartedTodo
-      ? terminateRunnerProcess(turn.runnerPid)
-      : false;
+    // Resolve ownership from the current attempt, not the PID snapshot read
+    // before Stop. It may have been spawned/attached during the awaits above.
+    // Latch cancellation during startup before publishing a terminal state.
+    const killedBeforeUpdate = runnerProcesses.stop(turn.runnerLogPath, turn.runnerPid);
     if (turn.runnerLogPath) {
       appendRunnerLogEntries(turn.runnerLogPath, stopEntries);
     }
@@ -4505,9 +4387,7 @@ app.post("/api/runner/stop", async (req: Request<object, object, RunnerStopReque
       );
     }
 
-    const killed = cancellingStartedTodo
-      ? killedBeforeUpdate
-      : terminateRunnerProcess(turn.runnerPid);
+    const killed = runnerProcesses.stop(turn.runnerLogPath, turn.runnerPid) || killedBeforeUpdate;
     res.json({
       ok: true,
       stopped: true,
@@ -5326,9 +5206,31 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
       accountExternalUserId: session.accountExternalUserId
     });
 
-    const autoModel = retryPending
+    let autoModel = retryPending
       ? await sessionStore.getSessionAutoModel(session.id)
       : await sessionStore.setSessionAutoModelEnabled(session.id, chatRequest.autoModel === true);
+    const recoverySession = await sessionStore.getSession(session.id);
+    const recoveryTurns = recoverySession ? await sessionStore.listSessionTurns(session.id) : [];
+    const typeSafeApiKey = autoModel.enabled ? autoModelSettings.apiKey() : undefined;
+    if (autoModel.enabled && recoverySession) {
+      const selection = await selectAutoModel({
+        state: buildAutoModelState({
+          prompt: messageForStorage,
+          session: recoverySession,
+          turns: recoveryTurns,
+          currentTurnId: turnId,
+          liveItemsByTurn: await sessionStore.listSessionLiveItems(session.id)
+        }),
+        apiKey: typeSafeApiKey,
+        fallback: autoModel
+      });
+      if (selection.provider === "typesafe") {
+        autoModel = await sessionStore.selectSessionAutoModel({ sessionId: session.id, model: selection.model, effort: selection.effort });
+      }
+      const selectionEvent = { ...selection, ...autoModel, turnId };
+      await sessionStore.recordSessionTurnEvent({ sessionId: session.id, turnId, eventName: "auto_model.selected", payload: selectionEvent });
+      emit(res, "auto_model.selected", selectionEvent);
+    }
     await sessionStore.setWorkspaceModelPreferences(
       session.workspaceId,
       chatRequest.modelPreferences ?? {}
@@ -5357,8 +5259,6 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
       }
     }]);
 
-    const recoverySession = await sessionStore.getSession(session.id);
-    const recoveryTurns = recoverySession ? await sessionStore.listSessionTurns(session.id) : [];
     const recoveryContext = recoverySession
       ? buildSessionRecoveryContext({
           session: recoverySession,
@@ -6788,6 +6688,19 @@ async function appendSessionTurnPromptLog(
 }
 
 async function spawnPromptRunner(job: RunnerJob): Promise<ChildProcess> {
+  const ownership = runnerProcesses.begin(job.logPath);
+  try {
+    return await spawnOwnedPromptRunner(job, ownership);
+  } catch (error) {
+    ownership.dispose();
+    throw error;
+  }
+}
+
+async function spawnOwnedPromptRunner(
+  job: RunnerJob,
+  ownership: ReturnType<RunnerProcessRegistry["begin"]>
+): Promise<ChildProcess> {
   mkdirSync(runnerJobDir, { recursive: true });
   mkdirSync(runnerLogDir, { recursive: true });
   mkdirSync(pendingRunnerLogDir, { recursive: true });
@@ -6821,6 +6734,9 @@ async function spawnPromptRunner(job: RunnerJob): Promise<ChildProcess> {
       },
       stdio: ["ignore", stdoutFd, stderrFd]
     });
+    ownership.attach(child.pid ?? null);
+    child.once("exit", ownership.dispose);
+    child.once("error", ownership.dispose);
     child.unref();
     return child;
   } finally {
@@ -8198,16 +8114,12 @@ function normalizeReasoningEffort(value: unknown): "minimal" | "low" | "medium" 
     : undefined;
 }
 
-function normalizeAutoModel(value: unknown): "gpt-5.6-luna" | "gpt-5.6-terra" | "gpt-5.6-sol" | undefined {
-  return value === "gpt-5.6-luna" || value === "gpt-5.6-terra" || value === "gpt-5.6-sol"
-    ? value
-    : undefined;
+function normalizeAutoModel(value: unknown) {
+  return isAutoModel(value) ? value : undefined;
 }
 
-function normalizeAutoEffort(value: unknown): "low" | "medium" | "high" | "xhigh" | undefined {
-  return value === "low" || value === "medium" || value === "high" || value === "xhigh"
-    ? value
-    : undefined;
+function normalizeAutoEffort(value: unknown) {
+  return isAutoEffort(value) ? value : undefined;
 }
 
 function safePathSegment(value: string) {
