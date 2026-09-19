@@ -63,6 +63,8 @@ import {
 } from "./sessionStore";
 import { ProcessMonitorService, type AdoptProcessMonitorInput, type MonitorProcessInput } from "./processMonitor";
 import { WaitEventService } from "./waitEvent";
+import { runnerFileName } from "./runnerFileName";
+import { steerProcessWake } from "./processWakeDelivery";
 import { chooseLoadBalancedAccount } from "./accountPicker";
 import { shouldChooseAccountForNewLoadBalancedThread } from "./loadBalanceRouting";
 import { agentCliExecutable, createEphemeralAgentHome, defaultAgentHomeCandidates, runAgentCliExec, trimAgentCliOutput } from "./agentCli";
@@ -112,7 +114,6 @@ import {
 import { DEFAULT_TURN_RING_MAX_BYTES, TurnRingLog } from "./turnRingLog";
 import { EventRingLog, type RingEvent } from "./eventRingLog";
 import { canInlineWorkspaceFile, resolveWorkspaceFilePath } from "./workspaceFiles";
-import { captureTurnGitBaseline, compactTurnGitBaseline } from "./turnGitPatch";
 import { runnerStartupIsWithinGrace } from "./runnerWatchdog";
 import {
   collectSessionReviewChanges,
@@ -135,9 +136,9 @@ import {
   readAppServerThread,
   subagentThreadBelongsToRoot
 } from "./subagentTranscript";
+import { RunnerUpdateQueue } from "./runnerUpdateQueue";
 import {
-  drainRunnerLogEntries,
-  initialRunnerLogReadState,
+  RunnerLogReplay,
   shouldRefreshRunnerHeartbeat,
   type RunnerLogApplicationMode
 } from "./runnerLogReader";
@@ -824,7 +825,10 @@ let eventPollSupplementInFlight: {
   workspaceId: string;
   promise: Promise<{ statusMonitor: WorkspaceMonitorStatus[]; processMonitors: ProcessMonitorRecord[] }>;
 } | null = null;
-let runnerUpdateQueue = Promise.resolve();
+const runnerUpdateQueue = new RunnerUpdateQueue();
+const runnerLogReplay = new RunnerLogReplay();
+const runnerDiagnoses = new Map<string, Promise<boolean>>();
+let watchdogRunning = false;
 let duckDbUiAssetServer: ChildProcess | null = null;
 let accountQuotaRefreshTimer: NodeJS.Timeout | null = null;
 let accountQuotaRefreshInFlight = false;
@@ -2432,7 +2436,10 @@ app.get("/api/workspaces/html/:workspaceId/:sessionId/:kind/*filePath", async (r
       res.status(403).send("File resolves outside the allowed directories.");
       return;
     }
-    const previewUrl = createHtmlPreviewUrl(realPath);
+    // Project previews preserve relative paths for sibling image dependencies.
+    // Temporary previews retain their existing directory scope.
+    const previewUrl = resolveWorkspaceFilePath(realpathSync(root), realPath)
+      ? createHtmlPreviewUrl(realPath, realpathSync(root)) : createHtmlPreviewUrl(realPath);
     if (req.query.format === "json") {
       res.json({ url: previewUrl });
       return;
@@ -5106,7 +5113,7 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
     const todoPlanClarificationPending = false;
     const forcePlanForTurn = false;
     const turnId = requestedTurnId ?? crypto.randomUUID();
-    const runnerAttemptId = pendingTurn ? `${turnId}.${crypto.randomUUID()}` : turnId;
+    const runnerAttemptId = runnerFileName(pendingTurn ? `${turnId}.${crypto.randomUUID()}` : turnId);
     const logPath = resolve(runnerLogDir, `${runnerAttemptId}.ndjson`);
     const pendingLogPath = resolve(pendingRunnerLogDir, `${runnerAttemptId}.ndjson`);
     const attachments = pendingTurn ? [] : saveUploadedAttachments(uploadDir, turnId, chatRequest.attachments);
@@ -5408,11 +5415,6 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
     };
 
     await waitForAccountQuotaRefresh(session.accountId);
-    try {
-      captureTurnGitBaseline(dataDir, turnId, session.cwd);
-    } catch (error) {
-      console.warn(`${session.id}: Could not capture shadow Git baseline for turn review: ${errorMessage(error)}`);
-    }
 
     // Stop can arrive while a claimed turn is waiting for quota/account setup.
     // Do not spawn a runner after that stop has already made the turn terminal.
@@ -5501,7 +5503,9 @@ let webVsCodeProcess: ChildProcess | null = null;
 void startApiServer();
 
 const watchdog = setInterval(() => {
-  void checkRunningTurns();
+  if (watchdogRunning) return;
+  watchdogRunning = true;
+  void checkRunningTurns().finally(() => { watchdogRunning = false; });
 }, runnerWatchdogMs);
 watchdog.unref();
 
@@ -6459,6 +6463,14 @@ async function dispatchWaitSubscription(subscription: WaitSubscriptionRecord, ev
   const payload = readObject(subscription.actionPayload);
   const message = readString(payload?.message)?.trim();
   if (!message) throw new Error("enqueue_prompt subscription requires actionPayload.message.");
+  if (event.topic === "process.exited" && await steerProcessWake(subscription.sessionId, message, {
+    runningTurnId: async (sessionId) => (await sessionStore.getLatestRunningTurn(sessionId))?.id ?? null,
+    steer: (input) => fetch(`${serverUrl.replace(/\/$/, "")}/api/runner/steer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input)
+    })
+  })) return;
   const response = await fetch(`${serverUrl.replace(/\/$/, "")}/api/pending-turns`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -6774,9 +6786,10 @@ async function spawnOwnedPromptRunner(
     ...job,
     codexHome: await prepareRunnerCodexHome(job)
   };
-  const jobPath = resolve(runnerJobDir, `${job.turnId}.json`);
-  const stdoutPath = resolve(runnerLogDir, `${job.turnId}.stdout.log`);
-  const stderrPath = resolve(runnerLogDir, `${job.turnId}.stderr.log`);
+  const fileName = runnerFileName(job.turnId);
+  const jobPath = resolve(runnerJobDir, `${fileName}.json`);
+  const stdoutPath = resolve(runnerLogDir, `${fileName}.stdout.log`);
+  const stderrPath = resolve(runnerLogDir, `${fileName}.stderr.log`);
   writeFileSync(jobPath, JSON.stringify(runnerJob, null, 2), "utf8");
 
   const stdoutFd = openSync(stdoutPath, "a");
@@ -8225,13 +8238,11 @@ async function processRunnerUpdate(
   update: Required<Pick<RunnerUpdateRequest, "id" | "sessionId" | "turnId" | "event">> & RunnerUpdateRequest,
   options: { refreshRunnerHeartbeat?: boolean } = {}
 ) {
-  const next = runnerUpdateQueue.then(async () => {
+  await runnerUpdateQueue.run(update.id, async () => {
     const stateApplied = await applyRunnerUpdate(update, options);
     await appendRunnerResponseToTurnLog(update, stateApplied);
     await publishRunnerUpdateEvent(update);
   });
-  runnerUpdateQueue = next.catch(() => undefined);
-  await next;
 }
 
 async function appendRunnerResponseToTurnLog(
@@ -8381,21 +8392,6 @@ async function applyRunnerUpdate(
   }
 
   if (update.event === "result") {
-    // Capture original review content before releasing this turn's writer slot.
-    try {
-      const turn = await sessionStore.getSessionTurn(update.turnId);
-      const session = await sessionStore.getSession(update.sessionId);
-      if (turn?.status === "running" && session && (!update.logPath || turn.runnerLogPath === update.logPath)) {
-        const items = await sessionStore.listSessionLiveItems(update.sessionId);
-        const paths = collectTurnReviewChanges(items[update.turnId] ?? []).flatMap((change) => {
-          const path = readObject(change)?.path;
-          return typeof path === "string" ? [path] : [];
-        });
-        compactTurnGitBaseline(dataDir, update.turnId, session.cwd, paths);
-      }
-    } catch (error) {
-      console.warn(`Retaining turn baseline ${update.turnId}: ${errorMessage(error)}`);
-    }
     const completed = await sessionStore.updateSessionTurn({
       id: update.turnId,
       agentResponse: objectString(update.data, "reply") ?? "Turn completed without a final agent message.",
@@ -9408,6 +9404,7 @@ async function applyRunnerLogEntry(
   try {
     await processRunnerUpdate({
       id: entry.id,
+      ts: entry.ts,
       sessionId: entry.sessionId,
       turnId: entry.turnId,
       event: entry.event,
@@ -9547,6 +9544,16 @@ async function releaseDeadRunningTurnsForDisplay(source: string) {
 }
 
 async function diagnoseRunningTurn(turn: SessionTurnRecord, source: string, now = Date.now()) {
+  const pending = runnerDiagnoses.get(turn.id);
+  if (pending) return pending;
+  const operation = diagnoseRunningTurnOnce(turn, source, now).finally(() => {
+    runnerDiagnoses.delete(turn.id);
+  });
+  runnerDiagnoses.set(turn.id, operation);
+  return operation;
+}
+
+async function diagnoseRunningTurnOnce(turn: SessionTurnRecord, source: string, now: number) {
   const replayedTerminal = await replayRunnerLogForTurn(turn);
   if (replayedTerminal) {
     return true;
@@ -9764,9 +9771,8 @@ async function replayRunnerLogForTurn(turn: SessionTurnRecord) {
   }
 
   let terminal = false;
-  await drainRunnerLogEntries(
+  await runnerLogReplay.replay(
     turn.runnerLogPath,
-    initialRunnerLogReadState(),
     async (entries) => {
       for (const entry of entries) {
         await applyRunnerLogEntry(entry, turn.runnerLogPath ?? "", "replay");

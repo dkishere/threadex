@@ -165,6 +165,7 @@ export function SideChatPanel({ codexSessionId, sessionId, sessionReady, workspa
   }
 
   function handleKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       void submit();

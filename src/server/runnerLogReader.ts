@@ -46,6 +46,46 @@ export function initialRunnerLogReadState(): RunnerLogReadState {
   return { offset: 0, buffer: "", jsonlIndex: 0 };
 }
 
+/** Keep watchdog recovery incremental, including when status requests overlap. */
+export class RunnerLogReplay {
+  private states = new Map<string, RunnerLogReadState>();
+  private pending = new Map<string, Promise<void>>();
+
+  replay(logPath: string, onEntries: RunnerLogEntriesCallback): Promise<void> {
+    const pending = this.pending.get(logPath);
+    if (pending) return pending;
+    const operation = this.drain(logPath, onEntries).finally(() => {
+      this.pending.delete(logPath);
+    });
+    this.pending.set(logPath, operation);
+    return operation;
+  }
+
+  private async drain(logPath: string, onEntries: RunnerLogEntriesCallback) {
+    let state = this.states.get(logPath) ?? initialRunnerLogReadState();
+    if (existsSync(logPath) && statSync(logPath).size < state.offset) {
+      state = initialRunnerLogReadState();
+    }
+    // Bound each pass to the bytes present at its start so a busy runner cannot
+    // keep a watchdog pass alive indefinitely.
+    const end = existsSync(logPath) ? statSync(logPath).size : 0;
+    while (state.offset < end) {
+      const result = readNewRunnerEntries(logPath, state.offset, state.buffer, state.jsonlIndex);
+      if (result.offset === state.offset) break;
+      if (result.items.length) await onEntries(result.items);
+      state = { offset: result.offset, buffer: result.buffer, jsonlIndex: result.jsonlIndex };
+      this.states.delete(logPath);
+      this.states.set(logPath, state);
+    }
+    // Retain recent completed logs too: late status requests must not restart
+    // their replay. Never evict a log while another pass is processing it.
+    for (const path of this.states.keys()) {
+      if (this.states.size <= 256) break;
+      if (!this.pending.has(path) && path !== logPath) this.states.delete(path);
+    }
+  }
+}
+
 export function readNewRunnerEntries(
   logPath: string,
   offset: number,

@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { Menu, PanelLeft, PanelLeftClose, PanelRightClose, PanelRightOpen, X } from "lucide-react";
 import "./styles/responsive.css";
+import { TaskNotifications } from "./TaskNotifications";
 
 const noopRunningSessionCount = () => undefined;
 const RunningSessionCountContext = createContext<(count: number) => void>(noopRunningSessionCount);
@@ -88,6 +89,7 @@ export function ResponsiveLayout({ children }: { children: ReactNode }) {
         </button>
         {!compact && <button className="layout-left-toggle" aria-label="Toggle sessions panel" aria-expanded={leftOpen} onClick={() => { setLeftOpen(!leftOpen); setMenuOpen(false); }} title="Sessions">{leftOpen ? <PanelLeftClose /> : <PanelLeft />}</button>}
         <button aria-label="Toggle middle panel" aria-expanded={middleOpen} onClick={() => setMiddleOpen(!middleOpen)} title="Sessions / Turns / Plan / Side chat">{middleOpen ? <PanelRightClose /> : <PanelRightOpen />}</button>
+        <TaskNotifications runningCount={runningSessionCount} />
       </div>
       {menuOpen && <button className="layout-backdrop" aria-label="Close navigation" onClick={() => { setMenuOpen(false); controls.current?.querySelector<HTMLButtonElement>(".layout-menu-toggle")?.focus(); }} />}
       <CompactLayoutContext.Provider value={compact}>

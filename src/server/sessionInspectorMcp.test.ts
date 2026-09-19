@@ -651,7 +651,13 @@ test("an explicit context fork keeps create_task available when planner metadata
   }
 });
 
-test("prompt_session queues a normal pending turn when the target session is running", async () => {
+for (const running of [false, true]) {
+for (const policy of [
+  { parent: "granular", explicit: undefined, expected: "granular" },
+  { parent: "granular", explicit: "on-request", expected: "on-request" },
+  { parent: "", explicit: undefined, expected: undefined }
+]) {
+test(`prompt_session ${running ? "queues" : "starts"} with parent=${policy.parent} explicit=${policy.explicit}`, { timeout: 15_000 }, async () => {
   const received: Array<{ url: string | undefined; body: Record<string, unknown> }> = [];
   const server = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
@@ -665,9 +671,15 @@ test("prompt_session queues a normal pending turn when the target session is run
       response.writeHead(200, { "Content-Type": "application/json" });
       response.end(JSON.stringify({
         session: { id: "local_target-1", workspaceId: "default", threadId: "thread-target-1" },
-        turns: [{ id: "running-turn-1", status: "running" }],
+        turns: running ? [{ id: "running-turn-1", status: "running" }] : [],
         turnPage: { total: 1, limit: 1, offset: 0, hasMore: false }
       }));
+      return;
+    }
+
+    if (request.method === "POST" && request.url === "/api/chat") {
+      response.writeHead(200, { "Content-Type": "text/event-stream" });
+      response.end('event: result\ndata: {"sessionId":"local_target-1","reply":"Done"}\n\n');
       return;
     }
 
@@ -691,7 +703,10 @@ test("prompt_session queues a normal pending turn when the target session is run
   const child = spawn(process.execPath, ["--import", "tsx", mcpPath], {
     env: {
       ...process.env,
-      SESSION_INSPECTOR_SERVER_URL: `http://127.0.0.1:${address.port}`
+      SESSION_INSPECTOR_SERVER_URL: `http://127.0.0.1:${address.port}`,
+      THREADEX_APPROVAL_POLICY: policy.parent,
+      THREADEX_TODO_AGENT_ROLE: "default",
+      THREADEX_CONTINUITY_ONLY: "0"
     },
     stdio: ["pipe", "pipe", "pipe"]
   });
@@ -719,16 +734,19 @@ test("prompt_session queues a normal pending turn when the target session is run
         sessionId: "local_target-1",
         message: "Please continue the normal session.",
         model: "gpt-5.6-terra",
+        ...(policy.explicit ? { approvalPolicy: policy.explicit } : {}),
         executionMode: "plan"
       }
     });
     assert.equal(called.error, undefined);
-    const pendingRequest = received.find((item) => item.url === "/api/pending-turns");
+    assert.equal((called.result as { isError?: boolean }).isError, undefined);
+    const pendingRequest = received.find((item) => item.url === (running ? "/api/pending-turns" : "/api/chat"));
     assert.deepEqual(pendingRequest?.body, {
       message: "Please continue the normal session.",
       sessionId: "local_target-1",
       workspaceId: "default",
       model: "gpt-5.6-terra",
+      ...(policy.expected ? { approvalPolicy: policy.expected } : {}),
       executionMode: "plan"
     });
   } finally {
@@ -737,6 +755,8 @@ test("prompt_session queues a normal pending turn when the target session is run
     await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
   }
 });
+}
+}
 
 
 test("lightweight agent exposes nested content tools and hides all legacy status writers", async () => {

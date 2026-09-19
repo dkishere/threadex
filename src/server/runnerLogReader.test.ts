@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   drainRunnerLogEntries,
   initialRunnerLogReadState,
+  RunnerLogReplay,
   shouldRefreshRunnerHeartbeat,
   type IndexedRunnerLogEntry,
   type RunnerLogEntry
@@ -35,6 +36,47 @@ function runnerEntry(index: number, event = "delta"): RunnerLogEntry {
     data: { text: `${index}:${"x".repeat(80)}` }
   };
 }
+
+test("watchdog replay shares overlapping passes and only applies newly appended entries", async () => {
+  const fixture = temporaryLog();
+  try {
+    const replay = new RunnerLogReplay();
+    writeFileSync(fixture.path, `${JSON.stringify(runnerEntry(0))}\n`);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const applied: string[] = [];
+    const first = replay.replay(fixture.path, async (entries) => {
+      await gate;
+      applied.push(...entries.map((entry) => entry.id));
+    });
+    const overlapping = replay.replay(fixture.path, () => { assert.fail("duplicate replay"); });
+    assert.equal(first, overlapping);
+    release();
+    await first;
+    await replay.replay(fixture.path, () => { assert.fail("unchanged log replayed"); });
+    appendFileSync(fixture.path, `${JSON.stringify(runnerEntry(1, "done"))}\n`);
+    await replay.replay(fixture.path, (entries) => { applied.push(...entries.map((entry) => entry.id)); });
+    assert.deepEqual(applied, ["entry-0", "entry-1"]);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("failed watchdog application remains retryable and truncated logs restart", async () => {
+  const fixture = temporaryLog();
+  try {
+    const replay = new RunnerLogReplay();
+    writeFileSync(fixture.path, `${JSON.stringify(runnerEntry(0))}\n${JSON.stringify(runnerEntry(1))}\n`);
+    await assert.rejects(replay.replay(fixture.path, () => { throw new Error("DB unavailable"); }));
+    const applied: string[] = [];
+    await replay.replay(fixture.path, (entries) => { applied.push(...entries.map((entry) => entry.id)); });
+    writeFileSync(fixture.path, `${JSON.stringify(runnerEntry(2))}\n`);
+    await replay.replay(fixture.path, (entries) => { applied.push(...entries.map((entry) => entry.id)); });
+    assert.deepEqual(applied, ["entry-0", "entry-1", "entry-2"]);
+  } finally {
+    fixture.cleanup();
+  }
+});
 
 test("drains a multi-chunk runner log through result and done at the tail", async () => {
   const fixture = temporaryLog();

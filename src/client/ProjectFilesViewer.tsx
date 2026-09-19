@@ -1,7 +1,9 @@
+import { createProjectViewer } from "./linkPreview";
+
 type FileChange = { path: string; [key: string]: unknown };
 
 export async function openProjectFiles({ sessionId, turnId, changes = [] }: { sessionId: string; turnId?: string; changes?: FileChange[] }) {
-  const newTab = window.open("about:blank", "_blank");
+  const newTab = createProjectViewer();
   if (!newTab) {
     window.alert("Allow pop-ups to open Web VS Code.");
     return;
@@ -16,7 +18,7 @@ export async function openProjectFiles({ sessionId, turnId, changes = [] }: { se
       : await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/web-vscode-url?returnUrl=${encodeURIComponent(window.location.href)}`);
     const payload = await response.json().catch(() => null);
     if (!response.ok || typeof payload?.url !== "string") throw new Error(payload?.error || `API returned ${response.status}`);
-    newTab.location.replace(payload.url);
+    newTab.navigate(payload.url);
   } catch (reason) {
     newTab.close();
     window.alert(reason instanceof Error ? reason.message : "Could not open Web VS Code.");
@@ -24,7 +26,7 @@ export async function openProjectFiles({ sessionId, turnId, changes = [] }: { se
 }
 
 export async function openSessionReview(sessionId: string) {
-  const newTab = window.open("about:blank", "_blank");
+  const newTab = createProjectViewer();
   if (!newTab) {
     window.alert("Allow pop-ups to open Web VS Code.");
     return;
@@ -37,7 +39,7 @@ export async function openSessionReview(sessionId: string) {
     });
     const payload = await response.json().catch(() => null);
     if (!response.ok || typeof payload?.url !== "string") throw new Error(payload?.error || `API returned ${response.status}`);
-    newTab.location.replace(payload.url);
+    newTab.navigate(payload.url);
   } catch (reason) {
     newTab.close();
     window.alert(reason instanceof Error ? reason.message : "Could not open the session review.");
@@ -45,7 +47,7 @@ export async function openSessionReview(sessionId: string) {
 }
 
 export async function openCodeWalkthrough(sessionId: string) {
-  const newTab = window.open("about:blank", "_blank");
+  const newTab = createProjectViewer();
   if (!newTab) {
     window.alert("Allow pop-ups to open Web VS Code.");
     return;
@@ -58,7 +60,7 @@ export async function openCodeWalkthrough(sessionId: string) {
     });
     const payload = await response.json().catch(() => null);
     if (!response.ok || typeof payload?.url !== "string") throw new Error(payload?.error || `API returned ${response.status}`);
-    newTab.location.replace(payload.url);
+    newTab.navigate(payload.url);
   } catch (reason) {
     newTab.close();
     window.alert(reason instanceof Error ? reason.message : "Could not open Code Walkthrough.");

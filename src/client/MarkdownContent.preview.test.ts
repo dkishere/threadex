@@ -53,6 +53,33 @@ test("image previews survive Markdown and workspace context updates", async () =
       await page.keyboard.press("Escape");
       await page.getByRole("dialog").waitFor({ state: "detached" });
     }
+    await page.evaluate(() => {
+      const matchMedia = window.matchMedia.bind(window);
+      window.matchMedia = (query) => {
+        const result = matchMedia(query);
+        Object.defineProperty(result, "matches", { value: true });
+        return result;
+      };
+    });
+    await page.route("**/api/workspaces/html/**", (route) => route.fulfill({
+      contentType: "application/json", body: JSON.stringify({ url: "/api/workspaces/html-content/test/report.html" })
+    }));
+    await page.route("**/api/workspaces/html-content/**", (route) => route.fulfill({
+      contentType: "text/html", body: "<h1>Report preview</h1>"
+    }));
+    await render("[report](C:/images/report.html)");
+    await page.getByRole("link", { name: "Open HTML preview in new tab" }).click();
+    await page.frameLocator('iframe[title="HTML preview"]').getByText("Report preview").waitFor();
+    assert.equal(page.url(), "http://preview.test/");
+    assert.equal(browser.contexts()[0].pages().length, 1);
+    const refreshed = page.waitForRequest("**/api/workspaces/html-content/test/report.html");
+    await page.getByRole("button", { name: "Refresh preview" }).click();
+    await refreshed;
+    await page.frameLocator('iframe[title="HTML preview"]').getByText("Report preview").waitFor();
+    assert.equal(page.url(), "http://preview.test/");
+    await page.getByRole("button", { name: "Close preview", exact: true }).click();
+    await page.getByRole("dialog").waitFor({ state: "detached" });
+    assert.equal(await page.getByRole("link", { name: "report", exact: true }).count(), 1);
   } finally {
     await browser.close();
   }

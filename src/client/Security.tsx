@@ -96,10 +96,10 @@ export function SecurityGate({ children }: { children: ReactNode }) {
     const timer = window.setInterval(() => void refresh(), hasError ? 5_000 : 30_000);
     return () => window.clearInterval(timer);
   }, [refresh, hasError]);
-  return <>{status?.authenticated ? children : <main className="security-login"><section className="settings-card">
+  return <>{!status ? <main className="security-login" aria-busy="true"><p role="status">{error ? "Waiting for connection…" : "Loading…"}</p></main> : status.authenticated ? children : <main className="security-login"><section className="settings-card">
     <h1>Threadex</h1>
     <h2>{status?.canSetup ? "Set your password" : "Sign in"}</h2>
-    {!status ? <p>{error ? "Waiting for connection…" : "Loading…"}</p> : status.configured || status.canSetup ? <PasswordForm setup={status.canSetup} onSuccess={() => void refresh()} /> : <p>Open Threadex on localhost to set the initial password before remote access.</p>}
+    {status.configured || status.canSetup ? <PasswordForm setup={status.canSetup} onSuccess={() => void refresh()} /> : <p>Open Threadex on localhost to set the initial password before remote access.</p>}
   </section></main>}
     {error && <SecurityError error={error} retry={() => void refresh()} />}
   </>;

@@ -212,7 +212,7 @@ const tools: ToolSpec[] = [
         message: { type: "string", minLength: 1, maxLength: 250000 },
         model: { type: "string" },
         modelReasoningEffort: { type: "string" },
-        approvalPolicy: { type: "string" },
+        approvalPolicy: { type: "string", description: "Defaults to the calling parent runner's approval policy when omitted." },
         executionMode: { type: "string", enum: ["default", "plan", "goal"], default: "default" },
         skills: {
           type: "array",
@@ -1161,13 +1161,14 @@ async function promptSession(input: SessionPromptInput) {
   }
 
   const runningTurns = readArray(inspection?.turns);
+  const approvalPolicy = readString(input.approvalPolicy) ?? managerApprovalPolicy;
   const payload = {
     message,
     sessionId,
     workspaceId: readString(session?.workspaceId) ?? input.workspaceId,
     ...(readString(input.model) ? { model: readString(input.model) } : {}),
     ...(readString(input.modelReasoningEffort) ? { modelReasoningEffort: readString(input.modelReasoningEffort) } : {}),
-    ...(readString(input.approvalPolicy) ? { approvalPolicy: readString(input.approvalPolicy) } : {}),
+    ...(approvalPolicy ? { approvalPolicy } : {}),
     ...(readString(input.executionMode) ? { executionMode: readString(input.executionMode) } : {}),
     ...(Array.isArray(input.skills) ? { skills: input.skills } : {}),
     ...(input.forcePlan !== undefined ? { forcePlan: input.forcePlan === true } : {}),

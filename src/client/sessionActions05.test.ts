@@ -227,3 +227,29 @@ test("Enter still submits when no composer suggestion was keyboard-selected", ()
   assert.equal(input.prevented(), true);
   assert.equal(input.submitted(), true);
 });
+
+for (const nativeEvent of [{ isComposing: true, keyCode: 13 }, { isComposing: false, keyCode: 229 }]) {
+  for (const key of ["Enter", " ", "Tab", "ArrowDown", "ArrowUp", "Escape"]) {
+    test(`IME ${JSON.stringify(nativeEvent)} keeps ${JSON.stringify(key)} out of composer shortcuts`, () => {
+      const unexpected = () => assert.fail("IME input must not change suggestions");
+      for (const slashTrigger of [null, { query: "dep" }]) {
+        for (const composerSuggestionIndex of [-1, 1]) {
+          const input = keyEvent(key, { nativeEvent });
+          handleEditorKeyDown(suggestionKeyContext({
+            slashTrigger,
+            composerSuggestionIndex,
+            visibleSlashSuggestions: suggestions,
+            selectSlashSuggestion: unexpected,
+            selectComposerSuggestion: unexpected,
+            setSlashSuggestionIndex: unexpected,
+            setComposerSuggestionIndex: unexpected,
+            setSlashTrigger: unexpected,
+            setComposerSuggestionTrigger: unexpected
+          }), input.event);
+          assert.equal(input.prevented(), false);
+          assert.equal(input.submitted(), false);
+        }
+      }
+    });
+  }
+}

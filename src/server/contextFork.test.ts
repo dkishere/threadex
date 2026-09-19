@@ -18,6 +18,8 @@ test("context fork orchestration asks the parent to create one self-contained ch
   assert.match(prompt, /Do not use `spawn_agent`, `todo_create_task`, or any other mechanism/);
   assert.match(prompt, /Do not perform the requested work in this parent session/);
   assert.match(prompt, /After creation succeeds, briefly return the child session link/);
+  assert.match(prompt, /Later requests sent to this parent belong to this parent/);
+  assert.match(prompt, /creating this child does not make it the default destination for future work/);
 });
 
 test("context fork user suffix makes the Threadex child contract explicit", () => {

@@ -49,6 +49,18 @@ test("sandbox assets work through a tunnel without cookies using only a scoped p
     const prefix = preview.slice(0, preview.lastIndexOf("/") + 1);
     assert.equal((await fetch(base + prefix + "..%2Fsecret.txt", { headers })).status, 403);
     assert.equal((await fetch(base + "/api/private", { headers })).status, 403);
+    const projectPreview = createHtmlPreviewUrl(join(dir, "report", "index.html"), dir);
+    assert.match(projectPreview, /\/report\/index.html$/);
+    mkdirSync(join(dir, "sibling images"));
+    writeFileSync(join(dir, "sibling images", "face.png"), "sibling image");
+    const sibling = new URL("../sibling%20images/face.png", base + projectPreview);
+    const siblingResponse = await fetch(sibling, { headers });
+    assert.equal(siblingResponse.status, 200);
+    assert.equal(await siblingResponse.text(), "sibling image");
+    assert.equal((await fetch(new URL("../secret.txt", base + projectPreview), { headers })).status, 403);
+    const projectPrefix = projectPreview.slice(0, projectPreview.indexOf("/report/"));
+    assert.equal((await fetch(base + projectPrefix + "/..%2Foutside.png", { headers })).status, 403);
+    assert.throws(() => createHtmlPreviewUrl(join(dir, "secret.txt"), join(dir, "report")), /asset root/);
     assert.equal((await fetch(base + preview.replace(/content\/[a-f0-9]+/, `content/${"0".repeat(48)}`), { headers })).status, 403);
     clearHtmlPreviewGrants();
     assert.equal((await fetch(image, { headers })).status, 403);

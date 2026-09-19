@@ -766,6 +766,9 @@ export function handleEditorPaste(ctx, event) {
 }
 
 export function handleEditorKeyDown(ctx, event) {
+    // Android IMEs can report 229 before isComposing becomes true. Leave all
+    // candidate-selection keys to the IME, including arrows, Space and Enter.
+    if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
     const { canSend, composerSuggestionIndex, composerSuggestionTrigger, currentSessionIsRunning, selectComposerSuggestion, selectSlashSuggestion, setComposerSuggestionIndex, setComposerSuggestionTrigger, setSlashSuggestionIndex, setSlashTrigger, slashSuggestionIndex, slashTrigger, submitSteer, visibleComposerSuggestions, visibleSlashSuggestions } = ctx;
         if (event.key === "Enter" && (event.ctrlKey || event.metaKey) && !event.nativeEvent.isComposing) {
             event.preventDefault();

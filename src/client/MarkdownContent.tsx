@@ -19,6 +19,7 @@ import remarkGfm from "remark-gfm";
 import { Download, ExternalLink, FileText, X } from "lucide-react";
 import { isHtmlFilePath, workspaceHtmlPreviewUrl } from "./markdownUrls";
 import { UrlTagIcon } from "./UrlTagIcon";
+import { createLinkPreview, isStandaloneApp } from "./linkPreview";
 import { isJsonFilePath, isMarkdownFilePath, threadexNavigationUrl, transformMarkdownUrl, workspaceFileDownloadUrl, workspaceFilePreviewUrl, workspaceFileReferenceFromUrl, workspaceImagePreviewName, type WorkspaceFilePreviewContext } from "./markdownUrls";
 import { advanceMarkdownChunks, type MarkdownChunks } from "./markdownChunks";
 
@@ -187,7 +188,8 @@ function HtmlPreviewLink({ path, context }: { path: string; context: WorkspaceFi
         event.preventDefault();
         if (loading) return;
         // Authenticate in the app before handing off to a PWA's external window.
-        const popup = window.open("about:blank", "_blank");
+        const preview = isStandaloneApp() ? createLinkPreview("HTML preview", true) : null;
+        const popup = preview ? null : window.open("about:blank", "_blank");
         if (popup) popup.opener = null;
         setLoading(true);
         setError(null);
@@ -197,9 +199,11 @@ function HtmlPreviewLink({ path, context }: { path: string; context: WorkspaceFi
           if (!response.ok || !payload.url?.startsWith("/api/workspaces/html-content/")) {
             throw new Error(payload.error || "Could not open HTML preview.");
           }
-          if (popup && !popup.closed) popup.location.replace(payload.url);
+          if (preview) preview.navigate(payload.url);
+          else if (popup && !popup.closed) popup.location.replace(payload.url);
           else setReadyUrl(payload.url);
         } catch (cause) {
+          preview?.close();
           popup?.close();
           setError(cause instanceof Error ? cause.message : "Could not open HTML preview.");
         } finally {

@@ -395,6 +395,9 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.match(thread.developerInstructions, /Never wrap commentary in JSON/i);
   assert.match(thread.developerInstructions, /Threadex session ownership/i);
   assert.match(thread.developerInstructions, /Context Fork\/New task is explicit delegation/i);
+  assert.match(thread.developerInstructions, /A parent remains an active working session after creating a fork/);
+  assert.match(thread.developerInstructions, /Execute subsequent user requests in the receiving parent session/);
+  assert.match(thread.developerInstructions, /that dependency alone does not authorize delegation/);
   assert.match(thread.developerInstructions, /Context preservation/i);
   assert.match(thread.developerInstructions, /substantive final response remains important/i);
   assert.match(thread.developerInstructions, /never run recursive file or text searches from a filesystem root, workspace root, or broad parent directory/i);
@@ -849,12 +852,26 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     turnId: "turn-1",
     message: "開 child task",
     contextForkRequest: true,
+    approvalPolicy: "on-request",
     logPath,
     codexHome: resolve(root, "codex-home"),
     cwd: projectRoot
   }), "utf8");
 
-  const child = spawn(process.execPath, ["--import", "tsx", runnerPath, jobPath], {
+  const forkSpawnShimPath = resolve(root, "fork-spawn-shim.mjs");
+  writeFileSync(forkSpawnShimPath, `
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+const originalSpawn = childProcess.spawn;
+childProcess.spawn = function (command, args, options) {
+  return command === process.env.CODEX_PATH
+    ? originalSpawn(process.execPath, [command, ...args], options)
+    : originalSpawn(command, args, options);
+};
+syncBuiltinESMExports();
+`, "utf8");
+
+  const child = spawn(process.execPath, ["--import", "tsx", "--import", pathToFileURL(forkSpawnShimPath).href, runnerPath, jobPath], {
     cwd: projectRoot,
     env: {
       ...process.env,
@@ -882,8 +899,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.doesNotMatch(turn.settings.developer_instructions, /Use get_session with sessionId or threadId/);
   assert.doesNotMatch(turn.settings.developer_instructions, /For Todo MCP planning/);
   assert.doesNotMatch(turn.settings.developer_instructions, /Use list_processes for a compact view/);
-  assert.deepEqual(turn.sandboxPolicy, { type: "readOnly", networkAccess: false });
-  assert.equal(turn.approvalPolicy, "never");
+  assert.equal(turn.sandboxPolicy.type, thread.sandbox === "workspace-write" ? "workspaceWrite" : thread.sandbox === "danger-full-access" ? "dangerFullAccess" : "readOnly");
+  assert.equal(turn.approvalPolicy, thread.approvalPolicy);
 });
 
 test("prompt runner retries an ignored context fork and verifies that a child session was created", async () => {

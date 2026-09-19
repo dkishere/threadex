@@ -30,6 +30,13 @@
   .responsive-layout[data-menu-open="true"] .workspace-header { display: flex; }
   .responsive-layout .workspace-tabs { flex: 1 0 100%; flex-wrap: wrap; overflow: visible; }
   .responsive-layout .workspace-tab { min-height: 44px; }
+  .responsive-layout .workspace-header-controls { flex: 1 1 100%; flex-wrap: wrap; align-items: flex-start; margin-left: 0; padding-left: 0; border-left: 0; }
+  .responsive-layout .header-account-popover-wrap { flex: 1 1 220px; min-width: 0; }
+  .responsive-layout .header-account-control { width: 100%; }
+  .responsive-layout .header-account-control > span { flex: 1; width: auto; }
+  /* Keep the account list in the scrolling menu's flow so it cannot be clipped. */
+  .responsive-layout .header-account-popover { position: static; width: 100%; margin-top: 5px; }
+  .responsive-layout .account-popover-list { max-height: none; overflow: visible; }
 }
 
 @media (width < 1080px) {
@@ -47,6 +54,7 @@
   .responsive-layout .layout-controls { width: auto; height: var(--chat-header-height); left: 4px; background: transparent; border-bottom: 0; }
   .responsive-layout .layout-controls button { background: transparent; }
   .responsive-layout .layout-controls button:hover { background: #e2e8f0; }
+  .responsive-layout .layout-controls .layout-menu-toggle { position: fixed; top: 0; right: 4px; height: var(--chat-header-height); }
   .responsive-layout .workspace-header { top: var(--chat-header-height); max-height: calc(var(--app-height, 100dvh) - var(--chat-header-height)); }
   .responsive-layout .layout-backdrop { top: var(--chat-header-height); }
   .responsive-layout[data-left-open="true"] .sidebar { top: var(--chat-header-height); height: calc(var(--app-height, 100dvh) - var(--chat-header-height)); }
@@ -73,7 +81,7 @@
   .responsive-layout .session-sessions-tab { display: inline-flex; }
   .responsive-layout .session-view-tabs { height: 40px; min-height: 40px; }
   .responsive-layout .session-view-tabs button { min-height: 40px; padding: 9px 8px; }
-  .responsive-layout .content-header { padding-left: 96px; }
+  .responsive-layout .content-header { padding-left: 52px; padding-right: 52px; }
   .responsive-layout .content-header-actions { max-width: 35%; }
   .responsive-layout .messages .message.assistant,
   .responsive-layout .chat[data-side-chat-open="true"] > .messages-pane > .messages .message.assistant {
@@ -88,6 +96,17 @@
   .responsive-layout .composer { min-width: 0; }
   .responsive-layout .settings-tabs { overflow-x: auto; flex-shrink: 0; }
   .responsive-layout .settings-account-table { overflow-x: auto; }
+}
+
+@media (768px <= width < 1080px) {
+  .responsive-layout[data-middle-open="false"] .composer > .queued-prompts,
+  .responsive-layout .chat:not([data-session-tab="turns"]) > .composer > .queued-prompts {
+    display: grid;
+    box-sizing: border-box;
+    width: 100%;
+    margin: 0;
+    padding: 0 8px 8px;
+  }
 }
 
 @media (width < 768px) {

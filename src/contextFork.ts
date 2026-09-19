@@ -7,6 +7,7 @@ const CONTEXT_FORK_PROMPT = [
   CONTEXT_FORK_USER_SUFFIX_START,
   "",
   "Handle the user's actual request in a new child session.",
+  "This handoff instruction applies only to this explicit context-fork turn. It does not apply to the child or later follow-ups, and does not change filesystem or approval permissions.",
   "",
   "1. Prepare a self-contained handoff prompt using the full relevant context from this thread.",
   "   - Use the language of the user's actual request, ignoring wrapper and operational instructions.",
@@ -20,6 +21,7 @@ const CONTEXT_FORK_PROMPT = [
   "   Do not use `spawn_agent`, `todo_create_task`, or any other mechanism to create the child task.",
   "",
   "4. After creation succeeds, briefly return the child session link.",
+  "   Later requests sent to this parent belong to this parent. Perform them here unless the user explicitly requests another handoff; creating this child does not make it the default destination for future work.",
   "",
   CONTEXT_FORK_USER_SUFFIX_END
 ].join("\n");

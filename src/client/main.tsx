@@ -2,6 +2,7 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import { SecurityGate } from "./Security";
+import { ensureNotificationWorker } from "./notificationWorker";
 import "./styles/app-01.css";
 import "./styles/app-02.css";
 import "./styles/app-03.css";
@@ -15,13 +16,10 @@ import "./styles/app-10.css";
 import "./styles/app-11.css";
 
 function registerServiceWorker() {
-  if (!import.meta.env.PROD || !("serviceWorker" in navigator)) return;
-
-  window.addEventListener("load", () => {
-    void navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch((error: unknown) => {
+  if (!window.isSecureContext || !("serviceWorker" in navigator)) return;
+    void ensureNotificationWorker().catch((error: unknown) => {
       console.warn("Threadex could not register its service worker.", error);
     });
-  });
 }
 
 registerServiceWorker();

@@ -53,8 +53,11 @@ export function createWebVsCodeReviewSession(input: {
   for (const [normalizedPath, groupedCandidates] of candidatesByPath) {
     const absolutePath = resolveWorkspaceFilePath(workspacePath, normalizedPath);
     if (!absolutePath) continue;
-    let patch = "";
-    const compactBefore = input.turnId && workspacePath === resolve(input.cwd)
+    // Saved runner diffs are authoritative. Legacy snapshots are only a
+    // fallback for historical records that did not store reviewable content.
+    let patch = buildWebVsCodeReview(groupedCandidates, workspacePath);
+    const hasSavedPatch = /^@@ /m.test(patch);
+    const compactBefore = !hasSavedPatch && input.turnId && workspacePath === resolve(input.cwd)
       ? readCompactTurnBaseline(input.dataDir, input.turnId, workspacePath, normalizedPath)
       : undefined;
     if (compactBefore !== undefined) {
@@ -66,7 +69,7 @@ export function createWebVsCodeReviewSession(input: {
         before: compactBefore ?? "", after
       }], workspacePath);
     }
-    if (compactBefore === undefined && input.turnId && workspacePath === resolve(input.cwd)) {
+    if (!hasSavedPatch && compactBefore === undefined && input.turnId && workspacePath === resolve(input.cwd)) {
       try {
         patch = buildTurnGitPatch(input.dataDir, input.turnId, workspacePath, [normalizedPath]) ?? "";
       } catch {}
