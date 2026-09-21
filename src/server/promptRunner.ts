@@ -204,7 +204,7 @@ type AutoModelState = {
 
 const GOAL_OBJECTIVE_INLINE_LIMIT = 4000;
 const RUNNER_UPDATE_CALLBACK_TIMEOUT_MS = 15_000;
-const DEFAULT_COMMAND_OUTPUT_HARD_LIMIT_CHARS = 16 * 1024 * 1024;
+const DEFAULT_COMMAND_OUTPUT_CAPTURE_LIMIT_CHARS = 16 * 1024 * 1024;
 
 const jobPath = process.argv[2];
 
@@ -268,10 +268,11 @@ async function run() {
   const linkedNativeTurnIds = new Set<string>();
   const startedAt = Date.now();
   const itemCache = new Map<string, StreamItem>();
-  const commandOutputChars = new Map<string, number>();
-  const commandOutputHardLimitChars = readPositiveInteger(
-    process.env.RUNNER_COMMAND_OUTPUT_HARD_LIMIT_CHARS,
-    DEFAULT_COMMAND_OUTPUT_HARD_LIMIT_CHARS
+  const commandOutputCapturedChars = new Map<string, number>();
+  const commandOutputCaptureStopped = new Set<string>();
+  const commandOutputCaptureLimitChars = readPositiveInteger(
+    process.env.RUNNER_COMMAND_OUTPUT_CAPTURE_LIMIT_CHARS ?? process.env.RUNNER_COMMAND_OUTPUT_HARD_LIMIT_CHARS,
+    DEFAULT_COMMAND_OUTPUT_CAPTURE_LIMIT_CHARS
   );
   let completeTurn: ((value: void) => void) | null = null;
   let failTurn: ((error: Error) => void) | null = null;
@@ -401,15 +402,39 @@ async function run() {
       const delta = readString(params?.delta) ?? "";
       const itemId = readString(params?.itemId);
       if (itemId) {
-        const outputChars = (commandOutputChars.get(itemId) ?? 0) + delta.length;
-        commandOutputChars.set(itemId, outputChars);
-        if (outputChars > commandOutputHardLimitChars) {
-          failTurn?.(new Error(
-            `Command output exceeded the Threadex safety limit of ${commandOutputHardLimitChars.toLocaleString()} characters. ` +
-            "The turn was stopped to prevent a runaway or self-referential log stream."
-          ));
+        const outputKey = streamItemCacheKey(params, itemId);
+        if (commandOutputCaptureStopped.has(outputKey)) {
           return;
         }
+
+        const capturedChars = commandOutputCapturedChars.get(outputKey) ?? 0;
+        const remainingChars = Math.max(0, commandOutputCaptureLimitChars - capturedChars);
+        if (delta.length > remainingChars) {
+          commandOutputCapturedChars.set(outputKey, commandOutputCaptureLimitChars);
+          commandOutputCaptureStopped.add(outputKey);
+          const marker =
+            `\n[Threadex truncated further command output after ${commandOutputCaptureLimitChars.toLocaleString()} characters; ` +
+            "the command continued.]\n";
+          const streamItem = updateCachedCommandItem(itemCache, params, delta.slice(0, remainingChars) + marker);
+          if (streamItem?.itemType === "command_execution") {
+            const truncatedItem: StreamItem = { ...streamItem, outputTruncated: true };
+            itemCache.set(outputKey, truncatedItem);
+            await emitEvent("item", truncatedItem);
+          }
+          await emitEvent("codex", {
+            method,
+            params: {
+              itemId,
+              deltaLength: delta.length,
+              deltaPreview: marker.trim(),
+              deltaTruncated: true,
+              outputCaptureStopped: true,
+              outputCaptureLimitChars: commandOutputCaptureLimitChars
+            }
+          });
+          return;
+        }
+        commandOutputCapturedChars.set(outputKey, capturedChars + delta.length);
       }
       const streamItem = updateCachedCommandItem(itemCache, params, delta);
       if (streamItem) {

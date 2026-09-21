@@ -64,7 +64,7 @@ import {
 import { ProcessMonitorService, type AdoptProcessMonitorInput, type MonitorProcessInput } from "./processMonitor";
 import { WaitEventService } from "./waitEvent";
 import { runnerFileName } from "./runnerFileName";
-import { steerProcessWake } from "./processWakeDelivery";
+import { deliverProcessWake } from "./processWakeDelivery";
 import { chooseLoadBalancedAccount } from "./accountPicker";
 import { shouldChooseAccountForNewLoadBalancedThread } from "./loadBalanceRouting";
 import { agentCliExecutable, createEphemeralAgentHome, defaultAgentHomeCandidates, runAgentCliExec, trimAgentCliOutput } from "./agentCli";
@@ -214,6 +214,7 @@ type SqlQueryRequest = {
 type ProcessMonitorRequest = MonitorProcessInput & {
   sessionId?: string;
   threadId?: string;
+  approvalPolicy?: ApprovalPolicy;
 };
 
 type VirtualProcessRestartAction =
@@ -226,7 +227,9 @@ type VirtualProcessMonitor = {
   restartAction: VirtualProcessRestartAction | null;
 };
 
-type AdoptProcessMonitorRequest = AdoptProcessMonitorInput;
+type AdoptProcessMonitorRequest = AdoptProcessMonitorInput & {
+  approvalPolicy?: ApprovalPolicy;
+};
 
 type WaitSubscriptionRequest = {
   eventId?: string;
@@ -1027,7 +1030,11 @@ app.post("/api/wait-subscriptions", async (req: Request<object, object, WaitSubs
       sessionId,
       turnId,
       actionType,
-      actionPayload: actionPayload ?? null
+      actionPayload: actionType === "enqueue_prompt" ? {
+        ...actionPayload,
+        approvalPolicy: normalizeApprovalPolicy(readString(actionPayload?.approvalPolicy)
+          ?? await sessionStore.resolveApprovalPolicy(sessionId))
+      } : actionPayload ?? null
     });
     res.status(201).json({ event, subscription });
   } catch (error) {
@@ -1138,6 +1145,7 @@ app.post(
         wakeThreadId
       });
       const waitEvent = await ensureProcessExitEvent(monitor);
+      await ensureProcessWakeSubscription(monitor, waitEvent, request.approvalPolicy);
       await publishRingEvent({
         eventId: crypto.randomUUID(),
         type: "process.monitor.changed",
@@ -1154,7 +1162,10 @@ app.post(
   }
 );
 
-app.post("/api/process-monitors/:monitorId/restart", async (req: Request<{ monitorId: string }>, res: Response) => {
+app.post("/api/process-monitors/:monitorId/restart", async (
+  req: Request<{ monitorId: string }, object, { approvalPolicy?: ApprovalPolicy }>,
+  res: Response
+) => {
   try {
     const workspace = await sessionStore.getActiveWorkspace();
     const virtualMonitor = (await virtualProcessMonitors(workspace))
@@ -1171,9 +1182,12 @@ app.post("/api/process-monitors/:monitorId/restart", async (req: Request<{ monit
       return;
     }
     const previousMonitor = await sessionStore.getProcessMonitor(req.params.monitorId);
+    const wakeApprovalPolicy = req.body?.approvalPolicy
+      ?? (previousMonitor ? await processWakeApprovalPolicy(previousMonitor) : undefined);
     const monitor = await processMonitor.restart(workspace, req.params.monitorId);
     if (previousMonitor) await cancelProcessExitEvent(previousMonitor);
     const waitEvent = await ensureProcessExitEvent(monitor);
+    await ensureProcessWakeSubscription(monitor, waitEvent, wakeApprovalPolicy);
     await publishRingEvent({
       eventId: crypto.randomUUID(),
       type: "process.monitor.changed",
@@ -1195,9 +1209,12 @@ app.post(
     try {
       const workspace = await sessionStore.getActiveWorkspace();
       const previousMonitor = await sessionStore.getProcessMonitor(req.params.monitorId);
+      const wakeApprovalPolicy = req.body?.approvalPolicy
+        ?? (previousMonitor ? await processWakeApprovalPolicy(previousMonitor) : undefined);
       const monitor = await processMonitor.adopt(workspace, req.params.monitorId, req.body ?? {} as AdoptProcessMonitorRequest);
       if (previousMonitor) await cancelProcessExitEvent(previousMonitor);
       const waitEvent = await ensureProcessExitEvent(monitor);
+      await ensureProcessWakeSubscription(monitor, waitEvent, wakeApprovalPolicy);
       await publishRingEvent({
         eventId: crypto.randomUUID(),
         type: "process.monitor.changed",
@@ -3854,6 +3871,18 @@ app.get("/api/session-auto-model/:sessionId", async (req: Request<{ sessionId: s
   }
 });
 
+app.put("/api/session-approval-policy/:sessionId", async (req: Request<{ sessionId: string }>, res: Response) => {
+  try {
+    const session = await sessionStore.getSession(req.params.sessionId);
+    if (!session) { res.status(404).json({ error: "Session not found." }); return; }
+    const policy = req.body?.approvalPolicy;
+    if (!["untrusted", "on-request", "granular", "never"].includes(policy)) {
+      res.status(400).json({ error: "Invalid approvalPolicy." }); return;
+    }
+    res.json({ approvalPolicy: await sessionStore.resolveApprovalPolicy(session.id, undefined, policy) });
+  } catch (error) { res.status(500).json({ error: errorMessage(error) }); }
+});
+
 app.put("/api/session-model-preferences/:sessionId", async (
   req: Request<{ sessionId: string }, object, SessionModelPreferencesInput>,
   res: Response
@@ -4584,6 +4613,8 @@ app.post("/api/pending-turns", async (req: Request<object, object, PendingTurnCr
       });
       return;
     }
+    await sessionStore.resolveApprovalPolicy(session.id, turnId,
+      chatRequest.approvalPolicy === undefined ? undefined : normalizeApprovalPolicy(chatRequest.approvalPolicy));
     const attachments = saveUploadedAttachments(uploadDir, turnId, chatRequest.attachments);
     const messageForStorage = attachments.length > 0 ? formatStoredUserInput(message, attachments) : message;
     await recordSessionTurnWithLog({
@@ -5113,6 +5144,10 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
     const todoPlanClarificationPending = false;
     const forcePlanForTurn = false;
     const turnId = requestedTurnId ?? crypto.randomUUID();
+    chatRequest.approvalPolicy = normalizeApprovalPolicy(await sessionStore.resolveApprovalPolicy(
+      session.id, turnId,
+      chatRequest.approvalPolicy === undefined ? undefined : normalizeApprovalPolicy(chatRequest.approvalPolicy)
+    ));
     const runnerAttemptId = runnerFileName(pendingTurn ? `${turnId}.${crypto.randomUUID()}` : turnId);
     const logPath = resolve(runnerLogDir, `${runnerAttemptId}.ndjson`);
     const pendingLogPath = resolve(pendingRunnerLogDir, `${runnerAttemptId}.ndjson`);
@@ -6414,23 +6449,48 @@ async function cancelProcessExitEvent(monitor: ProcessMonitorRecord) {
   if (event.status === "pending") await waitEvents.cancel(event.id);
 }
 
+function processWakeSubscriptionId(event: WaitEventRecord, monitor: ProcessMonitorRecord) {
+  return monitor.wakeSessionId ? `process_wake:${event.id}:${monitor.wakeSessionId}` : null;
+}
+
+async function ensureProcessWakeSubscription(
+  monitor: ProcessMonitorRecord,
+  event: WaitEventRecord,
+  approvalPolicy?: unknown
+) {
+  const id = processWakeSubscriptionId(event, monitor);
+  if (!id || !monitor.wakePrompt || !monitor.wakeSessionId) return null;
+  const requestedApprovalPolicy = readString(approvalPolicy)?.trim()
+    || await sessionStore.resolveApprovalPolicy(monitor.wakeSessionId);
+  const subscription = await waitEvents.subscribe({
+    id,
+    eventId: event.id,
+    workspaceId: monitor.workspaceId,
+    sessionId: monitor.wakeSessionId,
+    actionType: "enqueue_prompt",
+    actionPayload: {
+      message: monitor.wakePrompt,
+      loadBalanceInWorkspace: false,
+      ...(requestedApprovalPolicy ? { approvalPolicy: normalizeApprovalPolicy(requestedApprovalPolicy) } : {})
+    }
+  });
+  return subscription.id;
+}
+
+async function processWakeApprovalPolicy(monitor: ProcessMonitorRecord) {
+  if (!monitor.wakePrompt || !monitor.wakeSessionId) return undefined;
+  const event = await ensureProcessExitEvent(monitor);
+  const id = processWakeSubscriptionId(event, monitor);
+  if (!id) return undefined;
+  const subscription = (await sessionStore.listWaitSubscriptions({ eventId: event.id }))
+    .find((candidate) => candidate.sessionId === monitor.wakeSessionId
+      && candidate.actionType === "enqueue_prompt" && candidate.status !== "cancelled");
+  return readString(readObject(subscription?.actionPayload)?.approvalPolicy)?.trim() || undefined;
+}
+
 async function publishProcessExit(monitor: ProcessMonitorRecord) {
   const event = await ensureProcessExitEvent(monitor);
-  let legacySubscriptionId: string | null = null;
-  if (monitor.wakePrompt && monitor.wakeSessionId) {
-    legacySubscriptionId = `process_wake:${event.id}:${monitor.wakeSessionId}`;
-    await waitEvents.subscribe({
-      id: legacySubscriptionId,
-      eventId: event.id,
-      workspaceId: monitor.workspaceId,
-      sessionId: monitor.wakeSessionId,
-      actionType: "enqueue_prompt",
-      actionPayload: {
-        message: monitor.wakePrompt,
-        loadBalanceInWorkspace: false
-      }
-    });
-  }
+  const legacySubscriptionId = await ensureProcessWakeSubscription(monitor, event);
   await waitEvents.fire(event.id, processExitPayload(monitor));
   if (legacySubscriptionId) {
     const subscription = (await sessionStore.listWaitSubscriptions({ eventId: event.id }))
@@ -6463,22 +6523,42 @@ async function dispatchWaitSubscription(subscription: WaitSubscriptionRecord, ev
   const payload = readObject(subscription.actionPayload);
   const message = readString(payload?.message)?.trim();
   if (!message) throw new Error("enqueue_prompt subscription requires actionPayload.message.");
-  if (event.topic === "process.exited" && await steerProcessWake(subscription.sessionId, message, {
-    runningTurnId: async (sessionId) => (await sessionStore.getLatestRunningTurn(sessionId))?.id ?? null,
-    steer: (input) => fetch(`${serverUrl.replace(/\/$/, "")}/api/runner/steer`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(input)
-    })
-  })) return;
+  const turnId = readString(payload?.turnId)?.trim() || `wait_${subscription.id}`;
+  if (event.topic === "process.exited") {
+    const requestedApprovalPolicy = readString(payload?.approvalPolicy)?.trim()
+      || await sessionStore.resolveApprovalPolicy(subscription.sessionId);
+    await deliverProcessWake({
+      sessionId: subscription.sessionId,
+      turnId,
+      message,
+      workspaceId: subscription.workspaceId,
+      ...(requestedApprovalPolicy ? { approvalPolicy: normalizeApprovalPolicy(requestedApprovalPolicy) } : {}),
+      loadBalanceInWorkspace: payload?.loadBalanceInWorkspace === true
+    }, {
+      runningTurnId: async (sessionId) => (await sessionStore.getLatestRunningTurn(sessionId))?.id ?? null,
+      steer: (input) => fetch(`${serverUrl.replace(/\/$/, "")}/api/runner/steer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(input)
+      }),
+      start: (input) => fetch(`${serverUrl.replace(/\/$/, "")}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(input)
+      })
+    });
+    return;
+  }
   const response = await fetch(`${serverUrl.replace(/\/$/, "")}/api/pending-turns`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       message,
-      turnId: readString(payload?.turnId)?.trim() || `wait_${subscription.id}`,
+      turnId,
       sessionId: subscription.sessionId,
       workspaceId: subscription.workspaceId,
+      approvalPolicy: readString(payload?.approvalPolicy)
+        ?? await sessionStore.resolveApprovalPolicy(subscription.sessionId),
       loadBalanceInWorkspace: payload?.loadBalanceInWorkspace === true
     })
   });

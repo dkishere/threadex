@@ -19,3 +19,35 @@ export async function steerProcessWake(
     || (response.status === 409 && error === "Agent is not running.")) return false;
   throw new Error(`Process wake steer returned HTTP ${response.status}: ${body.slice(-500)}`);
 }
+
+export async function deliverProcessWake(
+  input: {
+    sessionId: string;
+    turnId: string;
+    message: string;
+    workspaceId: string;
+    approvalPolicy?: string;
+    loadBalanceInWorkspace: boolean;
+  },
+  dependencies: {
+    runningTurnId: (sessionId: string) => Promise<string | null>;
+    steer: (input: { sessionId: string; turnId: string; message: string }) => Promise<Response>;
+    start: (input: {
+      sessionId: string;
+      turnId: string;
+      message: string;
+      workspaceId: string;
+      approvalPolicy?: string;
+      loadBalanceInWorkspace: boolean;
+    }) => Promise<Response>;
+  }
+): Promise<"steered" | "started"> {
+  if (await steerProcessWake(input.sessionId, input.message, dependencies)) return "steered";
+  const response = await dependencies.start(input);
+  if (response.ok) {
+    await response.arrayBuffer();
+    return "started";
+  }
+  const body = await response.text();
+  throw new Error(`Process wake start returned HTTP ${response.status}: ${body.slice(-500)}`);
+}

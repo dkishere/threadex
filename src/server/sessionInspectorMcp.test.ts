@@ -533,6 +533,122 @@ test("create_task posts a same-session child handoff to Threadex", async () => {
   }
 });
 
+test("wake prompts and event subscriptions inherit the manager approval policy", async () => {
+  const received: Array<{ url: string; body: Record<string, unknown> }> = [];
+  const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    received.push({
+      url: request.url ?? "",
+      body: JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>
+    });
+    response.writeHead(201, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ ok: true }));
+  });
+  await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+
+  const child = spawn(process.execPath, ["--import", "tsx", mcpPath], {
+    env: {
+      ...process.env,
+      SESSION_INSPECTOR_SERVER_URL: `http://127.0.0.1:${address.port}`,
+      THREADEX_SESSION_ID: "local_parent-1",
+      THREADEX_THREAD_ID: "thread-parent-1",
+      THREADEX_APPROVAL_POLICY: "granular"
+    },
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  const lines = createInterface({ input: child.stdout });
+  const pending = new Map<number, (value: Record<string, unknown>) => void>();
+  lines.on("line", (line) => {
+    const message = JSON.parse(line) as Record<string, unknown>;
+    const id = typeof message.id === "number" ? message.id : null;
+    if (id !== null) pending.get(id)?.(message);
+  });
+  const rpc = (id: number, method: string, params?: unknown) => new Promise<Record<string, unknown>>((resolveRpc) => {
+    pending.set(id, resolveRpc);
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, ...(params ? { params } : {}) })}\n`);
+  });
+
+  try {
+    await rpc(1, "initialize");
+    await rpc(2, "tools/call", {
+      name: "subscribe_wait_event",
+      arguments: {
+        eventId: "wait_event-1",
+        sessionId: "local_parent-1",
+        actionType: "enqueue_prompt",
+        actionPayload: { message: "Continue after completion." }
+      }
+    });
+    await rpc(3, "tools/call", {
+      name: "monitor_process",
+      arguments: {
+        label: "background job",
+        pid: 1234,
+        wakePrompt: "Inspect the completed job."
+      }
+    });
+    await rpc(4, "tools/call", {
+      name: "adopt_process_monitor",
+      arguments: {
+        id: "process_monitor-1",
+        pid: 1234,
+        exe: process.execPath,
+        args: ["-e", "setTimeout(() => {}, 1000)"]
+      }
+    });
+    await rpc(5, "tools/call", {
+      name: "restart_process_monitor",
+      arguments: { id: "process_monitor-1" }
+    });
+
+    assert.deepEqual(received, [
+      {
+        url: "/api/wait-subscriptions",
+        body: {
+          eventId: "wait_event-1",
+          sessionId: "local_parent-1",
+          actionType: "enqueue_prompt",
+          actionPayload: {
+            message: "Continue after completion.",
+            approvalPolicy: "granular"
+          }
+        }
+      },
+      {
+        url: "/api/process-monitors",
+        body: {
+          label: "background job",
+          pid: 1234,
+          wakePrompt: "Inspect the completed job.",
+          approvalPolicy: "granular",
+          sessionId: "local_parent-1",
+          threadId: "thread-parent-1"
+        }
+      },
+      {
+        url: "/api/process-monitors/process_monitor-1/adopt",
+        body: {
+          pid: 1234,
+          exe: process.execPath,
+          args: ["-e", "setTimeout(() => {}, 1000)"],
+          approvalPolicy: "granular"
+        }
+      },
+      {
+        url: "/api/process-monitors/process_monitor-1/restart",
+        body: { approvalPolicy: "granular" }
+      }
+    ]);
+  } finally {
+    child.kill("SIGTERM");
+    lines.close();
+    await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+  }
+});
+
 test("todo workers cannot create another task during ordinary follow-up turns", async () => {
   const child = spawn(process.execPath, ["--import", "tsx", mcpPath], {
     env: {

@@ -259,13 +259,25 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.equal(entries.at(-1)?.event, "done");
 });
 
-test("prompt runner stops a runaway command output stream", async () => {
+test("prompt runner truncates a runaway command output stream without stopping the turn", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "prompt-runner-command-output-limit-"));
   const fakeCodexPath = resolve(root, "fake-codex.mjs");
+  const spawnShimPath = resolve(root, "spawn-shim.mjs");
   const jobPath = resolve(root, "job.json");
   const logPath = resolve(root, "runner.ndjson");
 
   try {
+    writeFileSync(spawnShimPath, `
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+const originalSpawn = childProcess.spawn;
+childProcess.spawn = function (command, args, options) {
+  return command === process.env.CODEX_PATH
+    ? originalSpawn(process.execPath, [command, ...args], options)
+    : originalSpawn(command, args, options);
+};
+syncBuiltinESMExports();
+`, "utf8");
     writeFileSync(fakeCodexPath, `#!/usr/bin/env node
 import { createInterface } from "node:readline";
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
@@ -279,6 +291,10 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     send({ method: "item/started", params: { item: { id: "command-1", type: "commandExecution", command: "rg recursive-log", status: "inProgress" } } });
     send({ method: "item/commandExecution/outputDelta", params: { itemId: "command-1", delta: "12345678" } });
     send({ method: "item/commandExecution/outputDelta", params: { itemId: "command-1", delta: "abcdefgh" } });
+    send({ method: "item/commandExecution/outputDelta", params: { itemId: "command-1", delta: "discard-me" } });
+    send({ method: "item/completed", params: { item: { id: "command-1", type: "commandExecution", command: "rg recursive-log", aggregatedOutput: "12345678abcd", exitCode: 0, status: "completed" } } });
+    send({ method: "item/completed", params: { item: { id: "message-1", type: "agentMessage", text: "finished after truncated output" } } });
+    send({ method: "turn/completed", params: { turn: { id: "app-turn-1", status: "completed", items: [{ id: "message-1", type: "agentMessage", text: "finished after truncated output" }] } } });
   }
 });
 `, "utf8");
@@ -293,12 +309,12 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       cwd: projectRoot
     }), "utf8");
 
-    const child = spawn(process.execPath, ["--import", "tsx", runnerPath, jobPath], {
+    const child = spawn(process.execPath, ["--import", "tsx", "--import", pathToFileURL(spawnShimPath).href, runnerPath, jobPath], {
       cwd: projectRoot,
       env: {
         ...process.env,
         CODEX_PATH: fakeCodexPath,
-        RUNNER_COMMAND_OUTPUT_HARD_LIMIT_CHARS: "12"
+        RUNNER_COMMAND_OUTPUT_CAPTURE_LIMIT_CHARS: "12"
       },
       stdio: ["ignore", "pipe", "pipe"]
     });
@@ -307,13 +323,19 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     const exitCode = await new Promise<number | null>((resolveExit) => child.once("exit", resolveExit));
 
-    assert.equal(exitCode, 1, stderr);
+    assert.equal(exitCode, 0, `${stderr}\n${readFileSync(logPath, "utf8")}`);
     const entries = readFileSync(logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
-    const error = entries.find((entry) => entry.event === "error");
-    assert.match(error?.data?.message ?? "", /safety limit of 12 characters/i);
-    assert.match(error?.data?.message ?? "", /runaway or self-referential log stream/i);
+    assert.equal(entries.some((entry) => entry.event === "error"), false);
+    const truncatedItem = entries.find((entry) =>
+      entry.event === "item" &&
+      entry.data?.itemType === "command_execution" &&
+      entry.data?.outputTruncated === true &&
+      /truncated further command output after 12 characters/i.test(entry.data?.aggregatedOutput ?? "")
+    );
+    assert.ok(truncatedItem);
+    assert.equal(JSON.stringify(entries).includes("discard-me"), false);
+    assert.equal(entries.find((entry) => entry.event === "result")?.data?.reply, "finished after truncated output");
     assert.equal(entries.at(-1)?.event, "done");
-    assert.equal(entries.some((entry) => entry.event === "result"), false);
   } finally {
     rmSync(root, { force: true, recursive: true });
   }

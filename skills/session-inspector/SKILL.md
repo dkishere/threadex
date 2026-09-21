@@ -173,6 +173,33 @@ npm run embed:session-descriptions
   `notify` for state-only observation. Fired events are retained and dispatch
   late subscriptions immediately.
 
+### Progress visibility
+
+When a user asks to see, track, or be told the progress of a long-running job,
+creating a process record is not sufficient. Identify every potentially long
+stage and expose its meaningful counter as a metric probe. Mark the primary
+counter with `nameSuffix: true` when it should be visible directly in the
+Process monitors list instead of only in the detail popover. A label describes
+the job; it does not count as progress.
+
+After creating or adopting the monitor, call `list_processes` (or
+`GET /api/process-monitors`) and verify that the process is running, every
+required metric has status `ok`, its value is plausible, and a live counter
+advances on a later sample. Do not report a value obtained only by manually
+tailing a log as though the monitor exposes it. If a required metric is missing,
+use `adopt_process_monitor` with the same live PID and complete launch spec to
+update the metric set without restarting the process when that is safe.
+
+When the user also asks to be notified on completion or failure, provide a
+`wakePrompt` at creation or subscribe the target session to the returned
+`process.exited` wait event. Verify that the subscription is waiting before
+claiming completion monitoring is configured. Wake prompts and
+`enqueue_prompt` subscriptions must preserve the invoking runner's approval
+policy so an automatic follow-up does not fall back to user-reviewed approvals.
+The MCP tools inherit it automatically; direct HTTP callers must pass
+`approvalPolicy` on the process-monitor request or in
+`actionPayload.approvalPolicy` on the wait subscription.
+
 ## Defaults
 
 Text fields are truncated to 20,000 characters by default. Increase `maxTextChars` for fuller context, or page through turns/events instead of requesting everything at once.

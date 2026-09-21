@@ -228,6 +228,19 @@ export function ThreadexShell(ctx) {
     const [isLoadingSessions, setIsLoadingSessions] = useState(false);
     const [loadingSessionProjects, setLoadingSessionProjects] = useState(() => new Set());
     const [isBootstrapped, setIsBootstrapped] = useState(false);
+    useReactEffect(() => {
+        if (!isBootstrapped || !sessionId) return;
+        const controller = new AbortController();
+        void fetch(`/api/session-approval-policy/${encodeURIComponent(sessionId)}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ approvalPolicy }),
+            signal: controller.signal
+        }).then((response) => {
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        }).catch((error) => { if (error.name !== "AbortError") console.warn("Could not save approval policy", error); });
+        return () => controller.abort();
+    }, [isBootstrapped, sessionId, approvalPolicy]);
     const [forkingTurnId, setForkingTurnId] = useState(null);
     const [switchingSessionTitle, setSwitchingSessionTitle] = useState(null);
     const [draggedQueuedPromptId, setDraggedQueuedPromptId] = useState(null);
@@ -1499,21 +1512,16 @@ message.turnStatus === "todo" && (_jsx("span", { className: "turn-status", child
                                             .filter((metric) => metric.nameSuffix === true && metric.status === "ok" && typeof metric.value === "string" && metric.value.trim())
                                             .map((metric) => metric.value.trim().replace(/\s+/g, " ").slice(0, 80))
                                             .join(" ");
-                                        if (metricNameSuffix) {
-                                            monitor = { ...monitor, label: `${monitor.label} ${metricNameSuffix}` };
-                                        }
-                                        const metricSummary = metricReadings.map((metric) => {
-                                            const result = [
-                                                metric.error ?? metric.value ?? "No value yet",
-                                                metric.updatedAt ? `updated ${formatTimestamp(metric.updatedAt)}` : "waiting for first sample"
-                                            ].join(" · ");
-                                            return `${metric.name} + ${metric.command}: ${result}`;
-                                        }).join(" · ");
-                                        const launchLabel = [
-                                            processCommand,
-                                            metricSummary ? `Metrics — ${metricSummary}` : "",
-                                            "External attachments and supervisor-managed processes may not expose logs."
-                                        ].filter(Boolean).join(" · ");
+                                        const rowLabel = metricNameSuffix ? `${monitor.label} ${metricNameSuffix}` : monitor.label;
+                                        const launchLabel = _jsxs("span", { className: "process-monitor-detail", children: [
+                                                _jsx("span", { className: "process-monitor-command", title: processCommand, children: processCommand }),
+                                                metricReadings.length > 0 && (_jsx("span", { className: "process-monitor-metrics", "aria-label": "Process metrics", children: metricReadings.map((metric) => {
+                                                        const value = metric.error ?? metric.value ?? "No value yet";
+                                                        const freshness = metric.updatedAt ? `Updated ${formatTimestamp(metric.updatedAt)}` : "Waiting for first sample";
+                                                        return (_jsxs("span", { className: "process-monitor-metric", "data-status": metric.status, title: `${metric.command} · ${freshness}`, children: [_jsx("span", { className: "process-monitor-metric-key", children: metric.name }), _jsx("strong", { children: value })] }, `${monitor.id}:${metric.name}`));
+                                                    }) })),
+                                                _jsx("span", { className: "process-monitor-note", children: "External attachments and supervisor-managed processes may not expose logs." })
+                                            ] });
                                         return (_jsxs("div", { className: "process-monitor-item", onMouseEnter: (event) => {
                                                 cancelHoveredProcessMonitorClose();
                                                 const bounds = event.currentTarget.getBoundingClientRect();
@@ -1534,7 +1542,7 @@ message.turnStatus === "todo" && (_jsx("span", { className: "turn-status", child
                                                             bottom: window.innerHeight - bounds.bottom,
                                                             left: Math.max(16, Math.min(bounds.right - 2, window.innerWidth - 376))
                                                         });
-                                                    }, children: [_jsx("span", { className: "process-monitor-dot", "data-status": monitor.status, "aria-hidden": "true" }), _jsx("span", { className: "process-monitor-label", title: monitor.label, children: monitor.label }), _jsx("small", { children: monitor.status })] }), hoveredProcessMonitor?.id === monitor.id && (_jsxs("section", { className: "thread-status-popover process-monitor-popover", role: "dialog", "aria-label": `${monitor.label} process details`, style: {
+                                                    }, children: [_jsx("span", { className: "process-monitor-dot", "data-status": monitor.status, "aria-hidden": "true" }), _jsx("span", { className: "process-monitor-label", title: rowLabel, children: rowLabel }), _jsx("small", { children: monitor.status })] }), hoveredProcessMonitor?.id === monitor.id && (_jsxs("section", { className: "thread-status-popover process-monitor-popover", role: "dialog", "aria-label": `${monitor.label} process details`, style: {
                                                         bottom: hoveredProcessMonitor.bottom,
                                                         left: hoveredProcessMonitor.left,
                                                         maxHeight: `calc(100vh - ${hoveredProcessMonitor.bottom + 16}px)`

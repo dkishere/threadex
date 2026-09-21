@@ -507,6 +507,58 @@
   overflow-y: auto;
 }
 
+.process-monitor-detail {
+  display: grid;
+  flex: 1 1 auto;
+  gap: 7px;
+  min-width: 0;
+}
+
+.process-monitor-command {
+  display: -webkit-box;
+  overflow: hidden;
+  color: #475569;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.process-monitor-metrics {
+  display: grid;
+  gap: 4px;
+  padding: 6px 7px;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  background: #f8fafc;
+}
+
+.process-monitor-metric {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 10px;
+  line-height: 1.3;
+}
+
+.process-monitor-metric-key {
+  color: #64748b;
+}
+
+.process-monitor-metric strong {
+  color: #0f172a;
+  font-size: 11px;
+  font-weight: 650;
+  text-align: right;
+}
+
+.process-monitor-metric[data-status="error"] strong {
+  color: #b91c1c;
+}
+
+.process-monitor-note {
+  color: #94a3b8;
+  font-size: 10px;
+}
+
 .process-monitor-entry-points {
   display: grid;
   gap: 4px;

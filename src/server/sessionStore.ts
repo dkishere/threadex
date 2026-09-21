@@ -2937,6 +2937,16 @@ export class SessionStore {
       const id = input.id ?? `wait_subscription_${crypto.randomUUID()}`;
       const existing = await this.getWaitSubscriptionWithConnection(connection, id);
       if (existing) return existing;
+      const event = await this.getWaitEventWithConnection(connection, input.eventId);
+      if (event?.topic === "process.exited" && input.actionType === "enqueue_prompt") {
+        const duplicates = await connection.run(
+          `SELECT id FROM wait_subscription WHERE event_id = $eventId AND session_id = $sessionId
+           AND action_type = 'enqueue_prompt' AND status <> 'cancelled' ORDER BY created, id LIMIT 1`,
+          { eventId: input.eventId, sessionId: input.sessionId }
+        );
+        const duplicate = (await duplicates.getRowObjectsJS())[0];
+        if (duplicate) return (await this.getWaitSubscriptionWithConnection(connection, String(duplicate.id)))!;
+      }
       await connection.run(
         `
           INSERT INTO wait_subscription (
@@ -3082,6 +3092,24 @@ export class SessionStore {
 
   async claimWaitSubscription(id: string): Promise<WaitSubscriptionRecord | null> {
     return this.write(async (connection) => {
+      const subscription = await this.getWaitSubscriptionWithConnection(connection, id);
+      if (subscription?.actionType === "enqueue_prompt") {
+        const event = await this.getWaitEventWithConnection(connection, subscription.eventId);
+        if (event?.topic === "process.exited") {
+          // Also cover legacy duplicates persisted before creation-time deduplication.
+          const peers = await connection.run(
+            `SELECT id FROM wait_subscription WHERE event_id = $eventId AND session_id = $sessionId
+             AND action_type = 'enqueue_prompt' AND status <> 'cancelled'
+             ORDER BY CASE WHEN status IN ('done', 'dispatching', 'error') THEN 0 ELSE 1 END, created, id LIMIT 1`,
+            { eventId: subscription.eventId, sessionId: subscription.sessionId }
+          );
+          const winner = (await peers.getRowObjectsJS())[0];
+          if (winner && String(winner.id) !== id) {
+            await connection.run("UPDATE wait_subscription SET status = 'cancelled', updated = now() WHERE id = $id AND status = 'waiting'", { id });
+            return null;
+          }
+        }
+      }
       const result = await connection.run(
         `
           UPDATE wait_subscription
@@ -3363,6 +3391,30 @@ export class SessionStore {
 
   async getSessionModelPreferences(sessionId: string): Promise<SessionModelPreferences> {
     return this.read(async (connection) => this.getSessionModelPreferencesWithConnection(connection, sessionId));
+  }
+
+  async resolveApprovalPolicy(sessionId: string, turnId?: string, explicit?: string): Promise<string | undefined> {
+    return this.write(async (connection) => {
+      const sessionKey = `session:${sessionId}`;
+      const turnKey = turnId ? `turn:${sessionId}:${turnId}` : sessionKey;
+      const rows = await connection.run(
+        `SELECT owner_id, policy FROM execution_approval_policy WHERE owner_id IN ($sessionKey, $turnKey)`,
+        { sessionKey, turnKey }
+      );
+      const policies = await rows.getRowObjectsJS();
+      const savedTurn = policies.find((row) => row.owner_id === turnKey);
+      const savedSession = policies.find((row) => row.owner_id === sessionKey);
+      const policy = explicit ?? (savedTurn ? String(savedTurn.policy) : savedSession ? String(savedSession.policy) : undefined);
+      if (policy) {
+        for (const ownerId of new Set([...(explicit ? [sessionKey] : []), ...(turnId ? [turnKey] : [])])) {
+          await connection.run(
+            `INSERT INTO execution_approval_policy (owner_id, policy) VALUES ($ownerId, $policy)
+             ON CONFLICT (owner_id) DO UPDATE SET policy = excluded.policy`, { ownerId, policy }
+          );
+        }
+      }
+      return policy;
+    });
   }
 
   async setSessionModelPreferences(
@@ -7023,6 +7075,12 @@ export class SessionStore {
         await connection.run(`ALTER TABLE process_monitor ADD COLUMN ${column} ${definition}`);
       }
     }
+    await connection.run(`
+      CREATE TABLE IF NOT EXISTS execution_approval_policy (
+        owner_id VARCHAR PRIMARY KEY,
+        policy VARCHAR NOT NULL
+      )
+    `);
     await connection.run(`
       CREATE TABLE IF NOT EXISTS session_turn (
         id VARCHAR PRIMARY KEY,

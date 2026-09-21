@@ -287,7 +287,7 @@ const tools: ToolSpec[] = [
   },
   {
     name: "subscribe_wait_event",
-    description: "Subscribe a session to an existing durable wait event. A fired retained event dispatches the subscription immediately. Use enqueue_prompt with actionPayload.message for follow-ups, retry_turn with turnId for pending turns, or notify for state-only observation.",
+    description: "Subscribe a session to an existing durable wait event. A fired retained event dispatches the subscription immediately. Use enqueue_prompt with actionPayload.message for follow-ups, retry_turn with turnId for pending turns, or notify for state-only observation. Enqueued prompts inherit the calling runner's approval policy unless actionPayload.approvalPolicy is provided.",
     inputSchema: {
       type: "object",
       required: ["eventId", "sessionId", "actionType"],
@@ -344,7 +344,7 @@ const tools: ToolSpec[] = [
           description: "Optional HTTP(S) URLs for opening the monitored process in the web UI."
         },
         cwd: { type: "string", description: "Optional path inside the active workspace." },
-        wakePrompt: { type: "string", maxLength: 12000, description: "Optional follow-up prompt queued when the process exits." },
+        wakePrompt: { type: "string", maxLength: 12000, description: "Optional follow-up prompt queued when the process exits, using the calling runner's approval policy." },
         timeoutSeconds: { type: "integer", minimum: 1, maximum: 604800, description: "Maximum monitor lifetime in seconds." }
       },
       additionalProperties: false
@@ -873,7 +873,19 @@ async function callTool(params: unknown) {
   }
 
   if (name === "subscribe_wait_event") {
-    return toolResult(await postJson("/api/wait-subscriptions", args));
+    const actionPayload = readObject(args.actionPayload);
+    const inheritedApprovalPolicy = readString(actionPayload?.approvalPolicy) ?? managerApprovalPolicy;
+    return toolResult(await postJson("/api/wait-subscriptions", {
+      ...args,
+      ...(readString(args.actionType) === "enqueue_prompt" && actionPayload
+        ? {
+            actionPayload: {
+              ...actionPayload,
+              ...(inheritedApprovalPolicy ? { approvalPolicy: inheritedApprovalPolicy } : {})
+            }
+          }
+        : {})
+    }));
   }
 
   if (name === "todo_list" || name === "todo_get_detail") {
@@ -1060,12 +1072,16 @@ async function callTool(params: unknown) {
     const id = readRequiredString(args, "id");
     return toolResult(await postJson(`/api/process-monitors/${encodeURIComponent(id)}/adopt`, {
       ...args,
-      id: undefined
+      id: undefined,
+      ...(managerApprovalPolicy ? { approvalPolicy: managerApprovalPolicy } : {})
     }));
   }
 
   if (name === "restart_process_monitor") {
-    return toolResult(await postJson(`/api/process-monitors/${encodeURIComponent(readRequiredString(args, "id"))}/restart`, {}));
+    return toolResult(await postJson(
+      `/api/process-monitors/${encodeURIComponent(readRequiredString(args, "id"))}/restart`,
+      managerApprovalPolicy ? { approvalPolicy: managerApprovalPolicy } : {}
+    ));
   }
 
   if (name === "stop_process_monitor") {
@@ -1243,6 +1259,7 @@ async function monitorProcess(input: Record<string, unknown>) {
     ...(input.entryPoints !== undefined ? { entryPoints: input.entryPoints } : {}),
     ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
     ...(input.wakePrompt !== undefined ? { wakePrompt: input.wakePrompt } : {}),
+    ...(input.wakePrompt !== undefined && managerApprovalPolicy ? { approvalPolicy: managerApprovalPolicy } : {}),
     ...(input.timeoutSeconds !== undefined ? { timeoutSeconds: input.timeoutSeconds } : {}),
     ...(managerSessionId ? { sessionId: managerSessionId } : {}),
     ...(managerThreadId ? { threadId: managerThreadId } : {})
