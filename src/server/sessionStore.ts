@@ -8540,6 +8540,8 @@ export class SessionStore {
     // Use the existing session/turn/created index to search backward, stopping
     // at the latest diff for each turn. Historical cumulative diffs can total
     // gigabytes; never read them all merely to retain the last one in JavaScript.
+    // Keep JSON extraction in JavaScript: PostgreSQL rejects escaped NULs when
+    // json_extract_string runs against raw Codex output.
     const result = await connection.run(`
       WITH event_turns AS (
         SELECT DISTINCT turn_id FROM session_turn_event
@@ -8553,13 +8555,11 @@ export class SessionStore {
           WHERE session_id = $sessionId AND turn_id = event_turns.turn_id
             AND event_name = 'codex'
             ${before ? "AND (created, id) < ($beforeCreated::TIMESTAMPTZ, $beforeId)" : ""}
-            AND json_extract_string(payload, '$.method') = 'turn/diff/updated'
+            AND contains(CAST(payload AS VARCHAR), 'turn/diff/updated')
           ORDER BY created DESC, id DESC LIMIT 1
         ) AS diff_event
       )
-      SELECT id AS event_id, turn_id,
-        json_extract_string(payload, '$.params.turnId') AS native_turn_id,
-        json_extract_string(payload, '$.params.diff') AS diff,
+      SELECT id AS event_id, turn_id, CAST(payload AS VARCHAR) AS payload_json,
         CAST(created AS VARCHAR) AS created
       FROM latest_diffs
     `, {
@@ -8568,7 +8568,16 @@ export class SessionStore {
       ...(authoritativeTurnIds.length ? { authoritativeTurnIds } : {}),
       ...(before ? { beforeCreated: before.created, beforeId: before.id } : {})
     });
-    return result.getRowObjectsJS();
+    return (await result.getRowObjectsJS()).flatMap((row) => {
+      const event = recordValue(parseJsonObject(row.payload_json));
+      if (event?.method !== "turn/diff/updated") return [];
+      const params = recordValue(event.params);
+      return [{
+        ...row,
+        native_turn_id: params?.turnId,
+        diff: params?.diff
+      }];
+    });
   }
 
   private async listSessionApprovalLiveItemsWithConnection(

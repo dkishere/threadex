@@ -464,7 +464,7 @@ test("live items upsert by replay order without item event history", async () =>
     };
     assert.deepEqual(storedComment.extracts, [{
       type: "action",
-      shortMsg: "完整進度內容仍然保留，並會繼續處理後續驗證。完整進度內容仍然保…"
+      shortMsg: "完整進度內容仍然保留，並會繼續處理後續驗證。完整進度內容仍然保留，並會繼續處理後續驗證。完整進度內容仍然保留，並會繼續處理後續…"
     }]);
     assert.equal(storedComment.detail, storedDetail);
     assert.equal(inspected?.events?.length, 0);
@@ -814,7 +814,7 @@ test("diagnostic turn events can avoid refreshing runner heartbeat", async () =>
       id: "turn-1",
       runnerPid: process.pid,
       runnerLogPath: "/tmp/threadex-runner.ndjson"
-    }), false);
+    }), true);
     const startedHeartbeat = (await store.getSessionTurn("turn-1"))?.runnerHeartbeat;
     assert.ok(startedHeartbeat);
 

@@ -255,7 +255,10 @@ export class ProcessMonitorService {
       metrics: record.metricMonitors,
       sourceCommandId: record.id,
       parameters,
-      parameterValues
+      parameterValues,
+      // A registered command remains available; each captured run is kept so
+      // its status and log can be inspected independently after completion.
+      removeOnExit: false
     });
   }
 
