@@ -43,6 +43,7 @@ export default defineConfig({
         DUCKDB_HOME_DIRECTORY: resolve(dataDir, "duckdb-home"),
         DUCKDB_EXTENSION_DIRECTORY: resolve(root, ".duckdb/extensions"),
         EVENT_RING_CAPACITY: "8",
+        WEB_VSCODE_AUTOSTART: "false",
         ACCOUNT_QUOTA_REFRESH_INTERVAL_MS: "0",
         SESSION_SUMMARIZER_ENABLED: "false",
         SESSION_SUMMARIZER_IDLE_MS: "3600000",

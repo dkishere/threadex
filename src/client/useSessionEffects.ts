@@ -1,6 +1,7 @@
 // @ts-nocheck
 import { useEffect, useLayoutEffect } from "react";
 import { deferSnapshotWrite } from "./deferredSnapshot";
+import { CLIENT_EVENT_TYPES } from "../eventProtocol";
 
 export function useSessionEffects(ctx) {
   const { accountPopoverRef, activeGearIndex, activePromptTurnIds, activeTurnId, activeTurnIdRef, activeWorkspace, approvalPolicy, backendConnection, backendConnectionRef, bumpViewKey, composerDraftSessionIdRef, currentModelPreferences, currentRunningTurnId, currentSessionIsRunning, currentSessionIsStopping, didBootReconnectRef, effectiveParentSessionId, escStopArmedRef, escStopTimerRef, eventStore, executionMode, explicitNewSessionRef, findAssistantMessageId, forcePlanNextPrompt, forkNextPrompt, gearProfiles, handleDurableEvent, hasRunningTurn, inlinePromptEditor, inlinePromptEditorRef, isAccountLoginOpen, isAccountPopoverOpen, isBootstrapped, isLikelyBackendDisconnect, isSessionSearchOpen, isSettingsOpen, latestMessagesRef, loadContext, loadSessionSearchPage, loadSessionsTimerRef, loadWorkspaceSnapshot, messageIndicatorMarks, messageScrollIndicatorRef, messageScrollTopRef, messages, messagesRef, modelPreferencesEditRevisionRef, navigationTargetRef, noteBackendDisconnect, noteBackendRequestSucceeded, patchStoredComposerDraft, persistModelPreferences, profileAccountId, profileWorkspaceId, promptTurns, promptTurnsScrollRef, queuedModelPreferencesRevisionRef, queuedPrompts, queuedPromptsBySession, queuedPromptsRef, readNavigationTarget, reconnectRunner, reconnectingTurnIdsRef, refreshSelectedSessionSnapshot, resetAccountLoginDialog, resetEscStopPrompt, resizeEditor, responseQuotePopover, restoreBackendConnection, resumeThreadId, runQueuedPrompt, runningSessionCount, selectedEffort, selectedModel, sessionExecutionStatusesRef, sessionId, sessionIdRef, sessionSearchQuery, setActivePromptTurnIds, setClockNow, setComposerResponseQuote, setIsAccountPopoverOpen, setIsLoadingProfileAnalytics, setIsLoadingSkills, setIsSettingsOpen, setParentSessionTodo, setPendingApprovalSessionIds, setProfileAnalytics, setProfileAnalyticsError, setProfileWorkspaceId, setResponseQuotePopover, setSelectedSkills, setSessionExecutionStatuses, setSkillSuggestions, setSlashSuggestionIndex, setStatus, setsEqual, settingsSection, showToast, skillSuggestions, slashTrigger, status, stickToMessageBottomRef, stopCurrentTurn, switchingSessionTitle, threadId, toastTimerRef, updateMessageIndicatorPositions, updateMessageViewportIndicator, useLoadBalanceInWorkspace, viewKeyRef, writeStoredSession } = ctx;
@@ -297,23 +298,7 @@ useEffect(() => {
         setSlashSuggestionIndex(0);
     }, [slashTrigger?.query]);
 useEffect(() => {
-        const unsubscribe = eventStore.subscribeTo([
-            "runner.session",
-            "runner.runner.started",
-            "runner.developer_instructions",
-            "runner.result",
-            "runner.pending",
-            "runner.error",
-            "runner.codex",
-            "runner.done",
-            "runner.runner.callback_error",
-            "runner.approval.requested",
-            "runner.approval.resolved",
-            "session.imported",
-            "session.task.created",
-            "workspace.created",
-            "workspace.switched"
-        ], (event) => void handleDurableEvent(event));
+        const unsubscribe = eventStore.subscribeTo(CLIENT_EVENT_TYPES, (event) => void handleDurableEvent(event));
         return unsubscribe;
     }, []);
 useEffect(() => {
@@ -324,6 +309,8 @@ useEffect(() => {
         async function pollEvents() {
             try {
                 const resetRequired = await eventStore.poll();
+                if (cancelled)
+                    return;
                 const shouldRestoreBackend = backendConnectionRef.current === "reconnecting";
                 noteBackendRequestSucceeded();
                 if (shouldRestoreBackend) {

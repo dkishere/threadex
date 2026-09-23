@@ -152,6 +152,20 @@ npm run embed:session-descriptions
   Threadex API server and Vite client are included as built-in read-only
   health records. The server reports its current PID; the client probes Vite's
   health endpoint so externally managed restarts do not leave stale PID state.
+- `register_process_command`: save a complete launch spec without executing it.
+  Optional `parameters` define `name`, `desc`, `type` (`option`/`string`/`number`),
+  and a type-correct `default`. `option` also requires an `options` string array.
+  Users get a prefilled form on Play; agents supply `parameterValues` by name to
+  `run_process_command` (omitted values use defaults). Use `{{name}}` in `args`
+  or `dockerRunArgs`, or read `THREADEX_PARAM_name` from the process environment.
+  Shell `command` uses quoted `"$THREADEX_PARAM_name"`, not text interpolation.
+  Never interpolate user input into interpreter code (`sh -c`, `node -e`, etc.);
+  pass it as separate argv entries or environment values instead.
+  Commands persist in the workspace Available tab. Accepts the launch, cwd, log,
+  entry-point and metric fields of `monitor_process`, without PID, wake prompt or
+  timeout. Users can click Run, or agents can use `run_process_command` with the
+  returned id. Each run creates a separate captured monitor in Running and keeps
+  the command available. `list_processes` includes commands with status `available`.
 - `monitor_process`: labels are display text and never discover a process. Use
   `pid` only for a temporary, non-restartable attachment that stores no launch
   args and disappears when that exact PID exits. For a durable monitor provide

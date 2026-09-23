@@ -29,6 +29,33 @@ test("file links use the displayed session context without URL query parameters"
   assert.doesNotMatch(switched, /local_project/);
 });
 
+test("renders Codex follow-up suggestions as buttons while preserving code and incomplete text", () => {
+  const directive = ':codex-followup[Review priority-60 sessions]{prompt="Audit the recurrent camera evidence for 74be and c185."}';
+  const render = (children: string) => renderToStaticMarkup(React.createElement(MarkdownContent, { children }));
+  assert.match(render(directive), /<button[^>]*>Review priority-60 sessions<\/button>/);
+  assert.doesNotMatch(render(`\`${directive}\``), /<button/);
+  assert.doesNotMatch(render(`\`\`\`\n${directive}\n\`\`\``), /<button/);
+  assert.doesNotMatch(render(directive.slice(0, -1)), /<button/);
+  assert.doesNotMatch(render(':codex-followup[Empty]{prompt=" "}'), /<button/);
+});
+
+test("renders Codex output file citations as workspace file links", () => {
+  const path = "/tmp/a7deca0c-610f-48c6-b6d9-e8bce39f0699-screenshots.csv";
+  const directive = `:codex-file-citation{path="${path}" purpose="output"}`;
+  const html = renderToStaticMarkup(React.createElement(MarkdownContent, { children: directive }));
+  assert.match(html, /class="codex-file-citation"/);
+  assert.match(html, /Output: a7deca0c-610f-48c6-b6d9-e8bce39f0699-screenshots\.csv/);
+  assert.ok(html.includes(`/api/workspaces/file?path=${encodeURIComponent(path)}`));
+});
+
+test("leaves invalid, relative and code-block file citations as text", () => {
+  const citation = ':codex-file-citation{path="/tmp/output.csv" purpose="output"}';
+  const render = (children: string) => renderToStaticMarkup(React.createElement(MarkdownContent, { children }));
+  for (const source of [':codex-file-citation{path="output.csv"}', ':codex-file-citation{path="/tmp/a.csv" path="/tmp/b.csv"}', `\`${citation}\``, `\`\`\`\n${citation}\n\`\`\``]) {
+    assert.doesNotMatch(render(source), /class="codex-file-citation"/);
+  }
+});
+
 test("renders an absolute workspace image link as an inline preview", () => {
   const path = "/Volumes/dev/tools/session-manager/concept image.png";
   const html = renderToStaticMarkup(

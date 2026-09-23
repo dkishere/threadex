@@ -6,6 +6,7 @@ import { AutoModelSettings, createAutoModelSettingsRouter } from "./autoModelSet
 import { RunnerProcessRegistry } from "./runnerProcessRegistry";
 import { clientLayoutInstructions } from "./clientLayoutInstructions";
 import { createTurnGrillHandler } from "./turnGrillRoute";
+import { createWorkspaceSnapshotHandler } from "./workspaceSnapshotRoute";
 import { reviseOutcomePlan } from "./lightweightTodo";
 import express from "express";
 import { createSecurity } from "./security";
@@ -114,6 +115,8 @@ import {
 } from "./pendingTurnRouting";
 import { DEFAULT_TURN_RING_MAX_BYTES, TurnRingLog } from "./turnRingLog";
 import { EventRingLog, type RingEvent } from "./eventRingLog";
+import { changedEventState, clientEventPage, versionEventState } from "./eventPoll";
+import type { EventStateVersions } from "../eventProtocol";
 import { canInlineWorkspaceFile, resolveWorkspaceFilePath } from "./workspaceFiles";
 import { runnerStartupIsWithinGrace } from "./runnerWatchdog";
 import {
@@ -707,6 +710,10 @@ type JsonRpcRequest = {
   reject: (error: Error) => void;
 };
 
+import { SessionCategories, createSessionCategoriesRouter } from "./sessionCategories";
+import { CategoryContextPools } from "./categoryContextPools";
+import { CategoryClassifier } from "./categoryClassifier";
+
 const app = express();
 const localBrowserBridge = new LocalBrowserBridgeClient();
 const sessionStore = new SessionStore();
@@ -716,6 +723,12 @@ const waitEvents = new WaitEventService(sessionStore, {
 type PendingSessionTurnCandidate = Awaited<ReturnType<SessionStore["listPendingSessionTurns"]>>[number];
 const sessionSummarizer = new SessionSummarizer(sessionStore, undefined, async (sessionId) => {
   await publishTodoChanged(sessionId, await sessionStore.getSessionTodo(sessionId));
+}, async (sessionId) => {
+  const session = await sessionStore.getSession(sessionId);
+  if (session && sessionCategories.read(session.workspaceId).enabled) {
+    sessionCategories.sync(session.workspaceId, await sessionStore.listSessions(session.workspaceId));
+    categoryClassifier.schedule(session.workspaceId);
+  }
 });
 const pendingAccountLogins = new Map<string, PendingAccountLogin>();
 const runnerSwitchReplayAttempts = new Map<string, number>();
@@ -768,6 +781,12 @@ const duckDbUiPort = parsePort(process.env.DUCKDB_UI_PORT, 4213);
 const serverDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(serverDir, "../..");
 const dataDir = resolve(process.env.SESSION_DATA_DIR ?? resolve(projectRoot, "data"));
+const sessionCategories = new SessionCategories(resolve(dataDir, "session-categories"), projectRoot);
+const runCategoryModel = sessionSummarizer.runCategoryTask.bind(sessionSummarizer);
+const categoryContextPools = new CategoryContextPools(sessionStore, sessionCategories, runCategoryModel);
+const categoryClassifier = new CategoryClassifier(sessionStore, sessionCategories, runCategoryModel, workspaceId => {
+  categoryContextPools.schedule(workspaceId);
+});
 const autoModelSettings = new AutoModelSettings(resolve(dataDir, "typesafe-api-key"));
 const runnerPath = resolve(serverDir, "promptRunner.ts");
 const tsxPath = resolve(projectRoot, "node_modules/tsx/dist/cli.mjs");
@@ -819,15 +838,16 @@ const pendingRetryFallbackMs = parseDurationMs(
 );
 const eventRingCapacity = Math.max(1, Number.parseInt(process.env.EVENT_RING_CAPACITY ?? "4096", 10) || 4096);
 const eventRingLog = new EventRingLog(eventRingLogPath, eventRingCapacity);
-let eventPollSupplementCache: {
-  workspaceId: string;
-  expiresAt: number;
+type EventPollSupplement = {
   statusMonitor: WorkspaceMonitorStatus[];
   processMonitors: ProcessMonitorRecord[];
-} | null = null;
+  grillSummaries: Awaited<ReturnType<SessionStore["listGrillSummaries"]>>;
+  versions: EventStateVersions;
+};
+let eventPollSupplementCache: EventPollSupplement & { workspaceId: string; expiresAt: number } | null = null;
 let eventPollSupplementInFlight: {
   workspaceId: string;
-  promise: Promise<{ statusMonitor: WorkspaceMonitorStatus[]; processMonitors: ProcessMonitorRecord[] }>;
+  promise: Promise<EventPollSupplement>;
 } | null = null;
 const runnerUpdateQueue = new RunnerUpdateQueue();
 const runnerLogReplay = new RunnerLogReplay();
@@ -841,6 +861,7 @@ let shuttingDown = false;
 app.use("/api", createSecurity(resolve(dataDir, "security.json")));
 app.use("/api", createHtmlPreviewRouter());
 app.use(express.json({ limit: "32mb" }));
+app.use("/api/experimental/session-categories", createSessionCategoriesRouter(sessionStore, sessionCategories, categoryContextPools, categoryClassifier));
 app.use("/api/settings/auto-model", createAutoModelSettingsRouter(autoModelSettings));
 app.use("/api/quick-chat", createQuickChatRouter(resolve(dataDir, "quick-chat-sessions.json")));
 app.use(express.static(resolve(projectRoot, "dist"), { index: "index.html" }));
@@ -1145,8 +1166,8 @@ app.post(
         wakeSessionId,
         wakeThreadId
       });
-      const waitEvent = await ensureProcessExitEvent(monitor);
-      await ensureProcessWakeSubscription(monitor, waitEvent, request.approvalPolicy);
+      const waitEvent = monitor.status === "available" ? null : await ensureProcessExitEvent(monitor);
+      if (waitEvent) await ensureProcessWakeSubscription(monitor, waitEvent, request.approvalPolicy);
       await publishRingEvent({
         eventId: crypto.randomUUID(),
         type: "process.monitor.changed",
@@ -1158,13 +1179,13 @@ app.post(
       res.status(201).json({ monitor, waitEvent });
     } catch (error) {
       const message = errorMessage(error);
-      res.status(message.includes("required") || message.includes("requires") || message.includes("exactly one") || message.includes("inside") || message.includes("between") || message.includes("session") || message.includes("entryPoint") || message.includes("dockerImage") || message.includes("Docker image") || message.includes("logFile") || message.includes("metrics") || message.includes("Metric") ? 400 : 500).json({ error: message });
+      res.status(message.includes("required") || message.includes("requires") || message.includes("exactly one") || message.includes("inside") || message.includes("between") || message.includes("session") || message.includes("entryPoint") || message.includes("dockerImage") || message.includes("Docker image") || message.includes("logFile") || message.includes("metrics") || message.includes("Metric") || /parameter/i.test(message) ? 400 : 500).json({ error: message });
     }
   }
 );
 
-app.post("/api/process-monitors/:monitorId/restart", async (
-  req: Request<{ monitorId: string }, object, { approvalPolicy?: ApprovalPolicy }>,
+app.post(["/api/process-monitors/:monitorId/restart", "/api/process-monitors/:monitorId/run"], async (
+  req: Request<{ monitorId: string }, object, ProcessMonitorRequest>,
   res: Response
 ) => {
   try {
@@ -1172,6 +1193,10 @@ app.post("/api/process-monitors/:monitorId/restart", async (
     const virtualMonitor = (await virtualProcessMonitors(workspace))
       .find(({ monitor }) => monitor.id === req.params.monitorId);
     if (virtualMonitor) {
+      if (req.path.endsWith("/run")) {
+        res.status(404).json({ error: "Registered command not found." });
+        return;
+      }
       if (!virtualMonitor.restartAction) {
         res.status(409).json({ error: "This externally supervised process has no restart control." });
         return;
@@ -1185,10 +1210,12 @@ app.post("/api/process-monitors/:monitorId/restart", async (
     const previousMonitor = await sessionStore.getProcessMonitor(req.params.monitorId);
     const wakeApprovalPolicy = req.body?.approvalPolicy
       ?? (previousMonitor ? await processWakeApprovalPolicy(previousMonitor) : undefined);
-    const monitor = await processMonitor.restart(workspace, req.params.monitorId);
-    if (previousMonitor) await cancelProcessExitEvent(previousMonitor);
-    const waitEvent = await ensureProcessExitEvent(monitor);
-    await ensureProcessWakeSubscription(monitor, waitEvent, wakeApprovalPolicy);
+    const monitor = req.path.endsWith("/run")
+      ? await processMonitor.run(workspace, req.params.monitorId, req.body?.parameterValues)
+      : await processMonitor.restart(workspace, req.params.monitorId);
+    if (previousMonitor && previousMonitor.status !== "available") await cancelProcessExitEvent(previousMonitor);
+    const waitEvent = monitor.status === "available" ? null : await ensureProcessExitEvent(monitor);
+    if (waitEvent) await ensureProcessWakeSubscription(monitor, waitEvent, wakeApprovalPolicy);
     await publishRingEvent({
       eventId: crypto.randomUUID(),
       type: "process.monitor.changed",
@@ -1258,7 +1285,7 @@ app.delete("/api/process-monitors/:monitorId", async (req: Request<{ monitorId: 
     const workspace = await sessionStore.getActiveWorkspace();
     const monitor = await sessionStore.getProcessMonitor(req.params.monitorId);
     await processMonitor.remove(workspace.id, req.params.monitorId);
-    if (monitor) await cancelProcessExitEvent(monitor);
+    if (monitor && monitor.status !== "available") await cancelProcessExitEvent(monitor);
     await publishRingEvent({
       eventId: crypto.randomUUID(),
       type: "process.monitor.changed",
@@ -1278,6 +1305,13 @@ app.get("/api/events", async (req, res) => {
   const after = Math.max(0, Number.parseInt(typeof req.query.after === "string" ? req.query.after : "0", 10) || 0);
   try {
     const workspace = await sessionStore.getActiveWorkspace();
+    if (req.query.view === "client") {
+      const page = clientEventPage(eventRingLog.entries, workspace.id, after);
+      if (page.resetRequired) { res.json(page); return; }
+      const supplement = await getEventPollSupplement(workspace);
+      res.json({ ...page, ...changedEventState(supplement, typeof req.query.stateVersion === "string" ? req.query.stateVersion : "") });
+      return;
+    }
     const oldestPos = eventRingLog.entries[0]?.pos ?? 0;
     const latestPos = eventRingLog.latestPosition;
     const resetRequired = after > 0 && (latestPos === 0 || after > latestPos || after < oldestPos - 1);
@@ -1291,7 +1325,7 @@ app.get("/api/events", async (req, res) => {
       resetRequired,
       statusMonitor: supplement.statusMonitor,
       processMonitors: supplement.processMonitors,
-      grillSummaries: await sessionStore.listGrillSummaries(workspace.id)
+      grillSummaries: supplement.grillSummaries
     });
   } catch (error) {
     res.status(500).json({ error: errorMessage(error) });
@@ -1383,9 +1417,10 @@ async function getEventPollSupplement(workspace: WorkspaceRecord) {
 
   const promise = Promise.all([
     getWorkspaceStatusMonitor(workspace.id, { releaseDeadRunningTurns: false }),
-    listProcessMonitors(workspace)
-  ]).then(([statusMonitor, processMonitors]) => {
-    const value = { statusMonitor, processMonitors };
+    listProcessMonitors(workspace),
+    sessionStore.listGrillSummaries(workspace.id)
+  ]).then(([statusMonitor, processMonitors, grillSummaries]) => {
+    const value = versionEventState(workspace.id, { statusMonitor, processMonitors, grillSummaries });
     eventPollSupplementCache = {
       workspaceId: workspace.id,
       expiresAt: Date.now() + 1_000,
@@ -1501,13 +1536,10 @@ app.post("/api/maintenance/sessions/cwd", async (
   }
 });
 
-app.get("/api/workspace/snapshot", async (_req, res) => {
-  try {
-    res.json(await getWorkspaceSnapshot());
-  } catch (error) {
-    res.status(500).json({ error: errorMessage(error) });
-  }
-});
+app.get("/api/workspace/snapshot", createWorkspaceSnapshotHandler({
+  readSnapshot: getWorkspaceSnapshot,
+  reconcileRunningTurns: () => releaseDeadRunningTurnsForDisplay("workspace_snapshot")
+}));
 
 app.get(["/api/sessions", "/api/sessions/list"], async (req, res) => {
   const offset = Math.max(0, Number.parseInt(typeof req.query.offset === "string" ? req.query.offset : "0", 10) || 0);
@@ -3144,7 +3176,6 @@ async function getWorkspaceSnapshot() {
   // snapshot is being assembled will then be replayed instead of being skipped.
   const eventCursor = eventRingLog.latestPosition;
   const activeWorkspace = await sessionStore.getActiveWorkspace();
-  await releaseDeadRunningTurnsForDisplay("workspace_snapshot");
   const [
     sessionPage,
     sessionExecutionStatuses,
@@ -3198,7 +3229,7 @@ async function getWorkspaceSnapshot() {
       .filter((approval) => approval.decision === undefined)
       .map(publicApprovalRecord),
     activeSessionId,
-    activeSession: activeSession ? await getSessionSnapshot(activeSession, true) : null,
+    activeSession: activeSession ? await getSessionSnapshot(activeSession) : null,
     processMonitors,
     statusMonitor,
     waitEvents: waitEventRecords,
@@ -3255,6 +3286,7 @@ function readOnlyServerProcessMonitor(workspace: WorkspaceRecord, restartable: b
     cwd: process.cwd(),
     pid: process.pid,
     status: "running",
+    sourceCommandId: null,
     managed: false,
     readOnly: true,
     restartable,
@@ -3796,6 +3828,16 @@ app.post("/api/sessions/summarize", async (req: Request<object, object, Summariz
       });
     }
     res.json({ ok: true, results });
+  } catch (error) {
+    res.status(500).json({ error: errorMessage(error) });
+  }
+});
+
+app.get("/api/sessions/:sessionId/side-chats", async (req, res) => {
+  try {
+    const result = await sessionStore.listSessionSideChats(req.params.sessionId);
+    if (!result) { res.status(404).json({ error: "Session not found." }); return; }
+    res.json(result);
   } catch (error) {
     res.status(500).json({ error: errorMessage(error) });
   }
@@ -5401,9 +5443,14 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
     }
     const startupSnapshot = session.threadId ? undefined : buildStartupSnapshot(session.cwd);
     // Composer Todo opts into the persistent lightweight harness. Explicit Plan mode remains separate.
+    if (sessionCategories.read(session.workspaceId).enabled) {
+      sessionCategories.sync(session.workspaceId, await sessionStore.listSessions(session.workspaceId));
+      categoryClassifier.schedule(session.workspaceId);
+    }
     const runnerDeveloperInstructions = [
       chatRequest.developerInstructions,
-      clientLayoutInstructions(chatRequest.clientLayout)
+      clientLayoutInstructions(chatRequest.clientLayout),
+      sessionCategories.context(session.workspaceId, session.id)
     ].filter(Boolean).join("\n\n") || undefined;
     const job: RunnerJob = {
       sessionId: session.id,
@@ -5571,6 +5618,8 @@ async function shutdown(signal: string) {
     clearTimeout(timer);
   }
   pendingTurnTimers.clear();
+  categoryClassifier.close();
+  categoryContextPools.close();
   sessionSummarizer.close();
   stopSessionQuestionRunners();
   stopDuckDbUiAssetServer();
@@ -9684,6 +9733,13 @@ async function diagnoseRunningTurnOnce(turn: SessionTurnRecord, source: string, 
         diagnostics
       },
       refreshRunnerHeartbeat: false
+    });
+    await publishRunnerUpdateEvent({
+      id: crypto.randomUUID(),
+      sessionId: turn.sessionId,
+      turnId: turn.id,
+      event: "pending",
+      data: { reason: "stopped" }
     });
     return true;
   }

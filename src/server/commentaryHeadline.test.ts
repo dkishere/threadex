@@ -47,6 +47,8 @@ test("headline output schema requires every property for strict structured outpu
     Object.keys(COMMENTARY_HEADLINE_OUTPUT_SCHEMA.properties).sort(),
     [...COMMENTARY_HEADLINE_OUTPUT_SCHEMA.required].sort()
   );
+  assert.deepEqual(COMMENTARY_HEADLINE_OUTPUT_SCHEMA.properties.extracts.items.properties.type.enum,
+    ["answer", "action", "edit", "verification", "solution", "wait"]);
 });
 
 test("ClickHouse progress keeps compact headlines and the deletion constraint", () => {

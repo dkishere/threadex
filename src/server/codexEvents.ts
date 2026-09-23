@@ -19,7 +19,8 @@ const COMMENT_FALLBACK_SHORTS: Record<StructuredAgentCommentType, string> = {
   action: "Working on the next step",
   edit: "Editing the requested changes",
   verification: "Verifying the result",
-  solution: "Solution identified"
+  solution: "Solution identified",
+  wait: "Waiting for the next step"
 };
 
 const LEGACY_COMMENT_FALLBACK_SHORTS = new Set([
@@ -145,7 +146,7 @@ export type StreamItem = {
     }
 );
 
-export type StructuredAgentCommentType = "answer" | "action" | "edit" | "verification" | "solution";
+export type StructuredAgentCommentType = "answer" | "action" | "edit" | "verification" | "solution" | "wait";
 
 export type StructuredAgentCommentExtract = {
   type: StructuredAgentCommentType;
@@ -438,6 +439,7 @@ function normalizeCommentSolutions(value: unknown): StructuredAgentCommentSoluti
 
 function inferCommentType(text: string) {
   const value = text.toLowerCase();
+  if (/\b(wait\w*|pending|queued|paused|holding)\b|等待|等緊|稍候|排隊中|暫停/.test(value)) return "wait";
   if (/\b(solution|resolved|workaround|fixed|recovered)\b|解決|已修正|已修復|方案|繞過/.test(value)) return "solution";
   if (/\b(test\w*|verif\w*|validat\w*|check\w*|build\w*|typecheck\w*)\b/.test(value)) return "verification";
   if (/驗證|測試|檢查|通過/.test(value)) return "verification";
@@ -447,7 +449,7 @@ function inferCommentType(text: string) {
 
 function normalizeCommentType(type: string, detail: string): StructuredAgentCommentType {
   const value = type.trim().toLowerCase();
-  if (value === "answer" || value === "edit" || value === "verification" || value === "solution") return value;
+  if (value === "answer" || value === "edit" || value === "verification" || value === "solution" || value === "wait") return value;
   if (value === "response" || value === "reply") return "answer";
   if (value === "fix" || value === "resolution" || value === "workaround") return "solution";
   if (value === "action" || value === "research" || value === "progress" || value === "note") return "action";

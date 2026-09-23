@@ -164,6 +164,57 @@ test("summarizer updates the title without generating or replacing keywords", as
   }
 });
 
+test("failed model calls preserve the title and summary cache until a successful retry", async () => {
+  const original = { ...session({ title: "Gemma prompt lab", titleSource: "summarizer" }), threadId: null };
+  let writes = 0;
+  let saved: unknown = null;
+  const store = {
+    listRunningSessionTurns: async () => [],
+    listPendingSessionTurns: async () => [],
+    getSession: async () => original,
+    hasIncompleteImportedLocalTurns: async () => false,
+    listSessionTurns: async () => [
+      turn("Build a local Gemma prompt lab for reviewed device findings"),
+      turn("run the llm call in concurrent on the page")
+    ],
+    getSessionSummaryState: async () => saved,
+    getWorkspace: async () => ({ codexHome: null }),
+    getOutcomePlan: async () => null,
+    upsertSessionSummary: async (value: { title: string }) => {
+      writes += 1;
+      saved = value;
+      original.title = value.title;
+      return original;
+    }
+  } as unknown as SessionStore;
+  const summarizer = new SessionSummarizer(store);
+  const internals = summarizer as unknown as {
+    runSummarizerLuna: (prompt: string) => Promise<unknown>;
+    pendingRetries: Map<string, unknown>;
+    processSession: (id: string, request: { force: boolean; reason: "idle" }) => Promise<void>;
+  };
+  try {
+    internals.runSummarizerLuna = async () => { throw new Error("transient model timeout"); };
+    await summarizer.forceSummarizeSession(original.id);
+    assert.equal(original.title, "Gemma prompt lab");
+    assert.equal(writes, 0);
+    assert.equal(saved, null);
+    assert.ok(internals.pendingRetries.has(original.id));
+
+    internals.runSummarizerLuna = async (prompt) => {
+      assert.match(prompt, /Build a local Gemma prompt lab/);
+      assert.match(prompt, /run the llm call in concurrent on the page/);
+      return { responseText: "title: Build Gemma prompt testing lab", usage: null, accountId: null };
+    };
+    await internals.processSession(original.id, { force: true, reason: "idle" });
+    assert.equal(writes, 1);
+    assert.equal(original.title, "Build Gemma prompt testing lab");
+    assert.equal(internals.pendingRetries.has(original.id), false);
+  } finally {
+    summarizer.close();
+  }
+});
+
 test("summarizer prompt titles the overall objective instead of a narrow latest turn", () => {
   const context = buildSummaryContext(
     session({ title: "Improve session retrieval" }),

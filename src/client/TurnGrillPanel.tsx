@@ -1,45 +1,35 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { ArrowUpRight, Check, ChevronDown, Eye, Flame, History, Loader2, MessageSquare, Pencil, RotateCcw, Send, X } from "lucide-react";
+import { useCallback, useEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
+import { ArrowUpRight, Check, ChevronDown, Copy, Eye, Flame, History, Loader2, MessageSquare, Pencil, RotateCcw, Send, X } from "lucide-react";
 import { MarkdownContent } from "./MarkdownContent";
 import { GrillHistoryDialog } from "./GrillHistoryDialog";
 import { canFollowUpGrill, grillAwaitingAck, grillContentVersion, grillHandoff, mergeGrillEdits, type GrillIssue, type TurnGrill } from "../turnGrill";
 import { eventStore, useEventStore } from "./eventStore";
+import { ApiError } from "./apiClient";
+import { loadTurnGrill, turnGrillUrl, updateTurnGrill } from "./sessionApi";
 import "./turnGrill.css";
 
-export function useGrilledTurns(sessionId: string | null) {
-  const { grillSummaries } = useEventStore();
+export function useGrilledTurns() {
+  const grillSummaries = useEventStore((state) => state.grillSummaries);
   const [keys, setKeys] = useState(() => new Set<string>());
   const markGrilled = useCallback((ownerId: string, turnId: string) => {
     const key = `${ownerId}:${turnId}`;
     setKeys((current) => current.has(key) ? current : new Set(current).add(key));
   }, []);
-  useEffect(() => {
-    if (!sessionId) return;
-    let disposed = false;
-    void fetch(`/api/sessions/${encodeURIComponent(sessionId)}/grills`).then(async (response) => {
-      if (!response.ok) return;
-      const data = await response.json();
-      if (!disposed && Array.isArray(data.turnIds)) {
-        setKeys((current) => new Set([...current, ...data.turnIds.map((id: string) => `${sessionId}:${id}`)]));
-      }
-    }).catch(() => { /* Loaded review panels still report their saved status. */ });
-    return () => { disposed = true; };
-  }, [sessionId]);
   return { grilledTurns: new Set([...keys, ...grillSummaries.map((item) => `${item.sessionId}:${item.turnId}`)]), markGrilled,
     pendingGrillTurns: new Set(grillSummaries.filter((item) => item.pending).map((item) => `${item.sessionId}:${item.turnId}`)),
     pendingGrillSessions: new Set(grillSummaries.filter((item) => item.pending).map((item) => item.sessionId)) };
 }
 
-export function TurnGrillPanel({ sessionId, turnId, latest, mainBusy, onImplement, actionExtras, onGrilled }: {
+export function TurnGrillPanel({ sessionId, turnId, latest, mainBusy, onImplement, actionExtras, onGrilled, copyText }: {
   sessionId: string; turnId: string; latest: boolean; mainBusy: boolean;
   onImplement: (prompt: string, origin: { turnId: string; observedVersion: number }) => Promise<void>;
   actionExtras?: ReactNode;
   onGrilled?: (sessionId: string, turnId: string) => void;
+  copyText?: string;
 }) {
   const [review, setReview] = useState<TurnGrill | null>(null);
-  const { grillSummaries, workspaceSnapshot } = useEventStore();
-  const remoteSummary = grillSummaries.find((item) => item.sessionId === sessionId && item.turnId === turnId);
-  const remoteRevision = remoteSummary?.revision ?? 0;
+  const workspaceSnapshot = useEventStore((state) => state.workspaceSnapshot);
+  const remoteSummary = useEventStore((state) => state.grillSummaries.find((item) => item.sessionId === sessionId && item.turnId === turnId));
   const knownAbsent = workspaceSnapshot !== null && !remoteSummary;
   const [issues, setIssues] = useState<GrillIssue[]>([]);
   const [loading, setLoading] = useState(true);
@@ -52,13 +42,14 @@ export function TurnGrillPanel({ sessionId, turnId, latest, mainBusy, onImplemen
   const [historyOpen, setHistoryOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "error">("idle");
   const [conflicts, setConflicts] = useState<string[]>([]);
   const conflictRef = useRef(false);
   const reviewRef = useRef<TurnGrill | null>(null);
   const issuesRef = useRef<GrillIssue[]>([]);
   const saveInFlight = useRef<Promise<TurnGrill | null> | null>(null);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const url = `/api/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/grill`;
+  const url = turnGrillUrl(sessionId, turnId);
   const accept = (value: TurnGrill | null) => {
     if (value && reviewRef.current && value.revision < reviewRef.current.revision) return;
     reviewRef.current = value; issuesRef.current = value?.issues ?? [];
@@ -78,14 +69,12 @@ export function TurnGrillPanel({ sessionId, turnId, latest, mainBusy, onImplemen
           const base = reviewRef.current;
           const snapshot = issuesRef.current;
           if (snapshot.some((issue) => !issue.md.trim())) throw new Error("Questions cannot be empty. Your edits are still here.");
-          const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
-            action: "save", revision: reviewRef.current.revision, issues: snapshot
-          }) });
-          const data = await response.json();
-          if (response.status === 409) {
-            const latestResponse = await fetch(url);
-            if (!latestResponse.ok) throw new Error("Could not load the latest review. Your edits are still here.");
-            const latest: TurnGrill | null = (await latestResponse.json()).grill;
+          let saved: TurnGrill;
+          try {
+            saved = await updateTurnGrill(url, { action: "save", revision: base.revision, issues: snapshot });
+          } catch (err) {
+            if (!(err instanceof ApiError) || err.status !== 409) throw err;
+            const latest = await loadTurnGrill(url, { fresh: true });
             if (!latest) throw new Error("The saved review is unavailable. Your edits are still here.");
             const merged = mergeGrillEdits(base.issues, issuesRef.current, latest.issues);
             reviewRef.current = latest; setReview(latest);
@@ -97,12 +86,11 @@ export function TurnGrillPanel({ sessionId, turnId, latest, mainBusy, onImplemen
             if (latest.status === "running" || ++retries > 2) throw new Error("Review is changing. Your edits are kept; retry autosave when it finishes.");
             continue;
           }
-          if (!response.ok) throw new Error(data.error || "Could not save changes. Your edits are still here.");
-          if (reviewRef.current && data.grill.revision < reviewRef.current.revision) continue;
-          reviewRef.current = data.grill;
-          setReview(data.grill);
+          if (reviewRef.current && saved.revision < reviewRef.current.revision) continue;
+          reviewRef.current = saved;
+          setReview(saved);
           // A late response must not replace edits made while this save was running.
-          if (issuesRef.current === snapshot) { issuesRef.current = data.grill.issues; setIssues(data.grill.issues); }
+          if (issuesRef.current === snapshot) { issuesRef.current = saved.issues; setIssues(saved.issues); }
           setSaveError("");
         }
         return reviewRef.current;
@@ -126,12 +114,10 @@ export function TurnGrillPanel({ sessionId, turnId, latest, mainBusy, onImplemen
       const saved = await flushChanges();
       if (!saved || !grillAwaitingAck(saved)) return;
       const observedVersion = grillContentVersion(saved);
-      const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "ack", observedVersion }) });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "Could not acknowledge Grill.");
-      if (reviewRef.current && data.grill.revision < reviewRef.current.revision) return;
-      const merged = mergeGrillEdits(reviewRef.current?.issues ?? [], issuesRef.current, data.grill.issues);
-      reviewRef.current = data.grill; setReview(data.grill); issuesRef.current = merged.issues; setIssues(merged.issues);
+      const acknowledged = await updateTurnGrill(url, { action: "ack", observedVersion });
+      if (reviewRef.current && acknowledged.revision < reviewRef.current.revision) return;
+      const merged = mergeGrillEdits(reviewRef.current?.issues ?? [], issuesRef.current, acknowledged.issues);
+      reviewRef.current = acknowledged; setReview(acknowledged); issuesRef.current = merged.issues; setIssues(merged.issues);
       if (merged.conflicts.length) { conflictRef.current = true; setConflicts(merged.conflicts); setSaveError("Another editor changed the same fields. Choose how to merge your edits."); }
     } catch (err) { setError(String(err)); }
     finally { setBusy(false); }
@@ -139,42 +125,48 @@ export function TurnGrillPanel({ sessionId, turnId, latest, mainBusy, onImplemen
   useEffect(() => () => { clearTimeout(saveTimer.current); void flushChanges(); }, [flushChanges]);
   useEffect(() => { if (review) { onGrilled?.(sessionId, turnId); eventStore.reportGrill(sessionId, turnId, review); } }, [review, sessionId, turnId, onGrilled]);
   useEffect(() => {
-    // The workspace snapshot already lists every saved review. Avoid a request
-    // per completed turn just to discover that most turns have no review.
+    // Wait for the authoritative summary before loading individual reviews.
+    if (workspaceSnapshot === null && !remoteSummary) return;
     if (knownAbsent && !reviewRef.current) {
       setLoading(false);
       return;
     }
-    let disposed = false;
-    let timer: ReturnType<typeof setTimeout>;
+    const controller = new AbortController();
+    let inFlight = false;
+    let loaded = false;
     async function load() {
+      const revision = eventStore.getState().grillSummaries.find((item) => item.sessionId === sessionId && item.turnId === turnId)?.revision ?? 0;
+      if (inFlight || (loaded && revision <= (reviewRef.current?.revision ?? 0))) return;
+      inFlight = true;
       try {
-        const response = await fetch(url);
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || "Could not load Grill review.");
-        if (!disposed) {
-          if (data.grill && reviewRef.current && data.grill.revision < reviewRef.current.revision) return;
-          if (reviewRef.current && data.grill && (conflictRef.current || JSON.stringify(issuesRef.current) !== JSON.stringify(reviewRef.current.issues))) {
-            const merged = mergeGrillEdits(reviewRef.current.issues, issuesRef.current, data.grill.issues);
-            reviewRef.current = data.grill; setReview(data.grill);
+        const latest = await loadTurnGrill(url, { signal: controller.signal });
+        if (!controller.signal.aborted) {
+          loaded = true;
+          if (reviewRef.current && (!latest || latest.revision < reviewRef.current.revision)) return;
+          if (reviewRef.current && latest && (conflictRef.current || JSON.stringify(issuesRef.current) !== JSON.stringify(reviewRef.current.issues))) {
+            const merged = mergeGrillEdits(reviewRef.current.issues, issuesRef.current, latest.issues);
+            reviewRef.current = latest; setReview(latest);
             issuesRef.current = merged.issues; setIssues(merged.issues);
             if (merged.conflicts.length) {
               conflictRef.current = true; setConflicts(merged.conflicts);
               setSaveError("Another editor changed the same fields. Choose how to merge your edits.");
             }
-          } else accept(data.grill);
+          } else accept(latest);
           setError("");
-          if (data.grill?.status === "running") timer = setTimeout(load, 2000);
         }
-      } catch (err) { if (!disposed) {
+      } catch { if (!controller.signal.aborted) {
+        loaded = false;
         setError("Could not reach the review server. Reconnecting…");
-        timer = setTimeout(load, 2000);
       } }
-      finally { if (!disposed) setLoading(false); }
+      finally { inFlight = false; if (!controller.signal.aborted) setLoading(false); }
     }
-    if (!reviewRef.current || remoteRevision > reviewRef.current.revision || reviewRef.current.status === "running") void load();
-    return () => { disposed = true; clearTimeout(timer); };
-  }, [url, review?.status === "running", remoteRevision, knownAbsent]);
+    // Recheck running jobs after a workspace snapshot/reconnect so the server
+    // can recover an interrupted job. Otherwise read only newer revisions.
+    loaded = !!reviewRef.current && reviewRef.current.status !== "running";
+    void load();
+    const unsubscribe = eventStore.subscribePoll(() => { void load(); });
+    return () => { controller.abort(); unsubscribe(); };
+  }, [url, knownAbsent, workspaceSnapshot]);
 
   async function act(action: "start" | "respond" | "followup", roundPrompt = "") {
     const observedVersion = grillContentVersion(reviewRef.current);
@@ -185,32 +177,25 @@ export function TurnGrillPanel({ sessionId, turnId, latest, mainBusy, onImplemen
     try {
       if (action !== "start" && !await flushChanges()) return null;
       submittedRevision = reviewRef.current?.revision ?? 0;
-      const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+      const result = await updateTurnGrill(url, {
         action, revision: reviewRef.current?.revision ?? 0, issues: issuesRef.current, prompt: roundPrompt, observedVersion
-      }) });
-      const data = await response.json();
-      if (!response.ok) {
-        if (response.status === 409) {
-          setError(`${data.error} Reload the review to get its latest state.`);
-          return null;
-        }
-        throw new Error(data.error || "Grill failed.");
-      }
-      accept(data.grill);
+      });
+      accept(result);
       if (action === "respond" || action === "followup") setPrompt("");
-      return data.grill as TurnGrill;
+      return result;
     } catch (err) {
+      if (err instanceof ApiError && err.status === 409) {
+        setError(`${err.message} Reload the review to get its latest state.`);
+        return null;
+      }
       // The connection may end before inference does. Recover the persisted job
       // instead of retrying it or reporting a transport JSON error as model failure.
       try {
-        const response = await fetch(url);
-        if (response.ok) {
-          const recovered: TurnGrill | null = (await response.json()).grill;
-          if (recovered && recovered.revision > submittedRevision) {
-            accept(recovered); setError("");
-            if (recovered.status !== "error" && action !== "start") setPrompt("");
-            return recovered;
-          }
+        const recovered = await loadTurnGrill(url, { fresh: true });
+        if (recovered && recovered.revision > submittedRevision) {
+          accept(recovered); setError("");
+          if (recovered.status !== "error" && action !== "start") setPrompt("");
+          return recovered;
         }
       } catch { /* Keep the local draft if recovery is also unavailable. */ }
       setError(err instanceof SyntaxError ? "The server connection ended without a complete response. Reload the review to check whether it finished." : String(err));
@@ -229,7 +214,24 @@ export function TurnGrillPanel({ sessionId, turnId, latest, mainBusy, onImplemen
   const promptId = `grill-prompt-${sessionId}-${turnId}`;
   const dropOrRestore = (issue: GrillIssue) => queueIssues(issuesRef.current.map((current) => current.id === issue.id
     ? { ...current, dropped: !current.dropped, selected: Boolean(current.dropped) } : current));
-  const actions = <div className="message-actions">{actionExtras}{latest && !review && !started && <button
+  const copyFinalResponse = async (event: MouseEvent<HTMLButtonElement>) => {
+    const content = copyText?.trim() || event.currentTarget.closest(".message")?.querySelector("[data-copy-markdown]")?.getAttribute("data-copy-markdown")?.trim();
+    if (!content || !navigator.clipboard) {
+      setCopyState("error");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopyState("copied");
+    } catch {
+      setCopyState("error");
+    }
+  };
+  const actions = <div className="message-actions">{actionExtras}<button
+    className="message-action-icon" type="button" data-copy-state={copyState === "idle" ? undefined : copyState}
+    title={copyState === "copied" ? "Agent response copied" : copyState === "error" ? "Could not copy agent response" : "Copy last agent response"}
+    aria-label={copyState === "copied" ? "Agent response copied" : copyState === "error" ? "Could not copy agent response" : "Copy last agent response"}
+    onClick={(event) => void copyFinalResponse(event)}><Copy aria-hidden="true" /></button>{latest && !review && !started && <button
     className="message-action-icon" type="button" title="Grill with Luna Max; long turns use Sol Max" aria-label="Grill agent"
     disabled={locked || mainBusy} onClick={() => void act("start")}><Flame aria-hidden="true" /></button>}</div>;
   if (!review && !started) return <>{actions}{error && <p role="alert">{error}</p>}</>;
@@ -249,7 +251,7 @@ export function TurnGrillPanel({ sessionId, turnId, latest, mainBusy, onImplemen
       <span>{conflicts.join(", ")}</span>
       <button type="button" disabled={saving} onClick={() => { conflictRef.current = false; setConflicts([]); void flushChanges(); }}>Keep local and merge</button>
       <button type="button" disabled={saving} onClick={async () => {
-        try { const response = await fetch(url); if (!response.ok) throw new Error("Could not reload latest review."); accept((await response.json()).grill); setEditing(null); }
+        try { accept(await loadTurnGrill(url, { fresh: true })); setEditing(null); }
         catch (err) { setSaveError(String(err)); }
       }}>Reload latest and discard local edits</button>
     </> : <button type="button" disabled={saving} onClick={() => void flushChanges()}>Retry autosave</button>}</div></div>}
@@ -257,7 +259,7 @@ export function TurnGrillPanel({ sessionId, turnId, latest, mainBusy, onImplemen
     {(error || review?.error) && <div className="grill-error" role="alert">
       <span>{error || review?.error}</span>
       <div><button type="button" disabled={busy} onClick={async () => {
-        try { const response = await fetch(url); const data = await response.json(); if (!response.ok) throw new Error(data.error); accept(data.grill); setError(""); } catch (err) { setError(String(err)); }
+        try { accept(await loadTurnGrill(url, { fresh: true })); setError(""); } catch (err) { setError(String(err)); }
       }}>Reload review</button>
       {review?.status === "error" && review.request && (review.request.action !== "followup" || canFollowUp) && <button type="button" disabled={locked} onClick={() => void act(review.request!.action, review.request!.prompt)}>Retry</button>}
       {!review && started && <button type="button" disabled={locked || mainBusy} onClick={() => void act("start")}>Retry Grill</button>}</div>

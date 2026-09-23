@@ -7,6 +7,57 @@ import test from "node:test";
 
 const mcpPath = resolve(import.meta.dirname, "sessionInspectorMcp.ts");
 
+test("agents can register commands without starting them and run by id", { timeout: 15_000 }, async () => {
+  const requests: { url: string; body: any }[] = [];
+  const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    requests.push({ url: request.url!, body: JSON.parse(Buffer.concat(chunks).toString()) });
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ monitor: { id: "saved-command" } }));
+  });
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const child = spawn(process.execPath, ["--import", "tsx", mcpPath], {
+    env: { ...process.env, SESSION_INSPECTOR_SERVER_URL: `http://127.0.0.1:${address.port}`, THREADEX_TODO_AGENT_ROLE: "worker", THREADEX_CONTINUITY_ONLY: "0" },
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  const lines = createInterface({ input: child.stdout });
+  const pending = new Map<number, (value: any) => void>();
+  lines.on("line", (line) => { const message = JSON.parse(line); pending.get(message.id)?.(message); });
+  let id = 0;
+  const rpc = (method: string, params?: unknown) => new Promise<any>((done) => {
+    pending.set(++id, done);
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+  });
+  try {
+    await rpc("initialize");
+    const list = (await rpc("tools/list")).result.tools;
+    const register = list.find((tool: any) => tool.name === "register_process_command");
+    assert.ok(register);
+    assert.equal(register.inputSchema.properties.pid, undefined);
+    assert.ok(list.some((tool: any) => tool.name === "run_process_command"));
+    const metrics = [{ name: "progress", command: "echo ready" }];
+    const parameters = [{ name: "count", desc: "Count", type: "number", default: 3 }];
+    assert.deepEqual(register.inputSchema.properties.parameters.items.required, ["name", "desc", "type", "default"]);
+    const saved = await rpc("tools/call", { name: "register_process_command", arguments: { label: "Example", exe: "node", args: ["-e", "console.log('ok')"], metrics, parameters } });
+    assert.equal(saved.result.isError, undefined);
+    assert.equal(requests[0].url, "/api/process-monitors");
+    assert.equal(requests[0].body.registerOnly, true);
+    assert.deepEqual(requests[0].body.metrics, metrics);
+    assert.deepEqual(requests[0].body.parameters, parameters);
+    const run = await rpc("tools/call", { name: "run_process_command", arguments: { id: "saved-command", parameterValues: { count: 8 } } });
+    assert.equal(run.result.isError, undefined);
+    assert.equal(requests[1].url, "/api/process-monitors/saved-command/run");
+    assert.deepEqual(requests[1].body.parameterValues, { count: 8 });
+  } finally {
+    child.kill("SIGTERM");
+    lines.close();
+    await new Promise<void>((done) => server.close(() => done()));
+  }
+});
+
 for (const count of ["1", undefined, "invalid", "NaN", "Infinity", "-1", "1.5"]) {
   test(`grill MCP exposes source lookup for totalTurns=${count}`, { timeout: 10_000 }, async () => {
     const env = { ...process.env, THREADEX_SESSION_ID: "single", THREADEX_GRILL_TURN_ID: "target", THREADEX_TODO_AGENT_ROLE: "turn_grill", THREADEX_GRILL_TOTAL_TURNS: count };

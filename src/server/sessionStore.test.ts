@@ -412,6 +412,17 @@ test("account auth is stored privately in PostgreSQL and updated with version ch
   }
 });
 
+test("snapshot live items preserve escaped NUL text", async () => {
+  const store = await createStore();
+  try {
+    await store.recordSessionTurnEvent({ id: "nul-item", turnId: "turn-1", sessionId: "session-1",
+      eventName: "item", jsonlIndex: 1,
+      payload: { id: "nul-message", itemType: "agent_message", eventType: "item.completed", text: "before\u0000after" } });
+    const items = await store.listSessionLiveItems("session-1");
+    assert.equal((items["turn-1"][0] as { text: string }).text, "before\u0000after");
+  } finally { await store.close(); }
+});
+
 test("live items upsert by replay order without item event history", async () => {
   const store = await createStore();
   try {

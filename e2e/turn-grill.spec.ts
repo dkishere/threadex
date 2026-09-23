@@ -1,18 +1,24 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./support/authenticated-test";
 import { apiBaseUrl, selectSession } from "./support/mock-runner.js";
 import { scenarioSessions } from "./support/scenarios.js";
 import type { TurnGrill } from "../src/turnGrill.js";
+import { mockGrillSummaries } from "./support/grill";
 
 test("Grill uses one turn composer, gates follow-up on a thread response, and preserves question management", async ({ page, request }) => {
   const session = scenarioSessions.switchAlpha;
   await selectSession(request, session.id);
   let saved: TurnGrill | null = null;
+  await mockGrillSummaries(page, session.id, () => saved);
   const actions: any[] = [];
   let releaseResponse!: () => void;
   const responseGate = new Promise<void>((resolve) => { releaseResponse = resolve; });
   await page.route("**/api/sessions/*/turns/*/grill", async (route) => {
     if (route.request().method() === "GET") return route.fulfill({ json: { grill: saved } });
     const body = route.request().postDataJSON(); actions.push(body);
+    if (body.action === "ack") {
+      saved = { ...saved!, revision: saved!.revision + 1, acknowledgedVersion: body.observedVersion };
+      return route.fulfill({ json: { grill: saved } });
+    }
     if (body.action === "respond") await responseGate;
     const issues = body.action === "start" ? [
       { id: "q1", md: "**Does the empty-input case preserve the existing result?** Add a fixture that exercises the public API.", responseMd: "", status: "open", selected: true },
@@ -127,6 +133,7 @@ test("autosave serializes rapid edits and retains changes after a failed save", 
   const gate = new Promise<void>((resolve) => { release = resolve; });
   let requests = 0;
   let fail = false;
+  await mockGrillSummaries(page, session.id, () => saved);
   await page.route("**/api/sessions/*/turns/*/grill", async (route) => {
     if (route.request().method() === "GET") return route.fulfill({ json: { grill: saved } });
     const body = route.request().postDataJSON();
@@ -168,6 +175,7 @@ test("409 merges independent edits and pauses same-field conflicts until the use
   let saved: TurnGrill = { revision: 1, status: "ready", updated: new Date().toISOString(), error: null,
     issues: [{ id: "q1", md: "Original", responseMd: "Answer", status: "open", selected: true }], rounds: [] };
   let mode = "independent";
+  await mockGrillSummaries(page, session.id, () => saved);
   const revisions: number[] = [];
   await page.route("**/api/sessions/*/turns/*/grill", async (route) => {
     if (route.request().method() === "GET") return route.fulfill({ json: { grill: saved } });
@@ -223,6 +231,7 @@ test("Grill recovers an empty transport response without submitting twice", asyn
   await selectSession(request, session.id);
   let saved: TurnGrill | null = null;
   let posts = 0;
+  await mockGrillSummaries(page, session.id, () => saved);
   await page.route("**/api/sessions/*/turns/*/grill", async (route) => {
     if (route.request().method() === "GET") return route.fulfill({ json: { grill: saved } });
     posts++;
@@ -274,7 +283,7 @@ test("only the latest completed turn offers a new Grill", async ({ page, request
     await route.fulfill({ response, json: data });
   });
   await page.route("**/api/sessions/*/turns/*/grill", (route) => route.fulfill({ json: { grill: null } }));
-  await page.route("**/api/sessions/*/grills", (route) => route.fulfill({ json: { turnIds: [`${session.id}-baseline`] } }));
+  await mockGrillSummaries(page, session.id, () => ({ revision: 1, status: "ready", updated: "", error: null, issues: [], rounds: [] }));
   await page.goto(`/?workspaceId=default&sessionId=${session.id}`);
   await expect(page.getByRole("button", { name: "Fork from this message", exact: true })).toHaveCount(2);
   await expect(page.getByRole("button", { name: "Grill agent", exact: true })).toHaveCount(1);

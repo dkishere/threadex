@@ -1,7 +1,8 @@
 import { DEFAULT_MODEL, defaultGearProfiles } from "../modelCatalog";
 import type { LightweightTodo } from "../lightweightTodo";
+import type { ProcessCommandParameter, ProcessCommandValues } from "../processCommandParameters";
 import { AUTO_MODEL_CHOICES, AUTO_EFFORT_CHOICES, isAutoModel, isAutoEffort, normalizeAutoModel } from "../autoModelCatalog";
-import { acknowledgeGrill, type GrillSummary, type TurnGrill } from "../turnGrill";
+import { acknowledgeGrill, grillAwaitingAck, type GrillSummary, type TurnGrill } from "../turnGrill";
 import { openPostgresSessionConnection, postgresSchemaFromStoreId, type SessionDbConnection, type SessionDbValue } from "./sessionDb";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync, type Stats } from "node:fs";
@@ -131,7 +132,7 @@ export type WorkspaceMonitorSessionRecord = {
   sessionName: string;
 };
 
-export type ProcessMonitorStatus = "starting" | "running" | "exited" | "stopped" | "error";
+export type ProcessMonitorStatus = "available" | "starting" | "running" | "exited" | "stopped" | "error";
 export type ProcessMonitorWakeStatus = "none" | "pending" | "sent" | "done" | "error";
 export type ProcessMetricStatus = "idle" | "ok" | "error";
 
@@ -389,6 +390,10 @@ export type ProcessMonitorRecord = {
   cwd: string;
   pid: number | null;
   status: ProcessMonitorStatus;
+  /** The registered command that created this run, when applicable. */
+  sourceCommandId: string | null;
+  parameters?: ProcessCommandParameter[];
+  parameterValues?: ProcessCommandValues;
   managed: boolean;
   /** Virtual status records such as the API server health monitor cannot be mutated. */
   readOnly?: boolean;
@@ -427,6 +432,9 @@ export type CreateProcessMonitorInput = {
   cwd: string;
   pid?: number | null;
   status?: ProcessMonitorStatus;
+  sourceCommandId?: string | null;
+  parameters?: ProcessCommandParameter[];
+  parameterValues?: ProcessCommandValues;
   managed?: boolean;
   removeOnExit?: boolean;
   wakePrompt?: string | null;
@@ -1283,6 +1291,9 @@ type ProcessMonitorRow = {
   cwd?: unknown;
   pid?: unknown;
   status?: unknown;
+  source_command_id?: unknown;
+  parameters_json?: unknown;
+  parameter_values_json?: unknown;
   managed?: unknown;
   remove_on_exit?: unknown;
   wake_prompt?: unknown;
@@ -2024,6 +2035,9 @@ export class SessionStore {
                 cwd,
                 pid,
                 status,
+                source_command_id,
+                CAST(parameters AS VARCHAR) AS parameters_json,
+                CAST(parameter_values AS VARCHAR) AS parameter_values_json,
                 managed,
                 remove_on_exit,
                 wake_prompt,
@@ -2063,6 +2077,9 @@ export class SessionStore {
               cwd,
               pid,
               status,
+              source_command_id,
+              CAST(parameters AS VARCHAR) AS parameters_json,
+              CAST(parameter_values AS VARCHAR) AS parameter_values_json,
               managed,
               remove_on_exit,
               wake_prompt,
@@ -2096,11 +2113,11 @@ export class SessionStore {
       await connection.run(
         `
           INSERT INTO process_monitor (
-            id, workspace_id, label, command, executable, docker_image, docker_run_args, args, log_file, entry_points, metric_monitors, metric_readings, cwd, pid, status, managed, remove_on_exit,
+            id, workspace_id, label, command, executable, docker_image, docker_run_args, args, log_file, entry_points, metric_monitors, metric_readings, cwd, pid, status, source_command_id, parameters, parameter_values, managed, remove_on_exit,
             wake_prompt, wake_session_id, wake_thread_id, timeout_at,
             wake_status, wake_error, woken_at, started_at, last_exit_code, last_signal, error, created, updated
           ) VALUES (
-            $id, $workspaceId, $label, $command, $executable, $dockerImage, $dockerRunArgs::JSON, $args::JSON, $logFile, $entryPoints::JSON, $metricMonitors::JSON, $metricReadings::JSON, $cwd, $pid, $status, $managed, $removeOnExit,
+            $id, $workspaceId, $label, $command, $executable, $dockerImage, $dockerRunArgs::JSON, $args::JSON, $logFile, $entryPoints::JSON, $metricMonitors::JSON, $metricReadings::JSON, $cwd, $pid, $status, $sourceCommandId, $parameters::JSON, $parameterValues::JSON, $managed, $removeOnExit,
             $wakePrompt, $wakeSessionId, $wakeThreadId, $timeoutAt,
             $wakeStatus, $wakeError, $wokenAt, $startedAt, $lastExitCode, $lastSignal, $error, now(), now()
           )
@@ -2121,6 +2138,9 @@ export class SessionStore {
           cwd: input.cwd,
           pid: input.pid ?? null,
           status: input.status ?? "starting",
+          sourceCommandId: input.sourceCommandId ?? null,
+          parameters: JSON.stringify(input.parameters ?? []),
+          parameterValues: JSON.stringify(input.parameterValues ?? {}),
           managed: input.managed ?? false,
           removeOnExit: input.removeOnExit ?? false,
           wakePrompt: input.wakePrompt ?? null,
@@ -2155,6 +2175,9 @@ export class SessionStore {
             cwd,
             pid,
             status,
+            source_command_id,
+            CAST(parameters AS VARCHAR) AS parameters_json,
+            CAST(parameter_values AS VARCHAR) AS parameter_values_json,
             managed,
             remove_on_exit,
             wake_prompt,
@@ -2199,6 +2222,9 @@ export class SessionStore {
         ["cwd", "cwd"],
         ["pid", "pid"],
         ["status", "status"],
+        ["sourceCommandId", "source_command_id"],
+        ["parameters", "parameters"],
+        ["parameterValues", "parameter_values"],
         ["managed", "managed"],
         ["removeOnExit", "remove_on_exit"],
         ["wakePrompt", "wake_prompt"],
@@ -2216,9 +2242,9 @@ export class SessionStore {
       for (const [inputKey, column] of fields) {
         if (inputKey in input) {
           const parameter = `value_${String(inputKey)}`;
-          const isJson = inputKey === "args" || inputKey === "entryPoints" || inputKey === "dockerRunArgs" || inputKey === "metricMonitors" || inputKey === "metricReadings";
+          const isJson = inputKey === "args" || inputKey === "entryPoints" || inputKey === "dockerRunArgs" || inputKey === "metricMonitors" || inputKey === "metricReadings" || inputKey === "parameters" || inputKey === "parameterValues";
           assignments.push(`${column} = $${parameter}${isJson ? "::JSON" : ""}`);
-          params[parameter] = (isJson ? JSON.stringify(input[inputKey] ?? []) : input[inputKey]) as SessionDbValue;
+          params[parameter] = (isJson ? JSON.stringify(input[inputKey] ?? (inputKey === "parameterValues" ? {} : [])) : input[inputKey]) as SessionDbValue;
         }
       }
       if ("entryPoints" in input) {
@@ -2250,6 +2276,9 @@ export class SessionStore {
             cwd,
             pid,
             status,
+            source_command_id,
+            CAST(parameters AS VARCHAR) AS parameters_json,
+            CAST(parameter_values AS VARCHAR) AS parameter_values_json,
             managed,
             remove_on_exit,
             wake_prompt,
@@ -2312,12 +2341,11 @@ export class SessionStore {
 
   async listGrillSummaries(workspaceId: string): Promise<GrillSummary[]> {
     return this.read(async (connection) => {
-      const result = await connection.run(`SELECT g.session_id, g.turn_id, g.revision,
-        jsonb_array_length(g.document::jsonb->'issues') > 0 AND COALESCE((g.document::jsonb->>'contentVersion')::integer,
-          (SELECT count(*) FROM jsonb_array_elements(g.document::jsonb->'rounds') r WHERE r->>'action' <> 'save'))
-          > COALESCE((g.document::jsonb->>'acknowledgedVersion')::integer, 0) AS pending
+      // Parse in JavaScript: PostgreSQL JSON extraction rejects escaped NULs
+      // in model-authored content, even when extracting unrelated fields.
+      const result = await connection.run(`SELECT g.session_id, g.turn_id, g.revision, g.document
         FROM session_turn_grill g JOIN sessions s ON s.id = g.session_id WHERE s.workspace_id = $workspaceId ORDER BY g.session_id, g.turn_id`, { workspaceId });
-      return (await result.getRowObjectsJS()).map((row) => ({ sessionId: String(row.session_id), turnId: String(row.turn_id), revision: Number(row.revision), pending: Boolean(row.pending) }));
+      return (await result.getRowObjectsJS()).map((row) => ({ sessionId: String(row.session_id), turnId: String(row.turn_id), revision: Number(row.revision), pending: grillAwaitingAck(JSON.parse(String(row.document)) as TurnGrill) }));
     });
   }
 
@@ -5441,6 +5469,16 @@ export class SessionStore {
     });
   }
 
+  async listSessionSideChats(sessionId: string) {
+    return this.read(async (connection) => {
+      if (!await this.getSessionWithConnection(connection, sessionId)) return null;
+      const page = await this.listSessionSideChatsWithConnection(connection, {
+        sessionId, limit: 100, offset: 0, order: "ASC"
+      });
+      return { sideChats: page.records, sideChatPage: { limit: 100, offset: 0, total: page.total, hasMore: page.total > page.records.length } };
+    });
+  }
+
   async recordSessionSideChat(input: RecordSessionSideChatInput): Promise<SessionSideChatRecord> {
     return this.write(async (connection) => {
       const id = input.id ?? `side_chat_${crypto.randomUUID()}`;
@@ -6016,9 +6054,10 @@ export class SessionStore {
         // Work completion adds no Grill discussion content and must not reopen ACK.
         // Consume the link once in the same transaction as terminal persistence.
         if (input.status === "done" && input.runnerExitCode === 0 && input.agentResponse.trim()) {
-          const grills = await connection.run("SELECT turn_id, document FROM session_turn_grill WHERE session_id = $sessionId AND document::jsonb->'workTurns'->>$workTurnId = 'pending' FOR UPDATE", { sessionId: turn.sessionId, workTurnId: input.id });
+          const grills = await connection.run("SELECT turn_id, document FROM session_turn_grill WHERE session_id = $sessionId FOR UPDATE", { sessionId: turn.sessionId });
           for (const row of await grills.getRowObjectsJS()) {
             const saved = JSON.parse(String(row.document)) as TurnGrill;
+            if (saved.workTurns?.[input.id] !== "pending") continue;
             const next = { ...saved, revision: saved.revision + 1,
               updated: new Date().toISOString(), workTurns: { ...saved.workTurns, [input.id]: "completed" } };
             await connection.run("UPDATE session_turn_grill SET revision = $revision, document = $document WHERE session_id = $sessionId AND turn_id = $turnId", { sessionId: turn.sessionId, turnId: String(row.turn_id), revision: next.revision, document: JSON.stringify(next) });
@@ -6990,6 +7029,9 @@ export class SessionStore {
         cwd VARCHAR NOT NULL,
         pid BIGINT,
         status VARCHAR NOT NULL DEFAULT 'starting',
+        source_command_id VARCHAR,
+        parameters JSON NOT NULL DEFAULT '[]'::JSON,
+        parameter_values JSON NOT NULL DEFAULT '{}'::JSON,
         managed BOOLEAN NOT NULL DEFAULT false,
         remove_on_exit BOOLEAN NOT NULL DEFAULT false,
         wake_prompt VARCHAR,
@@ -7062,6 +7104,9 @@ export class SessionStore {
       ["metric_monitors", "JSON DEFAULT '[]'::JSON"],
       ["metric_readings", "JSON DEFAULT '[]'::JSON"],
       ["entry_point", "VARCHAR"],
+      ["source_command_id", "VARCHAR"],
+      ["parameters", "JSON DEFAULT '[]'::JSON"],
+      ["parameter_values", "JSON DEFAULT '{}'::JSON"],
       ["remove_on_exit", "BOOLEAN DEFAULT false"],
       ["wake_prompt", "VARCHAR"],
       ["wake_session_id", "VARCHAR"],
@@ -8430,47 +8475,39 @@ export class SessionStore {
     // event. Synthesize its final net file list on read so historical turns are
     // corrected too. New runners also persist this item directly for realtime
     // updates; in that case the stored authoritative item wins.
-    const turnDiffResult = await connection.run(
-      `
-        SELECT
-          id AS event_id,
-          turn_id,
-          CAST(payload AS VARCHAR) AS payload_json,
-          CAST(created AS VARCHAR) AS created
-        FROM session_turn_event
-        WHERE session_id = $sessionId
-          ${turnFilter}
-          AND event_name = 'codex'
-          AND contains(CAST(payload AS VARCHAR), 'turn/diff/updated')
-        ORDER BY created ASC, id ASC
-      `,
-      queryParams
-    );
+    // Stored net diffs already win over history. Only failed edits can require
+    // repairing an incorrectly stored empty diff, so keep those turns eligible.
+    const authoritativeTurnIds = Object.entries(itemsByTurn).filter(([, items]) =>
+      items.some(isAuthoritativeFileChangeItem) && !items.some((item) => {
+        const edit = recordValue(item);
+        return edit?.itemType === "file_change" && !edit.authoritative && edit.status === "failed";
+      })
+    ).map(([id]) => id);
+    const turnDiffRows = await this.listLatestTurnDiffsWithConnection(connection, sessionId, turnId, undefined, authoritativeTurnIds);
     const latestTurnDiffByTurn = new Map<string, Record<string, unknown>>();
     const rejectedEmptyDiffTurns = new Set<string>();
-    for (const row of await turnDiffResult.getRowObjectsJS()) {
-      // Decode in JavaScript: PostgreSQL JSON extraction rejects escaped NULs
-      // in tool output, even when extracting an unrelated field such as method.
-      const event = recordValue(parseJsonObject(row.payload_json));
-      if (event?.method !== "turn/diff/updated") continue;
-      const params = recordValue(event.params);
-      const turnId = stringValue((row as { turn_id?: unknown }).turn_id);
-      if (!turnId) continue;
-      const diffRow: Record<string, unknown> = { ...row, native_turn_id: params?.turnId, diff: params?.diff };
-      const diffTime = Date.parse(stringValue(diffRow.created));
-      const lastEdit = (itemsByTurn[turnId] ?? [])
+    for (const latestRow of turnDiffRows) {
+      const currentTurnId = stringValue(latestRow.turn_id);
+      if (!currentTurnId) continue;
+      const edits = (itemsByTurn[currentTurnId] ?? [])
         .map(recordValue)
-        .filter((item) => item?.itemType === "file_change" && !item.authoritative &&
-          Date.parse(stringValue(item.sortCreated)) <= diffTime)
-        .sort((a, b) => Date.parse(stringValue(b?.sortCreated)) - Date.parse(stringValue(a?.sortCreated)))[0];
-      // Failed patches sometimes publish an empty diff despite leaving earlier
-      // successful edits intact. Recover the preceding net diff on historical reads.
-      if (!stringValue(diffRow.diff).trim() && lastEdit?.status === "failed") {
-        rejectedEmptyDiffTurns.add(turnId);
-        continue;
+        .filter((item) => item?.itemType === "file_change" && !item.authoritative)
+        .sort((a, b) => Date.parse(stringValue(b?.sortCreated)) - Date.parse(stringValue(a?.sortCreated)));
+      let diffRow: Record<string, unknown> | undefined = latestRow;
+      while (diffRow) {
+        const diffTime = Date.parse(stringValue(diffRow.created));
+        const lastEdit = edits.find((item) => Date.parse(stringValue(item?.sortCreated)) <= diffTime);
+        // Walk back only when a failed patch published an invalid empty diff.
+        // A successful revert's empty diff is authoritative and must stop here.
+        if (stringValue(diffRow.diff).trim() || lastEdit?.status !== "failed") {
+          latestTurnDiffByTurn.set(currentTurnId, diffRow);
+          break;
+        }
+        rejectedEmptyDiffTurns.add(currentTurnId);
+        [diffRow] = await this.listLatestTurnDiffsWithConnection(connection, sessionId, currentTurnId, {
+          created: stringValue(diffRow.created), id: stringValue(diffRow.event_id)
+        });
       }
-      rejectedEmptyDiffTurns.delete(turnId);
-      latestTurnDiffByTurn.set(turnId, diffRow);
     }
     for (const [turnId, row] of latestTurnDiffByTurn) {
       if (rejectedEmptyDiffTurns.has(turnId)) {
@@ -8491,6 +8528,47 @@ export class SessionStore {
       });
     }
     return itemsByTurn;
+  }
+
+  private async listLatestTurnDiffsWithConnection(
+    connection: SessionDbConnection,
+    sessionId: string,
+    turnId?: string,
+    before?: { created: string; id: string },
+    authoritativeTurnIds: string[] = []
+  ): Promise<Record<string, unknown>[]> {
+    // Use the existing session/turn/created index to search backward, stopping
+    // at the latest diff for each turn. Historical cumulative diffs can total
+    // gigabytes; never read them all merely to retain the last one in JavaScript.
+    const result = await connection.run(`
+      WITH event_turns AS (
+        SELECT DISTINCT turn_id FROM session_turn_event
+        WHERE session_id = $sessionId AND event_name = 'codex'
+          ${turnId ? "AND turn_id = $turnId" : ""}
+          ${authoritativeTurnIds.length ? "AND turn_id <> ALL($authoritativeTurnIds::VARCHAR[])" : ""}
+      ), latest_diffs AS MATERIALIZED (
+        SELECT diff_event.* FROM event_turns
+        CROSS JOIN LATERAL (
+          SELECT id, turn_id, payload, created FROM session_turn_event
+          WHERE session_id = $sessionId AND turn_id = event_turns.turn_id
+            AND event_name = 'codex'
+            ${before ? "AND (created, id) < ($beforeCreated::TIMESTAMPTZ, $beforeId)" : ""}
+            AND json_extract_string(payload, '$.method') = 'turn/diff/updated'
+          ORDER BY created DESC, id DESC LIMIT 1
+        ) AS diff_event
+      )
+      SELECT id AS event_id, turn_id,
+        json_extract_string(payload, '$.params.turnId') AS native_turn_id,
+        json_extract_string(payload, '$.params.diff') AS diff,
+        CAST(created AS VARCHAR) AS created
+      FROM latest_diffs
+    `, {
+      sessionId,
+      ...(turnId ? { turnId } : {}),
+      ...(authoritativeTurnIds.length ? { authoritativeTurnIds } : {}),
+      ...(before ? { beforeCreated: before.created, beforeId: before.id } : {})
+    });
+    return result.getRowObjectsJS();
   }
 
   private async listSessionApprovalLiveItemsWithConnection(
@@ -9758,6 +9836,7 @@ export class SessionStore {
         SELECT 1 AS found
         FROM information_schema.columns
         WHERE table_name = $tableName
+          AND table_schema = current_schema()
           AND column_name = $columnName
         LIMIT 1
       `,
@@ -11930,6 +12009,9 @@ function toProcessMonitorRecord(row: ProcessMonitorRow): ProcessMonitorRecord {
     cwd: stringValue(row.cwd),
     pid: nullableNumber(row.pid),
     status: isProcessMonitorStatus(status) ? status : "error",
+    sourceCommandId: nullableString(row.source_command_id),
+    parameters: (parseJsonObject(row.parameters_json) ?? []) as ProcessCommandParameter[],
+    parameterValues: (parseJsonObject(row.parameter_values_json) ?? {}) as ProcessCommandValues,
     managed: row.managed === true,
     removeOnExit: row.remove_on_exit === true,
     wakePrompt: nullableString(row.wake_prompt),
@@ -11992,7 +12074,7 @@ function parseProcessMetricReadings(value: unknown, metricMonitors: ProcessMetri
 }
 
 function isProcessMonitorStatus(value: string): value is ProcessMonitorStatus {
-  return ["starting", "running", "exited", "stopped", "error"].includes(value);
+  return ["available", "starting", "running", "exited", "stopped", "error"].includes(value);
 }
 
 function isProcessMonitorWakeStatus(value: string): value is ProcessMonitorWakeStatus {

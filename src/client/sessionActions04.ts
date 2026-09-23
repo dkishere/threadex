@@ -305,7 +305,13 @@ export function handleStreamEvent(ctx, event, target) {
         }
         if (event.type === "auto_model.selected") {
             setMessages((current) => current.map((message) => message.role === "user" && message.turnId === (event.data.turnId ?? target.turnId)
-                ? { ...message, autoModel: true, autoModelProvider: event.data.provider }
+                ? {
+                    ...message,
+                    model: event.data.model,
+                    reasoningEffort: event.data.effort,
+                    autoModel: true,
+                    autoModelProvider: event.data.provider
+                }
                 : message));
             if (isTargetVisible(target)) {
                 setSessionAutoModel(event.data);

@@ -153,6 +153,15 @@ test("commentary short token cap handles English words", () => {
   assert.equal(comment?.extracts[0]?.shortMsg.endsWith("…"), true);
 });
 
+test("normalizes wait commentary as its own type", () => {
+  const comment = normalizeStructuredAgentComment({
+    extracts: [{ type: "wait", shortMsg: "Waiting for the next step" }],
+    detail: "Waiting for the next step."
+  });
+
+  assert.deepEqual(comment?.extracts, [{ type: "wait", shortMsg: "Waiting for the next step." }]);
+});
+
 test("merges extracts of the same type while preserving first-type order", () => {
   const detail = "Inspect the session, report the failure, then trace the runner and propose a fix.";
   assert.deepEqual(normalizeStructuredAgentComment({

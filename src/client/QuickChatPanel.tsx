@@ -4,14 +4,8 @@ import type { QuickChatSession, QuickChatStatus } from "../quickChat";
 import { ComposerFrame, ComposerSurface, ComposerToolbar } from "./ComposerFrame";
 import { InlineLinkComposer } from "./InlineLinkComposer";
 import { MarkdownContent } from "./MarkdownContent";
+import { apiJson } from "./apiClient";
 import "./QuickChatPanel.css";
-
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`/api/quick-chat${path}`, init);
-  const body = await response.json();
-  if (!response.ok) throw new Error(body.error || `Quick Chat returned ${response.status}`);
-  return body as T;
-}
 
 export function QuickChatPanel({ active }: { active: boolean }) {
   const [status, setStatus] = useState<QuickChatStatus>({ accounts: [], models: [] });
@@ -31,17 +25,17 @@ export function QuickChatPanel({ active }: { active: boolean }) {
 
   useEffect(() => {
     if (!active || sending) return;
-    let disposed = false;
+    const controller = new AbortController();
     setLoading(true);
-    void api<QuickChatStatus>("/status").then(body => {
-      if (disposed) return;
+    void apiJson<QuickChatStatus>("/api/quick-chat/status", { signal: controller.signal }).then(body => {
+      if (controller.signal.aborted) return;
       setStatus(body);
       setAccountId(current => body.accounts.some(account => account.id === current) ? current : body.accounts[0]?.id ?? "");
       setModel(current => body.models.some(option => option.id === current) ? current : body.models[0]?.id ?? "");
       setError(body.error ?? "");
-    }).catch(err => { if (!disposed) setError(err.message); })
-      .finally(() => { if (!disposed) setLoading(false); });
-    return () => { disposed = true; };
+    }).catch(err => { if (!controller.signal.aborted) setError(err.message); })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
+    return () => controller.abort();
   }, [active, revision]);
 
   useEffect(() => {
@@ -50,7 +44,7 @@ export function QuickChatPanel({ active }: { active: boolean }) {
     setSessionsLoading(true);
     setSessions([]);
     setSessionId("");
-    void api<{ sessions: QuickChatSession[] }>(`/sessions?accountId=${encodeURIComponent(accountId)}`, { signal: controller.signal })
+    void apiJson<{ sessions: QuickChatSession[] }>(`/api/quick-chat/sessions?accountId=${encodeURIComponent(accountId)}`, { signal: controller.signal })
       .then(body => { if (!controller.signal.aborted) setSessions(body.sessions); })
       .catch(err => { if (!controller.signal.aborted) setError(err.message); })
       .finally(() => { if (!controller.signal.aborted) setSessionsLoading(false); });
@@ -69,9 +63,8 @@ export function QuickChatPanel({ active }: { active: boolean }) {
     setPending(prompt);
     setError("");
     try {
-      const body = await api<{ session: QuickChatSession }>("/messages", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ accountId, sessionId: sessionId || null, model, prompt })
+      const body = await apiJson<{ session: QuickChatSession }>("/api/quick-chat/messages", {
+        method: "POST", body: { accountId, sessionId: sessionId || null, model, prompt }
       });
       setSessions(current => [body.session, ...current.filter(session => session.id !== body.session.id)]);
       setSessionId(body.session.id);
@@ -79,7 +72,7 @@ export function QuickChatPanel({ active }: { active: boolean }) {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to send message");
       try {
-        const body = await api<{sessions: QuickChatSession[]}>(`/sessions?accountId=${encodeURIComponent(accountId)}`);
+        const body = await apiJson<{sessions: QuickChatSession[]}>(`/api/quick-chat/sessions?accountId=${encodeURIComponent(accountId)}`, { fresh: true });
         setSessions(body.sessions);
       } catch { /* Retain the send error and draft when the server is unavailable. */ }
     }

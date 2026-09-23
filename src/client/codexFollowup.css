@@ -1,0 +1,30 @@
+.markdown-content .codex-followup {
+  display: inline-flex;
+  max-width: 100%;
+  padding: 8px 12px;
+  border: 1px solid currentColor;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.markdown-content .codex-followup:hover {
+  background: color-mix(in srgb, currentColor 8%, transparent);
+}
+
+.markdown-content .codex-followup:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 3px;
+}
+
+.markdown-content .codex-file-citation {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 10px;
+  border: 1px solid currentColor;
+  border-radius: 8px;
+  text-decoration: none;
+}

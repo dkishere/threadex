@@ -5,6 +5,7 @@ import { structuredCommentIcon } from "./sessionHelpers02.js";
 test("uses search for action comments and keeps verification distinct", () => {
   const icons = {
     CheckCircle2: () => null,
+    Hourglass: () => null,
     Lightbulb: () => null,
     MessageSquare: () => null,
     Pencil: () => null,
@@ -14,4 +15,5 @@ test("uses search for action comments and keeps verification distinct", () => {
 
   assert.equal(structuredCommentIcon(icons, "action"), icons.Search);
   assert.equal(structuredCommentIcon(icons, "verification"), icons.CheckCircle2);
+  assert.equal(structuredCommentIcon(icons, "wait"), icons.Hourglass);
 });

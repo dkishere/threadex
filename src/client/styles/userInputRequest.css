@@ -1,19 +1,37 @@
-.user-input-card { --border: #d6deeb; --accent: #2563eb; border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin: 12px 0; background: #fff; color: #172033; }
+.user-input-card { --border: #e2e8f0; --accent: #2563eb; width: 100%; max-width: 760px; border: 1px solid var(--border); border-radius: 14px; padding: 18px 20px; margin: 12px 0; background: #fff; color: #334155; box-shadow: 0 2px 8px #0f172a04; font-size: 13px; line-height: 1.55; }
 .user-input-card header, .user-input-card footer { display: flex; align-items: center; gap: 10px; }
-.user-input-card header > span { margin-left: auto; font-size: 12px; opacity: .7; }
-.user-input-card fieldset { border: 0; padding: 0; margin: 20px 0; min-width: 0; }
-.user-input-card legend { display: grid; gap: 6px; margin-bottom: 10px; line-height: 1.5; }
-.user-input-card legend small { opacity: .6; font-size: 11px; }
+.user-input-card header { flex-wrap: wrap; }
+.user-input-card header > svg { color: #64748b; }
+.user-input-card header > strong { color: #0f172a; font-size: 13px; font-weight: 650; }
+.user-input-card header > span { display: inline-flex; align-items: center; gap: 5px; margin-left: auto; padding: 3px 8px; border-radius: 6px; background: #eff6ff; color: #2563eb; font-size: 11px; }
+.user-input-card[data-resolved="true"] .user-input-status { background: #f1f5f9; color: #64748b; }
+.user-input-card fieldset { border: 0; padding: 0; margin: 18px 0 0; min-width: 0; }
+.user-input-card fieldset + fieldset { padding-top: 16px; border-top: 1px solid var(--border); }
+.user-input-card legend { display: grid; width: 100%; padding: 0; gap: 6px; margin-bottom: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.user-input-card legend > span { color: #1e293b; font-weight: 550; }
+.user-input-card legend small { color: #64748b; font-size: 11px; }
 .user-input-option { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; margin: 6px 0; border: 1px solid var(--border, #454851); border-radius: 8px; cursor: pointer; }
 .user-input-option:has(input:checked) { border-color: var(--accent, #7d9fff); background: color-mix(in srgb, var(--accent, #7d9fff) 10%, transparent); }
-.user-input-option input { margin-top: 4px; flex-shrink: 0; }
+.user-input-option:hover { border-color: #b8c8df; background: #f8fafc; }
+.user-input-option input { margin: 3px 0 0; width: 15px; height: 15px; flex-shrink: 0; accent-color: var(--accent); }
 .user-input-option span { display: grid; gap: 4px; overflow-wrap: anywhere; }
-.user-input-option small { opacity: .65; line-height: 1.5; }
+.user-input-option strong { font-size: 13px; font-weight: 550; }
+.user-input-option small { color: #64748b; font-size: 12px; line-height: 1.5; }
 .user-input-text { box-sizing: border-box; width: 100%; margin-top: 8px; padding: 10px; border: 1px solid var(--border, #454851); border-radius: 8px; color: inherit; background: transparent; }
-.user-input-card footer { justify-content: space-between; flex-wrap: wrap; }
-.user-input-card footer > span { font-size: 12px; opacity: .6; }
-.user-input-card button { display: inline-flex; align-items: center; gap: 6px; padding: 8px 12px; }
-.user-input-card [role=alert] { color: var(--danger, #ed9696); }
-.user-input-answer { white-space: pre-wrap; overflow-wrap: anywhere; }
+.user-input-card footer { justify-content: space-between; flex-wrap: wrap; margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
+.user-input-card footer > span { font-size: 11px; color: #64748b; }
+.user-input-card button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 9px 13px; border-radius: 8px; background: #2563eb; color: #fff; font-size: 12px; font-weight: 600; cursor: pointer; }
+.user-input-card button:hover:not(:disabled) { background: #1d4ed8; }
+.user-input-card button:disabled { background: #f1f5f9; color: #94a3b8; cursor: default; }
+.user-input-option:focus-within, .user-input-text:focus-visible, .user-input-card button:focus-visible { outline: 2px solid #2563eb; outline-offset: 3px; }
+.user-input-card [role=alert] { color: #b91c1c; }
+.user-input-answer { padding: 10px 13px; border-left: 2px solid #cbd5e1; border-radius: 0 7px 7px 0; background: #f8fafc; overflow-wrap: anywhere; }
+.user-input-answer-label { display: block; margin-bottom: 3px; color: #64748b; font-size: 10px; font-weight: 600; }
+.user-input-answer p { margin: 0; color: #334155; white-space: pre-wrap; }
 .approval-mini-popover.user-input-mini-popover { width: min(420px, calc(100vw - 32px)); border-color: #bfdbfe; }
 .approval-mini-popover .user-input-card { margin: 0; border: 0; border-radius: 0; }
+@media (max-width: 480px) {
+  .user-input-card { padding: 14px; }
+  .user-input-card footer > span { flex-basis: 100%; }
+  .user-input-card footer button { width: 100%; }
+}

@@ -3,7 +3,7 @@
 // pieces are migrated out of this file incrementally; the temporary directive
 // keeps the existing UI buildable while those boundaries gain strict types.
 import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
-import { Activity, ArrowDown, ArrowLeft, ArrowUp, BetweenHorizontalStart, CheckCircle2, CheckSquare2, ChevronDown, ChevronRight, Circle, Clock3, Copy, Cpu, Database, Diff, ExternalLink, FileText, Folder, GitFork, Lightbulb, ListChecks, Loader2, MessageSquare, Pencil, Plus, Quote, Search, Send, ShieldCheck, Settings, RotateCcw, Shrink, Square, Target, TerminalSquare, TriangleAlert, Trash2, User, UserPlus, X } from "lucide-react";
+import { Activity, ArrowDown, ArrowLeft, ArrowUp, BetweenHorizontalStart, CheckCircle2, CheckSquare2, ChevronDown, ChevronRight, Circle, Clock3, Copy, Cpu, Database, Diff, ExternalLink, FileText, Folder, GitFork, Hourglass, Lightbulb, ListChecks, Loader2, MessageSquare, Pencil, Plus, Quote, Search, Send, ShieldCheck, Settings, RotateCcw, Shrink, Square, Target, TerminalSquare, TriangleAlert, Trash2, User, UserPlus, X } from "lucide-react";
 import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { eventStore, useEventStore } from "./eventStore";
 import { MonacoDiffEditor } from "./MonacoDiffEditor";
@@ -155,7 +155,7 @@ function hasVisibleTodoPlan(todo) { return sessionHelpers02.hasVisibleTodoPlan({
 const LiveEvent = memo(function LiveEvent({ item, sessionId }) { return sessionHelpers02.LiveEvent({ ApprovalEvent, CheckSquare2, ChevronRight, Circle, DeferredDetails, FileChangeEvent, Loader2, MarkdownContent, MessageSquare, Shrink, StatusUpdateIndicator, StructuredCommentEvent, SubagentEvent, _jsx, _jsxs, commandStatus, fileChangeItemFromPatchCommand }, { item, sessionId }); });
 const StructuredCommentEvent = memo(function StructuredCommentEvent({ item, activities = [], id, sessionId }) { return sessionHelpers02.StructuredCommentEvent({ ChevronRight, DeferredDetails, FileEditIcon, LiveEvent, MarkdownContent, Search, TerminalSquare, _jsx, _jsxs, commentaryActivityCounts, commentaryTypeForActivities, structuredCommentIcon, structuredCommentType }, { item, activities, id, sessionId }); }, (previous, next) => previous.item === next.item && previous.id === next.id && previous.sessionId === next.sessionId && sameTimelineItems(previous.activities ?? [], next.activities ?? []));
 function structuredCommentType(type) { return sessionHelpers02.structuredCommentType({  }, type); }
-function structuredCommentIcon(type) { return sessionHelpers02.structuredCommentIcon({ CheckCircle2, Lightbulb, MessageSquare, Pencil, Search, TriangleAlert }, type); }
+function structuredCommentIcon(type) { return sessionHelpers02.structuredCommentIcon({ CheckCircle2, Hourglass, Lightbulb, MessageSquare, Pencil, Search, TriangleAlert }, type); }
 function StatusUpdateIndicator({ text, spinning = true, completedIcon }) { return sessionHelpers02.StatusUpdateIndicator({ CheckCircle2, Loader2, _jsx, _jsxs }, { text, spinning, completedIcon }); }
 function SubagentEvent({ item, sessionId }) { return sessionHelpers02.SubagentEvent({ ChevronRight, MarkdownContent, SubagentTranscript, UserPlus, _Fragment, _jsx, _jsxs, fetchSubagentTranscript, formatSubagentStatus, subagentNames, subagentStatusTone, subagentToolLabel, useEffect, useRef, useState, visibleSubagentAgents }, { item, sessionId }); }
 function SubagentTranscript({ anchorPrefix, onRetry, state, threadId, sessionId }) {

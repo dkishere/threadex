@@ -583,6 +583,10 @@
   color: #16a34a;
 }
 
+.structured-comment-extract[data-comment-type="wait"] .structured-comment-icon {
+  color: #d97706;
+}
+
 .turn-issue-tracker {
   overflow: hidden;
   border: 1px solid #e2e8f0;

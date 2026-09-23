@@ -1,0 +1,45 @@
+.process-command-dialog {
+  width: min(440px, calc(100vw - 32px));
+  max-height: calc(100vh - 48px);
+  padding: 20px;
+  border: 1px solid #e4e4e7;
+  border-radius: 12px;
+  background: #fff;
+  color: #27272a;
+  box-shadow: 0 16px 48px #0003;
+}
+.process-command-dialog::backdrop { background: #0006; }
+.process-command-dialog header, .process-command-dialog footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: space-between;
+}
+.process-command-dialog h2 { margin: 0; font-size: 16px; overflow-wrap: anywhere; }
+.process-command-dialog button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border: 1px solid #e4e4e7;
+  border-radius: 6px;
+  background: #f4f4f5;
+  color: inherit;
+  cursor: pointer;
+}
+.process-command-dialog button:disabled { opacity: .5; cursor: default; }
+.process-command-fields { display: grid; gap: 16px; margin: 20px 0; }
+.process-command-fields label { display: grid; gap: 6px; font-size: 13px; }
+.process-command-fields small { color: #71717a; white-space: pre-wrap; }
+.process-command-fields input, .process-command-fields select {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 8px;
+  border: 1px solid #d4d4d8;
+  border-radius: 6px;
+  background: #fff;
+  color: inherit;
+  font: inherit;
+}
+.process-command-dialog footer { justify-content: flex-end; }

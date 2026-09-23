@@ -196,7 +196,7 @@ export type StreamEvent =
   | { type: "error"; data: { message: string; needsLogin?: boolean; account?: AccountRecord } };
 
 export type ItemEventType = "item.started" | "item.updated" | "item.completed";
-export type StructuredCommentType = "answer" | "action" | "edit" | "verification" | "solution";
+export type StructuredCommentType = "answer" | "action" | "edit" | "verification" | "solution" | "wait";
 export type StructuredComment = {
   extracts: Array<{ type: StructuredCommentType; shortMsg: string }>;
   detail: string;

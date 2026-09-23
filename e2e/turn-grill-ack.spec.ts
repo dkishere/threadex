@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./support/authenticated-test";
 import { selectSession } from "./support/mock-runner.js";
 import { scenarioSessions } from "./support/scenarios.js";
 import { grillAwaitingAck, type TurnGrill } from "../src/turnGrill.js";

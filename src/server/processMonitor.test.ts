@@ -6,6 +6,117 @@ import { resolve } from "node:path";
 import test from "node:test";
 import { ProcessMonitorService } from "./processMonitor.js";
 import { SessionStore } from "./sessionStore.js";
+import { openPostgresSessionConnection, postgresSchemaFromStoreId } from "./sessionDb.js";
+
+test("command parameter migration checks the current schema even when another schema already has the columns", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "command-parameter-migration-test-"));
+  const currentId = resolve(root, "current.postgres");
+  const other = new SessionStore(resolve(root, "other.postgres"));
+  const legacy = new SessionStore(currentId);
+  let reopened: SessionStore | undefined;
+  try {
+    await other.ready();
+    await legacy.ready();
+    await legacy.close();
+    const connection = await openPostgresSessionConnection(undefined, postgresSchemaFromStoreId(currentId));
+    try {
+      // Only the disposable test schema is changed to simulate an older installation.
+      await connection.run("ALTER TABLE process_monitor DROP COLUMN parameters, DROP COLUMN parameter_values");
+    } finally {
+      await connection.close();
+    }
+    reopened = new SessionStore(currentId);
+    await reopened.ready();
+    const workspace = await reopened.getActiveWorkspace();
+    const parameters = [{ name: "count", desc: "Count", type: "number" as const, default: 1 }];
+    const saved = await reopened.createProcessMonitor({ workspaceId: workspace.id, label: "Migrated", cwd: workspace.cwd, status: "available", executable: "/bin/echo", parameters });
+    assert.deepEqual((await reopened.getProcessMonitor(saved.id))?.parameters, parameters);
+    assert.deepEqual((await reopened.getProcessMonitor(saved.id))?.parameterValues, {});
+  } finally {
+    await reopened?.close();
+    await other.close();
+  }
+});
+
+test("registered commands remain available and create independent captured runs", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "registered-command-test-"));
+  const store = new SessionStore(resolve(root, "sessions.postgres"));
+  const service = new ProcessMonitorService(store, { logDir: resolve(root, "logs") });
+  try {
+    await store.ready();
+    const workspace = await store.getActiveWorkspace();
+    const command = await service.monitor(workspace, {
+      label: "Reusable command", registerOnly: true,
+      exe: process.execPath, args: ["-e", "console.log('registered-output')"]
+    });
+    assert.equal(command.status, "available");
+    assert.equal(command.pid, null);
+    await service.start();
+    assert.equal((await service.list(workspace.id))[0].status, "available");
+    const run = await service.run(workspace, command.id);
+    assert.notEqual(run.id, command.id);
+    assert.equal(run.sourceCommandId, command.id);
+    assert.equal((await service.list(workspace.id)).find((record) => record.id === run.id)?.sourceCommandId, command.id);
+    await waitFor(async () => (await store.getProcessMonitor(run.id))?.status === "exited", 2_000);
+    assert.match((await service.readLog(workspace.id, run.id)).content, /registered-output/);
+    assert.equal((await store.getProcessMonitor(command.id))?.status, "available");
+    await assert.rejects(service.run({ ...workspace, id: "other-workspace" }, command.id), /not found/);
+    await assert.rejects(service.run(workspace, run.id), /not found/);
+    const second = await service.run(workspace, command.id);
+    assert.notEqual(second.id, run.id);
+    await service.remove(workspace.id, second.id);
+    await service.remove(workspace.id, command.id);
+    assert.ok(await store.getProcessMonitor(run.id));
+  } finally {
+    service.stop();
+    await store.close();
+  }
+});
+
+test("parameterized commands persist definitions and run values, with literal argv and shell environment values", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "command-parameters-test-"));
+  const store = new SessionStore(resolve(root, "sessions.postgres"));
+  const service = new ProcessMonitorService(store, { logDir: resolve(root, "logs") });
+  try {
+    await store.ready();
+    const workspace = await store.getActiveWorkspace();
+    const command = await service.monitor(workspace, {
+      label: "With parameters", registerOnly: true, exe: process.execPath,
+      args: ["-e", "console.log(JSON.stringify(process.argv.slice(1))); console.log(process.env.THREADEX_PARAM_count)", "--", "{{text}}", "{{mode}}", "{{count}}"],
+      parameters: [
+        { name: "text", desc: "Input text", type: "string", default: "hello" },
+        { name: "mode", desc: "Mode", type: "option", default: "fast", options: ["fast", "full"] },
+        { name: "count", desc: "Count", type: "number", default: 3 }
+      ]
+    });
+    assert.deepEqual((await store.getProcessMonitor(command.id))?.parameters, command.parameters);
+    assert.equal(command.pid, null);
+    const before = (await service.list(workspace.id)).length;
+    await assert.rejects(service.run(workspace, command.id, { mode: "invalid" }), /Parameter mode/);
+    assert.equal((await service.list(workspace.id)).length, before);
+    const text = "hello world'; $(echo unexpected)";
+    const run = await service.run(workspace, command.id, { text, count: 0 });
+    assert.deepEqual(run.parameterValues, { text, mode: "fast", count: 0 });
+    await waitFor(async () => (await store.getProcessMonitor(run.id))?.status === "exited", 2_000);
+    assert.match((await service.readLog(workspace.id, run.id)).content, /\["hello world'; \$\(echo unexpected\)","fast","0"\]/);
+    const restarted = await service.restart(workspace, run.id);
+    assert.deepEqual(restarted.parameterValues, run.parameterValues);
+    await waitFor(async () => (await store.getProcessMonitor(run.id))?.status === "exited", 2_000);
+    assert.equal((await service.readLog(workspace.id, run.id)).content.trim().split("\n").at(-1), "0");
+    const shell = await service.monitor(workspace, {
+      label: "Shell parameters", registerOnly: true,
+      command: 'printf "%s" "$THREADEX_PARAM_text"',
+      parameters: [{ name: "text", desc: "Text", type: "string", default: text }]
+    });
+    const shellRun = await service.run(workspace, shell.id);
+    await waitFor(async () => (await store.getProcessMonitor(shellRun.id))?.status === "exited", 2_000);
+    assert.equal((await service.readLog(workspace.id, shellRun.id)).content, text);
+    assert.deepEqual((await store.getProcessMonitor(command.id))?.args.slice(-3), ["{{text}}", "{{mode}}", "{{count}}"]);
+  } finally {
+    service.stop();
+    await store.close();
+  }
+});
 
 test("temporary PID monitors disappear after the process exits", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "process-monitor-test-"));

@@ -106,4 +106,6 @@
 .session-row[data-grill-await-ack] .session-title::after { content: " · Await ack"; color: #d68d32; font-size: 11px; }
 .prompt-turn-grill-tag[data-await-ack] { color: #d68d32; background: color-mix(in srgb, #d68d32 18%, transparent); outline: 1px solid #d68d32; }
 .prompt-turn-card:has(.prompt-turn-grill-tag[data-await-ack]) { border-color: #d68d32; }
+.message-actions > .message-action-icon[data-copy-state="copied"] { border-color: #86efac; background: #dcfce7; color: #15803d; }
+.message-actions > .message-action-icon[data-copy-state="error"] { border-color: #fecdd3; background: #fff1f2; color: #be123c; }
 .grill-title { flex-wrap: wrap; }

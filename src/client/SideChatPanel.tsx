@@ -7,6 +7,7 @@ import { EFFORT_OPTIONS, MODEL_OPTIONS, ULTRA_EFFORT_OPTIONS } from "./appConsta
 import type { ChatMessage } from "./appTypes";
 import { formatResponseAnnotationsPrompt, type ResponseAnnotation } from "./responseAnnotations";
 import { annotationLabel } from "./ResponseAnnotationList";
+import { askSession, loadSideChats, type SessionSideChat } from "./sessionApi";
 import {
   ComposerFrame,
   ComposerGearSelector,
@@ -14,23 +15,6 @@ import {
   ComposerToolbar,
   type ComposerGearProfile
 } from "./ComposerFrame";
-
-type SessionSideChat = {
-  id: string;
-  sessionId: string;
-  question: string;
-  answer: string;
-  model: string;
-  created: string;
-};
-
-type InspectionResponse = {
-  sideChats?: SessionSideChat[];
-};
-
-type AskResponse = {
-  sideChat: SessionSideChat;
-};
 
 type CompletedTurnComponent = (props: {
   message: ChatMessage;
@@ -41,6 +25,7 @@ type CompletedTurnComponent = (props: {
 }) => React.ReactNode;
 
 type SideChatPanelProps = {
+  active: boolean;
   codexSessionId?: string;
   sessionId: string;
   sessionReady: boolean;
@@ -50,16 +35,7 @@ type SideChatPanelProps = {
   onClearAnnotation?: () => void;
 };
 
-async function readApiError(response: Response, fallback: string) {
-  try {
-    const body = await response.json() as { error?: unknown };
-    return typeof body.error === "string" && body.error.trim() ? body.error : fallback;
-  } catch {
-    return fallback;
-  }
-}
-
-export function SideChatPanel({ codexSessionId, sessionId, sessionReady, workspaceId, CompletedTurn, annotation, onClearAnnotation }: SideChatPanelProps) {
+export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady, workspaceId, CompletedTurn, annotation, onClearAnnotation }: SideChatPanelProps) {
   const [messages, setMessages] = useState<SessionSideChat[]>([]);
   const [input, setInput] = useState("");
   const [pendingQuestion, setPendingQuestion] = useState("");
@@ -70,6 +46,9 @@ export function SideChatPanel({ codexSessionId, sessionId, sessionReady, workspa
   const [error, setError] = useState<string | null>(null);
   const composerRef = useRef<InlineLinkComposerHandle | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const sessionGeneration = useRef(0);
+  const sendingRef = useRef(false);
+  const loadedSession = useRef<string | null>(null);
   const activeGear = gearProfiles[activeGearIndex] ?? gearProfiles[0];
 
   useEffect(() => {
@@ -86,39 +65,39 @@ export function SideChatPanel({ codexSessionId, sessionId, sessionReady, workspa
   }
 
   useEffect(() => {
-    const controller = new AbortController();
+    sessionGeneration.current++;
+    loadedSession.current = null;
+    sendingRef.current = false;
+    setIsSending(false);
     setMessages([]);
     setInput("");
     setPendingQuestion("");
     setError(null);
     setIsLoading(true);
-    if (!sessionReady) {
-      return () => controller.abort();
-    }
-    void fetch("/api/session-inspector/session", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        sessionId,
-        includeSideChats: true,
-        sideChatLimit: 100,
-        order: "asc",
-        turnLimit: 1,
-        maxTextChars: 200
-      }),
-      signal: controller.signal
-    }).then(async (response) => {
-      if (!response.ok) throw new Error(await readApiError(response, `Side chat API returned ${response.status}`));
-      const body = await response.json() as InspectionResponse;
-      setMessages(Array.isArray(body.sideChats) ? body.sideChats : []);
+    return () => { sessionGeneration.current++; };
+  }, [sessionId, sessionReady]);
+
+  useEffect(() => {
+    if (!active || !sessionReady || loadedSession.current === sessionId) return;
+    const controller = new AbortController();
+    setIsLoading(true);
+    void loadSideChats(sessionId, controller.signal).then((sideChats) => {
+      if (!controller.signal.aborted) {
+        loadedSession.current = sessionId;
+        setMessages((current) => {
+          const savedIds = new Set(sideChats.map((entry) => entry.id));
+          return [...sideChats, ...current.filter((entry) => !savedIds.has(entry.id))];
+        });
+        setError(null);
+      }
     }).catch((loadError) => {
-      if (loadError instanceof DOMException && loadError.name === "AbortError") return;
+      if (controller.signal.aborted) return;
       setError(loadError instanceof Error ? loadError.message : "Unable to load side chat");
     }).finally(() => {
       if (!controller.signal.aborted) setIsLoading(false);
     });
     return () => controller.abort();
-  }, [sessionId, sessionReady]);
+  }, [active, sessionId, sessionReady]);
 
   useEffect(() => {
     const element = scrollRef.current;
@@ -128,33 +107,34 @@ export function SideChatPanel({ codexSessionId, sessionId, sessionReady, workspa
   async function submit(event?: FormEvent) {
     event?.preventDefault();
     const question = annotation ? formatResponseAnnotationsPrompt([annotation], input.trim()) : input.trim();
-    if (!question || isSending || !sessionReady) return;
+    if (!question || sendingRef.current || isLoading || !sessionReady) return;
+    const generation = sessionGeneration.current;
+    sendingRef.current = true;
     setInput("");
     setPendingQuestion(question);
     setError(null);
     setIsSending(true);
     try {
-      const response = await fetch("/api/session-inspector/ask", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sessionId,
-          question,
-          model: activeGear.model,
-          modelReasoningEffort: activeGear.effort
-        })
+      const sideChat = await askSession({
+        sessionId,
+        question,
+        model: activeGear.model,
+        modelReasoningEffort: activeGear.effort
       });
-      if (!response.ok) throw new Error(await readApiError(response, `Side chat API returned ${response.status}`));
-      const body = await response.json() as AskResponse;
-      setMessages((current) => [...current, body.sideChat]);
+      if (sessionGeneration.current !== generation) return;
+      setMessages((current) => [...current.filter((entry) => entry.id !== sideChat.id), sideChat]);
       onClearAnnotation?.();
     } catch (sendError) {
+      if (sessionGeneration.current !== generation) return;
       setInput(input);
       setError(sendError instanceof Error ? sendError.message : "Unable to send side-chat message");
     } finally {
-      setIsSending(false);
-      setPendingQuestion("");
-      window.requestAnimationFrame(() => composerRef.current?.focus());
+      if (sessionGeneration.current === generation) {
+        sendingRef.current = false;
+        setIsSending(false);
+        setPendingQuestion("");
+        window.requestAnimationFrame(() => composerRef.current?.focus());
+      }
     }
   }
 
@@ -253,7 +233,7 @@ export function SideChatPanel({ codexSessionId, sessionId, sessionReady, workspa
               <button className="composer-icon" type="button" onClick={() => { setInput(""); onClearAnnotation?.(); }} disabled={!input && !annotation} title="Clear" aria-label="Clear">
                 <X aria-hidden="true" />
               </button>
-              <button className="send-button" type="submit" disabled={(!input.trim() && !annotation) || isSending || !sessionReady} title="Send" aria-label="Send">
+              <button className="send-button" type="submit" disabled={(!input.trim() && !annotation) || isLoading || isSending || !sessionReady} title="Send" aria-label="Send">
                 {isSending ? <Loader2 className="spin" aria-hidden="true" /> : <Send aria-hidden="true" />}
               </button>
             </ComposerToolbar>

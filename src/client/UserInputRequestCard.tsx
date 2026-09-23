@@ -33,11 +33,11 @@ export function UserInputRequestCard({ item, onDecisionSubmitted }: {
     } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
     finally { setBusy(false); }
   }
-  return <section className="user-input-card" data-approval-id={item.approvalId} aria-label="Agent questions">
-    <header><MessageCircle size={17} /><strong>Your input</strong><span>{resolved ? saved || submitted ? "Answered" : "Closed" : blocking ? "Waiting for you" : "Agent is continuing"}</span></header>
+  return <section className="user-input-card" data-resolved={resolved} data-approval-id={item.approvalId} aria-label="Agent questions">
+    <header><MessageCircle size={17} /><strong>Your input</strong><span className="user-input-status">{resolved && (saved || submitted) && <Check size={12} />}{resolved ? saved || submitted ? "Answered" : "Closed" : blocking ? "Waiting for you" : "Agent is continuing"}</span></header>
     {questions.map((q, index) => <fieldset key={q.id} disabled={busy || resolved}>
       <legend><small>{index + 1} · {q.header}</small><span>{q.question}</span></legend>
-      {resolved ? <p className="user-input-answer">{q.isSecret ? "••••••••" : saved?.answers[q.id]?.answers.join(", ") || (submitted ? values[q.id] : "No answer submitted")}</p> : <>
+      {resolved ? <div className="user-input-answer"><span className="user-input-answer-label">Your answer</span><p>{q.isSecret ? "••••••••" : saved?.answers[q.id]?.answers.join(", ") || (submitted ? values[q.id] : "No answer submitted")}</p></div> : <>
         {q.options?.map((option, optionIndex) => <label className="user-input-option" key={optionIndex}>
           <input type="radio" name={`${instanceId}-${q.id}`} checked={!custom[q.id] && values[q.id] === option.label}
             onChange={() => { setCustom((v) => ({ ...v, [q.id]: false })); setValues((v) => ({ ...v, [q.id]: option.label })); }} />

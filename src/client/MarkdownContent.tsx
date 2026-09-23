@@ -18,6 +18,7 @@ import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Download, ExternalLink, FileText, X } from "lucide-react";
 import { isHtmlFilePath, workspaceHtmlPreviewUrl } from "./markdownUrls";
+import { CODEX_FOLLOWUP_EVENT, remarkCodexFileCitation, remarkCodexFollowup } from "./codexFollowup";
 import { UrlTagIcon } from "./UrlTagIcon";
 import { createLinkPreview, isStandaloneApp } from "./linkPreview";
 import { isJsonFilePath, isMarkdownFilePath, threadexNavigationUrl, transformMarkdownUrl, workspaceFileDownloadUrl, workspaceFilePreviewUrl, workspaceFileReferenceFromUrl, workspaceImagePreviewName, type WorkspaceFilePreviewContext } from "./markdownUrls";
@@ -33,6 +34,12 @@ export const MarkdownWorkspaceContext = createContext<WorkspaceFilePreviewContex
 // Stable component types preserve open previews and code blocks while the
 // surrounding Markdown receives new streamed text.
 const markdownComponents: Components = {
+  button: ({ node, children }) => {
+    const prompt = node?.properties["data-followup-prompt"] ?? node?.properties.dataFollowupPrompt;
+    return <button type="button" className="codex-followup" title="Add to message" onClick={() => {
+      if (typeof prompt === "string") window.dispatchEvent(new CustomEvent(CODEX_FOLLOWUP_EVENT, { detail: prompt }));
+    }}>{children}</button>;
+  },
   a: ({ node: _node, ...props }) => <MarkdownLink {...props} />,
   code: ({ className, children, node: _node, ...props }) => {
     const language = /language-([\w-]+)/.exec(className ?? "")?.[1];
@@ -42,7 +49,7 @@ const markdownComponents: Components = {
   pre: ({ children }) => findMermaidChild(children) ?? <pre className="markdown-code-block">{children}</pre>,
   img: ({ node: _node, ...props }) => <MarkdownImage {...props} />
 };
-const markdownPlugins = [remarkGfm];
+const markdownPlugins = [remarkGfm, remarkCodexFollowup, remarkCodexFileCitation];
 
 export const MarkdownContent = memo(function MarkdownContent({ children, className, id }: { children: string; className?: string; id?: string }) {
   const previous = useRef<MarkdownChunks | null>(null);

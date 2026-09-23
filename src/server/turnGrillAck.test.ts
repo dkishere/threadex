@@ -30,7 +30,8 @@ test("Grill acknowledgment persists, aggregates turns, and never consumes unseen
         inferenceCalls++; entered?.(); await gate;
         const input = JSON.parse(prompt);
         return { responseText: JSON.stringify(input.action === "start"
-          ? [{ id: "q1", md: "Question", responseMd: "", status: "open" }]
+          // JSON can preserve escaped NULs from model output; jsonb rejects them.
+          ? [{ id: "q1", md: "Question\u0000with escaped NUL", responseMd: "", status: "open" }]
           : input.issues.map((issue: object) => ({ ...issue, responseMd: "New answer", status: "open" }))),
         usage: null, authIdentity: { externalAccountId: null, externalUserId: null } };
       } });

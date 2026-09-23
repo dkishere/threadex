@@ -363,6 +363,7 @@ Main browser API:
 | `POST /api/process-monitors/:monitorId/adopt` | Attach a durable restart launch spec to an already-running PID |
 | `POST /api/process-monitors/:monitorId/stop` | Stop a monitored process while retaining its monitor and launch spec |
 | `POST /api/process-monitors/:monitorId/restart` | Restart a monitor with a saved launch spec |
+| `POST /api/process-monitors/:monitorId/run` | Run a registered command in a new captured monitor |
 | `DELETE /api/process-monitors/:monitorId` | Stop and remove a monitor |
 | `GET /api/wait-events` | List durable backend events and per-session subscription delivery state |
 | `POST /api/wait-subscriptions` | Subscribe a session action to an existing retained event |
@@ -380,7 +381,46 @@ event, so multiple sessions can subscribe to the same completion. Rate-limited
 turns use the same durable event system and share `quota.available` events instead
 of owning separate reset timers. `entryPoints` optionally stores HTTP(S) URLs that are
 shown as web links in the process monitor detail popover. `timeoutSeconds` limits the
-monitor lifetime. Completed executable monitors remain available for restart;
+monitor lifetime. Pass `registerOnly: true` with a complete launch spec to save a
+command without executing it (no PID, wake prompt, or timeout). The Available tab
+lists these reusable commands; Run creates a separate monitor and switches to
+Running. A registered command run disappears from Running after it exits; its most
+recent captured output remains available through the command's Logs popup.
+Registration is
+workspace-scoped and persists across server restarts. Agents use
+`register_process_command`, `list_processes`, and `run_process_command` for the
+same flow. Removing a registered command leaves its previous runs intact.
+
+Registered commands can define `parameters` using `name`, `desc`, `type`
+(`option`, `string`, or `number`), and `default`. Option parameters also require
+`options`, an array of allowed strings. Clicking Play opens a form with these
+defaults. Agents pass `parameterValues: {name: value}` to `run_process_command`;
+omitted values use defaults. Wrong types and unknown options/names are rejected
+before launching. Each run saves its values, including across restarts.
+
+Use `{{name}}` in `args` or `dockerRunArgs` to replace part or all of one argument.
+Each value also becomes an environment variable named `THREADEX_PARAM_name`
+(including inside Docker). For shell `command` text, use quoted environment
+references such as `"$THREADEX_PARAM_query"`; shell text is not interpolated.
+Do not put user-input placeholders into interpreter code such as `sh -c` or
+`node -e`; pass them as separate arguments or read the environment instead.
+
+Example registration:
+
+```json
+{
+  "label": "Fetch gallery",
+  "exe": "python3",
+  "args": ["fetch.py", "--mode", "{{mode}}", "--query", "{{query}}", "--limit", "{{limit}}"],
+  "parameters": [
+    {"name": "mode", "desc": "Fetch mode", "type": "option", "default": "recent", "options": ["recent", "all"]},
+    {"name": "query", "desc": "Search text", "type": "string", "default": ""},
+    {"name": "limit", "desc": "Maximum items", "type": "number", "default": 20}
+  ]
+}
+```
+
+Completed executable monitors remain available for restart;
 Interpreter executable monitors (`node`, shells, Python, and similar) must include
 the script or command options in `args`. Labels are display-only and do not find a
 process. PID-only monitors are temporary, store no launch args, cannot restart,

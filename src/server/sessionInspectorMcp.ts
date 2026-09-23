@@ -697,6 +697,32 @@ if (lightweightTodo && managerSessionId && apiBaseUrl) {
   );
 }
 
+const commandLaunchProperties = { ...(tools.find((tool) => tool.name === "monitor_process")!.inputSchema.properties as Record<string, unknown>) };
+for (const key of ["pid", "wakePrompt", "timeoutSeconds"]) delete commandLaunchProperties[key];
+commandLaunchProperties.parameters = {
+  type: "array", maxItems: 32,
+  description: 'User-editable launch parameters. Use {{name}} in args/dockerRunArgs; in shell command text use quoted "$THREADEX_PARAM_name". Each run receives THREADEX_PARAM_name environment variables.',
+  items: {
+    type: "object", required: ["name", "desc", "type", "default"], additionalProperties: false,
+    properties: {
+      name: { type: "string", pattern: "^[A-Za-z][A-Za-z0-9_]{0,63}$" },
+      desc: { type: "string", maxLength: 2000 },
+      type: { type: "string", enum: ["option", "string", "number"] },
+      default: { type: ["string", "number"] },
+      options: { type: "array", minItems: 1, maxItems: 100, items: { type: "string", minLength: 1 }, description: "Required for option parameters; default must be one of these values." }
+    }
+  }
+};
+tools.push({
+  name: "register_process_command",
+  description: "Save a reusable command in the workspace Available tab without executing it. Supply exactly one complete launch spec: exe with args, command, or dockerImage. Returns an id for run_process_command; users can also click Run. Each run creates a separate captured process monitor and keeps the command available.",
+  inputSchema: { type: "object", required: ["label"], properties: commandLaunchProperties, additionalProperties: false }
+}, {
+  name: "run_process_command",
+  description: "Execute an available registered command by id and create a Running process monitor with captured logs. Use list_processes to discover commands with status available. The saved command remains available for later runs.",
+  inputSchema: { type: "object", required: ["id"], properties: { id: { type: "string" }, parameterValues: { type: "object", additionalProperties: { type: ["string", "number"] }, description: "Values keyed by registered parameter name. Omitted values use their defaults." } }, additionalProperties: false }
+});
+
 function toolsForAgent() {
   if (todoAgentRole === "turn_grill") return tools.filter((tool) => tool.name === "get_session");
   if (lightweightTodo) return tools.filter((tool) => !tool.name.startsWith("todo_"));
@@ -1067,6 +1093,14 @@ async function callTool(params: unknown) {
     }));
   }
 
+  if (name === "register_process_command") {
+    return toolResult(await monitorProcess({ ...args, registerOnly: true }));
+  }
+
+  if (name === "run_process_command") {
+    return toolResult(await postJson(`/api/process-monitors/${encodeURIComponent(readRequiredString(args, "id"))}/run`, { parameterValues: args.parameterValues ?? {} }));
+  }
+
   if (name === "monitor_process") {
     return toolResult(await monitorProcess(args));
   }
@@ -1232,6 +1266,7 @@ async function listProcesses() {
         id: readString(value.id),
         label: readString(value.label),
         status: readString(value.status),
+        parameters: Array.isArray(value.parameters) ? value.parameters : [],
         readOnly: value.readOnly === true,
         restartable: value.restartable === true,
         pid: typeof value.pid === "number" ? value.pid : null,
@@ -1250,6 +1285,8 @@ async function listProcesses() {
 
 async function monitorProcess(input: Record<string, unknown>) {
   return postJson("/api/process-monitors", {
+    ...(input.registerOnly === true ? { registerOnly: true } : {}),
+    ...(input.parameters !== undefined ? { parameters: input.parameters } : {}),
     label: readRequiredString(input, "label"),
     ...(input.pid !== undefined ? { pid: input.pid } : {}),
     ...(input.exe !== undefined ? { exe: input.exe } : {}),
@@ -1260,6 +1297,7 @@ async function monitorProcess(input: Record<string, unknown>) {
     ...(input.dockerRunArgs !== undefined ? { dockerRunArgs: input.dockerRunArgs } : {}),
     ...(input.logFile !== undefined ? { logFile: input.logFile } : {}),
     ...(input.entryPoints !== undefined ? { entryPoints: input.entryPoints } : {}),
+    ...(input.metrics !== undefined ? { metrics: input.metrics } : {}),
     ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
     ...(input.wakePrompt !== undefined ? { wakePrompt: input.wakePrompt } : {}),
     ...(input.wakePrompt !== undefined && managerApprovalPolicy ? { approvalPolicy: managerApprovalPolicy } : {}),

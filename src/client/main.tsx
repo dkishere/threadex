@@ -14,6 +14,7 @@ import "./styles/app-08.css";
 import "./styles/app-09.css";
 import "./styles/app-10.css";
 import "./styles/app-11.css";
+import "./codexFollowup.css";
 
 function registerServiceWorker() {
   if (!window.isSecureContext || !("serviceWorker" in navigator)) return;

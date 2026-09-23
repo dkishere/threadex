@@ -49,6 +49,8 @@ export type WorkspaceStatusMonitor = {
 };
 
 export type ProcessMonitor = {
+  parameters?: import("../processCommandParameters").ProcessCommandParameter[];
+  parameterValues?: import("../processCommandParameters").ProcessCommandValues;
   id: string;
   workspaceId: string;
   label: string;
@@ -71,7 +73,8 @@ export type ProcessMonitor = {
   }>;
   cwd: string;
   pid: number | null;
-  status: "starting" | "running" | "exited" | "stopped" | "error";
+  status: "available" | "starting" | "running" | "exited" | "stopped" | "error";
+  sourceCommandId: string | null;
   managed: boolean;
   readOnly?: boolean;
   restartable?: boolean;
@@ -133,6 +136,9 @@ export type EventStoreState = {
 };
 
 type EventsResponse = {
+  workspaceId?: string;
+  stateVersion?: string;
+  hasMore?: boolean;
   grillSummaries?: GrillSummary[];
   events?: RingEvent[];
   nextPos?: number;
@@ -171,6 +177,9 @@ export class EventStore {
   private cursorListeners = new Set<() => void>();
   private eventListeners = new Map<string, Set<EventListener>>();
   private pollPromise: Promise<boolean> | null = null;
+  private pollListeners = new Set<() => void>();
+  private stateVersion = "";
+  private snapshotGeneration = 0;
   private waitSubscriptionUpdates = new Map<string, WaitSubscription>();
 
   getState = () => this.state;
@@ -198,7 +207,14 @@ export class EventStore {
     };
   };
 
-  subscribeTo(types: string[], listener: EventListener) {
+  // Feature reads retry on the existing event heartbeat, including polls with
+  // no changes. They do not need a timer or a render for each heartbeat.
+  subscribePoll = (listener: () => void) => {
+    this.pollListeners.add(listener);
+    return () => { this.pollListeners.delete(listener); };
+  };
+
+  subscribeTo(types: readonly string[], listener: EventListener) {
     for (const type of types) {
       const listeners = this.eventListeners.get(type) ?? new Set<EventListener>();
       listeners.add(listener);
@@ -219,6 +235,8 @@ export class EventStore {
     selectedSessionSnapshot: unknown | null,
     cursor: number
   ) {
+    this.snapshotGeneration++;
+    this.stateVersion = "";
     const cursorChanged = normalizeCursor(cursor) !== this.state.cursor;
     this.state = {
       workspaceSnapshot,
@@ -298,13 +316,20 @@ export class EventStore {
 
   async poll() {
     if (this.pollPromise) return this.pollPromise;
-    this.pollPromise = this.pollOnce().finally(() => {
+    this.pollPromise = this.pollPages().then((resetRequired) => {
+      if (!resetRequired) for (const listener of this.pollListeners) {
+        try { listener(); } catch (error) { console.error("Event poll subscriber failed", error); }
+      }
+      return resetRequired;
+    }).finally(() => {
       this.pollPromise = null;
     });
     return this.pollPromise;
   }
 
   reset(cursor = 0) {
+    this.snapshotGeneration++;
+    this.stateVersion = "";
     const nextCursor = normalizeCursor(cursor);
     if (nextCursor === this.state.cursor) return;
     // The cursor is transport metadata. Keep the main store snapshot identity
@@ -314,18 +339,38 @@ export class EventStore {
     this.emitCursorChange();
   }
 
+  private async pollPages() {
+    // Drain a backlog immediately, but yield to the regular heartbeat if an
+    // unusually busy workspace keeps producing pages without a pause.
+    for (let page = 0; page < 8; page++) {
+      const result = await this.pollOnce();
+      if (result.resetRequired) return true;
+      if (!result.hasMore) return false;
+    }
+    return false;
+  }
+
   private async pollOnce() {
-    const response = await fetch(`/api/events?after=${this.state.cursor}`, { cache: "no-store" });
+    const generation = this.snapshotGeneration;
+    const after = this.state.cursor;
+    const params = new URLSearchParams({ after: String(after), view: "client" });
+    if (this.stateVersion) params.set("stateVersion", this.stateVersion);
+    const response = await fetch(`/api/events?${params}`, { cache: "no-store" });
     if (!response.ok) throw new Error(`API returned ${response.status}`);
     const payload = (await response.json()) as EventsResponse;
-    if (payload.resetRequired) return true;
+    if (generation !== this.snapshotGeneration) return { resetRequired: false, hasMore: false };
+    const workspaceId = readWorkspaceId(this.state.workspaceSnapshot);
+    if (payload.resetRequired || (workspaceId && payload.workspaceId && payload.workspaceId !== workspaceId)) {
+      this.stateVersion = "";
+      return { resetRequired: true, hasMore: false };
+    }
 
     const nextStatusMonitor = Array.isArray(payload.statusMonitor) ? payload.statusMonitor : this.state.statusMonitor;
     const grillSummaries = reuseJsonValue(this.state.grillSummaries, payload.grillSummaries?.map((item) => {
       const local = this.state.grillSummaries.find((old) => old.sessionId === item.sessionId && old.turnId === item.turnId);
       return local && local.revision > item.revision ? local : item;
     }) ?? this.state.grillSummaries);
-    const nextProcessMonitors = Array.isArray(payload.processMonitors) ? payload.processMonitors : [];
+    const nextProcessMonitors = Array.isArray(payload.processMonitors) ? payload.processMonitors : this.state.processMonitors;
     const nextWaitEvents = Array.isArray(payload.waitEvents) ? payload.waitEvents : this.state.waitEvents;
     const nextWaitSubscriptions = this.reconcileWaitSubscriptions(Array.isArray(payload.waitSubscriptions) ? payload.waitSubscriptions : this.state.waitSubscriptions);
     const statusMonitor = reuseJsonValue(this.state.statusMonitor, nextStatusMonitor);
@@ -339,6 +384,7 @@ export class EventStore {
       if (!isRingEvent(event) || event.pos <= cursor) continue;
       cursor = event.pos;
       this.emitEvent(event);
+      if (generation !== this.snapshotGeneration) return { resetRequired: false, hasMore: false };
     }
     if (typeof payload.nextPos === "number") cursor = Math.max(cursor, normalizeCursor(payload.nextPos));
     // Event listeners can synchronously install a newer workspace snapshot.
@@ -363,7 +409,8 @@ export class EventStore {
       persistCursor(cursor);
       this.emitCursorChange();
     }
-    return false;
+    this.stateVersion = typeof payload.stateVersion === "string" ? payload.stateVersion : "";
+    return { resetRequired: false, hasMore: payload.hasMore === true && cursor > after };
   }
 
   private emitEvent(event: RingEvent) {
@@ -412,6 +459,12 @@ function readProcessMonitors(value: unknown): ProcessMonitor[] {
   return Array.isArray(monitors) ? monitors as ProcessMonitor[] : [];
 }
 
+function readWorkspaceId(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  const workspace = (value as { activeWorkspace?: { id?: unknown } }).activeWorkspace;
+  return typeof workspace?.id === "string" ? workspace.id : null;
+}
+
 function readArrayField<T>(value: unknown, field: string): T[] {
   if (!value || typeof value !== "object" || Array.isArray(value)) return [];
   const items = (value as Record<string, unknown>)[field];
@@ -420,8 +473,11 @@ function readArrayField<T>(value: unknown, field: string): T[] {
 
 export const eventStore = new EventStore();
 
-export function useEventStore() {
-  return useSyncExternalStore(eventStore.subscribe, eventStore.getState, eventStore.getState);
+export function useEventStore(): EventStoreState;
+export function useEventStore<T>(select: (state: EventStoreState) => T): T;
+export function useEventStore<T>(select?: (state: EventStoreState) => T) {
+  const getSnapshot = () => select ? select(eventStore.getState()) : eventStore.getState();
+  return useSyncExternalStore(eventStore.subscribe, getSnapshot, getSnapshot);
 }
 
 export function useEventCursor() {

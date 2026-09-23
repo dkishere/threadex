@@ -90,7 +90,15 @@ export async function loadWorkspaceSnapshot(ctx, options = {}) {
                 selectedSnapshot = preservedSelectedSnapshot;
             }
             else if (navigationTarget) {
-                if (navigationTarget.sessionId) {
+                if (navigationTarget.sessionId &&
+                    payload.activeSessionId === navigationTarget.sessionId &&
+                    payload.activeSession?.session?.id === navigationTarget.sessionId &&
+                    payload.activeSession.session.workspaceId === payload.activeWorkspace.id) {
+                    // The workspace response already contains the selected transcript.
+                    // Avoid reading it again and switching to the already-active session.
+                    selectedSnapshot = payload.activeSession;
+                }
+                else if (navigationTarget.sessionId) {
                     const snapshotResponse = await fetch(`/api/sessions/${encodeURIComponent(navigationTarget.sessionId)}/snapshot`, { cache: "no-store" });
                     if (snapshotResponse.ok) {
                         const snapshot = (await snapshotResponse.json());
@@ -450,22 +458,25 @@ export async function refreshApprovalState(ctx, ) {
     
 }
 
-export async function restartProcessMonitor(ctx, monitor) {
+export async function restartProcessMonitor(ctx, monitor, parameterValues) {
     const { eventStore, readApiError, setProcessMonitorAction, setStatus } = ctx;
         setProcessMonitorAction(`restart:${monitor.id}`);
         try {
-            const response = await fetch(`/api/process-monitors/${encodeURIComponent(monitor.id)}/restart`, {
+            const response = await fetch(`/api/process-monitors/${encodeURIComponent(monitor.id)}/${monitor.status === "available" ? "run" : "restart"}`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: "{}"
+                body: JSON.stringify({ parameterValues })
             });
             if (!response.ok)
                 throw new Error(await readApiError(response));
-            setStatus(`Restarted ${monitor.label}`);
+            setStatus(`${monitor.status === "available" ? "Started" : "Restarted"} ${monitor.label}`);
             await eventStore.poll();
+            return true;
         }
         catch (error) {
             setStatus(error instanceof Error ? `Restart failed: ${error.message}` : "Restart failed");
+            if (ctx.rethrowErrors) throw error;
+            return false;
         }
         finally {
             setProcessMonitorAction(null);

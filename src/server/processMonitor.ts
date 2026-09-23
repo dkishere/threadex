@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, openSync, readSync, rmSync, statSync } from "node:fs";
 import { resolve, sep } from "node:path";
+import { interpolateCommandArgs, normalizeCommandParameters, resolveCommandValues, type ProcessCommandParameter, type ProcessCommandValues } from "../processCommandParameters";
 import type {
   CreateProcessMonitorInput,
   ProcessMetricMonitor,
@@ -13,6 +14,11 @@ import type {
 } from "./sessionStore";
 
 export type MonitorProcessInput = {
+  registerOnly?: boolean;
+  parameters?: ProcessCommandParameter[];
+  parameterValues?: ProcessCommandValues;
+  /** Internal link from a launched run back to its registered command. */
+  sourceCommandId?: string | null;
   label: string;
   command?: string | null;
   exe?: string | null;
@@ -113,6 +119,11 @@ export class ProcessMonitorService {
   }
 
   async monitor(workspace: WorkspaceRecord, input: MonitorProcessInput) {
+    const parameters = normalizeCommandParameters(input.parameters);
+    const parameterValues = resolveCommandValues(parameters, input.parameterValues);
+    if (input.registerOnly && (input.pid != null || input.wakePrompt || input.timeoutSeconds != null)) {
+      throw new Error("Command registration requires a launch spec without pid, wakePrompt or timeoutSeconds.");
+    }
     const label = normalizeLabel(input.label);
     const removeOnExit = normalizeRemoveOnExit(input.removeOnExit);
     const command = normalizeCommand(input.command);
@@ -123,6 +134,13 @@ export class ProcessMonitorService {
     const dockerImage = normalizeDockerImage(input.dockerImage ?? input.image);
     const dockerRunArgs = normalizeArgs(input.dockerRunArgs);
     const args = normalizeArgs(input.args);
+    if (input.registerOnly && parameters.length > 0) {
+      interpolateCommandArgs(args, parameterValues);
+      interpolateCommandArgs(dockerRunArgs, parameterValues);
+      if (command && /\{\{[A-Za-z][A-Za-z0-9_]*\}\}/.test(command)) {
+        throw new Error('Shell command parameters use quoted environment variables, e.g. "$THREADEX_PARAM_name", instead of {{name}}.');
+      }
+    }
     const logFile = normalizeLogFile(workspace, input.logFile);
     const entryPoints = normalizeEntryPoints(input.entryPoints, input.entryPoint);
     const metricMonitors = normalizeMetricMonitors(input.metrics);
@@ -189,11 +207,15 @@ export class ProcessMonitorService {
       metricMonitors,
       metricReadings: emptyMetricReadings(metricMonitors),
       cwd,
-      status: "starting",
+      status: input.registerOnly ? "available" : "starting",
+      sourceCommandId: input.sourceCommandId ?? null,
+      parameters,
+      parameterValues: input.registerOnly ? {} : parameterValues,
       managed: true,
       removeOnExit,
       ...monitorOptions
     });
+    if (input.registerOnly) return record;
     try {
       await this.startProcess(record);
       return this.refreshMetrics((await this.store.getProcessMonitor(record.id)) ?? record, true);
@@ -205,6 +227,7 @@ export class ProcessMonitorService {
 
   async restart(workspace: WorkspaceRecord, id: string) {
     const record = await this.requireWorkspaceRecord(workspace.id, id);
+    if (record.status === "available") return this.run(workspace, id);
     if (!hasLaunchSpec(record)) {
       throw new Error("This monitor tracks an existing PID and has no managed launch to restart.");
     }
@@ -212,6 +235,28 @@ export class ProcessMonitorService {
     await this.terminate(record);
     await this.startProcess(record);
     return this.refreshMetrics((await this.store.getProcessMonitor(record.id)) ?? record, true);
+  }
+
+  async run(workspace: WorkspaceRecord, id: string, values: unknown = {}) {
+    const record = await this.requireWorkspaceRecord(workspace.id, id);
+    if (record.status !== "available") throw new Error("Registered command not found.");
+    const parameters = normalizeCommandParameters(record.parameters);
+    const parameterValues = resolveCommandValues(parameters, values);
+    return this.monitor(workspace, {
+      label: record.label,
+      command: record.command,
+      exe: record.executable,
+      dockerImage: record.dockerImage,
+      dockerRunArgs: parameters.length ? interpolateCommandArgs(record.dockerRunArgs, parameterValues) : record.dockerRunArgs,
+      args: parameters.length ? interpolateCommandArgs(record.args, parameterValues) : record.args,
+      cwd: record.cwd,
+      logFile: record.logFile,
+      entryPoints: record.entryPoints,
+      metrics: record.metricMonitors,
+      sourceCommandId: record.id,
+      parameters,
+      parameterValues
+    });
   }
 
   async adopt(workspace: WorkspaceRecord, id: string, input: AdoptProcessMonitorInput) {
@@ -355,17 +400,18 @@ export class ProcessMonitorService {
   }
 
   private async startProcess(record: ProcessMonitorRecord) {
+    const parameterEnv = Object.fromEntries(Object.entries(record.parameterValues ?? {}).map(([name, value]) => [`THREADEX_PARAM_${name}`, String(value)]));
     const logFd = this.openLog(record);
     const spawnOptions: SpawnOptions = {
       cwd: record.cwd,
       detached: true,
-      env: process.env,
+      env: { ...process.env, ...parameterEnv },
       stdio: logFd === null ? "ignore" : ["ignore", logFd, logFd]
     };
     let child: ChildProcess;
     try {
       child = record.dockerImage
-        ? spawn("docker", ["run", "--rm", ...record.dockerRunArgs, record.dockerImage, ...record.args], spawnOptions)
+        ? spawn("docker", ["run", "--rm", ...record.dockerRunArgs, ...Object.entries(parameterEnv).flatMap(([name, value]) => ["-e", `${name}=${value}`]), record.dockerImage, ...record.args], spawnOptions)
         : record.executable
         ? spawn(record.executable, record.args, spawnOptions)
         : spawn(record.command ?? "", {

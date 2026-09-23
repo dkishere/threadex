@@ -307,7 +307,7 @@ export function StructuredCommentEvent(ctx, { item, activities = [], id, session
 export function structuredCommentType(ctx, type) {
     const {  } = ctx;
     const value = String(type ?? "").toLowerCase();
-    if (value === "answer" || value === "edit" || value === "verification" || value === "trouble" || value === "solution")
+    if (value === "answer" || value === "edit" || value === "verification" || value === "trouble" || value === "solution" || value === "wait")
         return value;
     if (value === "response" || value === "reply")
         return "answer";
@@ -320,7 +320,7 @@ export function structuredCommentType(ctx, type) {
 }
 
 export function structuredCommentIcon(ctx, type) {
-    const { CheckCircle2, Lightbulb, MessageSquare, Pencil, Search, TriangleAlert } = ctx;
+    const { CheckCircle2, Hourglass, Lightbulb, MessageSquare, Pencil, Search, TriangleAlert } = ctx;
     if (type === "answer")
         return MessageSquare;
     if (type === "edit")
@@ -331,6 +331,8 @@ export function structuredCommentIcon(ctx, type) {
         return TriangleAlert;
     if (type === "solution")
         return Lightbulb;
+    if (type === "wait")
+        return Hourglass;
     return Search;
 
 }
