@@ -6,11 +6,15 @@ import {
   COMMENTARY_HEADLINE_OUTPUT_SCHEMA,
   COMMENTARY_HEADLINE_MIN_DETAIL_CHARS,
   commentaryHeadlineContext,
+  CommentaryHeadlineValidationError,
   generateCommentaryHeadline,
+  generateCommentaryHeadlineWithRetry,
   mergeCommentaryIssueTracker,
   parseCommentaryHeadlineResponse,
-  shouldGenerateCommentaryHeadline
+  shouldGenerateCommentaryHeadline,
+  stopCommentaryHeadlineWorker
 } from "./commentaryHeadline.js";
+import { IsolatedLunaRunner } from "./isolatedLunaRunner.js";
 
 test("short commentary is shown directly without headline generation", () => {
   assert.equal(shouldGenerateCommentaryHeadline("檢查中"), false);
@@ -139,6 +143,15 @@ test("headline instructions distinguish read-only sed from edits", () => {
   assert.match(prompt, /sed without -i\/--in-place such as sed -n/);
 });
 
+test("duplicate model summaries are rejected before display deduplication", () => {
+  const detail = "確認測試通過，下一步檢查部署設定。";
+  assert.throws(() => parseCommentaryHeadlineResponse(JSON.stringify({ extracts: [
+    { type: "verification", shortMsg: "測試全部通過" },
+    { type: "answer", shortMsg: "測試全部通過。" },
+    { type: "action", shortMsg: "檢查部署設定" }
+  ] }), detail, "action"), /Duplicate extracts/);
+});
+
 test("same-type model output becomes one extract without changing detail", () => {
   const detail = "我會先追查 status fallback 嘅來源，再檢查 runner 點樣儲存。";
   const comment = parseCommentaryHeadlineResponse(
@@ -157,24 +170,112 @@ test("same-type model output becomes one extract without changing detail", () =>
   });
 });
 
-test("generic model output is replaced by a semantic fallback while copied prefixes are rejected", () => {
+test("generic model output and copied prefixes are rejected before fallback", () => {
   const detail = "正在追查 runner ownership 同 fallback 來源。";
-  assert.deepEqual(
-    parseCommentaryHeadlineResponse(
+  assert.throws(
+    () => parseCommentaryHeadlineResponse(
       JSON.stringify({ type: "action", short: "正在處理" }),
       detail,
       "action"
     ),
-    { extracts: [{ type: "action", shortMsg: "追查 runner ownership 同 fallback 來源。" }], detail }
+    CommentaryHeadlineValidationError
   );
-  assert.deepEqual(
-    parseCommentaryHeadlineResponse(
+  assert.throws(
+    () => parseCommentaryHeadlineResponse(
       JSON.stringify({ type: "action", short: "正在追查 runner ownership…" }),
       detail,
       "action"
     ),
-    { extracts: [{ type: "action", shortMsg: "追查 runner ownership 同 fallback 來源。" }], detail }
+    CommentaryHeadlineValidationError
   );
+});
+
+test("all model prose fields reject language drift before normalization", () => {
+  const detail = "The 74be calculator follow-up is unsupported. I removed it in a reviewed copy; validation is pending.";
+  const context = { issueLedger: [{ issueKey: 1, issue: "无依据的计算器追查" }] };
+  const cases = [
+    { extracts: [{ type: "edit", shortMsg: "移除計算器追查" }, { type: "wait", shortMsg: "等待驗證" }] },
+    { extracts: [], issues: ["计算器用途不明"] },
+    { extracts: [], solutions: [{ issueKey: 1, solution: "移除无依据的计算器追查" }] },
+    { extracts: [], blockers: [{ issueKey: 1, blocker: "缺少验证工具" }] }
+  ];
+  for (const response of cases) {
+    assert.throws(() => parseCommentaryHeadlineResponse(JSON.stringify(response), detail, "action", context),
+      CommentaryHeadlineValidationError);
+  }
+  const corrected = parseCommentaryHeadlineResponse(JSON.stringify({ extracts: [
+    { type: "edit", shortMsg: "Removed the unsupported calculator follow-up" },
+    { type: "wait", shortMsg: "Validation of the reviewed copy is pending" }
+  ], solutions: [{ issueKey: 1, solution: "Removed the unsupported calculator follow-up from a reviewed copy" }] }), detail, "action", context)!;
+  assert.equal(corrected.extracts.length, 2);
+  assert.equal(corrected.solutions?.[0].issueKey, 1);
+  assert.equal(corrected.detail, detail);
+  assert.throws(() => parseCommentaryHeadlineResponse(JSON.stringify({ extracts: [], issues: ["Missing validation tools"] }),
+    "缺少驗證工具，暫時未能完成檢查。", "action"), CommentaryHeadlineValidationError);
+});
+
+test("model correction receives validation feedback with one retry", async (t) => {
+  const previousProvider = process.env.SESSION_COMMENTARY_HEADLINE_PROVIDER;
+  process.env.SESSION_COMMENTARY_HEADLINE_PROVIDER = "agent";
+  const requests: Array<Record<string, unknown>> = [];
+  const detail = "c185 is the first completed result: priority 80, with mechanical validation passed. Its draft uses the rapid-start-plus-camera route and keeps the script-pattern indicator at 1. 5b770 has now started.";
+  const corrected = { extracts: [
+    { type: "verification", shortMsg: "c185 passed validation with priority 80" },
+    { type: "action", shortMsg: "5b770 review has started" }
+  ], issues: [], solutions: [], blockers: [] };
+  let response = JSON.stringify({ extracts: [
+    { type: "verification", shortMsg: "c185 通過驗證，優先級 80" },
+    { type: "action", shortMsg: "5b770 已開始" }
+  ] });
+  const run = t.mock.method(IsolatedLunaRunner.prototype, "run", async function (input: string) {
+    requests.push(JSON.parse(input));
+    const output = response;
+    response = JSON.stringify(corrected);
+    return { responseText: output, usage: null, authIdentity: { externalAccountId: null, externalUserId: null } };
+  });
+  try {
+    const result = await generateCommentaryHeadlineWithRetry({ detail, fallbackType: "action", cwd: "/tmp" });
+    assert.deepEqual(result?.comment.extracts, corrected.extracts);
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0].retryFeedback, undefined);
+    assert.match(String(requests[1].retryFeedback), /extracts\[0\].*same language/);
+    assert.equal(requests[1].currentUpdate, detail);
+    // Check the instructions of the actual production worker, not just the alternate prompt builder.
+    const worker = run.mock.calls[0].this as unknown as { options: { baseInstructions: string } };
+    assert.match(worker.options.baseInstructions, /issues\[\], solutions\[\]\.solution and blockers\[\]\.blocker/);
+    assert.match(worker.options.baseInstructions, /English update requires English in all four fields/);
+    assert.match(worker.options.baseInstructions, /compare extracts by meaning/);
+    assert.doesNotMatch(worker.options.baseInstructions, /完整比對/);
+
+    requests.length = 0;
+    response = JSON.stringify({ extracts: [corrected.extracts[0], { ...corrected.extracts[0], type: "answer" }] });
+    const deduplicated = await generateCommentaryHeadlineWithRetry({ detail, fallbackType: "action", cwd: "/tmp" });
+    assert.deepEqual(deduplicated?.comment.extracts, corrected.extracts);
+    assert.equal(requests.length, 2);
+    assert.match(String(requests[1].retryFeedback), /Duplicate extracts/);
+  } finally {
+    stopCommentaryHeadlineWorker();
+    if (previousProvider === undefined) delete process.env.SESSION_COMMENTARY_HEADLINE_PROVIDER;
+    else process.env.SESSION_COMMENTARY_HEADLINE_PROVIDER = previousProvider;
+  }
+});
+
+test("persistently invalid model output stops after two attempts", async (t) => {
+  const previousProvider = process.env.SESSION_COMMENTARY_HEADLINE_PROVIDER;
+  process.env.SESSION_COMMENTARY_HEADLINE_PROVIDER = "agent";
+  const run = t.mock.method(IsolatedLunaRunner.prototype, "run", async () => ({
+    responseText: JSON.stringify({ extracts: [], issues: ["缺少參考資料"] }), usage: null,
+    authIdentity: { externalAccountId: null, externalUserId: null }
+  }));
+  try {
+    await assert.rejects(generateCommentaryHeadlineWithRetry({ detail: "The draft is missing its reference lists.", fallbackType: "action", cwd: "/tmp" }),
+      CommentaryHeadlineValidationError);
+    assert.equal(run.mock.callCount(), 2);
+  } finally {
+    stopCommentaryHeadlineWorker();
+    if (previousProvider === undefined) delete process.env.SESSION_COMMENTARY_HEADLINE_PROVIDER;
+    else process.env.SESSION_COMMENTARY_HEADLINE_PROVIDER = previousProvider;
+  }
 });
 
 test("headline output includes only issue and solution deltas", () => {

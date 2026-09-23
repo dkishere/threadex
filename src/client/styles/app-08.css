@@ -45,7 +45,7 @@
 
 .file-change-trigger {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
   width: 100%;
@@ -68,13 +68,23 @@
 .file-change-badge {
   display: inline-flex;
   align-items: center;
+  gap: 5px;
   flex: 0 0 auto;
   min-height: 22px;
   padding: 0 8px;
   border-radius: 999px;
   font-size: 11px;
   font-weight: 750;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   text-transform: uppercase;
+}
+
+.file-change-badge [data-tone="add"] {
+  color: #047857;
+}
+
+.file-change-badge [data-tone="delete"] {
+  color: #b91c1c;
 }
 
 .file-change-badge[data-operation="add"] {

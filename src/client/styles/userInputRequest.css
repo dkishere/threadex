@@ -30,6 +30,20 @@
 .user-input-answer p { margin: 0; color: #334155; white-space: pre-wrap; }
 .approval-mini-popover.user-input-mini-popover { width: min(420px, calc(100vw - 32px)); border-color: #bfdbfe; }
 .approval-mini-popover .user-input-card { margin: 0; border: 0; border-radius: 0; }
+.user-input-card[data-resolved="false"] {
+  --border: #bfdbfe;
+  border-color: #93c5fd;
+  background: #f5f9ff;
+  box-shadow: inset 4px 0 0 #2563eb, 0 3px 12px #2563eb0d;
+}
+.user-input-card[data-resolved="false"] header > svg { color: #2563eb; }
+.user-input-card[data-resolved="false"] header > strong { color: #1e40af; font-size: 14px; }
+.user-input-card[data-resolved="false"] .user-input-status { padding: 4px 10px; background: #2563eb; color: #fff; font-weight: 600; }
+.user-input-card[data-resolved="false"] .user-input-status::before { content: ""; width: 6px; height: 6px; flex-shrink: 0; border-radius: 50%; background: currentColor; }
+.user-input-card[data-resolved="false"] .user-input-option,
+.user-input-card[data-resolved="false"] .user-input-text { background: #fff; }
+.user-input-card[data-resolved="false"] .user-input-option:hover { background: #f0f6ff; }
+.user-input-card[data-resolved="false"] .user-input-option:has(input:checked) { border-color: #2563eb; background: #e8f0ff; }
 @media (max-width: 480px) {
   .user-input-card { padding: 14px; }
   .user-input-card footer > span { flex-basis: 100%; }
