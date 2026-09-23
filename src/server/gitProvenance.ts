@@ -53,7 +53,15 @@ export function recordGitProvenance(cwd: string, sessionId: string, turnId: stri
     ? [record.host, sessionId, turnId, eventId] : [record.host, sessionId, turnId])).digest("hex");
   const destination = resolve(repo.pending, `${key}.json`);
   // Terminal runner events can be replayed; never resurrect consumed associations.
-  if (existsSync(destination)) return;
+  if (existsSync(destination)) {
+    const existing = JSON.parse(readFileSync(destination, "utf8"));
+    if (existing.turnNumber === undefined && record.turnNumber !== undefined) {
+      const temporary = `${destination}.${randomUUID()}.tmp`;
+      writeFileSync(temporary, JSON.stringify({ ...existing, turnNumber: record.turnNumber }));
+      renameSync(temporary, destination);
+    }
+    return;
+  }
   const temporary = `${destination}.${randomUUID()}.tmp`;
   writeFileSync(temporary, JSON.stringify(record));
   renameSync(temporary, destination);
@@ -84,6 +92,30 @@ export function parseGitProvenance(message: string): GitProvenance[] {
   });
 }
 
+export async function resolvePendingTurnNumbers(cwd: string, lookup: (record: GitProvenance) => Promise<number | { turnNumber: number; workspaceId: string }>) {
+  const { root, pending } = repository(cwd);
+  if (!existsSync(pending)) return;
+  const staged = new Set(git(root, ["diff", "--cached", "--name-only", "--no-renames", "-z"]).split("\0").filter(Boolean));
+  const numbers = new Map<string, { turnNumber: number; workspaceId?: string }>();
+  for (const name of readdirSync(pending).filter(name => name.endsWith(".json"))) {
+    const path = resolve(pending, name);
+    const record: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (!validRecord(record) || !record.files.length || record.turnNumber !== undefined) continue;
+    if (!record.files.some(path => staged.has(path))) continue;
+    const key = JSON.stringify([record.workspaceId ?? "default", canonicalSessionId(record.sessionId), record.turnId]);
+    const resolved = numbers.get(key) ?? await lookup(record);
+    const number = typeof resolved === "number" ? resolved : resolved.turnNumber;
+    const workspaceId = typeof resolved === "number" ? record.workspaceId : resolved.workspaceId;
+    if (!Number.isSafeInteger(number) || number <= 0 || !workspaceId) throw new Error(`Cannot resolve turn number: ${record.sessionId}/${record.turnId}`);
+    numbers.set(key, { turnNumber: number, workspaceId });
+    // Re-read to preserve consumption or enrichment performed while resolving.
+    const latest = JSON.parse(readFileSync(path, "utf8"));
+    const temporary = `${path}.${randomUUID()}.tmp`;
+    writeFileSync(temporary, JSON.stringify({ ...latest, turnNumber: number, workspaceId }));
+    renameSync(temporary, path);
+  }
+}
+
 export function prepareGitProvenance(cwd: string, messagePath: string) {
   const { root, pending } = repository(cwd);
   if (!existsSync(pending)) return;
@@ -112,6 +144,7 @@ export function prepareGitProvenance(cwd: string, messagePath: string) {
     if (!validRecord(record)) continue;
     const files = record.files.filter(path => staged.has(path));
     if (!files.length) continue;
+    if (record.turnNumber === undefined) throw new Error(`Missing turn number for ${record.sessionId}/${record.turnId}; resolve pending references before committing.`);
     if (record.turnNumber !== undefined) {
       addNumber(record);
       continue;

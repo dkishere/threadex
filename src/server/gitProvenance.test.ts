@@ -6,7 +6,36 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 import { parseCodexReference } from "../codexReference";
-import { finishGitProvenance, inspectGitProvenance, installGitProvenanceHooks, parseGitProvenance, prepareGitProvenance, recordGitProvenance, recordLiveGitProvenance } from "./gitProvenance";
+import { finishGitProvenance, inspectGitProvenance, installGitProvenanceHooks, parseGitProvenance, prepareGitProvenance, recordGitProvenance, recordLiveGitProvenance, resolvePendingTurnNumbers } from "./gitProvenance";
+
+test("resolves missing numbers for staged edits and preserves consumed tombstones", async () => {
+  const cwd = mkdtempSync(resolve(tmpdir(), "threadex-missing-numbers-"));
+  const git = (...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" });
+  try {
+    git("init", "-q"); git("config", "user.name", "Test"); git("config", "user.email", "test@example.invalid");
+    git("config", "commit.gpgsign", "false");
+    writeFileSync(resolve(cwd, "a.txt"), "a\n");
+    for (const n of [1, 2, 3, 5, 6]) recordGitProvenance(cwd, "local_task", `uuid-${n}`, ["a.txt"], `event-${n}`);
+    recordGitProvenance(cwd, "local_other", "unrelated", ["b.txt"]);
+    git("add", "a.txt");
+    const message = resolve(cwd, ".git", "message");
+    writeFileSync(message, "Missing numbers\n");
+    assert.throws(() => prepareGitProvenance(cwd, message), /Missing turn number/);
+    await assert.rejects(resolvePendingTurnNumbers(cwd, async () => NaN), /Cannot resolve/);
+    await resolvePendingTurnNumbers(cwd, async record => {
+      assert.equal(record.sessionId, "local_task");
+      return { turnNumber: Number(record.turnId!.split("-")[1]), workspaceId: "default" };
+    });
+    prepareGitProvenance(cwd, message);
+    assert.match(readFileSync(message, "utf8"), /threadex:\/\/default\/tx_task#1\/2\/3\/5\/6/);
+    git("commit", "-qm", readFileSync(message, "utf8")); finishGitProvenance(cwd);
+    recordGitProvenance(cwd, "local_task", "uuid-1", ["a.txt"], "event-1", "default", 1);
+    writeFileSync(resolve(cwd, "a.txt"), "next\n"); git("add", "a.txt");
+    await resolvePendingTurnNumbers(cwd, async () => { throw new Error("must not resolve consumed edits"); });
+    writeFileSync(message, "Unrelated\n"); prepareGitProvenance(cwd, message);
+    assert.deepEqual(parseGitProvenance(readFileSync(message, "utf8")), []);
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
 
 test("groups numbered turns per workspace/session and consumes only committed associations", () => {
   const cwd = mkdtempSync(resolve(tmpdir(), "threadex-numbered-"));

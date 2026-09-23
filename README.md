@@ -851,6 +851,10 @@ number to its UUID. On first use, existing turns receive numbers in creation
 order (UUID breaks ties); later arrivals append, even for backdated imports.
 Deleted numbers are not reused. Numbers are stable references, not recalculated
 transcript positions. Existing database `local_` targets use `tx_` aliases.
+Before preparing the message, the hook resolves staged pending records that
+only contain UUIDs through the Threadex API (`RUNNER_SERVER_URL`, default
+`http://127.0.0.1:8787`). A failed lookup stops the commit with an error instead
+of silently omitting its author. Enrichment preserves consumed event tombstones.
 The client resolves all requested numbers and navigates to the first turn. This does
 not register an operating-system protocol handler for external applications.
 No file list is written to the message. The Git CLI accepts only the numbered

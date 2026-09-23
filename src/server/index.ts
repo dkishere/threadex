@@ -1613,7 +1613,7 @@ app.get("/api/sessions/resolve-reference", async (req, res) => {
   }
 
   try {
-    const workspaceId = normalizeWorkspaceId(requestedWorkspaceId) || (await sessionStore.getActiveWorkspace()).id;
+    const workspaceId = normalizeWorkspaceId(requestedWorkspaceId) || (isThreadexSessionId(target) ? undefined : (await sessionStore.getActiveWorkspace()).id);
     const session = await sessionStore.resolveSession(
       isThreadexSessionId(target)
         ? { sessionId: target, workspaceId }
@@ -1633,10 +1633,11 @@ app.get("/api/sessions/resolve-reference", async (req, res) => {
       res.status(400).json({ error: "Invalid turnNumbers." });
       return;
     }
-    const turns = requestedNumbers
-      ? (await sessionStore.getSessionTurnReferences({ sessionId: session.id, workspaceId })).filter(turn => numbers.includes(turn.turnNumber))
+    const requestedTurnId = typeof req.query.turnId === "string" ? req.query.turnId : "";
+    const turns = requestedNumbers || requestedTurnId
+      ? (await sessionStore.getSessionTurnReferences({ sessionId: session.id, workspaceId: session.workspaceId })).filter(turn => requestedTurnId ? turn.turnId === requestedTurnId : numbers.includes(turn.turnNumber))
       : undefined;
-    if (turns && new Set(numbers).size !== turns.length) {
+    if (turns && (requestedTurnId ? 1 : new Set(numbers).size) !== turns.length) {
       res.status(404).json({ error: "Referenced turn not found.", session, turns });
       return;
     }
