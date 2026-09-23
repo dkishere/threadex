@@ -46,6 +46,7 @@ export function UserInputRequestCard({ item, onDecisionSubmitted }: {
         {q.isOther && !!q.options?.length && <label className="user-input-option"><input type="radio" name={`${instanceId}-${q.id}`} checked={!!custom[q.id]}
           onChange={() => { setCustom((v) => ({ ...v, [q.id]: true })); setValues((v) => ({ ...v, [q.id]: "" })); }} /><span>Write my own answer</span></label>}
         {(!q.options?.length || custom[q.id]) && <input className="user-input-text" type={q.isSecret ? "password" : "text"} aria-label={`Answer: ${q.header}`} placeholder="Your answer…" value={values[q.id] ?? ""}
+          onKeyDown={(event) => { if (event.key === "Enter" && !event.nativeEvent.isComposing) { event.preventDefault(); void submit(); } }}
           onChange={(event) => setValues((v) => ({ ...v, [q.id]: event.target.value }))} />}
       </>}
     </fieldset>)}
