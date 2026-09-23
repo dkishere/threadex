@@ -1,4 +1,4 @@
-import { buildCodexReference } from "../codexReference";
+import { buildCodexReference, canonicalSessionId, parseCodexReference } from "../codexReference";
 import type { TurnIssueCopyPayload } from "./appTypes";
 
 export type TurnIssueCopyInput = {
@@ -17,7 +17,7 @@ export function buildTurnIssueCopyPayload(input: TurnIssueCopyInput): TurnIssueC
     kind: "threadex-issue-context",
     cli: "codex",
     id: input.id,
-    sessionUrl: buildCodexReference(input.workspaceId, input.sessionId),
+    sessionUrl: buildCodexReference(input.workspaceId, input.sessionId, input.turnId),
     workspaceId: input.workspaceId,
     sessionId: input.sessionId,
     turnId: input.turnId,
@@ -52,7 +52,10 @@ export function parseTurnIssueContext(value: string): TurnIssueCopyPayload | nul
   if (record.solution !== null && !isNonEmptyString(record.solution)) return null;
   if (record.resolved !== (record.solution !== null)) return null;
   if (record.blocker !== undefined && (!isNonEmptyString(record.blocker) || record.resolved)) return null;
-  if (record.sessionUrl !== buildCodexReference(record.workspaceId, record.sessionId)) return null;
+  const reference = typeof record.sessionUrl === "string" ? parseCodexReference(record.sessionUrl) : null;
+  if (!reference || reference.workspaceId !== record.workspaceId
+    || reference.target !== canonicalSessionId(record.sessionId)
+    || (reference.turnId && reference.turnId !== record.turnId)) return null;
   return candidate as TurnIssueCopyPayload;
 }
 

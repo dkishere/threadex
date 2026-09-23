@@ -761,13 +761,123 @@ npm run sync:local-sessions -- --codex-home /path/to/.codex --no-raw-events
 
 The importer is idempotent. Sessions whose recorded cwd is inside this repo are
 assigned to the `threadex` workspace; other imported sessions stay in
-`default`. App-created local session ids use a `local_` prefix.
+`default`. New Threadex session IDs use a `tx_` prefix. Existing database `local_`
+IDs are retained and resolve through equivalent `tx_` aliases; reimporting a
+known Codex thread reuses its existing session.
 Use `--codex-home` or `SESSION_LOCAL_CODEX_HOME` to import from a non-default
 Codex home. The maintenance scripts intentionally ignore the process
 `CODEX_HOME` default because Codex-managed shells set it to this app's
 workspace-specific home.
 
 This repo also ships a project-local Codex `Stop` hook in `.codex/hooks.json`.
+Threadex records successful completed file-change events immediately, including
+while the turn is running. `session_turn.changed_files` is a PostgreSQL `TEXT[]`
+containing only deduplicated paths (including old/new paths for renames), without
+diffs or file contents. This is an accumulated history of touched paths, so a
+later revert does not remove a path. Failed/started edits and aggregate turn diffs
+are excluded. Existing rows default to an empty array. This migration does not
+rescan previously stored live items; normal legacy-event migration and imports
+can populate the array when processing successful edit events.
+
+Schema creation and upgrades live in `SessionStore.open()` in
+`src/server/sessionStore.ts`, alongside the other inline migrations (there is no
+separate migration file for this column). After creating `session_turn` if
+needed, it executes `ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS
+changed_files TEXT[] NOT NULL DEFAULT '{}'::TEXT[]`. PostgreSQL supplies an empty
+array for existing rows and future inserts that omit the column. The constructor
+starts `open()`; both `ready()` and the read/write `enqueue()` wait for it.
+`startApiServer()` in `src/server/index.ts` awaits `ready()` before listening and
+exits on initialization failure, so writes cannot race ahead of this migration.
+
+The shared `changedFilePaths()` helper in `src/server/changedFilePaths.ts` accepts
+a normalized successful edit event and returns only sorted, unique paths,
+including old/new rename paths. It preserves reported path spelling and performs
+no Git, filesystem, or DB operations. It is used by the DB live-item writer in
+`SessionStore`, the server event filter, and `recordLiveGitProvenance()`.
+`src/server/gitProvenance.ts` handles the Git-specific work: resolving paths into
+a worktree, ignoring paths outside it, persisting pending associations, selecting
+staged paths, and publishing/consuming trailers. Keeping extraction separate is
+a dependency boundary, not a technical requirement for another file: the DB
+must record paths for non-Git projects without importing the Git adapter. Both
+consumers reuse the same extractor; there is no second event-path implementation.
+
+Focused evidence is in `src/server/gitProvenancePersistence.test.ts`:
+
+- `fresh schema creates changed_files as non-null text[] with an empty default`
+  checks the actual PostgreSQL type, nullability, default, and inserted row.
+- `existing schema gains changed_files before writes; old and new rows read [] and reopen is idempotent`
+  removes the column only in an isolated test schema containing a legacy row,
+  reopens through the real initializer, and checks both empty defaults and an
+  event write that persists after another reopen.
+- `raw file-change events persist rename paths and accumulate across actual commits in one running turn`
+  changes and renames real fixture files, feeds native-format events through
+  `streamItemFromThreadItem()` and `recordSessionTurnEvent()`, and executes two
+  real commits with installed hooks. It asserts the DB array before and after
+  each commit, rename paths in trailers, and deduplication after event replay.
+  The native event source is simulated; it does not launch a live Codex process.
+
+`src/server/codexEvents.test.ts` also checks flat and structured rename payloads
+in `native file changes retain rename targets during stream-item conversion`.
+
+For Git projects, the runner synchronously writes an event-scoped record into
+the worktree's Git metadata (`threadex/provenance`) before queuing the DB callback,
+so a following commit in the same turn can find it. Server callbacks also record
+the same event idempotently for recovery. Non-Git projects still store the DB
+array. This does not stage files or create commits.
+
+Enable commit annotation in each repository by running (from that repository):
+
+```sh
+node --import /absolute/path/to/threadex/node_modules/tsx/dist/loader.mjs /absolute/path/to/threadex/scripts/git-provenance.ts install
+```
+
+The installer preserves existing hooks by refusing to overwrite them. If hooks
+already exist, chain the CLI's `prepare-commit-msg "$1"` and `post-commit`
+commands from those hooks. The generated hooks depend on this Threadex checkout
+and its Node installation. Git's configured hooks directory is respected.
+
+`prepare-commit-msg` adds one `Threadex-author:` trailer per contributing session,
+using the existing Threadex reference format, for example:
+
+```text
+Threadex-author: threadex://default/tx_example#1/2/3
+```
+
+The commit link is built with `buildThreadexTurnReference()` and the task's
+workspace ID. Turn numbers are sorted and deduplicated in the fragment:
+`threadex://{workspace}/{codexId|threadexId}#1/2/3`. Session-wide links omit the
+fragment. The database's `session_turn_reference` table persistently maps each
+number to its UUID. On first use, existing turns receive numbers in creation
+order (UUID breaks ties); later arrivals append, even for backdated imports.
+Deleted numbers are not reused. Numbers are stable references, not recalculated
+transcript positions. Existing database `local_` targets use `tx_` aliases.
+The client resolves all requested numbers and navigates to the first turn. This does
+not register an operating-system protocol handler for external applications.
+No file list is written to the message. The Git CLI accepts only the numbered
+`Threadex-author:` format. UUID-based internal links elsewhere in the UI still work.
+The link and IDs are visible to anyone who can read Git history.
+
+`post-commit` consumes associations for paths committed by that task. Uncommitted
+paths from partial staging remain available for a later commit; an unrelated
+next commit gets no stale task link. Failed commits do not consume associations.
+
+To query a commit, optionally filtered to a file (relative to the current directory):
+
+```sh
+node --import /absolute/path/to/threadex/node_modules/tsx/dist/loader.mjs /absolute/path/to/threadex/scripts/git-provenance.ts inspect HEAD src/example.ts
+```
+
+The output lists the commit's linked tasks. A file filter verifies that the file
+changed in the commit, then returns those task candidates: compact trailers do
+not retain a per-task file mapping and cannot prove which task edited that file.
+The trailer URL uses the shared internal navigation. Missing trailers mean unknown provenance.
+Git annotation covers managed runner edit events received before the commit,
+including unfinished turns. Imported external sessions update the DB array when
+their edits are imported but do not populate the Git hook index. Edits reverted
+before commit, concurrent changes to the same file, and partial staging can
+produce broader associations. Untracked shell edits have no structured evidence.
+Amend/rebase can retain earlier trailers; these are historical associations.
+
 After you review and trust it with `/hooks`, completed non-manager Codex turns
 are synced automatically. If the Threadex server is listening,
 `scripts/codex-stop-sync.mjs` posts the completed transcript to

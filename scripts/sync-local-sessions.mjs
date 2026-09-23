@@ -488,7 +488,7 @@ function idFromFilename(path) {
 }
 
 function localSessionIdForCodexSessionId(sessionId) {
-  return sessionId?.startsWith("local_") ? sessionId : `local_${sessionId}`;
+  return `tx_${sessionId?.replace(/^(local_|tx_)/, "")}`;
 }
 
 function parseArgs(argv) {

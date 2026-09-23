@@ -20,7 +20,7 @@ test("HTML routes retain context and directories for dynamic relative assets", (
   assert.equal(isHtmlFilePath("report.HTM"), true);
   assert.equal(isHtmlFilePath("report.html.txt"), false);
 });
-import { isJsonFilePath, isMarkdownFilePath, localFilePathFromMarkdownUrl, threadexNavigationUrl, transformMarkdownUrl, workspaceFileDownloadUrl, workspaceFilePreviewUrl, workspaceFileReferenceFromUrl, workspaceImagePreviewName } from "./markdownUrls";
+import { isJsonFilePath, isMarkdownFilePath, localFilePathFromMarkdownUrl, resolveWorkspaceMarkdownUrl, threadexNavigationUrl, transformMarkdownUrl, workspaceFileDownloadUrl, workspaceFilePreviewUrl, workspaceFileReferenceFromUrl, workspaceImagePreviewName } from "./markdownUrls";
 
 test("rewrites absolute workspace paths through the workspace file endpoint", () => {
   const path = "/Volumes/dev/My Project/concept image.png";
@@ -88,12 +88,24 @@ test("leaves web, codex, relative, and app URLs unchanged", () => {
   }
 });
 
+test("resolves workspace Markdown links beside the previewed file", () => {
+  const source = "/Volumes/dev/My Project/docs/report.md";
+  assert.equal(resolveWorkspaceMarkdownUrl("../images/chart%201.png", source), "/Volumes/dev/My Project/images/chart 1.png");
+  assert.equal(resolveWorkspaceMarkdownUrl("./notes.md", source), "/Volumes/dev/My Project/docs/notes.md");
+  assert.equal(resolveWorkspaceMarkdownUrl("../images/chart.png", "C:\\AI\\docs\\report.md"), "C:/AI/images/chart.png");
+  for (const url of ["#section", "?raw=1", "/api/health", "https://example.com/report", "codex://threads/local_123"]) {
+    assert.equal(resolveWorkspaceMarkdownUrl(url, source), url);
+  }
+});
+
 test("converts scoped Codex session references into Threadex routes", () => {
   assert.equal(
     threadexNavigationUrl("codex://threads/local_123?workspace=threadex"),
-    "?sessionId=local_123&workspaceId=threadex"
+    "?sessionId=tx_123&workspaceId=threadex"
   );
-  assert.equal(threadexNavigationUrl("codex://threads/thread_123"), null);
+  assert.equal(threadexNavigationUrl("codex://threads/thread_123"), "?threadId=thread_123");
+  assert.equal(threadexNavigationUrl("threadex://default/tx_123/turn-2"), "?sessionId=tx_123&workspaceId=default&turnId=turn-2");
+  assert.equal(threadexNavigationUrl("threadex://default/tx_123#3/1/2/1"), "?sessionId=tx_123&workspaceId=default&turnNumbers=1%2F2%2F3");
 });
 
 test("identifies passive workspace images for inline previews", () => {

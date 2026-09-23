@@ -11,6 +11,8 @@ import { relative, resolve } from "node:path";
 import { PENDING_CODEX_SESSION_TITLE_PREFIX } from "./codexSessionTitles";
 import { stripTodoPlanOperationalSuffix } from "./todoInstructions";
 import { fileChangesFromTurnDiff, normalizeStructuredAgentComment } from "./codexEvents";
+import { changedFilePaths } from "./changedFilePaths";
+import { canonicalSessionId, isThreadexSessionId, sessionIdAliases } from "../codexReference";
 import { stripContextForkOperationalSuffix } from "../contextFork";
 
 export type KeywordWeights = Record<string, number>;
@@ -19,7 +21,7 @@ export type KeywordWeights = Record<string, number>;
 // adopts the thread ID. Keep the resulting empty import out of navigation.
 const emptyNativeSessionAliasSql = `(
   sessions.thread_id IS NOT NULL
-  AND sessions.id = 'local_' || sessions.thread_id
+  AND sessions.id IN ('local_' || sessions.thread_id, 'tx_' || sessions.thread_id)
   AND sessions.parent_session_id IS NULL
   AND NOT EXISTS (SELECT 1 FROM session_turn WHERE session_id = sessions.id)
   AND EXISTS (
@@ -3402,16 +3404,16 @@ export class SessionStore {
   }
 
   async getSession(id: string): Promise<SessionRecord | null> {
-    return this.read(async (connection) => this.getSessionWithConnection(connection, id));
+    return this.read(async (connection) => this.resolveSessionWithConnection(connection, { sessionId: id }));
   }
 
   async resolveSessionAlias(id: string): Promise<SessionRecord | null> {
     return this.read(async (connection) => {
-      const session = await this.getSessionWithConnection(connection, id);
+      const session = await this.resolveSessionWithConnection(connection, { sessionId: id });
       if (!session?.threadId) return session;
       const aliases = await connection.run(
         `SELECT id FROM sessions WHERE id = $id AND ${emptyNativeSessionAliasSql}`,
-        { id }
+        { id: session.id }
       );
       if ((await aliases.getRowObjectsJS()).length === 0) return session;
       return await this.getSessionByThreadIdWithConnection(connection, session.threadId, session.workspaceId) ?? session;
@@ -3420,6 +3422,27 @@ export class SessionStore {
 
   async getSessionModelPreferences(sessionId: string): Promise<SessionModelPreferences> {
     return this.read(async (connection) => this.getSessionModelPreferencesWithConnection(connection, sessionId));
+  }
+
+  async getSessionTurnReferences(input: SessionInspectorLookup): Promise<Array<{ turnId: string; turnNumber: number }>> {
+    return this.transaction(async (connection) => {
+      const session = await this.resolveSessionWithConnection(connection, input);
+      if (!session) return [];
+      const params = { sessionId: session.id };
+      // Serialize allocation across stores/processes. Retain mappings after turn
+      // deletion so published numbers are never reused or shifted by imports.
+      await connection.run("SELECT id FROM sessions WHERE id = $sessionId FOR UPDATE", params);
+      await connection.run(`INSERT INTO session_turn_reference (session_id, turn_id, turn_number)
+        SELECT $sessionId, t.id,
+          (SELECT COALESCE(MAX(turn_number), 0) FROM session_turn_reference WHERE session_id = $sessionId)
+          + ROW_NUMBER() OVER (ORDER BY t.created, t.id)
+        FROM session_turn t WHERE t.session_id = $sessionId
+          AND NOT EXISTS (SELECT 1 FROM session_turn_reference r WHERE r.session_id = $sessionId AND r.turn_id = t.id)`, params);
+      const result = await connection.run(`SELECT r.turn_id, r.turn_number FROM session_turn_reference r
+        JOIN session_turn t ON t.id = r.turn_id AND t.session_id = r.session_id
+        WHERE r.session_id = $sessionId ORDER BY r.turn_number`, params);
+      return (await result.getRowObjectsJS()).map(row => ({ turnId: String(row.turn_id), turnNumber: Number(row.turn_number) }));
+    });
   }
 
   async resolveApprovalPolicy(sessionId: string, turnId?: string, explicit?: string): Promise<string | undefined> {
@@ -6395,6 +6418,15 @@ export class SessionStore {
         created: input.created ?? null
       }
     );
+    const paths = changedFilePaths(item);
+    if (paths.length) {
+      await connection.run(
+        `UPDATE session_turn SET changed_files = ARRAY(
+          SELECT DISTINCT path FROM unnest(changed_files || $paths::TEXT[]) AS files(path) ORDER BY path
+        ) WHERE id = $turnId AND session_id = $sessionId`,
+        { paths, turnId: input.turnId, sessionId: input.sessionId }
+      );
+    }
     return item;
   }
 
@@ -7337,6 +7369,13 @@ export class SessionStore {
       WHERE title_source IS NULL OR title_source NOT IN ('initial', 'summarizer', 'user')
     `);
     await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS account_id VARCHAR");
+    // open() upgrades both fresh and existing stores before ready()/enqueue()
+    // release readers or writers. PostgreSQL supplies [] for pre-existing rows.
+    await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS changed_files TEXT[] NOT NULL DEFAULT '{}'::TEXT[]");
+    await connection.run(`CREATE TABLE IF NOT EXISTS session_turn_reference (
+      session_id VARCHAR NOT NULL, turn_id VARCHAR NOT NULL, turn_number BIGINT NOT NULL CHECK (turn_number > 0),
+      PRIMARY KEY (session_id, turn_id), UNIQUE (session_id, turn_number)
+    )`);
     await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS account_name VARCHAR");
     await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS account_email VARCHAR");
     await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS account_external_account_id VARCHAR");
@@ -8277,13 +8316,15 @@ export class SessionStore {
     const workspaceId = normalizeText(input.workspaceId);
     const sessionId = normalizeText(input.sessionId);
     if (sessionId) {
-      const direct = await this.getSessionWithConnection(connection, sessionId);
-      if (direct && (!workspaceId || direct.workspaceId === workspaceId)) {
-        return direct;
+      for (const alias of sessionIdAliases(sessionId)) {
+        const direct = await this.getSessionWithConnection(connection, alias);
+        if (direct && (!workspaceId || direct.workspaceId === workspaceId)) return direct;
       }
-      const local = sessionId.startsWith("local_") ? null : await this.getSessionWithConnection(connection, `local_${sessionId}`);
-      if (local && (!workspaceId || local.workspaceId === workspaceId)) {
-        return local;
+      if (!isThreadexSessionId(sessionId)) {
+        for (const alias of [`tx_${sessionId}`, `local_${sessionId}`]) {
+          const local = await this.getSessionWithConnection(connection, alias);
+          if (local && (!workspaceId || local.workspaceId === workspaceId)) return local;
+        }
       }
     }
 
@@ -10595,7 +10636,7 @@ function idFromLocalCodexFilename(path: string) {
 }
 
 function localCodexSessionId(sessionId: string) {
-  return sessionId.startsWith("local_") ? sessionId : `local_${sessionId}`;
+  return isThreadexSessionId(sessionId) ? canonicalSessionId(sessionId) : `tx_${sessionId}`;
 }
 
 function importedLocalParentSessionId(payload: Record<string, unknown>) {

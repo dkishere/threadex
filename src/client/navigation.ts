@@ -1,6 +1,9 @@
 export type NavigationTarget = {
   workspaceId: string | null;
   sessionId: string | null;
+  turnId?: string | null;
+  turnNumbers?: string | null;
+  threadId?: string | null;
 };
 
 const WORKSPACE_QUERY_KEY = "workspaceId";
@@ -10,7 +13,10 @@ export function readNavigationTarget(href = window.location.href): NavigationTar
   const url = new URL(href, window.location.origin);
   return {
     workspaceId: nonEmptyQueryValue(url.searchParams.get(WORKSPACE_QUERY_KEY)),
-    sessionId: nonEmptyQueryValue(url.searchParams.get(SESSION_QUERY_KEY))
+    sessionId: nonEmptyQueryValue(url.searchParams.get(SESSION_QUERY_KEY)),
+    ...(url.searchParams.get("turnId") ? { turnId: nonEmptyQueryValue(url.searchParams.get("turnId")) } : {}),
+    ...(url.searchParams.get("turnNumbers") ? { turnNumbers: nonEmptyQueryValue(url.searchParams.get("turnNumbers")) } : {}),
+    ...(url.searchParams.get("threadId") ? { threadId: nonEmptyQueryValue(url.searchParams.get("threadId")) } : {})
   };
 }
 
@@ -20,13 +26,16 @@ export function readOptionalNavigationTarget(href = window.location.href) {
 
 export function hasNavigationTarget(href = window.location.href) {
   const url = new URL(href, window.location.origin);
-  return url.searchParams.has(WORKSPACE_QUERY_KEY) || url.searchParams.has(SESSION_QUERY_KEY);
+  return url.searchParams.has(WORKSPACE_QUERY_KEY) || url.searchParams.has(SESSION_QUERY_KEY) || url.searchParams.has("threadId");
 }
 
 export function navigationUrl(target: NavigationTarget, href = window.location.href) {
   const url = new URL(href, window.location.origin);
   setQueryValue(url, WORKSPACE_QUERY_KEY, target.workspaceId);
   setQueryValue(url, SESSION_QUERY_KEY, target.sessionId);
+  setQueryValue(url, "turnId", target.turnId ?? null);
+  setQueryValue(url, "turnNumbers", target.turnNumbers ?? null);
+  setQueryValue(url, "threadId", target.threadId ?? null);
   return `${url.pathname}${url.search}${url.hash}`;
 }
 

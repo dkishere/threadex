@@ -229,7 +229,7 @@ export function captureResponseQuoteSelection(ctx, event) {
             top: Math.max(160, selectionRect.top - 8),
             source: {
                 type: "response",
-                sessionUrl: buildCodexReference(sourceWorkspaceId, sourceTarget),
+                sessionUrl: buildCodexReference(sourceWorkspaceId, sourceTarget, sourceTurnId),
                 ...(sourceTurnId ? { turnId: sourceTurnId } : {}),
                 ...(Number.isInteger(sourceTurnNumber) && sourceTurnNumber > 0 ? { turnNumber: sourceTurnNumber } : {})
             }
@@ -329,7 +329,7 @@ export async function startChatTurn(ctx, message, turnAttachments, turnExecution
             return;
         }
         const currentSessionId = restoredSessionId;
-        const targetSessionId = currentSessionId ?? `local_${crypto.randomUUID()}`;
+        const targetSessionId = currentSessionId ?? `tx_${crypto.randomUUID()}`;
         if (!currentSessionId) {
             moveStoredComposerDraft(null, targetSessionId);
             composerDraftSessionIdRef.current = targetSessionId;

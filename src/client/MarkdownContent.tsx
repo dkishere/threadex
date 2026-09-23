@@ -21,7 +21,7 @@ import { isHtmlFilePath, workspaceHtmlPreviewUrl } from "./markdownUrls";
 import { CODEX_FOLLOWUP_EVENT, remarkCodexFileCitation, remarkCodexFollowup } from "./codexFollowup";
 import { UrlTagIcon } from "./UrlTagIcon";
 import { createLinkPreview, isStandaloneApp } from "./linkPreview";
-import { isJsonFilePath, isMarkdownFilePath, threadexNavigationUrl, transformMarkdownUrl, workspaceFileDownloadUrl, workspaceFilePreviewUrl, workspaceFileReferenceFromUrl, workspaceImagePreviewName, type WorkspaceFilePreviewContext } from "./markdownUrls";
+import { isJsonFilePath, isMarkdownFilePath, resolveWorkspaceMarkdownUrl, threadexNavigationUrl, transformMarkdownUrl, workspaceFileDownloadUrl, workspaceFilePreviewUrl, workspaceFileReferenceFromUrl, workspaceImagePreviewName, type WorkspaceFilePreviewContext } from "./markdownUrls";
 import { advanceMarkdownChunks, type MarkdownChunks } from "./markdownChunks";
 
 const MonacoTextEditor = lazy(async () => {
@@ -51,20 +51,20 @@ const markdownComponents: Components = {
 };
 const markdownPlugins = [remarkGfm, remarkCodexFollowup, remarkCodexFileCitation];
 
-export const MarkdownContent = memo(function MarkdownContent({ children, className, id }: { children: string; className?: string; id?: string }) {
+export const MarkdownContent = memo(function MarkdownContent({ children, className, id, sourcePath }: { children: string; className?: string; id?: string; sourcePath?: string }) {
   const previous = useRef<MarkdownChunks | null>(null);
   const chunks = advanceMarkdownChunks(previous.current, children);
   previous.current = chunks;
   const workspaceFileContext = useContext(MarkdownWorkspaceContext) ?? workspaceFilePreviewContextFromPage();
   return (
     <div className={className ? `markdown-content ${className}` : "markdown-content"} id={id}>
-      {[...chunks.frozen, chunks.tail].map((source, index) => <Fragment key={index}>{index > 0 ? "\n" : null}<MarkdownPart source={source} context={workspaceFileContext} /></Fragment>)}
+      {[...chunks.frozen, chunks.tail].map((source, index) => <Fragment key={index}>{index > 0 ? "\n" : null}<MarkdownPart source={source} context={workspaceFileContext} sourcePath={sourcePath} /></Fragment>)}
     </div>
   );
 });
 
-const MarkdownPart = memo(function MarkdownPart({ source, context }: { source: string; context: WorkspaceFilePreviewContext }) {
-  return <ReactMarkdown remarkPlugins={markdownPlugins} components={markdownComponents} urlTransform={(url) => transformMarkdownUrl(url, context)}>{source}</ReactMarkdown>;
+const MarkdownPart = memo(function MarkdownPart({ source, context, sourcePath }: { source: string; context: WorkspaceFilePreviewContext; sourcePath?: string }) {
+  return <ReactMarkdown remarkPlugins={markdownPlugins} components={markdownComponents} urlTransform={(url) => transformMarkdownUrl(sourcePath ? resolveWorkspaceMarkdownUrl(url, sourcePath) : url, context)}>{source}</ReactMarkdown>;
 });
 
 function MarkdownImage({ alt, src, ...props }: ComponentPropsWithoutRef<"img">) {
@@ -359,7 +359,7 @@ function WorkspaceFilePopup({ path, line, context, onClose }: { path: string; li
         </header>
         <div className={isMarkdownFile ? "workspace-file-content workspace-markdown-file-content" : isJsonFile ? "workspace-file-content workspace-json-file-content" : "workspace-file-content"}>
           {error ? <p className="workspace-file-state">{error}</p> : content === null ? <p className="workspace-file-state">Loading file…</p> : (
-            isMarkdownFile ? <MarkdownContent className="workspace-file-markdown" children={content} /> : isJsonFile ? <JsonFileViewer content={content} /> : (
+            isMarkdownFile ? <MarkdownContent className="workspace-file-markdown" sourcePath={path} children={content} /> : isJsonFile ? <JsonFileViewer content={content} /> : (
               <Suspense fallback={<p className="workspace-file-state">Loading editor…</p>}>
                 <MonacoTextEditor value={content} filePath={path} line={line} />
               </Suspense>

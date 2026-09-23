@@ -6,7 +6,7 @@ type UrlTagIconProps = {
 };
 
 export function isCodexUrl(url?: string | null) {
-  return url?.trim().toLocaleLowerCase().startsWith("codex://") ?? false;
+  return /^(codex|threadex):\/\//i.test(url?.trim() ?? "");
 }
 
 /** A shared leading icon for every URL chip, in the composer and sent messages. */

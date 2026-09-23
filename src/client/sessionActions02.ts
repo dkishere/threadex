@@ -30,7 +30,7 @@ export async function restoreSelectedSessionForWorkspace(ctx, workspaceId) {
 export async function loadWorkspaceSnapshot(ctx, options = {}) {
     const { activeTurnIdRef, activeWorkspaceIdRef, applyAccountPayload, applySelectedSessionSnapshot, approvalRecordToLiveItem, clearNewSessionProjectSelection, createSystemMessage, eventStore, isApprovalLiveItem, isLikelyBackendDisconnect, navigationRequestIdRef, noteBackendDisconnect, noteBackendRequestSucceeded, prepareNewLocalModelPreferences, replaceComposerDraftForSession, replaceNavigationUrl, replaceRunningTurns, restoreSelectedSessionForWorkspace, sessionIdRef, setActiveSessionId, setActiveTurnId, setActiveWorkspace, setIsBootstrapped, setMessages, setParentSessionTodo, setPendingApprovalItems, setPendingApprovalSessionIds, setSessionExecutionStatuses, setSessionId, setSessionTodo, setStatus, setThreadId, setWorkspaceList, toSessionPageState, updateNavigationUrl, viewKeyRef } = ctx;
         const requestId = ++navigationRequestIdRef.current;
-        const navigationTarget = options.navigationTarget;
+        let navigationTarget = options.navigationTarget;
         const expectedViewKey = typeof options.viewKey === "number" ? options.viewKey : null;
         const previousWorkspaceId = activeWorkspaceIdRef.current;
         const preserveSelectedSession = options.preserveSelectedSession === true && !navigationTarget;
@@ -39,6 +39,16 @@ export async function loadWorkspaceSnapshot(ctx, options = {}) {
             ? eventStore.getState().selectedSessionSnapshot
             : null;
         try {
+            if (navigationTarget?.threadId || navigationTarget?.turnNumbers) {
+                const params = new URLSearchParams({ target: navigationTarget.threadId || navigationTarget.sessionId });
+                if (navigationTarget.workspaceId) params.set("workspaceId", navigationTarget.workspaceId);
+                if (navigationTarget.turnNumbers) params.set("turnNumbers", navigationTarget.turnNumbers);
+                const resolved = await fetch(`/api/sessions/resolve-reference?${params}`, { cache: "no-store" });
+                if (!resolved.ok) throw new Error("Linked thread was not found.");
+                const result = await resolved.json();
+                navigationTarget = { ...navigationTarget, sessionId: result.session.id, workspaceId: result.session.workspaceId, threadId: null,
+                    turnId: result.turns?.[0]?.turnId ?? navigationTarget.turnId };
+            }
             let response = await fetch("/api/workspace/snapshot", { cache: "no-store" });
             if (!response.ok)
                 throw new Error(`API returned ${response.status}`);
@@ -180,7 +190,9 @@ export async function loadWorkspaceSnapshot(ctx, options = {}) {
             if (options.canonicalizeUrl) {
                 replaceNavigationUrl({
                     workspaceId: payload.activeWorkspace.id,
-                    sessionId: selectedSnapshot?.session?.id ?? null
+                    sessionId: selectedSnapshot?.session?.id ?? null,
+                    turnId: navigationTarget?.turnId ?? null,
+                    turnNumbers: navigationTarget?.turnNumbers ?? null
                 });
             }
         }

@@ -503,7 +503,7 @@ export function ThreadexShell(ctx) {
     }
     function migrateLocalQueuedPrompts(nextSessionId) {
         const previousSessionId = sessionIdRef.current;
-        if (!previousSessionId?.startsWith("local_") || previousSessionId === nextSessionId) {
+        if (!/^(local_|tx_)/.test(previousSessionId ?? "") || previousSessionId === nextSessionId) {
             return;
         }
         const previousQueueKey = queuedPromptSessionKey(previousSessionId);
@@ -523,7 +523,7 @@ export function ThreadexShell(ctx) {
     }
     function migrateLocalComposerDraft(nextSessionId) {
         const previousSessionId = sessionIdRef.current;
-        if (!previousSessionId?.startsWith("local_") || previousSessionId === nextSessionId) {
+        if (!/^(local_|tx_)/.test(previousSessionId ?? "") || previousSessionId === nextSessionId) {
             return;
         }
         moveStoredComposerDraft(previousSessionId, nextSessionId);
@@ -532,6 +532,24 @@ export function ThreadexShell(ctx) {
         }
     }
     const transcript = useMemo(() => messages.filter((message) => message.role !== "system" && message.kind !== "steer"), [messages]);
+    const lastLinkedTurnRef = useRef(null);
+    useReactEffect(() => {
+        const target = readNavigationTarget();
+        if (!target.turnId || target.sessionId !== sessionId || target.workspaceId !== activeWorkspace?.id) {
+            lastLinkedTurnRef.current = null;
+            return;
+        }
+        const key = `${activeWorkspace.id}:${sessionId}:${target.turnId}`;
+        const message = transcript.find(item => item.turnId === target.turnId && item.role === "assistant");
+        if (!message || lastLinkedTurnRef.current === key) return;
+        const frame = requestAnimationFrame(() => {
+            if (!messageElementsRef.current[message.id]) return;
+            lastLinkedTurnRef.current = key;
+            stickToMessageBottomRef.current = false;
+            scrollToMessage(message.id);
+        });
+        return () => cancelAnimationFrame(frame);
+    }, [transcript, sessionId, activeWorkspace?.id]);
     const transcriptEntries = useMemo(() => groupTranscriptByStepMarkers(transcript), [transcript]);
     const promptTurns = useMemo(() => transcript.filter((message) => message.role === "user" && message.turnId).map((prompt, index) => {
         const response = transcript.find((message) => message.role === "assistant" && message.turnId === prompt.turnId);

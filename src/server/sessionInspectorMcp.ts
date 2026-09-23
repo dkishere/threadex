@@ -128,7 +128,7 @@ const tools: ToolSpec[] = [
     inputSchema: {
       type: "object",
       properties: {
-        sessionId: { type: "string", description: "Local session id. The local_ prefix is optional for imported sessions." },
+        sessionId: { type: "string", description: "Threadex tx_ session id. Legacy local_ aliases and unprefixed imported IDs are also accepted." },
         threadId: { type: "string", description: "Codex thread id associated with the session." },
         workspaceId: { type: "string", description: "Workspace id used to resolve a session across workspaces." },
         view: {

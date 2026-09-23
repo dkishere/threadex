@@ -39,6 +39,28 @@ export function transformMarkdownUrl(url: string, context: WorkspaceFilePreviewC
   return `${WORKSPACE_FILE_ENDPOINT}?path=${encodeURIComponent(reference.path)}${suffix ? `&${suffix}` : ""}`;
 }
 
+/** Resolve links in a rendered workspace Markdown file from that file's directory. */
+export function resolveWorkspaceMarkdownUrl(url: string, sourcePath: string) {
+  const value = url.trim();
+  if (!value || value.startsWith("#") || value.startsWith("?") || value.startsWith("/") ||
+      /^[a-z][a-z\d+.-]*:/i.test(value) || value.startsWith("\\\\")) return url;
+
+  const relativePath = value.split(/[?#]/, 1)[0] ?? "";
+  const normalizedSource = sourcePath.replaceAll("\\", "/");
+  const directory = normalizedSource.slice(0, normalizedSource.lastIndexOf("/") + 1);
+  const segments = [...directory.split("/"), ...decodePath(relativePath).replaceAll("\\", "/").split("/")];
+  const resolved: string[] = [];
+  for (const segment of segments) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") {
+      if (resolved.length > 0 && !/^[a-z]:$/i.test(resolved[resolved.length - 1])) resolved.pop();
+    } else {
+      resolved.push(segment);
+    }
+  }
+  return `${normalizedSource.startsWith("/") ? "/" : ""}${resolved.join("/")}`;
+}
+
 export function workspaceFileDownloadUrl(url: string) {
   try {
     const parsed = new URL(url, "http://threadex.local");
@@ -98,18 +120,20 @@ export function workspaceHtmlPreviewUrl(path: string, context: WorkspaceFilePrev
 }
 
 /**
- * Session references are normally copied in their Codex URI form. In rendered
+ * Session references are copied in their Threadex URI form. In rendered
  * Markdown, point those at this UI instead of asking the browser to open an
- * external `codex://` handler.
+ * external protocol handler. Legacy Codex references use the same route.
  */
 export function threadexNavigationUrl(url: string): string | null {
   const reference = parseCodexReference(url);
-  if (!reference || reference.lookupKind !== "sessionId") return null;
+  if (!reference) return null;
 
-  const params = new URLSearchParams({ sessionId: reference.target });
+  const params = new URLSearchParams({ [reference.lookupKind]: reference.target });
   if (reference.workspaceId) {
     params.set("workspaceId", reference.workspaceId);
   }
+  if (reference.turnId) params.set("turnId", reference.turnId);
+  if (reference.turnNumbers) params.set("turnNumbers", reference.turnNumbers.join("/"));
   return `?${params}`;
 }
 

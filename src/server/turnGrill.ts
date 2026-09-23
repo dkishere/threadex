@@ -63,7 +63,7 @@ export function turnGrillModel(longTurn: boolean) {
 export function buildTurnGrillSessionContext(session: SessionRecord, turnId: string, turns: Array<{ id: string }>) {
   const index = turns.findIndex((turn) => turn.id === turnId);
   if (index < 0) throw new Error("Grill me target turn is missing from session history.");
-  return { sessionUrl: buildCodexReference(session.workspaceId, session.id), sessionId: session.id, workspaceId: session.workspaceId, turnId, currentTurnNumber: index + 1, totalTurns: turns.length };
+  return { sessionUrl: buildCodexReference(session.workspaceId, session.id, turnId), sessionId: session.id, workspaceId: session.workspaceId, turnId, currentTurnNumber: index + 1, totalTurns: turns.length };
 }
 
 export function buildTurnGrillInspectorConfig(session: SessionRecord, serverUrl: string, targetTurnId: string) {

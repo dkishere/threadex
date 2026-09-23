@@ -266,6 +266,37 @@ async function createStore() {
   return store;
 }
 
+test("turn changed_files is a persistent path-only array updated before completion", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "session-changed-files-test-"));
+  const dbPath = resolve(root, "threadex.postgres");
+  let store = new SessionStore(dbPath);
+  await store.ready();
+  await store.upsertSession({ id: "session-1" });
+  await store.recordSessionTurn({ id: "turn-1", sessionId: "session-1", userInput: "test",
+    agentResponse: "", tokenIn: 0, tokenOut: 0, status: "running" });
+  const emit = (id: string, status: string, changes: unknown[], extra = {}) => store.recordSessionTurnEvent({
+    id, sessionId: "session-1", turnId: "turn-1", eventName: "item",
+    payload: { id, itemType: "file_change", eventType: "item.completed", status, changes, ...extra }
+  });
+  try {
+    const initial = await store.runSqlQuery({ sql: "SELECT changed_files, pg_typeof(changed_files)::text AS type FROM session_turn WHERE id = 'turn-1'" });
+    assert.deepEqual(initial.rows, [{ changed_files: [], type: "text[]" }]);
+    await emit("failed", "failed", [{ path: "failed.ts" }]);
+    await emit("started", "inProgress", [{ path: "started.ts" }], { eventType: "item.started" });
+    await emit("aggregate", "completed", [{ path: "aggregate.ts" }], { authoritative: true });
+    await emit("edit-1", "completed", [{ path: "src/a.ts", unifiedDiff: "not stored here" }, { path: "old.ts", movePath: "new.ts" }]);
+    await emit("edit-1", "completed", [{ path: "src/a.ts" }]);
+    await emit("edit-2", "completed", [{ path: "src/b.ts", content: "not stored here" }]);
+    const result = await store.runSqlQuery({ sql: "SELECT changed_files, status FROM session_turn WHERE id = 'turn-1'" });
+    assert.deepEqual(result.rows, [{ changed_files: ["new.ts", "old.ts", "src/a.ts", "src/b.ts"], status: "running" }]);
+    await store.close();
+    store = new SessionStore(dbPath);
+    await store.ready();
+    const persisted = await store.runSqlQuery({ sql: "SELECT changed_files FROM session_turn WHERE id = 'turn-1'" });
+    assert.deepEqual(persisted.rows[0]?.changed_files, result.rows[0]?.changed_files);
+  } finally { await store.close(); }
+});
+
 test("session turn effort falls back to a recorded setting when the preferred token sample omits it", async () => {
   const store = await createStore();
   try {

@@ -117,11 +117,11 @@ export function TurnChangeList(ctx, { changes, sessionId, turnId }) {
 }
 
 export function FileChangeList(ctx, { changes }) {
-    const { FileEditIcon, FileChangeDiffPopup, _Fragment, _jsx, _jsxs, compactFilePath, fileChangeLabel, fileChangeTone, useState } = ctx;
+    const { FileEditIcon, FileChangeDiffPopup, _Fragment, _jsx, _jsxs, compactFilePath, fileChangeTone, useState } = ctx;
     const [selectedFileChange, setSelectedFileChange] = useState(null);
     return (_jsxs(_Fragment, { children: [_jsx("ul", { className: "file-change-list", children: changes.map((change) => {
         const stats = fileChangeLineStats({}, change);
-        return (_jsx("li", { children: _jsxs("button", { className: "file-change-trigger", type: "button", onClick: () => setSelectedFileChange(change), children: [_jsx("span", { className: "file-change-badge", "data-operation": fileChangeTone(change.kind), children: fileChangeLabel(change.kind) }), _jsx("code", { className: "file-change-path", title: change.path, children: compactFilePath(change.path) }), _jsxs("span", { className: "file-change-lines", "aria-label": `${stats.additions} lines added, ${stats.deletions} lines deleted`, children: [_jsxs("span", { "data-tone": "add", children: ["+", stats.additions] }), _jsxs("span", { "data-tone": "delete", children: ["−", stats.deletions] })] }), _jsx(FileEditIcon, { "aria-hidden": "true" })] }) }, `${change.kind}:${change.path}`));
+        return (_jsx("li", { children: _jsxs("button", { className: "file-change-trigger", type: "button", onClick: () => setSelectedFileChange(change), children: [_jsxs("span", { className: "file-change-badge", "data-operation": fileChangeTone(change.kind), "aria-label": `${stats.additions} lines added, ${stats.deletions} lines deleted`, children: [_jsxs("span", { "data-tone": "add", children: ["+", stats.additions] }), _jsxs("span", { "data-tone": "delete", children: ["−", stats.deletions] })] }), _jsx("code", { className: "file-change-path", title: change.path, children: compactFilePath(change.path) }), _jsx(FileEditIcon, { "aria-hidden": "true" })] }) }, `${change.kind}:${change.path}`));
     }) }), selectedFileChange && _jsx(FileChangeDiffPopup, { change: selectedFileChange, onClose: () => setSelectedFileChange(null) })] }));
 
 }

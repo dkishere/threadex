@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import type { WorkspaceRecord } from "./sessionStore";
 
 const sessionInspectorSkillName = "session-inspector";
-const builtinSkillNames = [sessionInspectorSkillName, "browser-bridge", "threadex-config"] as const;
+const builtinSkillNames = [sessionInspectorSkillName, "browser-bridge", "threadex-config", "threadex-author"] as const;
 
 function injectSkill(workspace: WorkspaceRecord, sourceRoot: string, skillName: string) {
   const source = resolve(sourceRoot, skillName);
@@ -33,6 +33,10 @@ export function injectSessionInspectorSkill(workspace: WorkspaceRecord, sourceRo
 
 export function injectSessionInspectorSkills(workspaces: WorkspaceRecord[], sourceRoot: string) {
   return workspaces.map((workspace) => injectSessionInspectorSkill(workspace, sourceRoot));
+}
+
+export function injectThreadexAuthorSkills(workspaces: WorkspaceRecord[], sourceRoot: string) {
+  return workspaces.map((workspace) => injectSkill(workspace, sourceRoot, "threadex-author"));
 }
 
 export function injectBuiltinSkills(workspace: WorkspaceRecord, sourceRoot: string) {

@@ -2,6 +2,22 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { fileChangesFromTurnDiff, normalizeStructuredAgentComment, streamItemFromPlanUpdate, streamItemFromThreadItem } from "./codexEvents.js";
 
+test("native file changes retain rename targets during stream-item conversion", () => {
+  for (const fields of [
+    { kind: "update", movePath: "new.txt" },
+    { kind: "update", move_path: "new.txt" },
+    { kind: { type: "update", move_path: "new.txt" } },
+    { kind: { type: "update", movePath: "new.txt" } }
+  ]) {
+    const item = streamItemFromThreadItem({ id: "rename", type: "fileChange", status: "completed",
+      changes: [{ path: "old.txt", ...fields }] }, "item.completed");
+    assert.equal(item?.itemType, "file_change");
+    if (item?.itemType === "file_change") {
+      assert.deepEqual(item.changes, [{ path: "old.txt", kind: "update", movePath: "new.txt" }]);
+    }
+  }
+});
+
 test("parses the authoritative net file list from a turn diff", () => {
   const changes = fileChangesFromTurnDiff([
     "diff --git a/src/kept.ts b/src/kept.ts",

@@ -1,4 +1,5 @@
 import { DEFAULT_MODEL, AUTO_MODEL_ORDER } from "../modelCatalog";
+import { recordLiveGitProvenance } from "./gitProvenance";
 import { USER_INPUT_METHOD, inputQuestions, inputResponse, asyncInputQuestions, asyncInputParams, asyncAnswerText } from "../userInputRequest";
 import { LIGHTWEIGHT_TODO_INSTRUCTIONS } from "./lightweightTodo";
 import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -34,12 +35,11 @@ import {
 } from "./codexEvents";
 import {
   commentaryHeadlineContext,
-  generateCommentaryHeadlineWithUsage,
+  generateCommentaryHeadlineWithRetry,
   mergeCommentaryIssueTracker,
   shouldGenerateCommentaryHeadline,
   stopCommentaryHeadlineWorker
 } from "./commentaryHeadline";
-import { runWithSingleRetry } from "./retry";
 import { CommentaryIssueInjector } from "./commentaryIssueInjection";
 import type { CommentaryIssueTracker } from "./commentaryHeadline";
 import {
@@ -66,7 +66,9 @@ import {
 
 type RunnerJob = {
   sessionId: string;
+  workspaceId?: string;
   turnId: string;
+  turnNumber?: number;
   message: string;
   threadId?: string | null;
   model?: string;
@@ -911,13 +913,13 @@ function queueCommentaryHeadline(item: StreamItem) {
     const context = commentaryHeadlineContext(job.message, previousComments, commentaryIssueTracker);
     previousCommentDetailsByOrigin.set(contextKey, [...previousComments, detail].slice(-2));
     try {
-      const generation = await runWithSingleRetry(() => generateCommentaryHeadlineWithUsage({
-          detail,
-          fallbackType,
-          context,
-          cwd: job.cwd ?? defaultThreadOptions.cwd,
-          codexHome: job.codexHome
-        }));
+      const generation = await generateCommentaryHeadlineWithRetry({
+        detail,
+        fallbackType,
+        context,
+        cwd: job.cwd ?? defaultThreadOptions.cwd,
+        codexHome: job.codexHome
+      });
       if (!generation) {
         return;
       }
@@ -1958,6 +1960,14 @@ async function emitEvent(
   };
 
   appendLogEntry(entry);
+
+  // Write locally before queuing the asynchronous DB callback. A following Git
+  // command must not depend on the server callback catching up first.
+  try {
+    recordLiveGitProvenance(job.cwd ?? defaultThreadOptions.cwd, entry, job.workspaceId, job.turnNumber);
+  } catch (error) {
+    console.warn("Unable to record live Git provenance", error);
+  }
 
   // Terminal callbacks wait for prior item callbacks so a completion snapshot
   // cannot be published before its file-change items have finished persisting.

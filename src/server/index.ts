@@ -1,4 +1,6 @@
 import { DEFAULT_MODEL } from "../modelCatalog";
+import { recordLiveGitProvenance } from "./gitProvenance";
+import { changedFilePaths } from "./changedFilePaths";
 import { USER_INPUT_METHOD, inputResponse } from "../userInputRequest";
 import { isAutoModel, isAutoEffort } from "../autoModelCatalog";
 import { buildAutoModelState, selectAutoModel } from "./autoModelSelector";
@@ -13,7 +15,7 @@ import { createSecurity } from "./security";
 import { createQuickChatRouter } from "./quickChatRoute";
 import { createHtmlPreviewRouter, createHtmlPreviewUrl } from "./htmlPreview";
 import type { Request, Response } from "express";
-import { buildCodexReference } from "../codexReference.js";
+import { buildCodexReference, canonicalSessionId, isThreadexSessionId } from "../codexReference.js";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import {
   appendFileSync,
@@ -440,6 +442,7 @@ type ManagedSession = {
 type RunnerJob = {
   sessionId: string;
   turnId: string;
+  turnNumber?: number;
   message: string;
   threadId?: string | null;
   model?: string;
@@ -1612,7 +1615,7 @@ app.get("/api/sessions/resolve-reference", async (req, res) => {
   try {
     const workspaceId = normalizeWorkspaceId(requestedWorkspaceId) || (await sessionStore.getActiveWorkspace()).id;
     const session = await sessionStore.resolveSession(
-      target.startsWith("local_")
+      isThreadexSessionId(target)
         ? { sessionId: target, workspaceId }
         : { threadId: target, workspaceId }
     );
@@ -1620,7 +1623,24 @@ app.get("/api/sessions/resolve-reference", async (req, res) => {
       res.status(404).json({ error: "Session not found." });
       return;
     }
-    res.json({ session });
+    const requestedNumbers = typeof req.query.turnNumbers === "string" ? req.query.turnNumbers : "";
+    if (requestedNumbers && !/^[1-9]\d*(\/[1-9]\d*)*$/.test(requestedNumbers)) {
+      res.status(400).json({ error: "Invalid turnNumbers." });
+      return;
+    }
+    const numbers = requestedNumbers.split("/").filter(Boolean).map(Number);
+    if (numbers.some(number => !Number.isSafeInteger(number))) {
+      res.status(400).json({ error: "Invalid turnNumbers." });
+      return;
+    }
+    const turns = requestedNumbers
+      ? (await sessionStore.getSessionTurnReferences({ sessionId: session.id, workspaceId })).filter(turn => numbers.includes(turn.turnNumber))
+      : undefined;
+    if (turns && new Set(numbers).size !== turns.length) {
+      res.status(404).json({ error: "Referenced turn not found.", session, turns });
+      return;
+    }
+    res.json({ session, ...(turns ? { turns } : {}) });
   } catch (error) {
     res.status(500).json({ error: errorMessage(error) });
   }
@@ -6772,7 +6792,7 @@ async function getOrCreateSession(request: ChatRequest, message: string): Promis
   // so the session remains addressable if the user switches views before the
   // first stream event is received. Do not treat arbitrary external ids as
   // new local session ids; those still use the existing generated-id path.
-  const id = reusableSession?.id ?? (requestedSessionId?.startsWith("local_") ? requestedSessionId : createLocalSessionId());
+  const id = reusableSession?.id ?? (requestedSessionId && isThreadexSessionId(requestedSessionId) ? canonicalSessionId(requestedSessionId) : createLocalSessionId());
   const threadId = reusableSession?.threadId || requestedThreadId || undefined;
   const workspaceId = reusableSession?.workspaceId ?? activeWorkspace.id;
   const cwd = resolveNewSessionCwd({
@@ -6842,11 +6862,11 @@ async function getSessionAccount(input: {
 
 async function getSessionForRequestedId(requestedSessionId: string) {
   const direct = await sessionStore.resolveSessionAlias(requestedSessionId);
-  if (direct || requestedSessionId.startsWith("local_")) {
+  if (direct || isThreadexSessionId(requestedSessionId)) {
     return direct;
   }
 
-  return sessionStore.resolveSessionAlias(`local_${requestedSessionId}`);
+  return sessionStore.resolveSessionAlias(`tx_${requestedSessionId}`);
 }
 
 function isSafeTranscriptIdentifier(value: string) {
@@ -6914,6 +6934,7 @@ async function spawnOwnedPromptRunner(
 
   const runnerJob = {
     ...job,
+    turnNumber: (await sessionStore.getSessionTurnReferences({ sessionId: job.sessionId })).find(turn => turn.turnId === job.turnId)?.turnNumber,
     codexHome: await prepareRunnerCodexHome(job)
   };
   const fileName = runnerFileName(job.turnId);
@@ -8361,7 +8382,7 @@ function createLocalSessionId() {
   const bytes = new Uint8Array(8);
   crypto.getRandomValues(bytes);
   const randomPart = Array.from(bytes, (byte) => byte.toString(36).padStart(2, "0")).join("");
-  return `local_${Date.now().toString(36)}_${randomPart}`;
+  return `tx_${Date.now().toString(36)}_${randomPart}`;
 }
 
 async function processRunnerUpdate(
@@ -8370,6 +8391,17 @@ async function processRunnerUpdate(
 ) {
   await runnerUpdateQueue.run(update.id, async () => {
     const stateApplied = await applyRunnerUpdate(update, options);
+    if (stateApplied && update.event === "item" && changedFilePaths(update.data).length) {
+      try {
+        const session = await sessionStore.getSession(update.sessionId);
+        if (session) {
+          const turnNumber = (await sessionStore.getSessionTurnReferences({ sessionId: session.id })).find(turn => turn.turnId === update.turnId)?.turnNumber;
+          recordLiveGitProvenance(session.cwd, update, session.workspaceId, turnNumber);
+        }
+      } catch (error) {
+        console.warn(`Git provenance recording failed for ${update.turnId}: ${errorMessage(error)}`);
+      }
+    }
     await appendRunnerResponseToTurnLog(update, stateApplied);
     await publishRunnerUpdateEvent(update);
   });

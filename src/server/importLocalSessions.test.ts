@@ -29,7 +29,7 @@ test("in-progress Codex app imports keep their newest activity timestamp", async
   try {
     await store.ready();
     const imported = await store.importLocalCodexSessionFile({ path: transcriptPath, codexHome });
-    const localSessionId = `local_${sessionId}`;
+    const localSessionId = `tx_${sessionId}`;
 
     assert.equal(await store.hasIncompleteImportedLocalTurns(localSessionId), true);
     assert.equal((await store.listSessionTurns(localSessionId)).length, 1);
@@ -187,7 +187,7 @@ test("local-session import upserts final live items without item snapshot events
       FROM session_live_item`
     });
     assert.deepEqual(rows.rows, [{ live_count: 3, output_length: customToolOutput.length, output_bytes: 64 * 1024 }]);
-    const inspected = await store.inspectSession({ sessionId: `local_${sessionId}`, includeLiveItems: true });
+    const inspected = await store.inspectSession({ sessionId: `tx_${sessionId}`, includeLiveItems: true });
     const command = (inspected?.turns[0]?.liveItems as Array<Record<string, unknown>>)
       .find((item) => item.itemType === "command_execution");
     assert.equal(command?.aggregatedOutputLength, customToolOutput.length);
@@ -256,7 +256,7 @@ test("local-session import keeps an interrupted delegated turn", async () => {
   try {
     await store.ready();
     await store.importLocalCodexSessionFile({ path: transcriptPath, codexHome });
-    const turns = await store.listSessionTurns(`local_${sessionId}`);
+    const turns = await store.listSessionTurns(`tx_${sessionId}`);
     assert.equal(turns.length, 1);
     assert.equal(turns[0]?.userInput, "Repair the interrupted task");
     assert.equal(turns[0]?.agentResponse, "Started the repair.\n\n_Turn interrupted by user before completion._");
@@ -317,8 +317,8 @@ test("local-session import preserves parent metadata for nested Codex tasks", as
   const store = new SessionStore(dbPath);
   try {
     await store.ready();
-    const child = await store.getSession(`local_${childSessionId}`);
-    assert.equal(child?.parentSessionId, `local_${parentSessionId}`);
+    const child = await store.getSession(`tx_${childSessionId}`);
+    assert.equal(child?.parentSessionId, `tx_${parentSessionId}`);
   } finally {
     await store.close();
   }
@@ -515,11 +515,11 @@ test("local-session sync imports default workspace codex-home sessions", async (
   const store = new SessionStore(dbPath);
   try {
     await store.ready();
-    const session = await store.getSession(`local_${sessionId}`);
+    const session = await store.getSession(`tx_${sessionId}`);
     assert.equal(session?.workspaceId, "default");
     assert.equal(session?.title, "default workspace sync me");
     const page = await store.listSessionsPage("default", 0, 20);
-    assert.deepEqual(page.sessions.find((candidate) => candidate.id === `local_${sessionId}`)?.modelTokenUsage, [
+    assert.deepEqual(page.sessions.find((candidate) => candidate.id === `tx_${sessionId}`)?.modelTokenUsage, [
       { model: "gpt-5.6-luna", tokenCount: 25, inputTokenCount: 20, cachedInputTokenCount: 0, outputTokenCount: 5 }
     ]);
     assert.deepEqual(await store.listImportedLocalCodexSessionFilePaths("default"), [rolloutPath]);
@@ -529,7 +529,7 @@ test("local-session sync imports default workspace codex-home sessions", async (
     assert.deepEqual(fileRows.rows, [{
       path: rolloutPath,
       workspace_id: "default",
-      session_id: `local_${sessionId}`
+      session_id: `tx_${sessionId}`
     }]);
   } finally {
     await store.close();
@@ -718,9 +718,9 @@ test("local-session import and sync ignore maintenance summarizer sessions", asy
   try {
     await store.ready();
     const sessionRows = await store.runSqlQuery({ sql: "SELECT id FROM sessions ORDER BY id" });
-    assert.deepEqual(sessionRows.rows, [{ id: `local_${normalSessionId}` }]);
+    assert.deepEqual(sessionRows.rows, [{ id: `tx_${normalSessionId}` }]);
     const fileRows = await store.runSqlQuery({ sql: "SELECT DISTINCT session_id FROM local_session_file WHERE session_id IS NOT NULL ORDER BY session_id" });
-    assert.deepEqual(fileRows.rows, [{ session_id: `local_${normalSessionId}` }]);
+    assert.deepEqual(fileRows.rows, [{ session_id: `tx_${normalSessionId}` }]);
   } finally {
     await store.close();
   }
@@ -833,6 +833,12 @@ test("server-side local Codex hook import upserts transcript into an existing ma
     assert.equal(imported.skipped, false);
     assert.equal(imported.sessionId, "local_existing-manager-session");
     assert.equal(imported.turns, 1);
+    assert.equal((await store.getSession("tx_existing-manager-session"))?.id, "local_existing-manager-session");
+    const aliasInspection = await store.inspectSession({ sessionId: "tx_existing-manager-session", includeLiveItems: true });
+    assert.equal(aliasInspection?.session.id, "local_existing-manager-session");
+    const importedAgain = await store.importLocalCodexSessionFile({ path: transcriptPath, codexHome });
+    assert.equal(importedAgain.sessionId, "local_existing-manager-session");
+    assert.equal(await store.getSession("tx_" + sessionId), null);
 
     const session = await store.getSession("local_existing-manager-session");
     assert.equal(session?.title, "hook sync me");
@@ -1252,7 +1258,7 @@ test("server-side local Codex import can use the source workspace instead of cwd
       workspaceId: "default"
     });
     assert.equal(imported.skipped, false);
-    const session = await store.getSession(`local_${sessionId}`);
+    const session = await store.getSession(`tx_${sessionId}`);
     assert.equal(session?.workspaceId, "default");
   } finally {
     await store.close();
@@ -1339,7 +1345,7 @@ test("local-session CLI import stores only the real user request from context-wr
   const store = new SessionStore(dbPath);
   try {
     await store.ready();
-    const turns = await store.listSessionTurns(`local_${sessionId}`);
+    const turns = await store.listSessionTurns(`tx_${sessionId}`);
     assert.equal(turns.length, 1);
     assert.equal(turns[0]?.userInput, objective);
     assert.equal(turns[0]?.agentResponse, "done");
@@ -1386,10 +1392,10 @@ test("server-side local Codex import uses goal objective instead of internal con
     const imported = await store.importLocalCodexSessionFile({ path: transcriptPath, codexHome });
     assert.equal(imported.skipped, false);
 
-    const session = await store.getSession(`local_${sessionId}`);
+    const session = await store.getSession(`tx_${sessionId}`);
     assert.equal(session?.title, "你做完後叫呢個thread繼續 codex://threadex/local_ms1xv7sz_393f6k3o131y1d1n");
     assert.equal(session?.description, objective);
-    const turns = await store.listSessionTurns(`local_${sessionId}`);
+    const turns = await store.listSessionTurns(`tx_${sessionId}`);
     assert.equal(turns[0]?.userInput, objective);
   } finally {
     await store.close();

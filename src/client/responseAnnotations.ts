@@ -141,14 +141,14 @@ function parseResponseAnnotationSource(value: unknown): ResponseAnnotationSource
       selection,
       ...(side ? { side } : {}),
       ...(workspaceId ? { workspaceId } : {}),
-      ...(/^codex:\/\/[^\s]+$/i.test(sessionUrl) ? { sessionUrl } : {})
+      ...(/^(codex|threadex):\/\/[^\s]+$/i.test(sessionUrl) ? { sessionUrl } : {})
     };
   }
 
   // Sources written before the discriminant was introduced are response sources.
   if (record.type !== undefined && record.type !== "response") return null;
   const sessionUrl = typeof record.sessionUrl === "string" ? record.sessionUrl.trim() : "";
-  if (!/^codex:\/\/[^\s]+$/i.test(sessionUrl)) return null;
+  if (!/^(codex|threadex):\/\/[^\s]+$/i.test(sessionUrl)) return null;
 
   return {
     type: "response",

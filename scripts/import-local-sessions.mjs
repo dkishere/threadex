@@ -567,9 +567,7 @@ function discoverSessionFiles(home) {
 }
 
 function selectFiles(files, options) {
-  const requestedCodexSessionId = options.sessionId?.startsWith("local_")
-    ? options.sessionId.slice("local_".length)
-    : options.sessionId;
+  const requestedCodexSessionId = options.sessionId?.replace(/^(local_|tx_)/, "");
   const selected = options.sessionId
     ? files.filter((file) => idFromFilename(file.path) === requestedCodexSessionId)
     : files;
@@ -704,7 +702,7 @@ function isMaintenanceSummarizerPrompt(value) {
 }
 
 function localSessionIdForCodexSessionId(sessionId) {
-  return sessionId?.startsWith("local_") ? sessionId : `local_${sessionId}`;
+  return `tx_${sessionId?.replace(/^(local_|tx_)/, "")}`;
 }
 
 function importedParentSessionId(payload) {
@@ -1009,6 +1007,13 @@ function dedupeRenderedAgentMessageLiveItems(turns, liveItems) {
 }
 
 async function upsertSession(db, session) {
+  // Re-importing a pre-tx_ database must reuse the existing session and its history.
+  const existing = await db.run(
+    "SELECT id FROM sessions WHERE thread_id = $threadId AND workspace_id = $workspaceId ORDER BY updated DESC LIMIT 1",
+    { threadId: session.threadId, workspaceId: workspaceIdForSession(session) }
+  );
+  const [row] = await existing.getRowObjectsJS();
+  if (row) session.sessionId = String(row.id);
   await db.run(
     `
       INSERT INTO sessions (

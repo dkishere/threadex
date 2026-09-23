@@ -8,7 +8,7 @@ import type { SessionRecord } from "./sessionStore";
 test("grill supplies a session URL and reuses only the existing inspector read tool", () => {
   const session = { id: "local_test", workspaceId: "workspace-a", threadId: "native-thread" } as SessionRecord;
   assert.deepEqual(buildTurnGrillSessionContext(session, "turn-a", [{ id: "earlier" }, { id: "turn-a" }, { id: "later" }]), {
-    sessionUrl: "codex://threads/local_test?workspace=workspace-a",
+    sessionUrl: "threadex://workspace-a/tx_test/turn-a",
     sessionId: "local_test", workspaceId: "workspace-a", turnId: "turn-a", currentTurnNumber: 2, totalTurns: 3
   });
   const config = buildTurnGrillInspectorConfig(session, "http://127.0.0.1:8787", "turn-a");

@@ -371,7 +371,11 @@ function normalizeCommentExtracts(record: Record<string, unknown>, detail: strin
   });
   const extracts: StructuredAgentCommentExtract[] = [];
   const extractIndexByType = new Map<StructuredAgentCommentType, number>();
+  const seenShorts = new Set<string>();
   for (const extract of normalizedExtracts) {
+    const shortKey = extract.shortMsg.trim().replace(/\s+/gu, " ");
+    if (seenShorts.has(shortKey)) continue;
+    seenShorts.add(shortKey);
     const existingIndex = extractIndexByType.get(extract.type);
     if (existingIndex === undefined) {
       extractIndexByType.set(extract.type, extracts.length);
@@ -402,13 +406,16 @@ function mergeCommentShorts(first: string, second: string) {
 }
 
 function normalizeCommentShort(rawShort: string, type: StructuredAgentCommentType, detail: string) {
-  const useProvidedShort = Boolean(
-    rawShort &&
-    !isGenericCommentFallbackShort(rawShort) &&
-    commentShortMatchesDetailLanguage(rawShort, detail) &&
-    !looksLikeTruncatedDetailPrefix(rawShort, detail)
-  );
-  return useProvidedShort ? limitCommentShort(rawShort) : fallbackCommentShort(type, detail);
+  return commentShortValidationError(rawShort, detail)
+    ? fallbackCommentShort(type, detail)
+    : limitCommentShort(rawShort);
+}
+
+/** Validate model output before historical-display normalization can replace it. */
+export function commentShortValidationError(rawShort: string, detail: string): string | undefined {
+  if (!rawShort || isGenericCommentFallbackShort(rawShort)) return "Write a concrete summary, not a generic status label.";
+  if (!commentShortMatchesDetailLanguage(rawShort, detail)) return "Use the same language as currentUpdate.";
+  if (looksLikeTruncatedDetailPrefix(rawShort, detail)) return "Summarize the distinct point; do not copy or truncate currentUpdate.";
 }
 
 function normalizeCommentIssues(value: unknown) {
@@ -456,7 +463,7 @@ function normalizeCommentType(type: string, detail: string): StructuredAgentComm
   return inferCommentType(detail);
 }
 
-function commentShortMatchesDetailLanguage(short: string, detail: string) {
+export function commentShortMatchesDetailLanguage(short: string, detail: string) {
   const usesCjkScript = (value: string) => /[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]/u.test(value);
   return usesCjkScript(short) === usesCjkScript(detail);
 }
@@ -734,12 +741,16 @@ function readFileChanges(value: unknown): FileChange[] {
   return value.flatMap((change) => {
     const record = readObject(change);
     const path = readString(record?.path) ?? readString(record?.file) ?? "";
-    const kind = readString(record?.kind) ?? readString(record?.type) ?? "";
+    const structuredKind = readObject(record?.kind);
+    const kind = readString(record?.kind) ?? readString(structuredKind?.type) ?? readString(record?.type) ?? "";
     if (!path) {
       return [];
     }
 
     const fileChange: FileChange = { path, kind };
+    const movePath = readString(record?.movePath) ?? readString(record?.move_path)
+      ?? readString(structuredKind?.movePath) ?? readString(structuredKind?.move_path);
+    if (movePath !== null) fileChange.movePath = movePath;
     for (const field of stringFields) {
       const fieldValue = readString(record?.[field]);
       if (fieldValue !== null) {

@@ -89,6 +89,19 @@ test("renders non-image workspace links as popup triggers", () => {
   assert.doesNotMatch(html, /target="_blank"/);
 });
 
+test("renders relative links in a Markdown file preview as workspace files", () => {
+  const html = renderToStaticMarkup(React.createElement(MarkdownWorkspaceContext.Provider,
+    { value: { sessionId: "local_report", workspaceId: "default" } },
+    React.createElement(MarkdownContent, {
+      sourcePath: "/Volumes/dev/My Project/docs/report.md",
+      children: "[notes](./notes.md) ![chart](../images/chart%201.png) [site](https://example.com)"
+    })));
+  assert.ok(html.includes(`path=${encodeURIComponent("/Volumes/dev/My Project/docs/notes.md")}`));
+  assert.ok(html.includes(`path=${encodeURIComponent("/Volumes/dev/My Project/images/chart 1.png")}`));
+  assert.match(html, /sessionId=local_report&amp;workspaceId=default/);
+  assert.match(html, /href="https:\/\/example.com"/);
+});
+
 test("renders Codex session links as same-tab Threadex routes", () => {
   const html = renderToStaticMarkup(
     React.createElement(MarkdownContent, {
@@ -96,7 +109,7 @@ test("renders Codex session links as same-tab Threadex routes", () => {
     })
   );
 
-  assert.match(html, /href="\?sessionId=local_123&amp;workspaceId=threadex"/);
+  assert.match(html, /href="\?sessionId=tx_123&amp;workspaceId=threadex"/);
   assert.doesNotMatch(html, /target="_blank"/);
 });
 
