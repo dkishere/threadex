@@ -40,11 +40,12 @@ test("grill rejects older turns and persists the latest turn's questions and fol
     assert.deepEqual((await store.listSessionTurns("fixture")).map((turn) => turn.id), ["z-oldest", "a-middle", "m-newest"]);
     let calls = 0;
     let lastPrompt: any;
+    const recordedModels: string[] = [];
     let extraQuestion = false;
     const app = express();
     app.use(express.json());
     const handler = createTurnGrillHandler({
-      sessionStore: store, serverUrl: "http://unused", recordUsage: async () => {},
+      sessionStore: store, serverUrl: "http://unused", recordUsage: async (usage) => { recordedModels.push(usage.model); },
       runGrill: async (_home, prompt, session, _serverUrl, totalTurns) => {
         calls++;
         const payload = JSON.parse(prompt);
@@ -77,6 +78,7 @@ test("grill rejects older turns and persists the latest turn's questions and fol
     assert.equal(response.status, 200, JSON.stringify(body));
     assert.equal(body.grill.issues[0].md, "**Evidence?**");
     assert.equal(calls, 1);
+    assert.deepEqual(recordedModels, ["gpt-6-luna"]);
     assert.equal(wholeSessionLiveItemReads, 0);
     assert.deepEqual(lastPrompt.fileChanges, [{ path: "src/target.ts", kind: "update", additions: 1, deletions: 1 }]);
     assert.deepEqual((await (await fetch(`${base}/m-newest/grill`)).json()).grill, body.grill);

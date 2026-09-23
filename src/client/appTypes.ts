@@ -100,6 +100,7 @@ export type MessageIndicatorMark = {
 };
 
 export type QueuedPrompt = {
+  requestSettings?: Record<string, unknown>;
   id: string;
   kind: "queue" | "steer";
   content: string;
@@ -442,7 +443,7 @@ export type StreamTarget = {
   completed?: boolean;
 };
 
-export type ModelReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "ultra";
+export type ModelReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 export type GearProfile = {
   model: string;
   effort: ModelReasoningEffort;

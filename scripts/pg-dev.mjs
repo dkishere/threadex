@@ -1,6 +1,13 @@
 #!/usr/bin/env node
 
-import { spawnSync } from "node:child_process";
+import { spawnSync as nativeSpawnSync } from "node:child_process";
+
+function spawnSync(command, args, options) {
+  if (command === "docker" && process.env.SESSION_DOCKER_WSL_DISTRO) {
+    return nativeSpawnSync("wsl.exe", ["-d", process.env.SESSION_DOCKER_WSL_DISTRO, "-u", "root", "--", "docker", ...args], options);
+  }
+  return nativeSpawnSync(command, args, options);
+}
 
 const config = {
   container: process.env.SESSION_PG_CONTAINER ?? "threadex-pg-migration",

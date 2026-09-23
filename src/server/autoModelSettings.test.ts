@@ -6,6 +6,27 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AutoModelSettings, createAutoModelSettingsRouter } from "./autoModelSettings";
 
+test("Luna max Auto rule survives an API save and reload", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "threadex-luna-max-"));
+  const path = join(dir, "key");
+  const app = express();
+  app.use(express.json());
+  app.use("/settings", createAutoModelSettingsRouter(new AutoModelSettings(path)));
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise<void>(resolve => server.once("listening", resolve));
+  try {
+    const endpoint = `http://127.0.0.1:${(server.address() as { port: number }).port}/settings`;
+    const rules = { "gpt-6-luna": { enabled: true, efforts: ["max"], condition: "" } };
+    const response = await fetch(endpoint, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ customRulesEnabled: true, customRules: rules }) });
+    assert.equal(response.status, 200);
+    assert.deepEqual((await response.json()).customRules, rules);
+    assert.deepEqual(new AutoModelSettings(path).customRules(), { customRulesEnabled: true, customRules: rules });
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("settings API persists and replaces private keys, never returns them, and clearing overrides environment defaults", async () => {
   const dir = mkdtempSync(join(tmpdir(), "threadex-auto-settings-"));
   const path = join(dir, "key");
@@ -40,8 +61,9 @@ test("settings API persists and replaces private keys, never returns them, and c
     assert.equal(bad.status, 400);
     assert.equal(settings.apiKey(), "test-secret-replacement");
     const rules = {
-      "gpt-5.6-terra": { enabled: true, efforts: ["high", "xhigh"], condition: "Database work" },
-      "gpt-5.6-sol": { enabled: false, efforts: ["high"], condition: "" }
+      "gpt-6-luna": { enabled: true, efforts: ["max"], condition: "" },
+      "gpt-6-sol": { enabled: true, efforts: ["high", "xhigh"], condition: "Database work" },
+      "gpt-6-astra": { enabled: false, efforts: ["high"], condition: "" }
     };
     const routing = await fetch(endpoint, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ customRulesEnabled: true, customRules: rules }) });
     assert.equal(routing.status, 200);

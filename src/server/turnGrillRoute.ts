@@ -1,5 +1,5 @@
 import type { RequestHandler } from "express";
-import { buildTurnGrillPrompt, buildTurnGrillSessionContext, grillTurn, isLongTurnGrill } from "./turnGrill";
+import { buildTurnGrillPrompt, buildTurnGrillSessionContext, grillTurn, isLongTurnGrill, turnGrillModel } from "./turnGrill";
 import { normalizeModelTokenUsage, type ModelTokenUsage } from "./modelTokenUsage";
 import { summarizeSessionFileChanges, type SessionStore } from "./sessionStore";
 import { acknowledgeGrill, grillContentVersion, canFollowUpGrill, parseGrillIssues, type TurnGrill } from "../turnGrill";
@@ -130,7 +130,7 @@ export function createTurnGrillHandler({ sessionStore, serverUrl, recordUsage, r
       await recordUsage({
         id: `background:turn_grill:${crypto.randomUUID()}`,
         task: "session_question", source: "app_server", workspaceId: workspace.id,
-        sessionId: session.id, accountId: session.accountId, model: "gpt-5.6-terra",
+        sessionId: session.id, accountId: session.accountId, model: turnGrillModel(longTurn),
         usage: normalizeModelTokenUsage(result.usage)
       });
       const returned = parseGrillIssues(JSON.parse(result.responseText.trim()));

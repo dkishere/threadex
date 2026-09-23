@@ -1,3 +1,4 @@
+import { REVIEW_MODEL } from "../modelCatalog";
 import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
@@ -416,7 +417,7 @@ async function answerWalkthroughSelection(input: { session: SessionRecord; works
         contextAfter: input.action.contextAfter,
         question: input.action.action.question
       }),
-      model: process.env.WEB_VSCODE_WALKTHROUGH_MODEL?.trim() || "gpt-5.6-terra",
+      model: process.env.WEB_VSCODE_WALKTHROUGH_MODEL?.trim() || REVIEW_MODEL,
       reasoningEffort: walkthroughReasoningEffort(process.env.WEB_VSCODE_WALKTHROUGH_REASONING_EFFORT),
       cwd: input.session.cwd,
       outputPath,

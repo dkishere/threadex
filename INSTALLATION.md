@@ -83,10 +83,27 @@ loopback-only development database.
 
 ## Windows via WSL2
 
+### This Windows installation
+
+For the DirectX/Unreal workflow, keep Threadex, Node.js, the Codex CLI, and
+code-server on native Windows. Run PostgreSQL only in the standalone Docker
+Engine inside the `Ubuntu-24.04` WSL2 distribution. Do not start Docker Desktop,
+switch Docker to Windows containers, or use a native Windows Docker engine for
+this setup. Threadex connects to the WSL database through the WSL2 address while
+keeping its Windows process and filesystem behavior.
+
+Set `SESSION_DOCKER_WSL_DISTRO=Ubuntu-24.04` when using the repository's Docker
+helper. Keep the WSL distribution alive while Threadex is running; do not use
+`wsl --shutdown` during a session. The PostgreSQL container uses the
+`threadex-pg-data-wsl-final` volume.
+
+Keep the PostgreSQL volume `threadex-pg-data-wsl-final` when recreating the container;
+replacing the container is safe when the volume is preserved.
+
 Install a Linux distribution using [Microsoft's WSL instructions](https://learn.microsoft.com/windows/wsl/install).
-In its Linux terminal, install Node 22.12+, Git, `procps`, `lsof`, and the Linux
-Codex CLI. Authenticate Codex inside WSL. Use Docker Desktop's WSL integration
-with Linux containers, or supply a PostgreSQL URL accessible from WSL.
+For this installation, use the standalone Docker Engine in Ubuntu-24.04 and
+keep the application, Node.js, Git, Codex CLI, and DirectX/Unreal tools on
+Windows. Do not use Docker Desktop's WSL integration.
 
 Clone into the Linux filesystem, for example `~/projects/threadex`, and follow
 the quick start above from that terminal. Open http://localhost:5173 in your

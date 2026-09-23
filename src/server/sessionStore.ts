@@ -1,5 +1,6 @@
+import { DEFAULT_MODEL, defaultGearProfiles } from "../modelCatalog";
 import type { LightweightTodo } from "../lightweightTodo";
-import { AUTO_MODEL_CHOICES, AUTO_EFFORT_CHOICES, isAutoModel, isAutoEffort } from "../autoModelCatalog";
+import { AUTO_MODEL_CHOICES, AUTO_EFFORT_CHOICES, isAutoModel, isAutoEffort, normalizeAutoModel } from "../autoModelCatalog";
 import { acknowledgeGrill, type GrillSummary, type TurnGrill } from "../turnGrill";
 import { openPostgresSessionConnection, postgresSchemaFromStoreId, type SessionDbConnection, type SessionDbValue } from "./sessionDb";
 import { createHash } from "node:crypto";
@@ -3570,11 +3571,11 @@ export class SessionStore {
       const shouldReset = enabled && !current.enabled;
       await connection.run(
         `
-          INSERT INTO session_auto_model (session_id, enabled, model, effort, revision, updated)
-          VALUES ($sessionId, $enabled, 'gpt-5.6-luna', 'high', 0, now())
+        INSERT INTO session_auto_model (session_id, enabled, model, effort, revision, updated)
+          VALUES ($sessionId, $enabled, '${DEFAULT_MODEL}', 'high', 0, now())
           ON CONFLICT (session_id) DO UPDATE SET
             enabled = excluded.enabled,
-            model = CASE WHEN $shouldReset THEN 'gpt-5.6-luna' ELSE session_auto_model.model END,
+            model = CASE WHEN $shouldReset THEN '${DEFAULT_MODEL}' ELSE session_auto_model.model END,
             effort = CASE WHEN $shouldReset THEN 'high' ELSE session_auto_model.effort END,
             revision = CASE WHEN $shouldReset THEN 0 ELSE session_auto_model.revision END,
             full_prompt_shown = CASE WHEN $shouldReset THEN false ELSE session_auto_model.full_prompt_shown END,
@@ -3636,7 +3637,7 @@ export class SessionStore {
       const currentEffortRank = effortOrder.indexOf(current.effort);
       const requestedEffortRank = effortOrder.indexOf(input.effort);
       if (requestedModelRank < 0 || requestedEffortRank < 0) {
-        throw new Error("Auto model upgrades support Luna, Terra, Sol, or Astra with low through ultra effort.");
+        throw new Error("Auto model upgrades support GPT-6 Luna, Sol, or Astra with low through ultra effort.");
       }
       if (requestedModelRank < currentModelRank || requestedEffortRank < currentEffortRank) {
         throw new Error(`Auto model cannot downgrade from ${current.model} ${current.effort}.`);
@@ -7145,7 +7146,7 @@ export class SessionStore {
       CREATE TABLE IF NOT EXISTS session_auto_model (
         session_id VARCHAR PRIMARY KEY,
         enabled BOOLEAN NOT NULL DEFAULT false,
-        model VARCHAR NOT NULL DEFAULT 'gpt-5.6-luna',
+        model VARCHAR NOT NULL DEFAULT '${DEFAULT_MODEL}',
         effort VARCHAR NOT NULL DEFAULT 'high',
         revision BIGINT NOT NULL DEFAULT 0,
         full_prompt_shown BOOLEAN NOT NULL DEFAULT false,
@@ -7157,9 +7158,9 @@ export class SessionStore {
     await connection.run(`
       CREATE TABLE IF NOT EXISTS session_model_preferences (
         session_id VARCHAR PRIMARY KEY,
-        selected_model VARCHAR NOT NULL DEFAULT 'gpt-5.6-terra',
+        selected_model VARCHAR NOT NULL DEFAULT '${DEFAULT_MODEL}',
         selected_effort VARCHAR NOT NULL DEFAULT 'low',
-        gear_profiles JSON NOT NULL DEFAULT '[{"model":"gpt-5.6-terra","effort":"low"},{"model":"gpt-5.6-luna","effort":"medium"},{"model":"gpt-5.6-sol","effort":"high"}]'::JSON,
+        gear_profiles JSON NOT NULL DEFAULT '${JSON.stringify(defaultGearProfiles())}'::JSON,
         active_gear_index INTEGER NOT NULL DEFAULT 0,
         updated TIMESTAMPTZ NOT NULL DEFAULT current_timestamp
       )
@@ -7167,9 +7168,9 @@ export class SessionStore {
     await connection.run(`
       CREATE TABLE IF NOT EXISTS workspace_model_preferences (
         workspace_id VARCHAR PRIMARY KEY,
-        selected_model VARCHAR NOT NULL DEFAULT 'gpt-5.6-terra',
+        selected_model VARCHAR NOT NULL DEFAULT '${DEFAULT_MODEL}',
         selected_effort VARCHAR NOT NULL DEFAULT 'low',
-        gear_profiles JSON NOT NULL DEFAULT '[{"model":"gpt-5.6-terra","effort":"low"},{"model":"gpt-5.6-luna","effort":"medium"},{"model":"gpt-5.6-sol","effort":"high"}]'::JSON,
+        gear_profiles JSON NOT NULL DEFAULT '${JSON.stringify(defaultGearProfiles())}'::JSON,
         active_gear_index INTEGER NOT NULL DEFAULT 0,
         updated TIMESTAMPTZ NOT NULL DEFAULT current_timestamp
       )
@@ -7900,7 +7901,7 @@ export class SessionStore {
     return {
       sessionId,
       enabled: row?.enabled === true,
-      model: stringValue(row?.model, "gpt-5.6-luna"),
+      model: normalizeAutoModel(row?.model) ?? DEFAULT_MODEL,
       effort: stringValue(row?.effort, "high"),
       revision: numberValue(row?.revision),
       updated: stringValue(row?.updated)
@@ -11253,16 +11254,9 @@ function parseSessionModelProfiles(value: unknown): SessionModelProfile[] | unde
 function defaultSessionModelPreferences(sessionId: string): SessionModelPreferences {
   return {
     sessionId,
-    selectedModel: "gpt-5.6-terra",
+    selectedModel: DEFAULT_MODEL,
     selectedEffort: "low",
-    gearProfiles: [
-      { model: "gpt-5.6-terra", effort: "low" },
-      { model: "gpt-5.6-luna", effort: "medium" },
-      { model: "gpt-5.6-sol", effort: "high" },
-      { model: "gpt-5.6-terra", effort: "xhigh" },
-      { model: "gpt-5.6-luna", effort: "high" },
-      { model: "gpt-5.6-sol", effort: "xhigh" }
-    ],
+    gearProfiles: defaultGearProfiles(),
     activeGearIndex: 0,
     updated: ""
   };

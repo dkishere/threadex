@@ -34,6 +34,8 @@ export type MonitorProcessInput = {
   wakeSessionId?: string | null;
   wakeThreadId?: string | null;
   timeoutSeconds?: number | null;
+  /** Defaults to true; explicitly set false to retain the monitor after exit. */
+  removeOnExit?: boolean;
 };
 
 export type AdoptProcessMonitorInput = Omit<MonitorProcessInput, "label" | "wakePrompt" | "wakeSessionId" | "wakeThreadId" | "timeoutSeconds"> & {
@@ -63,6 +65,12 @@ export type ProcessMonitorLog = {
   truncated: boolean;
   updatedAt: string | null;
 };
+
+function normalizeRemoveOnExit(value: boolean | undefined, fallback = true): boolean {
+  if (value === undefined) return fallback;
+  if (typeof value !== "boolean") throw new Error("removeOnExit requires a boolean.");
+  return value;
+}
 
 const monitorPollMs = Number(process.env.PROCESS_MONITOR_POLL_MS ?? 2_000);
 const metricRefreshMs = Number(process.env.PROCESS_METRIC_REFRESH_MS ?? 5_000);
@@ -106,6 +114,7 @@ export class ProcessMonitorService {
 
   async monitor(workspace: WorkspaceRecord, input: MonitorProcessInput) {
     const label = normalizeLabel(input.label);
+    const removeOnExit = normalizeRemoveOnExit(input.removeOnExit);
     const command = normalizeCommand(input.command);
     const executable = normalizeExecutable(input.exe);
     if (input.dockerImage !== undefined && input.image !== undefined && input.dockerImage !== input.image) {
@@ -160,8 +169,7 @@ export class ProcessMonitorService {
         status: "running",
         managed: launchCount > 0,
         // An attached PID is never owned by this monitor until it is restarted.
-        // Keep it after exit when it has a launch spec so the user can restart it.
-        removeOnExit: launchCount === 0,
+        removeOnExit,
         ...monitorOptions,
         startedAt: new Date().toISOString()
       });
@@ -183,7 +191,7 @@ export class ProcessMonitorService {
       cwd,
       status: "starting",
       managed: true,
-      removeOnExit: false,
+      removeOnExit,
       ...monitorOptions
     });
     try {
@@ -208,6 +216,7 @@ export class ProcessMonitorService {
 
   async adopt(workspace: WorkspaceRecord, id: string, input: AdoptProcessMonitorInput) {
     const record = await this.requireWorkspaceRecord(workspace.id, id);
+    const removeOnExit = normalizeRemoveOnExit(input.removeOnExit, record.removeOnExit);
     const label = input.label === undefined ? record.label : normalizeLabel(input.label);
     const command = normalizeCommand(input.command);
     const executable = normalizeExecutable(input.exe);
@@ -252,7 +261,7 @@ export class ProcessMonitorService {
       pid,
       status: "running",
       managed: true,
-      removeOnExit: false,
+      removeOnExit,
       startedAt: new Date().toISOString(),
       lastExitCode: null,
       lastSignal: null,
@@ -481,8 +490,12 @@ export class ProcessMonitorService {
         wakeStatus: "sent",
         wakeError: null
       })) ?? updated;
-      void this.dispatchWake(sent);
-      return sent;
+      await this.dispatchWake(sent);
+      if (sent.removeOnExit) {
+        await this.store.deleteProcessMonitor(sent.id);
+        return null;
+      }
+      return (await this.store.getProcessMonitor(sent.id)) ?? sent;
     }
     if (updated.removeOnExit) {
       await this.store.deleteProcessMonitor(updated.id);

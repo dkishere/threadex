@@ -10,10 +10,11 @@ in `SESSION_DATA_DIR/typesafe-api-key`, and never returned by the settings API.
 cleared. Removing the key also overrides that environment default.
 
 With a key, every Auto turn calls TypeSafe's `jev-latest` before the runner
-starts. Independent Choice questions select Luna, Terra, Sol or Astra and
+starts. Independent Choice questions select GPT-6 Luna, GPT-6 Sol or GPT-6 Astra and
 low/medium/high/xhigh/ultra effort. The routing criteria favor the least costly
 setting judged sufficient for the task; this is a heuristic, not a guarantee
-of optimal quality or cost. Legacy models remain available in manual gears.
+of optimal quality or cost. Historical model ids are migrated when old settings
+are loaded.
 
 The state includes the current prompt (up to 12,000 characters) and a bounded
 version of the session summariser's context (up to 20,000 characters). It prefers
@@ -22,7 +23,7 @@ commentary; unsummarised turns use a bounded final response. It retains the
 original objective and up to 23 recent prior turns. Current/future queued turns
 and raw tool output are excluded. Truncation preserves both ends of long inputs.
 
-Without a key, Auto follows its original logic: start at Luna/high when enabled,
+Without a key, Auto follows its original logic: start at GPT-6 Luna/high when enabled,
 retain the session's setting, and let the agent request upgrades. A failed,
 invalid, low-confidence or timed-out Jev request keeps that existing setting.
 Requests time out after eight seconds. Successful selections may move down for

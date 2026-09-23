@@ -80,6 +80,27 @@ test("image previews survive Markdown and workspace context updates", async () =
     await page.getByRole("button", { name: "Close preview", exact: true }).click();
     await page.getByRole("dialog").waitFor({ state: "detached" });
     assert.equal(await page.getByRole("link", { name: "report", exact: true }).count(), 1);
+    await page.context().route("https://external.test/**", (route) => route.fulfill({
+      contentType: "text/html", body: "<h1>External website</h1>"
+    }));
+    await render("[External site](https://external.test/report)");
+    await page.getByRole("link", { name: "External site", exact: true }).click();
+    await page.frameLocator('iframe[title="https://external.test/report"]').getByText("External website").waitFor();
+    assert.equal(page.url(), "http://preview.test/");
+    assert.equal(browser.contexts()[0].pages().length, 1);
+    assert.equal(await page.getByRole("link", { name: "Open in browser" }).getAttribute("href"), "https://external.test/report");
+    await render("[External site](https://external.test/report)\n\nStreaming update");
+    assert.equal(await page.getByRole("dialog").count(), 1);
+    await page.getByRole("button", { name: "Close preview", exact: true }).click();
+    await page.getByRole("dialog").waitFor({ state: "detached" });
+    await page.evaluate(() => { window.matchMedia = () => ({ matches: false }) as MediaQueryList; });
+    const popupPromise = page.waitForEvent("popup");
+    await page.getByRole("link", { name: "External site", exact: true }).click();
+    const popup = await popupPromise;
+    await popup.waitForLoadState();
+    assert.equal(popup.url(), "https://external.test/report");
+    assert.equal(await page.getByRole("dialog").count(), 0);
+    await popup.close();
   } finally {
     await browser.close();
   }

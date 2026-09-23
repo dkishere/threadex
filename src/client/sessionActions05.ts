@@ -711,7 +711,7 @@ export function updateGearProfile(ctx, index, update) {
             const requestedEffort = nextModel === AUTO_MODEL_VALUE ? "high" : update.effort ?? gear.effort;
             return {
                 model: nextModel,
-                effort: requestedEffort === "ultra" && !supportsUltraEffort(nextModel) ? "xhigh" : requestedEffort
+                effort: (requestedEffort === "max" || requestedEffort === "ultra") && !supportsUltraEffort(nextModel) ? "xhigh" : requestedEffort
             };
         }));
     

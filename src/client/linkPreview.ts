@@ -4,7 +4,7 @@ export function isStandaloneApp() {
 }
 
 // Keep navigation inside a child frame so the app and its draft stay mounted.
-export function createLinkPreview(title: string, htmlPreview = false) {
+export function createLinkPreview(title: string, htmlPreview = false, externalUrl?: string) {
   const previousFocus = document.activeElement;
   const dialog = document.createElement("dialog");
   dialog.setAttribute("aria-label", title);
@@ -33,6 +33,15 @@ export function createLinkPreview(title: string, htmlPreview = false) {
   const close = previewIconButton("Close preview", "M6 6l12 12 M6 18L18 6");
   close.onclick = () => dialog.close();
   actions.append(refresh, close);
+  if (externalUrl) {
+    const external = document.createElement("a");
+    external.href = externalUrl;
+    external.target = "_blank";
+    external.rel = "noopener noreferrer";
+    external.textContent = "Open in browser";
+    external.style.cssText = "padding:8px;color:inherit;white-space:nowrap";
+    actions.prepend(external);
+  }
   header.append(label, actions);
   const status = document.createElement("p");
   status.textContent = "Loading…";

@@ -1,3 +1,4 @@
+import { DEFAULT_MODEL, REVIEW_MODEL } from "../modelCatalog";
 import { IsolatedLunaRunner } from "./isolatedLunaRunner";
 import { buildCodexReference } from "../codexReference";
 import { buildSideChatMcpCliConfigArgs, buildSideChatSessionInspectorConfig } from "./sessionQuestion";
@@ -55,6 +56,10 @@ export function isLongTurnGrill(input: { userInput: string; agentResponse: strin
     input.userInput.length + input.agentResponse.length >= LONG_TURN_EVIDENCE_CHAR_THRESHOLD;
 }
 
+export function turnGrillModel(longTurn: boolean) {
+  return longTurn ? REVIEW_MODEL : DEFAULT_MODEL;
+}
+
 export function buildTurnGrillSessionContext(session: SessionRecord, turnId: string, turns: Array<{ id: string }>) {
   const index = turns.findIndex((turn) => turn.id === turnId);
   if (index < 0) throw new Error("Grill me target turn is missing from session history.");
@@ -75,7 +80,7 @@ export async function grillTurn(codexHome: string, prompt: string, session: Sess
   const mcpConfig = buildTurnGrillInspectorConfig(session, serverUrl, turnId);
   const runner = new IsolatedLunaRunner({
     name: "turn-grill",
-    model: "gpt-5.6-terra",
+    model: turnGrillModel(longTurn),
     reasoningEffort: "max",
     sourceHomeCandidates: [codexHome],
     allowMissingAuth: false,

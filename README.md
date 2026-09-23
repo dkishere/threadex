@@ -174,7 +174,7 @@ SESSION_EMBED_PROVIDER=ollama
 SESSION_EMBED_MODEL=mxbai-embed-large
 SESSION_EMBED_BASE_URL=http://127.0.0.1:11434
 SESSION_SUMMARIZER_ENABLED=true
-SESSION_SUMMARIZER_MODEL=gpt-5.6-luna
+  SESSION_SUMMARIZER_MODEL=gpt-6-luna
 SESSION_SUMMARIZER_REASONING_EFFORT=low
 SESSION_SUMMARIZER_IDLE_MS=300000
 SESSION_SUMMARIZER_SWEEP_MS=60000
@@ -185,13 +185,13 @@ SESSION_SUMMARIZER_RUNNER_MAX_RUNS=100
 SESSION_SUMMARIZER_RUNNER_MAX_AGE_MS=1800000
 SESSION_SUMMARIZER_PROMPT_DUMP_DIR=data/session-summarizer-prompts
 RUNNER_COMMAND_OUTPUT_HARD_LIMIT_CHARS=16777216
-SESSION_COMMENTARY_HEADLINE_MODEL=gpt-5.6-luna
+  SESSION_COMMENTARY_HEADLINE_MODEL=gpt-6-luna
 SESSION_COMMENTARY_HEADLINE_REASONING_EFFORT=none
 SESSION_COMMENTARY_HEADLINE_TIMEOUT_MS=12000
 SESSION_QUESTION_MODEL=luna
 SESSION_QUESTION_TIMEOUT_MS=90000
 SESSION_QUESTION_AGENT_HOME=~/.codex
-SESSION_ROUTER_MODEL=gpt-5.6-luna
+  SESSION_ROUTER_MODEL=gpt-6-luna
 SESSION_ROUTER_TIMEOUT_MS=90000
 SESSION_ROUTER_AGENT_HOME=~/.codex
 RUNNER_SERVER_URL=http://127.0.0.1:8787
@@ -514,12 +514,12 @@ stored per persisted session in the backend database; an unsent New session
 keeps those preferences in localStorage until its first prompt creates the DB
 session.
 
-Selecting **Auto** in a composer gear starts that session at GPT-5.6 Luna with
+Selecting **Auto** in a composer gear starts that session at GPT-6 Luna with
 high reasoning. The runner adds an Auto-mode prompt prefix and exposes
 `session_inspector.upgrade_model`. The agent is instructed to finish inexpensive
 context gathering first, then call the tool only before a substantive technical
 or business decision. A valid request runs without a separate user approval and
-may jump directly to Terra or Sol and up to xhigh effort, but cannot lower either
+may jump directly to Sol or Astra and up to xhigh effort, but cannot lower either
 model or effort. Threadex then
 continues the same user request in the same Codex thread with the upgraded
 setting. Auto state and its monotonic revision are isolated per local session.
@@ -650,7 +650,7 @@ Useful defaults:
 
 ```bash
 SESSION_SUMMARIZER_ENABLED=true
-SESSION_SUMMARIZER_MODEL=gpt-5.6-luna
+SESSION_SUMMARIZER_MODEL=gpt-6-luna
 SESSION_SUMMARIZER_REASONING_EFFORT=low
 SESSION_SUMMARIZER_IDLE_MS=300000
 SESSION_SUMMARIZER_SWEEP_MS=60000
@@ -668,7 +668,7 @@ that must not reorder sessions through background summary updates.
 ## Commentary Headlines
 
 Completed commentary remains the agent's original prose. The runner sends every
-completed commentary item to a read-only GPT-5.6 Luna helper at `none` reasoning
+completed commentary item to a read-only GPT-6 Luna helper at `none` reasoning
 effort and uses its compact headline/type for the collapsed status card. The
 main agent is told to write plain prose and never produce the headline JSON
 envelope; the runner applies a temporary default card until Luna responds. Luna runs in a separate
@@ -690,7 +690,7 @@ and may retry on the next summarised update. Completed turns receive no injectio
 Useful defaults:
 
 ```bash
-SESSION_COMMENTARY_HEADLINE_MODEL=gpt-5.6-luna
+SESSION_COMMENTARY_HEADLINE_MODEL=gpt-6-luna
 SESSION_COMMENTARY_HEADLINE_REASONING_EFFORT=none
 SESSION_COMMENTARY_HEADLINE_TIMEOUT_MS=12000
 ```

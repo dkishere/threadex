@@ -230,7 +230,7 @@ export function TurnGrillPanel({ sessionId, turnId, latest, mainBusy, onImplemen
   const dropOrRestore = (issue: GrillIssue) => queueIssues(issuesRef.current.map((current) => current.id === issue.id
     ? { ...current, dropped: !current.dropped, selected: Boolean(current.dropped) } : current));
   const actions = <div className="message-actions">{actionExtras}{latest && !review && !started && <button
-    className="message-action-icon" type="button" title="Grill me with Terra Max" aria-label="Grill agent"
+    className="message-action-icon" type="button" title="Grill with Luna Max; long turns use Sol Max" aria-label="Grill agent"
     disabled={locked || mainBusy} onClick={() => void act("start")}><Flame aria-hidden="true" /></button>}</div>;
   if (!review && !started) return <>{actions}{error && <p role="alert">{error}</p>}</>;
 

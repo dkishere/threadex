@@ -1,5 +1,6 @@
 // @ts-nocheck
-function currentClientLayout() {
+import { DEFAULT_MODEL } from "../modelCatalog";
+export function currentClientLayout() {
     return window.matchMedia("(width < 768px)").matches ? "mobile"
         : window.matchMedia("(width < 1080px)").matches ? "tablet" : "desktop";
 }
@@ -348,7 +349,7 @@ export async function startChatTurn(ctx, message, turnAttachments, turnExecution
         const displayExecutionMode = contextForkRequest ? "default" : turnExecutionMode;
         const modelPreferences = currentModelPreferences();
         const turnModel = selectedModel === AUTO_MODEL_VALUE
-            ? sessionAutoModel?.model ?? "gpt-5.6-luna"
+            ? sessionAutoModel?.model ?? DEFAULT_MODEL
             : modelPreferences.selectedModel;
         const turnReasoningEffort = selectedModel === AUTO_MODEL_VALUE
             ? sessionAutoModel?.effort ?? "high"
@@ -391,7 +392,7 @@ export async function startChatTurn(ctx, message, turnAttachments, turnExecution
                     clientLayout: currentClientLayout(),
                     turnId,
                     grillOrigin,
-                    model: selectedModel === AUTO_MODEL_VALUE ? "gpt-5.6-luna" : selectedModel,
+                    model: selectedModel === AUTO_MODEL_VALUE ? DEFAULT_MODEL : selectedModel,
                     modelReasoningEffort: selectedModel === AUTO_MODEL_VALUE ? "high" : selectedEffort,
                     modelPreferences,
                     approvalPolicy,
@@ -576,7 +577,8 @@ export function enqueuePrompt(ctx, message, kind, mode, skills, promptAttachment
             executionMode: mode,
             skills,
             contextFork,
-            forcePlan
+            forcePlan,
+            requestSettings: ctx.requestSettings
         };
         setQueuedPrompts((current) => {
             if (kind === "queue") {

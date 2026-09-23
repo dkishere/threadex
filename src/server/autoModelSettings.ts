@@ -1,3 +1,4 @@
+import { MODEL_CATALOG, supportsAutoLowEffort } from "../modelCatalog";
 import { Router } from "express";
 import { mkdirSync, readFileSync, renameSync, writeFileSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
@@ -46,11 +47,13 @@ export class AutoModelSettings {
         return { customRulesEnabled: false, customRules };
       }
       for (const model of Object.keys(AUTO_MODEL_CHOICES) as AutoModel[]) {
-        const rule = (savedRules as Record<string, unknown>)[model];
+        const saved = savedRules as Record<string, unknown>;
+        const aliases = Object.values(MODEL_CATALOG).find(entry => entry.id === model)?.aliases ?? [];
+        const rule = saved[model] ?? aliases.map(alias => saved[alias]).find(value => value !== undefined);
         if (!rule || typeof rule !== "object" || Array.isArray(rule)) continue;
         const record = rule as Record<string, unknown>;
         const efforts = Array.isArray(record.efforts) ? record.efforts.filter(isAutoEffort) : isAutoEffort(record.effort) ? [record.effort] : [];
-        const allowed = [...new Set(efforts)].filter(effort => model === "gpt-6-astra" || !["low", "medium"].includes(effort));
+        const allowed = [...new Set(efforts)].filter(effort => supportsAutoLowEffort(model) || !["low", "medium"].includes(effort));
         if (typeof record.enabled !== "boolean" || typeof record.condition !== "string") continue;
         customRules[model] = { enabled: record.enabled, efforts: allowed.length ? allowed : ["high"], condition: record.condition.trim() };
       }
@@ -115,7 +118,7 @@ export function createAutoModelSettingsRouter(settings: AutoModelSettings) {
         if (!allowedModels.has(model) || !value || typeof value !== "object" || Array.isArray(value)) return true;
         const rule = value as Record<string, unknown>;
         return typeof rule.enabled !== "boolean" || !Array.isArray(rule.efforts) || !rule.efforts.length
-          || rule.efforts.some(effort => !isAutoEffort(effort) || (model !== "gpt-6-astra" && ["low", "medium"].includes(effort)))
+          || rule.efforts.some(effort => !isAutoEffort(effort) || (!supportsAutoLowEffort(model) && ["low", "medium"].includes(effort)))
           || typeof rule.condition !== "string" || rule.condition.length > 10_000;
       });
       const totalChars = entries.reduce((total, [, value]) => total + String((value as Record<string, unknown>)?.condition ?? "").length, 0);

@@ -1,3 +1,4 @@
+import { DEFAULT_MODEL, AUTO_MODEL_ORDER } from "../modelCatalog";
 import { USER_INPUT_METHOD, inputQuestions, inputResponse, asyncInputQuestions, asyncInputParams, asyncAnswerText } from "../userInputRequest";
 import { LIGHTWEIGHT_TODO_INSTRUCTIONS } from "./lightweightTodo";
 import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -1798,7 +1799,7 @@ function sessionInspectorDeveloperInstructions(job: RunnerJob) {
     todoInstructions,
     "Initial Todo plans MUST use todo_set_plan exactly once; later changes MUST use todo_update_item or todo_add_item.",
     TODO_LANGUAGE_RULE,
-    "Use list_processes for a compact view of monitored processes. A monitor label is display text only and never discovers a process. A PID-only monitor is temporary, stores no executable/args, cannot restart, and disappears when that exact PID exits. To attach an existing PID with restart control, supply the PID together with exactly one complete launch spec: exe plus args, dockerImage, or legacy command. Restart first signals only that attached PID, then launches and captures the supplied spec. Use stop_process_monitor to signal a live monitored PID while retaining its monitor. Built-in read-only monitors can still be restartable when they advertise restartable: true; restart_process_monitor then delegates to their supervisor. Interpreter executables such as node, sh, bash, and python must include the script or command args; never launch a bare interpreter. Use adopt_process_monitor to add a complete restart launch spec to an existing PID-only monitor without restarting it. For Docker monitors, dockerRunArgs are flags before the image while args are passed to the container command. Optional entryPoints are HTTP(S) web links; wakePrompt creates one backward-compatible subscription on exit; timeoutSeconds limits lifetime. Monitoring is server-side and does not consume turns. list_wait_events shows central durable events and per-session delivery state; subscribe_wait_event lets multiple sessions subscribe to the same retained event."
+    "Use list_processes for a compact view of monitored processes. A monitor label is display text only and never discovers a process. All newly registered monitors default to removeOnExit: true and are cleaned up after completion. Set removeOnExit: false explicitly only when persistent retention is required. Adoption preserves the existing cleanup setting unless explicitly changed. A PID-only monitor stores no executable/args and cannot restart. To attach an existing PID with restart control, supply the PID together with exactly one complete launch spec: exe plus args, dockerImage, or legacy command. Restart first signals only that attached PID, then launches and captures the supplied spec. Use stop_process_monitor to signal a live monitored PID while retaining its monitor. Built-in read-only monitors can still be restartable when they advertise restartable: true; restart_process_monitor then delegates to their supervisor. Interpreter executables such as node, sh, bash, and python must include the script or command args; never launch a bare interpreter. Use adopt_process_monitor to add a complete restart launch spec to an existing PID-only monitor without restarting it. For Docker monitors, dockerRunArgs are flags before the image while args are passed to the container command. Optional entryPoints are HTTP(S) web links; wakePrompt creates one backward-compatible subscription on exit; timeoutSeconds limits lifetime. Monitoring is server-side and does not consume turns. list_wait_events shows central durable events and per-session delivery state; subscribe_wait_event lets multiple sessions subscribe to the same retained event."
   ].join("\n");
 }
 
@@ -1867,7 +1868,7 @@ function autoModelDeveloperInstructions(job: RunnerJob) {
   return [
     "Automatic model selection is enabled for this Threadex session. Threadex selects the initial model and effort for each turn using the user prompt and summarized context. Start work at the current setting.",
     "If the task is difficult or complex, or one or two attempts have not produced a good result, consider a higher reasoning effort or a stronger model.",
-    "Available upgrades are gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, or gpt-6-astra with low, medium, high, xhigh, or ultra effort. Use the session_inspector.upgrade_model tool with model, effort, and a concise reason; direct jumps are allowed, but downgrades within a turn are not.",
+    `Available upgrades are ${AUTO_MODEL_ORDER.join(", ")} with low, medium, high, xhigh, max, or ultra effort. Use the session_inspector.upgrade_model tool with model, effort, and a concise reason; direct jumps are allowed, but downgrades within a turn are not.`,
     "Call upgrade_model only immediately before a substantive technical or business decision that benefits materially from the stronger setting.",
     "After upgrade_model succeeds, do not make the decision or continue implementation in this phase. End the phase immediately with a terse handoff; Threadex will automatically continue the same user request in the same thread at the upgraded setting.",
     "Do not upgrade for mechanical edits, straightforward verification, summarization, or merely because a task is long."
@@ -2108,7 +2109,7 @@ function buildLongGoalObjectiveUserRequest(filePath: string) {
 function buildAutoModelPrefix(job: RunnerJob) {
   return [
     "[AUTO MODEL]",
-    `Current setting: ${job.model ?? "gpt-5.6-luna"} / ${job.modelReasoningEffort ?? "high"}.`,
+    `Current setting: ${job.model ?? DEFAULT_MODEL} / ${job.modelReasoningEffort ?? "high"}.`,
     "Upgrade with session_inspector.upgrade_model when needed; direct jumps are allowed and downgrades are not.",
     "[END AUTO MODEL]"
   ].join("\n");
@@ -2129,7 +2130,7 @@ async function fetchSessionAutoModel(job: RunnerJob): Promise<AutoModelState> {
   return {
     sessionId: readString(value.sessionId) ?? job.sessionId,
     enabled: value.enabled === true,
-    model: readString(value.model) ?? job.model ?? "gpt-5.6-luna",
+    model: readString(value.model) ?? job.model ?? DEFAULT_MODEL,
     effort: readString(value.effort) ?? job.modelReasoningEffort ?? "high",
     revision: typeof value.revision === "number" ? value.revision : 0,
     updated: readString(value.updated) ?? new Date().toISOString()
@@ -2458,8 +2459,8 @@ async function syncAccountSnapshotFromCodexHomeSafely() {
   }
 }
 
-function isReasoningEffort(value: unknown): value is "minimal" | "low" | "medium" | "high" | "xhigh" | "ultra" {
-  return value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh" || value === "ultra";
+function isReasoningEffort(value: unknown): value is "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" {
+  return value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh" || value === "max" || value === "ultra";
 }
 
 function escapePromptAttribute(value: string) {

@@ -1,3 +1,4 @@
+import { defaultGearProfiles, modelLabel as modelOptionLabel, supportsUltraEffort } from "../modelCatalog";
 import { LockKeyhole, Loader2, Quote, Send, X } from "lucide-react";
 import { FormEvent, KeyboardEvent, useEffect, useRef, useState } from "react";
 import { InlineLinkComposer, type InlineLinkComposerHandle } from "./InlineLinkComposer";
@@ -64,14 +65,7 @@ export function SideChatPanel({ codexSessionId, sessionId, sessionReady, workspa
   const [pendingQuestion, setPendingQuestion] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [isSending, setIsSending] = useState(false);
-  const [gearProfiles, setGearProfiles] = useState<ComposerGearProfile[]>([
-    { model: "gpt-5.6-sol", effort: "xhigh" },
-    { model: "gpt-5.6-luna", effort: "medium" },
-    { model: "gpt-5.6-terra", effort: "xhigh" },
-    { model: "gpt-5.6-terra", effort: "low" },
-    { model: "gpt-5.6-luna", effort: "high" },
-    { model: "gpt-5.6-sol", effort: "high" }
-  ]);
+  const [gearProfiles, setGearProfiles] = useState<ComposerGearProfile[]>(defaultGearProfiles);
   const [activeGearIndex, setActiveGearIndex] = useState(1);
   const [error, setError] = useState<string | null>(null);
   const composerRef = useRef<InlineLinkComposerHandle | null>(null);
@@ -86,7 +80,7 @@ export function SideChatPanel({ codexSessionId, sessionId, sessionReady, workspa
     setGearProfiles((current) => current.map((gear, gearIndex) => {
       if (gearIndex !== index) return gear;
       const next = { ...gear, ...patch };
-      if (next.effort === "ultra" && !supportsUltraEffort(next.model)) next.effort = "xhigh";
+      if ((next.effort === "max" || next.effort === "ultra") && !supportsUltraEffort(next.model)) next.effort = "xhigh";
       return next;
     }));
   }
@@ -268,15 +262,6 @@ export function SideChatPanel({ codexSessionId, sessionId, sessionReady, workspa
       </form>
     </aside>
   );
-}
-
-function supportsUltraEffort(model: string) {
-  return /^gpt-5\.6(?:-|\s|$)/i.test(model);
-}
-
-function modelOptionLabel(model: string) {
-  const gpt56Match = /^gpt-5\.6-(terra|luna|sol)$/i.exec(model);
-  return gpt56Match ? `5.6 ${capitalize(gpt56Match[1])}` : model.replace(/^gpt-/i, "");
 }
 
 function capitalize(value: string) {

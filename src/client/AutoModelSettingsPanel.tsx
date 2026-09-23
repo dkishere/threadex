@@ -1,3 +1,4 @@
+import { modelLabel as catalogModelLabel, supportsAutoLowEffort } from "../modelCatalog";
 import { useEffect, useState, type FormEvent } from "react";
 import { AUTO_EFFORT_CHOICES, AUTO_MODEL_CHOICES, type AutoCustomRules, type AutoEffort, type AutoModel } from "../autoModelCatalog";
 
@@ -16,14 +17,13 @@ const efforts = Object.keys(AUTO_EFFORT_CHOICES) as AutoEffort[];
 function editableRules(saved: AutoCustomRules = {}): Record<AutoModel, EditableRule> {
   return Object.fromEntries(models.map(model => [model, saved[model] ?? {
     enabled: true,
-    efforts: model === "gpt-6-astra" ? efforts : efforts.filter(effort => effort !== "low" && effort !== "medium"),
+    efforts: supportsAutoLowEffort(model) ? efforts : efforts.filter(effort => effort !== "low" && effort !== "medium"),
     condition: ""
   }])) as Record<AutoModel, EditableRule>;
 }
 
 function modelLabel(model: AutoModel): string {
-  if (model === "gpt-6-astra") return "GPT-6 Astra";
-  return `GPT-5.6 ${model.slice("gpt-5.6-".length).replace(/^./, letter => letter.toUpperCase())}`;
+  return `GPT-${catalogModelLabel(model)}`;
 }
 
 export function AutoModelSettingsPanel() {
@@ -102,8 +102,8 @@ export function AutoModelSettingsPanel() {
     <div className="settings-section-heading"><div><h2>Auto model</h2><p>Choose Auto as a gear's model in gearbox configuration to select a model for each turn.</p></div></div>
     <section className="settings-card auto-model-settings-card">
       <h3>TypeSafe Jev</h3>
-      <p>Jev selects Luna, Terra, Sol, or Astra using your prompt and summarized conversation. Long input is truncated before it is sent to TypeSafe.</p>
-      <p>Without a key, Auto starts at Luna/high and lets the agent upgrade when needed. If Jev is unavailable, the existing Auto setting is kept.</p>
+      <p>Jev selects GPT-6 Luna, Sol, or Astra using your prompt and summarized conversation. Long input is truncated before it is sent to TypeSafe.</p>
+      <p>Without a key, Auto starts at GPT-6 Luna/high and lets the agent upgrade when needed. If Jev is unavailable, the existing Auto setting is kept.</p>
       <p>This key and the custom rules apply to all workspaces on this Threadex server.</p>
       <form className="account-login-form" onSubmit={event => void saveKey(event)}>
         <label><span>TypeSafe API key</span><input type="password" value={key} autoComplete="new-password" spellCheck={false}
@@ -123,7 +123,7 @@ export function AutoModelSettingsPanel() {
         {customRulesEnabled && <div className="auto-model-rules">
           {models.map(model => {
             const rule = customRules[model];
-            const allowedEfforts = model === "gpt-6-astra" ? efforts : efforts.filter(effort => effort !== "low" && effort !== "medium");
+            const allowedEfforts = supportsAutoLowEffort(model) ? efforts : efforts.filter(effort => effort !== "low" && effort !== "medium");
             return <fieldset className="auto-model-rule" key={model} disabled={busy || !settings}>
               <div className="auto-model-rule-header">
                 <label><input type="checkbox" checked={rule.enabled} onChange={event => updateRule(model, { enabled: event.target.checked })} />

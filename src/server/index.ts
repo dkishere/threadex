@@ -1,3 +1,4 @@
+import { DEFAULT_MODEL } from "../modelCatalog";
 import { USER_INPUT_METHOD, inputResponse } from "../userInputRequest";
 import { isAutoModel, isAutoEffort } from "../autoModelCatalog";
 import { buildAutoModelState, selectAutoModel } from "./autoModelSelector";
@@ -7482,7 +7483,7 @@ function escapeRegExp(value: string) {
 }
 
 function experimentalSessionRouterModel() {
-  return process.env.SESSION_ROUTER_MODEL?.trim() || "gpt-5.6-luna";
+  return process.env.SESSION_ROUTER_MODEL?.trim() || DEFAULT_MODEL;
 }
 
 function experimentalSessionRouterTimeoutMs() {
@@ -8260,8 +8261,8 @@ function normalizeModel(value: unknown): string | undefined {
   return /^[A-Za-z0-9._: -]{1,80}$/.test(trimmed) ? trimmed : undefined;
 }
 
-function normalizeReasoningEffort(value: unknown): "minimal" | "low" | "medium" | "high" | "xhigh" | "ultra" | undefined {
-  return value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh" || value === "ultra"
+function normalizeReasoningEffort(value: unknown): "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | undefined {
+  return value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh" || value === "max" || value === "ultra"
     ? value
     : undefined;
 }

@@ -1,9 +1,9 @@
-/** Ordered by routing capability; legacy models remain available in manual gears. */
+import { MODEL_CATALOG, normalizeModelId } from "./modelCatalog";
+/** Ordered by routing capability; legacy model ids are accepted only during migration. */
 export const AUTO_MODEL_CHOICES = {
-  "gpt-5.6-luna": "Use for explicit, mechanical tasks with a known target and desired outcome: change specified text or simple CSS at a location supplied by Browser Bridge JSON; execute routine terminal or log-extraction commands. Routine Git status, diff, add, commit and push belong here, including a plain 'commit and push' request: the user need not supply exact shell commands, file names or a commit message. Normal preflight checks, inspecting the diff to identify the requested changes, and writing a commit message are part of this routine workflow. Do not inherit complexity from the changes being committed or the earlier thread. Resolving merge/rebase conflicts, deciding how to reconcile code, substantive code review or debugging requires reassessment at a higher tier.",
-  "gpt-5.6-terra": "Use for everyday small development, code/content lookup, investigation and routine debugging when no Sol or Astra criterion applies. This is the default when the task requires finding the target or deciding how to implement it rather than following fully mechanical instructions.",
-  "gpt-5.6-sol": "Use at minimum for moderate reviews/audits, planning, performance optimization, prompt design/evaluation/optimization, investigating logs for clues or root causes, and reasoning over large datasets or many records. Also use for multi-part analysis and changes requiring meaningful reasoning across interacting constraints. Merely displaying prompt text or running an exact supplied log command does not trigger this criterion. Escalate to Astra for large scope or when an Astra criterion applies.",
-  "gpt-6-astra": "Use for 3D model/scene creation, editing and manipulation; all security or safety work; large reviews/audits spanning a codebase or multiple subsystems; and large plans involving architecture, migrations or substantial cross-system coordination. Also use for the hardest problems and repeated failures or stalled attempts at lower tiers. Unrelated historical mentions or terminology-only translation do not trigger this criterion; active continuations do."
+  [MODEL_CATALOG.luna.id]: "Use for explicit, mechanical tasks with a known target and desired outcome: change specified text or simple CSS at a location supplied by Browser Bridge JSON; execute routine terminal or log-extraction commands. Routine Git status, diff, add, commit and push belong here, including a plain 'commit and push' request: the user need not supply exact shell commands, file names or a commit message. Normal preflight checks, inspecting the diff to identify the requested changes, and writing a commit message are part of this routine workflow. Do not inherit complexity from the changes being committed or the earlier thread. Resolving merge/rebase conflicts, deciding how to reconcile code, substantive code review or debugging requires reassessment at a higher tier.",
+  [MODEL_CATALOG.sol.id]: "Use for everyday small development, code/content lookup, investigation and routine debugging when no Astra criterion applies. This is the default when the task requires finding the target or deciding how to implement it rather than following fully mechanical instructions. Also use at minimum for moderate reviews/audits, planning, performance optimization, prompt design/evaluation/optimization, investigating logs for clues or root causes, and reasoning over large datasets or many records. Escalate to Astra for large scope or when an Astra criterion applies.",
+  [MODEL_CATALOG.astra.id]: "Use for 3D model/scene creation, editing and manipulation; all security or safety work; large reviews/audits spanning a codebase or multiple subsystems; and large plans involving architecture, migrations or substantial cross-system coordination. Also use for the hardest problems and repeated failures or stalled attempts at lower tiers. Unrelated historical mentions or terminology-only translation do not trigger this criterion; active continuations do."
 } as const;
 
 export const AUTO_EFFORT_CHOICES = {
@@ -11,6 +11,7 @@ export const AUTO_EFFORT_CHOICES = {
   medium: "Routine work requiring a few reasoning steps.",
   high: "Substantial analysis, implementation or debugging.",
   xhigh: "Difficult work with many interacting constraints or subtle failure modes.",
+  max: "Maximum reasoning effort for tasks explicitly requiring max effort.",
   ultra: "Exceptional reasoning depth for the hardest problems; use sparingly."
 } as const;
 
@@ -23,4 +24,9 @@ export function isAutoModel(value: unknown): value is AutoModel {
 }
 export function isAutoEffort(value: unknown): value is AutoEffort {
   return typeof value === "string" && Object.hasOwn(AUTO_EFFORT_CHOICES, value);
+}
+
+export function normalizeAutoModel(value: unknown): AutoModel | undefined {
+  const normalized = typeof value === "string" ? normalizeModelId(value) : undefined;
+  return isAutoModel(normalized) ? normalized : undefined;
 }

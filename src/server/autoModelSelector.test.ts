@@ -7,7 +7,7 @@ const session = { id: "session", workspaceId: "workspace", cwd: "/project" } as 
 function turn(id: string, userInput = id, agentResponse = "done"): SessionTurnRecord {
   return { id, sessionId: "session", userInput, agentResponse, status: "done", created: "2026-09-18", pendingReason: null } as SessionTurnRecord;
 }
-const answer = (model = "gpt-5.6-sol", effort = "high", confidence = 0.9) => ({
+const answer = (model = "gpt-6-sol", effort = "high", confidence = 0.9) => ({
   answers: { model: { choice: model, confidence }, effort: { choice: effort, confidence } }
 });
 
@@ -42,6 +42,8 @@ test("Jev choice uses the documented authenticated endpoint and validates both a
     const body = JSON.parse(String(init?.body));
     assert.equal(body.model, "jev-latest");
     assert.equal(body.state, "bounded state");
+    assert.deepEqual(Object.keys(body.questions.model.criteria), ["gpt-6-luna", "gpt-6-sol", "gpt-6-astra"]);
+    assert.equal(Object.hasOwn(body.questions.model.criteria, "gpt-5.6-terra"), false);
     assert.ok(body.questions.model.criteria["gpt-6-astra"]);
     assert.equal(body.questions.effort.type, "choice");
     assert.ok(init?.signal);
@@ -52,6 +54,22 @@ test("Jev choice uses the documented authenticated endpoint and validates both a
   assert.equal(selection.provider, "typesafe");
 });
 
+test("Luna custom routing sends and preserves max effort", async () => {
+  const selection = await selectAutoModel({
+    state: "commit and push", apiKey: "test-key", customRulesEnabled: true,
+    customRules: { "gpt-6-luna": { enabled: true, efforts: ["max"], condition: "" } },
+    fetch: async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      assert.deepEqual(Object.keys(body.questions["effort_gpt-6-luna"].criteria), ["max"]);
+      assert.match(body.questions.model.criteria["gpt-6-luna"], /Routine Git/);
+      return Response.json({ answers: { model: { choice: "gpt-6-luna", confidence: 0.9 }, "effort_gpt-6-luna": { choice: "max", confidence: 0.9 } } });
+    }
+  });
+  assert.equal(selection.model, "gpt-6-luna");
+  assert.equal(selection.effort, "max");
+  assert.equal(selection.provider, "typesafe");
+});
+
 test("custom rules restrict model choices and set effort for the selected model", async () => {
   const custom = "Use for database work in this environment.";
   const selection = await selectAutoModel({
@@ -59,23 +77,23 @@ test("custom rules restrict model choices and set effort for the selected model"
     apiKey: "test-key",
     customRulesEnabled: true,
     customRules: {
-      "gpt-5.6-luna": { enabled: false, efforts: ["high"], condition: "" },
-      "gpt-5.6-terra": { enabled: true, efforts: ["high", "xhigh"], condition: custom }
+      "gpt-6-luna": { enabled: false, efforts: ["high"], condition: "" },
+      "gpt-6-sol": { enabled: true, efforts: ["high", "xhigh"], condition: custom }
     },
     fetch: async (_url, init) => {
     const body = JSON.parse(String(init?.body));
-    assert.deepEqual(body.questions.model.criteria, { "gpt-5.6-terra": custom });
+    assert.deepEqual(body.questions.model.criteria, { "gpt-6-sol": custom });
     assert.equal(body.questions.effort, undefined);
-    assert.deepEqual(Object.keys(body.questions["effort_gpt-5.6-terra"].criteria), ["high", "xhigh"]);
-    return Response.json({ answers: { model: { choice: "gpt-5.6-terra", confidence: 0.9 }, "effort_gpt-5.6-terra": { choice: "xhigh", confidence: 0.9 } } });
+    assert.deepEqual(Object.keys(body.questions["effort_gpt-6-sol"].criteria), ["high", "xhigh"]);
+    return Response.json({ answers: { model: { choice: "gpt-6-sol", confidence: 0.9 }, "effort_gpt-6-sol": { choice: "xhigh", confidence: 0.9 } } });
   } });
-  assert.equal(selection.model, "gpt-5.6-terra");
+  assert.equal(selection.model, "gpt-6-sol");
   assert.equal(selection.effort, "xhigh");
 });
 
 test("non-Astra selections have a hard high effort floor while Astra retains its selected effort", async () => {
-  for (const model of ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra"]) {
-    for (const effort of ["low", "medium", "high", "xhigh", "ultra"]) {
+  for (const model of ["gpt-6-luna", "gpt-6-sol", "gpt-6-astra"]) {
+    for (const effort of ["low", "medium", "high", "xhigh", "max", "ultra"]) {
       const selection = await selectAutoModel({
         state: "task", apiKey: "test-key", fetch: async () => Response.json(answer(model, effort))
       });
@@ -86,18 +104,19 @@ test("non-Astra selections have a hard high effort floor while Astra retains its
 
 test("no key never calls TypeSafe and preserves the old Auto setting", async () => {
   const initial = await selectAutoModel({ state: "ignored", fetch: async () => { throw new Error("must not call"); } });
-  assert.equal(initial.model, "gpt-5.6-luna");
+  assert.equal(initial.model, "gpt-6-luna");
   assert.equal(initial.effort, "high");
-  const upgraded = await selectAutoModel({ state: "ignored", fallback: { model: "gpt-5.6-sol", effort: "xhigh" } });
-  assert.equal(upgraded.model, "gpt-5.6-sol");
+  const upgraded = await selectAutoModel({ state: "ignored", fallback: { model: "gpt-6-sol", effort: "xhigh" } });
+  assert.equal(upgraded.model, "gpt-6-sol");
   assert.equal(upgraded.effort, "xhigh");
+  const migrated = await selectAutoModel({ state: "ignored", fallback: { model: "gpt-5.6-terra", effort: "high" } });
+  assert.equal(migrated.model, "gpt-6-luna");
 });
 
 test("low-confidence Jev choices upgrade by one model tier and remain Jev selections", async () => {
   const cases = [
-    ["gpt-5.6-luna", "gpt-5.6-terra"],
-    ["gpt-5.6-terra", "gpt-5.6-sol"],
-    ["gpt-5.6-sol", "gpt-6-astra"],
+    ["gpt-6-luna", "gpt-6-sol"],
+    ["gpt-6-sol", "gpt-6-astra"],
     ["gpt-6-astra", "gpt-6-astra"]
   ] as const;
   for (const [chosen, expected] of cases) {
@@ -116,14 +135,14 @@ test("errors and malformed choices retain the prior setting without leaking prov
     async () => new Response("secret provider body", { status: 401 }),
     async () => new Response("not json"),
     async () => Response.json(answer("__proto__")),
-    async () => Response.json(answer("gpt-5.6-sol", "invalid")),
-    async () => Response.json(answer("gpt-5.6-sol", "high", 3)),
+    async () => Response.json(answer("gpt-6-sol", "invalid")),
+    async () => Response.json(answer("gpt-6-sol", "high", 3)),
     async () => { throw new Error("secret provider error"); }
   ];
   for (const fetch of cases) {
-    const result = await selectAutoModel({ state: "private state", apiKey: "secret", fallback: { model: "gpt-5.6-sol", effort: "xhigh" }, fetch });
+    const result = await selectAutoModel({ state: "private state", apiKey: "secret", fallback: { model: "gpt-6-sol", effort: "xhigh" }, fetch });
     assert.equal(result.provider, "fallback");
-    assert.equal(result.model, "gpt-5.6-sol");
+    assert.equal(result.model, "gpt-6-sol");
     assert.equal(result.effort, "xhigh");
     assert.doesNotMatch(JSON.stringify(result), /secret|private state/);
   }

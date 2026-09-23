@@ -28,6 +28,21 @@ test("summarizer prompt requests only a Chinese title", () => {
   assert.doesNotMatch(prompt, /keywords?:/i);
 });
 
+test("title language survives short English follow-ups and automated notices", () => {
+  const context = buildSummaryContext(session({}), [
+    turn("clickhouse 仲係唔得，我想 preview delete"),
+    turn("我係 head studio 搞"),
+    turn("Fix?"),
+    turn("Threadex commentary issue follow-up for the current task. The summariser has recorded issues without a solution.")
+  ], 20000)!;
+  assert.equal(context.titleLanguage, "Traditional Chinese/Cantonese");
+});
+
+test("Japanese titles use kana before shared Han characters", () => {
+  const context = buildSummaryContext(session({}), [turn("日本語のタイトルを修正してください")], 20000)!;
+  assert.equal(context.titleLanguage, "Japanese");
+});
+
 test("summarizer prompt keeps English as the default title language", () => {
   const context = buildSummaryContext(
     session({ title: "Fix summarizer prompt" }),

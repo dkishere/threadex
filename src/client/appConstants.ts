@@ -14,9 +14,9 @@ export const APPROVAL_POLICY_OPTIONS: Array<{ value: ApprovalPolicy; label: stri
   { value: "never", label: "Full access" },
   { value: "untrusted", label: "Custom (config.toml)" }
 ];
-export const MODEL_OPTIONS = ["gpt-6-astra", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini"] as const;
+export { MODEL_OPTIONS } from "../modelCatalog";
 export const EFFORT_OPTIONS: ModelReasoningEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
-export const ULTRA_EFFORT_OPTIONS: ModelReasoningEffort[] = [...EFFORT_OPTIONS, "ultra"];
+export const ULTRA_EFFORT_OPTIONS: ModelReasoningEffort[] = [...EFFORT_OPTIONS, "max", "ultra"];
 export const MAX_ATTACHMENTS = 6;
 export const MAX_ATTACHMENT_BYTES = MAX_INLINE_ATTACHMENT_BYTES;
 export { MAX_PATH_ATTACHMENT_BYTES };

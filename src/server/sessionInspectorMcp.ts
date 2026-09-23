@@ -1,3 +1,4 @@
+import { AUTO_MODEL_ORDER } from "../modelCatalog";
 import { createInterface } from "node:readline";
 import { createTurnGrillHistoryReader } from "./turnGrillContext";
 import {
@@ -303,7 +304,7 @@ const tools: ToolSpec[] = [
   },
   {
     name: "monitor_process",
-    description: "Start a durable, restartable process from a complete launch spec, temporarily observe one existing PID, or attach an existing PID with a complete launch spec for later restart. Labels are display text only and never discover a process. PID-only monitors store no executable/args, cannot restart, and disappear when that PID exits. A PID paired with exe plus complete args, dockerImage, or command keeps that launch spec: it can be restarted into a Threadex-owned, captured process. Threadex captures logs only for commands it launches; external attachments and supervisor-managed processes may have no readable output. Add metrics when output may be unavailable: each name-and-command probe reports its latest value in the monitor detail panel. Never launch a bare interpreter such as node, sh, bash, or python. Do not create duplicate built-in monitors. When list_processes marks a built-in read-only record restartable, restart_process_monitor delegates to its external supervisor.",
+    description: "Start a restartable process from a complete launch spec, temporarily observe one existing PID, or attach an existing PID with a complete launch spec for later restart. All monitors default to automatic cleanup after completion; set removeOnExit: false explicitly to retain one after exit. Labels are display text only and never discover a process. PID-only monitors store no executable/args, cannot restart, and disappear when that PID exits by default. A PID paired with exe plus complete args, dockerImage, or command keeps that launch spec: it can be restarted into a Threadex-owned, captured process. Threadex captures logs only for commands it launches; external attachments and supervisor-managed processes may have no readable output. Add metrics when output may be unavailable: each name-and-command probe reports its latest value in the monitor detail panel. Never launch a bare interpreter such as node, sh, bash, or python. Do not create duplicate built-in monitors. When list_processes marks a built-in read-only record restartable, restart_process_monitor delegates to its external supervisor.",
     inputSchema: {
       type: "object",
       required: ["label"],
@@ -345,7 +346,8 @@ const tools: ToolSpec[] = [
         },
         cwd: { type: "string", description: "Optional path inside the active workspace." },
         wakePrompt: { type: "string", maxLength: 12000, description: "Optional follow-up prompt queued when the process exits, using the calling runner's approval policy." },
-        timeoutSeconds: { type: "integer", minimum: 1, maximum: 604800, description: "Maximum monitor lifetime in seconds." }
+        timeoutSeconds: { type: "integer", minimum: 1, maximum: 604800, description: "Maximum monitor lifetime in seconds." },
+        removeOnExit: { type: "boolean", default: true, description: "Automatically remove the monitor after completion. Explicitly set false only for a persistent monitor that must remain available after exit." }
       },
       additionalProperties: false
     }
@@ -357,6 +359,7 @@ const tools: ToolSpec[] = [
       type: "object",
       required: ["id", "pid"],
       properties: {
+        removeOnExit: { type: "boolean", description: "Preserves the existing cleanup setting when omitted. Set false explicitly to retain the monitor after exit." },
         id: { type: "string" },
         pid: { type: "integer", minimum: 1 },
         label: { type: "string", minLength: 1, maxLength: 100 },
@@ -642,7 +645,7 @@ if (managerSessionId) {
         model: { type: "string", description: "Optional model for the child task. Defaults to the current task model." },
         modelReasoningEffort: {
           type: "string",
-          enum: ["minimal", "low", "medium", "high", "xhigh", "ultra"],
+          enum: ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
           description: "Optional reasoning effort for the child task. Defaults to the current task effort."
         }
       },
@@ -660,8 +663,8 @@ if (autoModelEnabled) {
       type: "object",
       required: ["model", "effort", "reason"],
       properties: {
-        model: { type: "string", enum: ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra"] },
-        effort: { type: "string", enum: ["low", "medium", "high", "xhigh", "ultra"] },
+        model: { type: "string", enum: [...AUTO_MODEL_ORDER] },
+        effort: { type: "string", enum: ["low", "medium", "high", "xhigh", "max", "ultra"] },
         reason: {
           type: "string",
           minLength: 10,
@@ -1261,6 +1264,7 @@ async function monitorProcess(input: Record<string, unknown>) {
     ...(input.wakePrompt !== undefined ? { wakePrompt: input.wakePrompt } : {}),
     ...(input.wakePrompt !== undefined && managerApprovalPolicy ? { approvalPolicy: managerApprovalPolicy } : {}),
     ...(input.timeoutSeconds !== undefined ? { timeoutSeconds: input.timeoutSeconds } : {}),
+    ...(input.removeOnExit !== undefined ? { removeOnExit: input.removeOnExit } : {}),
     ...(managerSessionId ? { sessionId: managerSessionId } : {}),
     ...(managerThreadId ? { threadId: managerThreadId } : {})
   });

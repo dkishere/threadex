@@ -49,6 +49,18 @@ test("headline output schema requires every property for strict structured outpu
   );
 });
 
+test("ClickHouse progress keeps compact headlines and the deletion constraint", () => {
+  const detail = "完整比對已讀過約 10.9 億筆原庫資料，接近完成。回收表目前冇重複 ID，筆數亦吻合；正等待最後嘅集合差異結果，確認冇錯收或漏收先恢復已確認嘅 Trim。";
+  const comment = parseCommentaryHeadlineResponse(JSON.stringify({ extracts: [
+    { type: "verification", shortMsg: "回收筆數吻合、無重複 ID" },
+    { type: "action", shortMsg: "等集合比對；刪除仍暫停" }
+  ], issues: [], solutions: [], blockers: [] }), detail, "action")!;
+  assert.equal(comment.detail, detail);
+  assert.equal(comment.extracts.length, 2);
+  assert.match(comment.extracts[1].shortMsg, /刪除仍暫停/);
+  assert.ok(comment.extracts.map(item => item.shortMsg).join("").length < detail.length * 0.6);
+});
+
 test("explicit blockers survive parsing and ledger context, and a later fix replaces them", () => {
   const context = { issueLedger: [{ issueKey: 1, issue: "Cannot deploy" }] };
   const blocked = parseCommentaryHeadlineResponse(JSON.stringify({ extracts: [], issues: [], solutions: [],

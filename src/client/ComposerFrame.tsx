@@ -47,12 +47,14 @@ const COMPACT_EFFORT_LABELS: Record<ModelReasoningEffort, string> = {
   medium: "M",
   high: "H",
   xhigh: "XH",
+  max: "Max",
   ultra: "U"
 };
 
 function compactModelLabel(model: string, label: string, isAuto: boolean) {
   if (isAuto) return "Auto";
   return label
+    .replace(/^6\s+(Astra|Luna|Sol)$/i, "$1")
     .replace(/^5\.6\s+(Terra|Luna|Sol)$/i, "$1")
     .replace(/^5\.4\s+Mini$/i, "5.4m")
     .replace(/^GPT-/i, "");

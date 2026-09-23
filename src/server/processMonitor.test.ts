@@ -165,6 +165,7 @@ test("managed process logs capture stdout and stderr and support bounded tail re
     const workspace = await store.getActiveWorkspace();
     const monitor = await service.monitor(workspace, {
       label: "logged-process",
+      removeOnExit: false,
       exe: process.execPath,
       args: ["-e", "process.stdout.write('stdout-line\\n'); process.stderr.write('stderr-line\\n')"]
     });
@@ -197,7 +198,8 @@ test("explicit log files survive launch-spec changes and capture the restarted c
     const adopted = await service.adopt(workspace, temporary.id, {
       pid: child.pid,
       command: `${process.execPath} -e "process.stdout.write('changed-command\\n')"`,
-      logFile: "logs/explicit-process.log"
+      logFile: "logs/explicit-process.log",
+      removeOnExit: false
     });
     assert.equal(adopted.logFile, resolve(workspace.cwd, "logs/explicit-process.log"));
     assert.equal(adopted.command, `${process.execPath} -e "process.stdout.write('changed-command\\n')"`);
@@ -304,7 +306,7 @@ test("bare shell and interpreter monitors are rejected with restart guidance", a
   }
 });
 
-test("an existing PID can adopt a durable restart launch spec", async () => {
+test("adopting a restart launch spec preserves automatic cleanup", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "process-monitor-test-"));
   const store = new SessionStore(resolve(root, "sessions.postgres"));
   const service = new ProcessMonitorService(store);
@@ -323,7 +325,7 @@ test("an existing PID can adopt a durable restart launch spec", async () => {
     assert.equal(adopted.executable, process.execPath);
     assert.deepEqual(adopted.args, ["-e", "setTimeout(() => {}, 10000)"]);
     assert.equal(adopted.managed, true);
-    assert.equal(adopted.removeOnExit, false);
+    assert.equal(adopted.removeOnExit, true);
     const restarted = await service.restart(workspace, adopted.id);
     assert.equal(restarted.status, "running");
     assert.notEqual(restarted.pid, child.pid);
@@ -351,7 +353,7 @@ test("an existing PID can be attached with a launch spec, stopped directly, then
       args: ["-e", "setTimeout(() => {}, 10000)"]
     });
     assert.equal(attached.managed, true);
-    assert.equal(attached.removeOnExit, false);
+    assert.equal(attached.removeOnExit, true);
     assert.equal(attached.pid, child.pid);
 
     const stopped = await service.stopProcess(workspace.id, attached.id);
@@ -537,6 +539,7 @@ test("a completed executable can wake a follow-up and remain restartable", async
     const workspace = await store.getActiveWorkspace();
     const monitor = await service.monitor(workspace, {
       label: "wakeable",
+      removeOnExit: false,
       exe: process.execPath,
       args: ["-e", "setTimeout(() => {}, 50)"],
       wakePrompt: "Continue after the process completed.",
@@ -578,11 +581,52 @@ test("every completed process publishes the exit hook without requiring a wake p
       args: ["-e", "setTimeout(() => {}, 25)"]
     });
     await waitFor(async () => exitedMonitorId === monitor.id, 2_000);
+    await waitFor(async () => (await store.getProcessMonitor(monitor.id)) === null, 2_000);
   } finally {
     service.stop();
     await store.close();
   }
 });
+
+for (const mode of ["managed", "attached", "wake"] as const) {
+  test(`default ${mode} monitor is removed after completion`, async () => {
+    const root = mkdtempSync(resolve(tmpdir(), "process-monitor-cleanup-test-"));
+    const store = new SessionStore(resolve(root, "sessions.postgres"));
+    let woke = false;
+    const service = new ProcessMonitorService(store, {
+      onWake: async ({ monitor }) => {
+        assert.ok(await store.getProcessMonitor(monitor.id));
+        woke = true;
+      }
+    });
+    let child: ReturnType<typeof spawn> | undefined;
+    try {
+      await store.ready();
+      const workspace = await store.getActiveWorkspace();
+      if (mode === "attached") {
+        child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 500)"], { stdio: "ignore" });
+        assert.ok(child.pid);
+      }
+      const monitor = await service.monitor(workspace, {
+        label: `cleanup-${mode}`,
+        exe: process.execPath,
+        args: ["-e", "setTimeout(() => {}, 50)"],
+        ...(child ? { pid: child.pid } : {}),
+        ...(mode === "wake" ? { wakePrompt: "Continue.", wakeSessionId: "cleanup-session" } : {})
+      });
+      assert.equal(monitor.removeOnExit, true);
+      await waitFor(async () => {
+        await service.list(workspace.id);
+        return (await store.getProcessMonitor(monitor.id)) === null;
+      }, 2_000);
+      assert.equal(woke, mode === "wake");
+    } finally {
+      service.stop();
+      child?.kill();
+      await store.close();
+    }
+  });
+}
 
 async function waitFor(predicate: () => Promise<boolean>, timeoutMs: number) {
   const deadline = Date.now() + timeoutMs;

@@ -170,7 +170,14 @@ function MarkdownLink({ href, children, onClick, ...props }: ComponentPropsWitho
   }
 
   return (
-    <a href={href} target="_blank" rel="noopener noreferrer" {...props}>
+    <a href={href} target="_blank" rel="noopener noreferrer" {...props}
+      onClick={(event) => {
+        onClick?.(event);
+        if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+        if (!href || !/^https?:\/\//i.test(href) || !isStandaloneApp()) return;
+        event.preventDefault();
+        createLinkPreview(href, false, href).navigate(href);
+      }}>
       <UrlTagIcon url={href} />
       {children}
     </a>

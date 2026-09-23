@@ -1,4 +1,5 @@
 // @ts-nocheck
+import { normalizeModelId, modelLabel, supportsUltraEffort as catalogSupportsUltraEffort, defaultGearProfiles } from "../modelCatalog";
 export function normalizeSessionModelPreferences(ctx, value) {
     const { MODEL_OPTIONS, isModelReasoningEffort, normalizeGearIndex, normalizeGearProfiles, normalizeStoredModel } = ctx;
     const fallbackModel = MODEL_OPTIONS[0];
@@ -152,12 +153,7 @@ export function normalizeStoredModel(ctx, value) {
     if (typeof value !== "string") {
         return MODEL_OPTIONS[0];
     }
-    const legacyAliases = {
-        "gpt-5.6 Terra": "gpt-5.6-terra",
-        "gpt-5.6 Luna": "gpt-5.6-luna",
-        "gpt-5.6 Sol": "gpt-5.6-sol"
-    };
-    const normalized = legacyAliases[value] ?? value;
+    const normalized = normalizeModelId(value);
     return MODEL_OPTIONS.some((model) => model === normalized) ? normalized : MODEL_OPTIONS[0];
 
 }
@@ -175,14 +171,8 @@ export function normalizeStoredApprovalPolicy(ctx, value) {
 
 export function normalizeGearProfiles(ctx, value, fallbackModel, fallbackEffort) {
     const { isModelReasoningEffort, normalizeEffortForModel, normalizeStoredModel } = ctx;
-    const defaults = [
-        { model: fallbackModel, effort: normalizeEffortForModel(fallbackEffort, fallbackModel) },
-        { model: "gpt-5.6-luna", effort: "medium" },
-        { model: "gpt-5.6-sol", effort: "high" },
-        { model: "gpt-5.6-terra", effort: "xhigh" },
-        { model: "gpt-5.6-luna", effort: "high" },
-        { model: "gpt-5.6-sol", effort: "xhigh" }
-    ];
+    const defaults = defaultGearProfiles();
+    defaults[0] = { model: fallbackModel, effort: normalizeEffortForModel(fallbackEffort, fallbackModel) };
     // Trim the briefly supported seventh Auto slot without losing manual presets.
     if (!Array.isArray(value) || ![3, 6, 7].includes(value.length)) {
         return defaults;
@@ -210,27 +200,16 @@ export function normalizeEffortForModel(ctx, effort, model) {
     const { AUTO_MODEL_VALUE, supportsUltraEffort } = ctx;
     if (model === AUTO_MODEL_VALUE)
         return "high";
-    return effort === "ultra" && !supportsUltraEffort(model) ? "xhigh" : effort;
+    return (effort === "max" || effort === "ultra") && !supportsUltraEffort(model) ? "xhigh" : effort;
 
 }
 
 export function supportsUltraEffort(ctx, model) {
-    const {  } = ctx;
-    return /^gpt-5\.6(?:-|\s|$)|^gpt-6-astra$/i.test(model);
-
+    return catalogSupportsUltraEffort(model);
 }
 
 export function modelOptionLabel(ctx, model) {
-    const { capitalize } = ctx;
-    if (/^gpt-6-astra$/i.test(model)) {
-        return "6 Astra";
-    }
-    const gpt56Match = /^gpt-5\.6-(terra|luna|sol)$/i.exec(model);
-    if (gpt56Match) {
-        return `5.6 ${capitalize(gpt56Match[1])}`;
-    }
-    return model.replace(/^gpt-/i, "");
-
+    return modelLabel(model);
 }
 
 export function toChatMessage(ctx, value) {
@@ -427,7 +406,7 @@ export function formatComposerLinkMarkdown(ctx, link) {
 
 export function isModelReasoningEffort(ctx, value) {
     const {  } = ctx;
-    return value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh" || value === "ultra";
+    return value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh" || value === "max" || value === "ultra";
 
 }
 

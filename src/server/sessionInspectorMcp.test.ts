@@ -587,6 +587,7 @@ test("wake prompts and event subscriptions inherit the manager approval policy",
       arguments: {
         label: "background job",
         pid: 1234,
+        removeOnExit: false,
         wakePrompt: "Inspect the completed job."
       }
     });
@@ -622,6 +623,7 @@ test("wake prompts and event subscriptions inherit the manager approval policy",
         body: {
           label: "background job",
           pid: 1234,
+          removeOnExit: false,
           wakePrompt: "Inspect the completed job.",
           approvalPolicy: "granular",
           sessionId: "local_parent-1",

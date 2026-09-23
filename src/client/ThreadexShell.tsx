@@ -1,5 +1,7 @@
 // @ts-nocheck
+import { DEFAULT_MODEL } from "../modelCatalog";
 import { useEffect as useReactEffect } from "react";
+import { dispatchBackgroundPrompt } from "./backgroundPromptQueue";
 import { MarkdownWorkspaceContext } from "./MarkdownContent";
 import { Flame, FolderOpen } from "lucide-react";
 import { TurnGrillPanel, useGrilledTurns } from "./TurnGrillPanel";
@@ -40,6 +42,7 @@ function sessionPopoverPosition(bounds, width) {
 function shortReasoningEffort(effort) {
   const normalized = typeof effort === "string" ? effort.trim().toLowerCase() : "";
   if (normalized === "ultra") return "U";
+  if (normalized === "max") return "MX";
   if (normalized === "xhigh") return "XH";
   if (normalized === "high") return "H";
   if (normalized === "medium") return "M";
@@ -264,6 +267,40 @@ export function ThreadexShell(ctx) {
     const modelPreferencesSaveQueueRef = useRef(Promise.resolve());
     const latestMessagesRef = useRef(restoredSession?.messages.length ? restoredSession.messages : []);
     const queuedPromptsRef = useRef(restoredSession?.queuedPrompts ?? []);
+    const backgroundQueueLocksRef = useRef(new Set());
+    const backgroundQueuesRef = useRef(queuedPromptsBySession);
+    backgroundQueuesRef.current = queuedPromptsBySession;
+    const dispatchBackgroundQueuesRef = useRef(() => {});
+    const selectedQueueRunnerRef = useRef(runQueuedPrompt);
+    selectedQueueRunnerRef.current = runQueuedPrompt;
+    dispatchBackgroundQueuesRef.current = () => {
+        for (const targetSessionId of Object.keys(backgroundQueuesRef.current)) {
+            if (targetSessionId === queuedPromptSessionKey(null) || targetSessionId === sessionIdRef.current) continue;
+            void dispatchBackgroundPrompt({
+                sessionId: targetSessionId,
+                locks: backgroundQueueLocksRef.current,
+                getQueue: () => backgroundQueuesRef.current[targetSessionId] ?? [],
+                remove: (id) => {
+                    const next = (backgroundQueuesRef.current[targetSessionId] ?? []).filter((prompt) => prompt.id !== id);
+                    backgroundQueuesRef.current = { ...backgroundQueuesRef.current, [targetSessionId]: next };
+                    setQueuedPromptsBySession((current) => ({ ...current, [targetSessionId]: (current[targetSessionId] ?? []).filter((prompt) => prompt.id !== id) }));
+                },
+                readStream: async (body) => {
+                    await readEventStream(body, () => {});
+                    await refreshSelectedSessionSnapshot(targetSessionId);
+                    // A second prompt may already be waiting when the stream ends.
+                    window.setTimeout(() => {
+                        dispatchBackgroundQueuesRef.current();
+                        if (sessionIdRef.current === targetSessionId) void selectedQueueRunnerRef.current();
+                    }, 0);
+                },
+                onError: (error) => showToast(`Queued prompt failed: ${error instanceof Error ? error.message : String(error)}`)
+            });
+        }
+    };
+    useReactEffect(() => {
+        dispatchBackgroundQueuesRef.current();
+    }, [queuedPromptsBySession, sessionId, sessionExecutionStatuses]);
     const queuedPromptEditRef = useRef(null);
     const inputEditorRef = useRef(null);
     const inlinePromptEditorRef = useRef(null);
@@ -852,8 +889,21 @@ export function ThreadexShell(ctx) {
     function queuePrompt(message, mode = executionMode, skills = selectedSkills, forcePlan = composerTodoPlanModeEnabled) { return appActions01.queuePrompt({ attachments, enqueuePrompt }, message, mode, skills, forcePlan); }
     async function steerPrompt(message, steerAttachments = attachments, clearComposer = true, steerSkills = selectedSkills, forcePlan = false) { return appActions01.steerPrompt({ addSteerMessage, clearComposerInputDraft, clearComposerSessionLinks, currentRunningTurnId, enqueuePrompt, executionMode, isInactiveSteerResponse, isLikelyBackendDisconnect, isSteering, noteBackendDisconnect, noteBackendRequestSucceeded, parseResponseAnnotations, refreshSelectedSessionSnapshot, sessionIdRef, setAttachments, setComposerForcePlanNextPrompt, setComposerInput, setComposerResponseQuote, setIsSteering, setResponseQuotePopover, setSelectedSkills, setSlashTrigger, setStatus, showToast }, message, steerAttachments, clearComposer, steerSkills, forcePlan); }
     function addSteerMessage(targetSessionId, turnId, content, steerAttachments, createdAt = new Date().toISOString(), forcePlan = false, id) { return appActions01.addSteerMessage({ appendSteerSegment, sessionIdRef, setMessages }, targetSessionId, turnId, content, steerAttachments, createdAt, forcePlan, id); }
-    function enqueuePrompt(message, kind, mode = executionMode, skills = selectedSkills, promptAttachments = attachments, contextFork = false, forcePlan = false, clearComposer = true) { return appActions01.enqueuePrompt({ clearComposerInputDraft, clearComposerSessionLinks, setAttachments, setComposerResponseQuote, setQueuedPrompts, setResponseQuotePopover, setSelectedSkills, setSlashTrigger, setStatus }, message, kind, mode, skills, promptAttachments, contextFork, forcePlan, clearComposer); }
-    async function runQueuedPrompt() { return appActions01.runQueuedPrompt({ currentSessionIsRunning, queuedPromptsRef, setQueuedPrompts, startChatTurn }); }
+    function enqueuePrompt(message, kind, mode = executionMode, skills = selectedSkills, promptAttachments = attachments, contextFork = false, forcePlan = false, clearComposer = true) { return appActions01.enqueuePrompt({ requestSettings: { model: selectedModel === AUTO_MODEL_VALUE ? DEFAULT_MODEL : selectedModel, modelReasoningEffort: selectedModel === AUTO_MODEL_VALUE ? "high" : selectedEffort, autoModel: selectedModel === AUTO_MODEL_VALUE, approvalPolicy, loadBalanceInWorkspace: useLoadBalanceInWorkspace, clientLayout: appActions01.currentClientLayout() }, clearComposerInputDraft, clearComposerSessionLinks, setAttachments, setComposerResponseQuote, setQueuedPrompts, setResponseQuotePopover, setSelectedSkills, setSlashTrigger, setStatus }, message, kind, mode, skills, promptAttachments, contextFork, forcePlan, clearComposer); }
+    async function runQueuedPrompt() {
+        const targetSessionId = sessionIdRef.current;
+        if (currentSessionIsRunning || !queuedPromptsRef.current.length || backgroundQueueLocksRef.current.has(targetSessionId)) return;
+        backgroundQueueLocksRef.current.add(targetSessionId);
+        try {
+            return await appActions01.runQueuedPrompt({ currentSessionIsRunning, queuedPromptsRef, setQueuedPrompts, startChatTurn });
+        } finally {
+            backgroundQueueLocksRef.current.delete(targetSessionId);
+            dispatchBackgroundQueuesRef.current();
+            if (sessionIdRef.current === targetSessionId && backgroundQueuesRef.current[queuedPromptSessionKey(targetSessionId)]?.length) {
+                window.setTimeout(() => void selectedQueueRunnerRef.current(), 0);
+            }
+        }
+    }
     async function loadSessionSearchPage(offset = 0, signal) { return appActions01.loadSessionSearchPage({ sessionSearchQuery, setIsSearchingSessions, setSessionSearchPage, setSessionSearchResults, setStatus }, offset, signal); }
     async function loadSessions(offset = 0, append = false, cwd = null) { return appActions01.loadSessions({ centralState, eventStore, isLikelyBackendDisconnect, noteBackendDisconnect, noteBackendRequestSucceeded, setIsLoadingSessions, setLoadingSessionProjects, setStatus, toSessionPageState }, offset, append, cwd); }
     async function refreshSelectedSessionSnapshot(targetSessionId, turnId) { return appActions01.refreshSelectedSessionSnapshot({ applySelectedSessionSnapshot, isLikelyBackendDisconnect, noteBackendDisconnect, noteBackendRequestSucceeded, pendingReconciliationTurnIdsRef, reconcilingTurnIdsRef, sessionIdRef, setStatus }, targetSessionId, turnId); }
@@ -863,7 +913,7 @@ export function ThreadexShell(ctx) {
     function applySelectedSessionSnapshot(payload) { return appActions02.applySelectedSessionSnapshot({ activeTurnIdRef, applyModelPreferencesState, composerDraftSessionIdRef, composerInputEditRevisionRef, displaySessionTitle, eventStore, explicitNewSessionRef, modelPreferencesHydratedRef, modelPreferencesWorkspaceIdRef, moveStoredComposerDraft, persistedModelPreferencesWorkspaceIdRef, queueModelPreferencesSave, readPendingModelPreferences, replaceComposerDraftForSession, sessionIdRef, sessionTurnsToMessages, setActiveSessionId, setActiveTurnId, setMessages, setResumeThreadId, setRunningTurnIds, setSessionAutoModel, setSessionId, setSessionTodo, setThreadId }, payload); }
     function clearTodoPanelState() { return appActions02.clearTodoPanelState({ setParentSessionTodo, setSessionTodo }); }
     function applyTodoSnapshotForSession(targetSessionId, todo) { return appActions02.applyTodoSnapshotForSession({ sessionIdRef, setSessionTodo }, targetSessionId, todo); }
-    async function handleDurableEvent(event) { return appActions02.handleDurableEvent({ activeTurnIdRef, applyDeveloperInstructionsToTurn, approvalEventToLiveItem, eventStore, finalizeTerminalAssistantMessage, isCodexTurnCompletedEvent, loadWorkspaceSnapshot, markTurnFinished, readRecord, readStringField, reconnectRunner, reconnectingTurnIdsRef, refreshSelectedSessionSnapshot, removePendingApprovalItem, scheduleLoadSessions, sessionIdRef, setActiveTurnId, setMessages, setPendingApprovalItems, setPendingApprovalSessionIds, setSessionExecutionStatuses, setSessionTodo, streamTargetsRef, upsertPendingApprovalItem, viewKeyRef }, event); }
+    async function handleDurableEvent(event) { if (appActions02.isTerminalRunnerDurableEvent(event)) window.setTimeout(() => dispatchBackgroundQueuesRef.current(), 0); return appActions02.handleDurableEvent({ activeTurnIdRef, applyDeveloperInstructionsToTurn, approvalEventToLiveItem, eventStore, finalizeTerminalAssistantMessage, isCodexTurnCompletedEvent, loadWorkspaceSnapshot, markTurnFinished, readRecord, readStringField, reconnectRunner, reconnectingTurnIdsRef, refreshSelectedSessionSnapshot, removePendingApprovalItem, scheduleLoadSessions, sessionIdRef, setActiveTurnId, setMessages, setPendingApprovalItems, setPendingApprovalSessionIds, setSessionExecutionStatuses, setSessionTodo, streamTargetsRef, upsertPendingApprovalItem, viewKeyRef }, event); }
     async function loadWorkspaces() { return appActions02.loadWorkspaces({ isLikelyBackendDisconnect, noteBackendDisconnect, noteBackendRequestSucceeded, setActiveWorkspace, setStatus, setWorkspaceList }); }
     async function loadAccounts() { return appActions02.loadAccounts({ applyAccountPayload, isLikelyBackendDisconnect, noteBackendDisconnect, noteBackendRequestSucceeded, setStatus }); }
     async function refreshApprovalState() { return appActions02.refreshApprovalState({ approvalRecordToLiveItem, isApprovalLiveItem, isLikelyBackendDisconnect, noteBackendDisconnect, readRecord, setPendingApprovalItems, setPendingApprovalSessionIds }); }

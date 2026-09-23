@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { buildTurnGrillPrompt } from "./turnGrill";
-import { buildTurnGrillInspectorConfig, buildTurnGrillSessionContext, isLongTurnGrill, TURN_GRILL_INSTRUCTIONS } from "./turnGrill";
+import { buildTurnGrillInspectorConfig, buildTurnGrillSessionContext, isLongTurnGrill, turnGrillModel, TURN_GRILL_INSTRUCTIONS } from "./turnGrill";
 import { createTurnGrillHistoryReader } from "./turnGrillContext";
 import type { SessionRecord } from "./sessionStore";
 
@@ -76,7 +76,9 @@ test("grill accepts a long final response without a prompt-size cutoff", () => {
 
 test("long turns switch to source-first review guidance", () => {
   assert.equal(isLongTurnGrill({ userInput: "short", agentResponse: "short", tokenIn: 1, tokenOut: 1 }), false);
+  assert.equal(turnGrillModel(isLongTurnGrill({ userInput: "short", agentResponse: "short", tokenIn: 1, tokenOut: 1 })), "gpt-6-luna");
   assert.equal(isLongTurnGrill({ userInput: "short", agentResponse: "short", tokenIn: 100_000, tokenOut: 1 }), true);
+  assert.equal(turnGrillModel(isLongTurnGrill({ userInput: "short", agentResponse: "short", tokenIn: 100_000, tokenOut: 1 })), "gpt-6-sol");
   assert.equal(isLongTurnGrill({ userInput: "x".repeat(100_000), agentResponse: "", tokenIn: 0, tokenOut: 0 }), true);
   assert.match(TURN_GRILL_INSTRUCTIONS, /Read the named project files yourself/);
 });

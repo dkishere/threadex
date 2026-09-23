@@ -1,3 +1,4 @@
+import { DEFAULT_MODEL } from "../modelCatalog";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -6,7 +7,7 @@ import { IsolatedLunaRunner } from "./isolatedLunaRunner";
 import { normalizeModelTokenUsage } from "./modelTokenUsage";
 import type { SessionRecord, WorkspaceRecord } from "./sessionStore";
 
-const defaultModel = "gpt-5.6-luna";
+const defaultModel = DEFAULT_MODEL;
 const defaultReasoningEffort: SideChatReasoningEffort = "medium";
 const defaultTimeoutMs = 90_000;
 const serverDir = dirname(fileURLToPath(import.meta.url));
