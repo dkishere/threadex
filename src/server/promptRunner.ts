@@ -97,7 +97,7 @@ type RunnerJob = {
   startupSnapshot?: string;
   contextParentSessionId?: string;
   contextForkRequest?: boolean;
-  childExecutionMode?: "default" | "plan" | "goal";
+  childExecutionMode?: "default" | "plan" | "goal" | "loop";
   todoParentSessionId?: string;
   todoItemId?: string;
   todoPlanAlreadyExists?: boolean;
@@ -207,6 +207,9 @@ type AutoModelState = {
 
 const GOAL_OBJECTIVE_INLINE_LIMIT = 4000;
 const RUNNER_UPDATE_CALLBACK_TIMEOUT_MS = 15_000;
+const COMPACTION_HEARTBEAT_MS = Math.max(1_000, readPositiveInteger(process.env.RUNNER_COMPACTION_HEARTBEAT_MS, 30_000));
+// Native compaction can be silent for several minutes; stop heartbeats before a genuinely stuck run is hidden indefinitely.
+const COMPACTION_HEARTBEAT_MAX_MS = 8 * 60_000;
 const DEFAULT_COMMAND_OUTPUT_CAPTURE_LIMIT_CHARS = 16 * 1024 * 1024;
 
 const jobPath = process.argv[2];
@@ -268,6 +271,27 @@ async function run() {
   let steeringFinished = false;
   let stopSteerControl: (() => Promise<void>) | undefined;
   let commentaryInjectionActive = false;
+  let compactionHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  let compactionStartedAt = 0;
+  const stopCompactionHeartbeat = () => {
+    if (compactionHeartbeatTimer) clearInterval(compactionHeartbeatTimer);
+    compactionHeartbeatTimer = null;
+    compactionStartedAt = 0;
+  };
+  const startCompactionHeartbeat = () => {
+    stopCompactionHeartbeat();
+    compactionStartedAt = Date.now();
+    compactionHeartbeatTimer = setInterval(() => {
+      const elapsedMs = Date.now() - compactionStartedAt;
+      if (elapsedMs >= COMPACTION_HEARTBEAT_MAX_MS) {
+        stopCompactionHeartbeat();
+        return;
+      }
+      void emitEvent("runner.compaction_heartbeat", { elapsedMs }).catch((error) => {
+        appendInternalLog("runner.compaction_heartbeat_error", { message: errorMessage(error) });
+      });
+    }, COMPACTION_HEARTBEAT_MS);
+  };
   const linkedNativeTurnIds = new Set<string>();
   const startedAt = Date.now();
   const itemCache = new Map<string, StreamItem>();
@@ -343,6 +367,10 @@ async function run() {
           ...streamItemOrigin(params, itemCache.get(cacheKey))
         };
         itemCache.set(cacheKey, streamItem);
+        if (streamItem.itemType === "context_compaction" && streamItemBelongsToRunnerThread(streamItem, threadId)) {
+          if (eventType === "item.started") startCompactionHeartbeat();
+          else stopCompactionHeartbeat();
+        }
         if (streamItem.itemType === "agent_message" && streamItemBelongsToRunnerThread(streamItem, threadId)) {
           finalResponse = streamItem.text;
         }
@@ -856,6 +884,7 @@ async function run() {
     await emitEvent("done", { ok: true }, { waitForCallback: true });
     process.exitCode = 1;
   } finally {
+    stopCompactionHeartbeat();
     await stopSteerControl?.();
     await appServer.stop();
     stopCommentaryHeadlineWorker();

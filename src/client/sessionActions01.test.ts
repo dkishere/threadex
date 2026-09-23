@@ -85,7 +85,7 @@ test("formats selected sessions as newline-separated Codex references", () => {
   );
 });
 
-test("consumes goal mode after submitting one prompt", async () => {
+test("consumes Loop mode after submitting one prompt", async () => {
   const executionModeUpdates: string[] = [];
   const startedTurns: unknown[][] = [];
 
@@ -99,7 +99,7 @@ test("consumes goal mode after submitting one prompt", async () => {
       composerTodoPlanModeEnabled: false,
       currentSessionIsRunning: false,
       enqueuePrompt() {},
-      executionMode: "goal",
+      executionMode: "loop",
       forkNextPrompt: false,
       formatComposerLinkMarkdown() { return ""; },
       formatResponseAnnotationsPrompt() { return ""; },
@@ -118,10 +118,10 @@ test("consumes goal mode after submitting one prompt", async () => {
 
   assert.deepEqual(executionModeUpdates, ["default"]);
   assert.equal(startedTurns.length, 1);
-  assert.equal(startedTurns[0][2], "goal");
+  assert.equal(startedTurns[0][2], "loop");
 });
 
-test("does not consume goal mode for an empty submission", async () => {
+test("does not consume Loop mode for an empty submission", async () => {
   const executionModeUpdates: string[] = [];
 
   await submit(
@@ -134,7 +134,7 @@ test("does not consume goal mode for an empty submission", async () => {
       composerTodoPlanModeEnabled: false,
       currentSessionIsRunning: false,
       enqueuePrompt() {},
-      executionMode: "goal",
+      executionMode: "loop",
       forkNextPrompt: false,
       formatComposerLinkMarkdown() { return ""; },
       formatResponseAnnotationsPrompt() { return ""; },
@@ -157,6 +157,7 @@ test("does not consume goal mode for an empty submission", async () => {
 test("direct steer submission bypasses the queue even when queue mode is active", async () => {
   const queued: string[] = [];
   const steered: string[] = [];
+  const executionModeUpdates: string[] = [];
 
   await submit(
     {
@@ -168,7 +169,7 @@ test("direct steer submission bypasses the queue even when queue mode is active"
       composerTodoPlanModeEnabled: false,
       currentSessionIsRunning: true,
       enqueuePrompt(message: string) { queued.push(message); },
-      executionMode: "default",
+      executionMode: "loop",
       forkNextPrompt: false,
       formatComposerLinkMarkdown() { return ""; },
       formatResponseAnnotationsPrompt() { return ""; },
@@ -177,7 +178,7 @@ test("direct steer submission bypasses the queue even when queue mode is active"
       replaceComposerLinkTokens(value: string) { return value; },
       selectedSkills: [],
       sessionIdRef: { current: "session-1" },
-      setComposerExecutionMode() {},
+      setComposerExecutionMode(mode: string) { executionModeUpdates.push(mode); },
       setComposerForkNextPrompt() {},
       async startChatTurn() {},
       async steerPrompt(message: string) { steered.push(message); }
@@ -188,6 +189,7 @@ test("direct steer submission bypasses the queue even when queue mode is active"
 
   assert.deepEqual(queued, []);
   assert.deepEqual(steered, ["Change direction"]);
+  assert.deepEqual(executionModeUpdates, []);
 });
 
 test("submitting a queued prompt edit commits it without starting a new turn", async () => {

@@ -19,6 +19,9 @@
 .grill-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; background: #f8fafc; border-bottom: 1px solid var(--grill-border); }
 .grill-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .grill-title > strong { color: #1e293b; font-size: 12px; font-weight: 650; }
+.turn-grill[data-automatic="true"] { border-color: #fdba74; }
+.turn-grill[data-automatic="true"] .grill-header { background: #fff7ed; }
+.turn-grill[data-automatic="true"] .grill-title > strong, .turn-grill[data-automatic="true"] .grill-mark { color: #c2410c; }
 .grill-mark { display: inline-flex; align-items: center; color: #b97730; }
 .grill-stage { margin-left: 3px; padding-left: 11px; border-left: 1px solid #dbe2ea; color: var(--grill-muted); font-size: 10px; }
 .turn-grill .grill-history-toggle { padding: 4px 0 4px 8px; border: 0; background: transparent; color: var(--grill-muted); font-size: 10px; }
@@ -31,6 +34,8 @@
 .grill-issue-body { min-width: 0; }
 .grill-issue-label { display: flex; align-items: center; gap: 9px; margin-bottom: 3px; color: #94a3b8; font-size: 9px; font-variant-numeric: tabular-nums; }
 .grill-issue-label .grill-resolved { display: inline-flex; align-items: center; gap: 3px; color: #059669; }
+.grill-issue-label .grill-todo-label { color: #0369a1; font-weight: 650; }
+.grill-issue-label .grill-blocker-label { color: #c2410c; font-weight: 650; }
 .grill-question { overflow-wrap: anywhere; }
 .turn-grill .markdown-content { font-size: inherit; line-height: inherit; }
 .turn-grill .markdown-content > :first-child { margin-top: 0; }

@@ -223,6 +223,36 @@ button {
   outline-offset: 1px;
 }
 
+.header-loop-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 28px;
+  min-width: 66px;
+  padding: 0 9px;
+  border: 1px solid #cbd5e1;
+  border-radius: 7px;
+  background: #f1f5f9;
+  color: #475569;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.header-loop-toggle > svg { width: 14px; height: 14px; }
+.header-loop-toggle:hover { background: #e2e8f0; }
+.header-loop-toggle:focus-visible { outline: 2px solid #ea580c; outline-offset: 2px; }
+.header-loop-toggle:disabled { opacity: .7; cursor: wait; }
+.header-loop-toggle[data-active="true"] {
+  border-color: #c2410c;
+  background: linear-gradient(135deg, #ea580c, #c2410c);
+  color: #fff;
+  box-shadow: 0 0 0 2px #fed7aa, 0 2px 8px rgb(194 65 12 / 28%);
+}
+.header-loop-toggle[data-active="true"]:hover { background: #9a3412; }
+
 .header-account-popover-wrap {
   position: relative;
 }

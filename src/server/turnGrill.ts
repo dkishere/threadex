@@ -19,7 +19,8 @@ export const TURN_GRILL_INSTRUCTIONS = [
   "Prefer reproducible tests over post-deployment verification: a concrete fixture, API integration test, or local E2E scenario should exercise the missing behaviour before any environment rollout. A backend change or an agent statement such as 'deployment still needed' is NOT a user request for deployment or a reason to ask for verification after deployment. Ask for post-deployment verification only when the user explicitly requests it and the specific behaviour cannot be established in the project's test environment. Do not rephrase a deploy request as 'after deploying, can you verify'.",
   "Ask only consequential questions grounded in this turn. Do not repeat answered questions, request permissions already granted, invent requirements, or produce a generic checklist. Ask about infrastructure and permission changes only when the task touches those boundaries; absence of permission tests alone is not a defect in an unrelated UI change. Ignore commit, push, branch cleanliness, and uncommitted/unpushed status when generating questions. These are not review gaps. Do not ask whether the user wants commits or pushes. Keep verification proportional to this task: focused tests and relevant typecheck/build/E2E evidence are sufficient unless you can identify a specific uncovered behaviour or integration risk from the supplied evidence. Do not ask for the full test suite, full CI pipeline, deployment, or deployed-environment verification merely because those were not run or shown. Do not turn this into a question about whether such extra work is needed. Raise broader CI or deployment verification only when the user explicitly requires it or the task directly changes that pipeline/environment and a concrete relevant risk remains. Never expand scope just to collect more evidence. Direct discoverable technical questions to the executing agent; reserve user questions for decisions only the user can make.",
   "For action=start, return 1-5 consequential questions (or an empty array if none). For action=respond, answer the selected questions using the supplied evidence and propose concrete action steps; do not execute them or mark them resolved. For action=followup (Re-grill), critically examine selected issues and the agent's responses. Mark status resolved (Satisfied) when the response adequately answers the concern. No reason is needed for Satisfied: preserve the existing responseMd without adding a satisfaction explanation. Otherwise keep open and explain the remaining question. Also inspect the turn for NEW consequential questions, even when issues is empty because all previous concerns are satisfied. You may append 1-5 new questions with fresh IDs absent from reservedIssueIds, status open, and selected true. Do not repeat answered concerns. Keep total reserved IDs plus new questions at most 20. Saved rounds are discussion history. Preserve every supplied issue ID and unselected issue unchanged; update selected responseMd and status. Satisfied and dropped issues are excluded from supplied issues and must not be returned or reused. Never claim code inspection or tests that you did not perform.",
-  'Return ONLY a JSON array of objects: {"id":"issue-1","md":"Markdown question","responseMd":"Markdown response and action plan, or empty initially","status":"open"}. No fences or preamble. Use the user language. Preserve questions unless the user edited them.'
+  "When autoLoop is true, this is Auto Grill. Classify each open issue with impact=blocking or impact=non_blocking. A non-blocking issue is concrete follow-up work that can safely be deferred to the session Todo without violating the user's acceptance criteria or leaving a correctness, security, data-loss, or failing-test defect. Treat uncertainty about those boundaries as blocking. The executing agent will work on blockers; non-blocking issues become Todo items. Do not mark a blocker resolved just to end the loop.",
+  'Return ONLY a JSON array of objects: {"id":"issue-1","md":"Markdown question","responseMd":"Markdown response and action plan, or empty initially","status":"open","impact":"blocking or non_blocking"}. No fences or preamble. Use the user language. Preserve questions unless the user edited them.'
 ].join("\n");
 
 export function buildTurnGrillPrompt(input: {
@@ -33,6 +34,7 @@ export function buildTurnGrillPrompt(input: {
   rounds?: GrillRound[];
   followup?: string;
   longTurn?: boolean;
+  autoLoop?: boolean;
 }) {
   return JSON.stringify({
     userInput: input.userInput,
@@ -44,7 +46,8 @@ export function buildTurnGrillPrompt(input: {
     reservedIssueIds: input.reservedIssueIds,
     rounds: input.rounds,
     followup: input.followup,
-    longTurn: input.longTurn
+    longTurn: input.longTurn,
+    autoLoop: input.autoLoop === true
   });
 }
 

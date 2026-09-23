@@ -468,6 +468,7 @@ export type SessionTitleSyncResult = SessionTitleSyncInput & {
 export type SessionTurnRecord = {
   id: string;
   sessionId: string;
+  loopMode?: boolean;
   accountId: string | null;
   userInput: string;
   agentResponse: string;
@@ -1102,6 +1103,7 @@ type AccountRow = {
 type SessionTurnRow = {
   id?: unknown;
   session_id?: unknown;
+  loop_mode?: unknown;
   account_id?: unknown;
   user_input?: unknown;
   agent_response?: unknown;
@@ -3445,6 +3447,48 @@ export class SessionStore {
     });
   }
 
+  async getGlobalLoopMode(): Promise<boolean> {
+    return this.read(async (connection) => {
+      const result = await connection.run("SELECT enabled FROM loop_mode_settings WHERE id = 'global'");
+      return (await result.getRowObjectsJS())[0]?.enabled === true;
+    });
+  }
+
+  async setGlobalLoopMode(enabled: boolean): Promise<void> {
+    await this.write(async (connection) => {
+      await connection.run(`INSERT INTO loop_mode_settings (id, enabled) VALUES ('global', $enabled)
+        ON CONFLICT (id) DO UPDATE SET enabled = excluded.enabled`, { enabled });
+    });
+  }
+
+  async enableTurnLoopMode(turnId: string): Promise<void> {
+    await this.write(async (connection) => {
+      await connection.run("INSERT INTO turn_loop_mode (turn_id) VALUES ($turnId) ON CONFLICT (turn_id) DO NOTHING", { turnId });
+    });
+  }
+
+  async isTurnLoopModeEnabled(turnId: string): Promise<boolean> {
+    return this.read(async (connection) => {
+      const result = await connection.run("SELECT turn_id FROM turn_loop_mode WHERE turn_id = $turnId", { turnId });
+      return (await result.getRowObjectsJS()).length > 0;
+    });
+  }
+
+  async recordLoopWorkTurn(turnId: string, rootTurnId: string, workCycle: number): Promise<void> {
+    await this.write(async (connection) => {
+      await connection.run(`INSERT INTO loop_work_turn (turn_id, root_turn_id, work_cycle)
+        VALUES ($turnId, $rootTurnId, $workCycle) ON CONFLICT (turn_id) DO NOTHING`, { turnId, rootTurnId, workCycle });
+    });
+  }
+
+  async getLoopWorkTurn(turnId: string): Promise<{ rootTurnId: string; workCycle: number } | null> {
+    return this.read(async (connection) => {
+      const result = await connection.run("SELECT root_turn_id, work_cycle FROM loop_work_turn WHERE turn_id = $turnId", { turnId });
+      const row = (await result.getRowObjectsJS())[0];
+      return row ? { rootTurnId: String(row.root_turn_id), workCycle: Number(row.work_cycle) } : null;
+    });
+  }
+
   async resolveApprovalPolicy(sessionId: string, turnId?: string, explicit?: string): Promise<string | undefined> {
     return this.write(async (connection) => {
       const sessionKey = `session:${sessionId}`;
@@ -3719,6 +3763,7 @@ export class SessionStore {
           SELECT
             session_turn.id,
             session_turn.session_id,
+            EXISTS (SELECT 1 FROM turn_loop_mode WHERE turn_id = session_turn.id) AS loop_mode,
             session_turn.account_id,
             session_turn.account_name,
             session_turn.account_email,
@@ -4377,6 +4422,7 @@ export class SessionStore {
           SELECT
             id,
             session_id,
+            EXISTS (SELECT 1 FROM turn_loop_mode WHERE turn_id = session_turn.id) AS loop_mode,
             account_id,
             user_input,
             agent_response,
@@ -7159,6 +7205,15 @@ export class SessionStore {
         policy VARCHAR NOT NULL
       )
     `);
+    await connection.run(`CREATE TABLE IF NOT EXISTS loop_mode_settings (
+      id VARCHAR PRIMARY KEY, enabled BOOLEAN NOT NULL
+    )`);
+    await connection.run(`CREATE TABLE IF NOT EXISTS turn_loop_mode (
+      turn_id VARCHAR PRIMARY KEY
+    )`);
+    await connection.run(`CREATE TABLE IF NOT EXISTS loop_work_turn (
+      turn_id VARCHAR PRIMARY KEY, root_turn_id VARCHAR NOT NULL, work_cycle INTEGER NOT NULL
+    )`);
     await connection.run(`
       CREATE TABLE IF NOT EXISTS session_turn (
         id VARCHAR PRIMARY KEY,
@@ -8246,6 +8301,7 @@ export class SessionStore {
         SELECT
           session_turn.id,
           session_turn.session_id,
+          EXISTS (SELECT 1 FROM turn_loop_mode WHERE turn_id = session_turn.id) AS loop_mode,
           session_turn.account_id,
           session_turn.user_input,
           session_turn.agent_response,
@@ -8282,6 +8338,7 @@ export class SessionStore {
         SELECT
           session_turn.id,
           session_turn.session_id,
+          EXISTS (SELECT 1 FROM turn_loop_mode WHERE turn_id = session_turn.id) AS loop_mode,
           session_turn.account_id,
           session_turn.user_input,
           session_turn.agent_response,
@@ -10825,6 +10882,7 @@ function toSessionTurnRecord(row: SessionTurnRow): SessionTurnRecord {
   return {
     id: stringValue(row.id),
     sessionId: stringValue(row.session_id),
+    loopMode: row.loop_mode === true,
     accountId: nullableString(row.account_id),
     userInput: stringValue(row.user_input),
     agentResponse: stringValue(row.agent_response),

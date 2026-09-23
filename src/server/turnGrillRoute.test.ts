@@ -54,7 +54,7 @@ test("grill rejects older turns and persists the latest turn's questions and fol
         assert.equal(payload.userInput, "Prompt m-newest");
         assert.equal(payload.agentResponse, "Reply m-newest");
         assert.deepEqual(payload.sessionContext, {
-          sessionUrl: "codex://threads/fixture?workspace=grill-test", sessionId: "fixture", workspaceId: "grill-test",
+          sessionUrl: "threadex://grill-test/fixture/m-newest", sessionId: "fixture", workspaceId: "grill-test",
           turnId: "m-newest", currentTurnNumber: 3, totalTurns: 3
         });
         assert.equal(totalTurns, 3);
@@ -156,6 +156,46 @@ test("grill rejects older turns and persists the latest turn's questions and fol
     const mismatch = `http://127.0.0.1:${address.port}/api/sessions/other/turns/m-newest/grill`;
     assert.equal((await fetch(mismatch)).status, 404);
     assert.equal((await fetch(mismatch, { method: "POST" })).status, 404);
+  } finally {
+    if (server.listening) await new Promise<void>((done) => server.close(() => done()));
+    await store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("automatic Loop review can Grill a completed turn after a newer turn exists", { timeout: 30_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "loop-grill-route-"));
+  const store = new SessionStore(join(root, "test.postgres"));
+  const server = createServer();
+  try {
+    await store.ready();
+    await store.upsertWorkspace({ id: "loop-workspace", name: "Loop", cwd: root, codexHome: join(root, "home") });
+    await store.upsertSession({ id: "loop-session", workspaceId: "loop-workspace", cwd: root, title: "Loop" });
+    for (const id of ["older", "newer"]) {
+      await store.recordSessionTurn({ id, sessionId: "loop-session", userInput: id, agentResponse: "Done", tokenIn: 0, tokenOut: 0, status: "done" });
+    }
+    const app = express();
+    app.use(express.json());
+    app.post("/api/sessions/:sessionId/turns/:turnId/grill", createTurnGrillHandler({
+      sessionStore: store, serverUrl: "http://unused", recordUsage: async () => {},
+      runGrill: async (_home, prompt) => {
+        assert.equal(JSON.parse(prompt).userInput, "older");
+        assert.equal(JSON.parse(prompt).autoLoop, true);
+        return { responseText: JSON.stringify([{ id: "q1", md: "Can be deferred", responseMd: "", status: "open", impact: "non_blocking" }]), usage: null, authIdentity: { externalAccountId: null, externalUserId: null } };
+      }
+    }));
+    server.on("request", app);
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const url = `http://127.0.0.1:${address.port}/api/sessions/loop-session/turns/older/grill`;
+    assert.equal((await fetch(url, { method: "POST" })).status, 409);
+    const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "start", autoLoop: true }) });
+    assert.equal(response.status, 200);
+    const review = (await response.json()).grill;
+    assert.equal(review.status, "ready");
+    assert.equal(review.automatic, true);
+    assert.equal(review.issues[0].impact, "non_blocking");
   } finally {
     if (server.listening) await new Promise<void>((done) => server.close(() => done()));
     await store.close();
