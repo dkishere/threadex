@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AUTO_CONTEXT_MAX_CHARS, AUTO_PROMPT_MAX_CHARS, buildAutoModelState, selectAutoModel } from "./autoModelSelector";
+import { AUTO_CONTEXT_MAX_CHARS, AUTO_PROMPT_MAX_CHARS, buildAutoModelState, selectAutoModel, shouldEnableAutoModel } from "./autoModelSelector";
 import type { SessionRecord, SessionTurnRecord } from "./sessionStore";
 
 const session = { id: "session", workspaceId: "workspace", cwd: "/project" } as SessionRecord;
@@ -9,6 +9,13 @@ function turn(id: string, userInput = id, agentResponse = "done"): SessionTurnRe
 }
 const answer = (model = "gpt-6-sol", effort = "high", confidence = 0.9) => ({
   answers: { model: { choice: model, confidence }, effort: { choice: effort, confidence } }
+});
+
+test("Auto gear resolves to routing mode before dispatching a Codex model", () => {
+  assert.equal(shouldEnableAutoModel("auto", undefined), true);
+  assert.equal(shouldEnableAutoModel("auto", false), true);
+  assert.equal(shouldEnableAutoModel("gpt-6-luna", true), true);
+  assert.equal(shouldEnableAutoModel("gpt-6-luna", false), false);
 });
 
 test("Jev receives bounded prompt plus summariser extracts, excluding raw commentary and future turns", () => {

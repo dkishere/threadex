@@ -46,8 +46,8 @@ export async function resendUserPrompt(ctx, message) {
         const resendMode = message.executionMode ?? "default";
         const resendForcePlan = message.forcePlan === true;
         if (currentSessionIsRunning) {
-            enqueuePrompt(prompt, "queue", resendMode, [], resendAttachments, false, resendForcePlan, false);
-            setStatus("Prompt queued for resend");
+            const queued = await enqueuePrompt(prompt, "queue", resendMode, [], resendAttachments, false, resendForcePlan, false);
+            if (queued !== false) setStatus("Prompt queued for resend");
             return;
         }
         setStatus("Resending prompt");
@@ -241,7 +241,7 @@ export async function savePromptEditor(ctx, event) {
             }
             noteBackendRequestSucceeded();
             setMessages((current) => current.map((candidate) => candidate.id === `${turnId}:user` || (userMessage && candidate.id === userMessage.id)
-                ? { ...candidate, content: payload.turn?.userInput ?? trimmedInput }
+                ? { ...candidate, content: trimmedInput, rawContent: trimmedInput }
                 : candidate));
             setPromptEditor(null);
             setStatus("Queued prompt edited");
@@ -298,6 +298,54 @@ export async function movePendingTurn(ctx, turnId, direction) {
             }
         }
     
+}
+
+export async function deletePendingTurn(ctx, turnId) {
+    const { isLikelyBackendDisconnect, noteBackendDisconnect, noteBackendRequestSucceeded, refreshSelectedSessionSnapshot, sessionId, setStatus, showToast } = ctx;
+    if (!sessionId || !turnId) return false;
+    try {
+        const response = await fetch(`/api/pending-turns/${encodeURIComponent(turnId)}`, {
+            method: "DELETE",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ sessionId })
+        });
+        const payload = await response.json().catch(() => null);
+        if (!response.ok || payload?.ok !== true) throw new Error(payload?.error || `API returned ${response.status}`);
+        noteBackendRequestSucceeded();
+        await refreshSelectedSessionSnapshot(sessionId);
+        setStatus("Queued prompt deleted");
+        return true;
+    } catch (error) {
+        if (isLikelyBackendDisconnect(error)) noteBackendDisconnect();
+        const detail = error instanceof Error ? error.message : "Unknown delete error";
+        showToast(`Delete failed: ${detail}`);
+        await refreshSelectedSessionSnapshot(sessionId);
+        return false;
+    }
+}
+
+export async function steerPendingTurn(ctx, turnId) {
+    const { isLikelyBackendDisconnect, noteBackendDisconnect, noteBackendRequestSucceeded, refreshSelectedSessionSnapshot, sessionId, setStatus, showToast } = ctx;
+    if (!sessionId || !turnId) return false;
+    try {
+        const response = await fetch(`/api/pending-turns/${encodeURIComponent(turnId)}/steer`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ sessionId })
+        });
+        const payload = await response.json().catch(() => null);
+        if (!response.ok || payload?.ok !== true) throw new Error(payload?.error || `API returned ${response.status}`);
+        noteBackendRequestSucceeded();
+        await refreshSelectedSessionSnapshot(sessionId);
+        setStatus("Queued prompt steered to the running agent");
+        return true;
+    } catch (error) {
+        if (isLikelyBackendDisconnect(error)) noteBackendDisconnect();
+        const detail = error instanceof Error ? error.message : "Unknown steer error";
+        showToast(`Steer failed: ${detail}`);
+        await refreshSelectedSessionSnapshot(sessionId);
+        return false;
+    }
 }
 
 export async function dropPendingTurn(ctx, targetTurnId) {

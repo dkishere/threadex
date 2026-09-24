@@ -1,0 +1,9 @@
+.archive-preview { height: 100%; overflow: auto; padding: 16px; font-size: 13px; }
+.archive-preview > p { margin: 0 0 14px; color: #64748b; }
+.archive-preview ul { list-style: none; padding-left: 20px; margin: 0; }
+.archive-preview > ul { padding-left: 0; }
+.archive-preview li { padding: 3px 0; }
+.archive-preview summary { cursor: pointer; overflow-wrap: anywhere; }
+.archive-file { display: flex; align-items: baseline; gap: 20px; padding-left: 16px; }
+.archive-file > span { overflow-wrap: anywhere; }
+.archive-file > small { margin-left: auto; color: #64748b; white-space: nowrap; }

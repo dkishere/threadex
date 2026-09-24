@@ -698,6 +698,56 @@
   box-shadow: 0 1px 2px rgb(15 23 42 / 4%);
 }
 
+.global-instructions-settings {
+  width: 100%;
+  max-width: 920px;
+  margin: 0 auto;
+}
+
+.global-instructions-card {
+  display: grid;
+  gap: 12px;
+  padding: 20px;
+}
+
+.global-instructions-card label {
+  font-weight: 600;
+}
+
+.global-instructions-card p {
+  margin: 0;
+  color: #475569;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.global-instructions-card textarea {
+  width: 100%;
+  min-height: 260px;
+  padding: 12px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  resize: vertical;
+  font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.global-instructions-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.global-instructions-actions button {
+  width: auto;
+}
+
+.global-instructions-card [role="alert"] {
+  color: #b91c1c;
+}
+
 .auto-model-settings {
   width: 100%;
   max-width: 920px;

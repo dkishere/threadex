@@ -8,6 +8,10 @@ export const AUTO_CONTEXT_MAX_CHARS = 20_000;
 const ENDPOINT = "https://api.typesafe.ai/v1/systemone";
 const FALLBACK = { model: DEFAULT_MODEL, effort: "high" } as const;
 
+export function shouldEnableAutoModel(selectedModel: string | undefined, requestedAutoModel: boolean | undefined): boolean {
+  return selectedModel === "auto" || requestedAutoModel === true;
+}
+
 export function truncateAutoInput(text: string, limit: number): string {
   if (text.length <= limit) return text;
   const marker = "\n[truncated]\n";

@@ -8,6 +8,21 @@ import { ProcessMonitorService } from "./processMonitor.js";
 import { SessionStore } from "./sessionStore.js";
 import { openPostgresSessionConnection, postgresSchemaFromStoreId } from "./sessionDb.js";
 
+test("failed process launches notify lifecycle observers", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "process-manager-failure-test-"));
+  const store = new SessionStore(resolve(root, "sessions.postgres"));
+  const failures: string[] = [];
+  const service = new ProcessMonitorService(store, { onExit: async monitor => { failures.push(monitor.status); } });
+  try {
+    await store.ready();
+    const workspace = await store.getActiveWorkspace();
+    await assert.rejects(service.monitor(workspace, { label: "Missing executable", exe: resolve(root, "does-not-exist"), args: [] }));
+    assert.deepEqual(failures, ["error"]);
+    const records = await store.listProcessMonitors(workspace.id);
+    assert.equal(records[0].status, "error");
+  } finally { service.stop(); await store.close(); }
+});
+
 test("command parameter migration checks the current schema even when another schema already has the columns", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "command-parameter-migration-test-"));
   const currentId = resolve(root, "current.postgres");

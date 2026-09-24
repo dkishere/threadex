@@ -220,7 +220,8 @@ export class ProcessMonitorService {
       await this.startProcess(record);
       return this.refreshMetrics((await this.store.getProcessMonitor(record.id)) ?? record, true);
     } catch (error) {
-      await this.store.updateProcessMonitor({ id: record.id, status: "error", error: errorMessage(error) });
+      const failed = await this.store.updateProcessMonitor({ id: record.id, status: "error", error: errorMessage(error) });
+      if (failed) await this.publishFailure(failed);
       throw error;
     }
   }
@@ -379,11 +380,13 @@ export class ProcessMonitorService {
     record = await this.refreshMetrics(record);
     if (record.pid === null) {
       if (record.status !== "starting") return record;
-      return (await this.store.updateProcessMonitor({
+      const failed = (await this.store.updateProcessMonitor({
         id: record.id,
         status: "error",
         error: record.error ?? "Process launch did not produce a process id."
       })) ?? record;
+      await this.publishFailure(failed);
+      return failed;
     }
     if (record.timeoutAt && Number.isFinite(Date.parse(record.timeoutAt)) && Date.parse(record.timeoutAt) <= Date.now()) {
       return this.expire(record);
@@ -478,8 +481,14 @@ export class ProcessMonitorService {
   private async markChildFailed(id: string, pid: number, error: string) {
     const current = await this.store.getProcessMonitor(id);
     if (current?.pid !== pid) return;
-    await this.store.updateProcessMonitor({ id, status: "error", pid: null, error });
+    const failed = await this.store.updateProcessMonitor({ id, status: "error", pid: null, error });
     this.children.delete(id);
+    if (failed) await this.publishFailure(failed);
+  }
+
+  private async publishFailure(record: ProcessMonitorRecord) {
+    try { await this.options.onExit?.(record); }
+    catch (error) { console.warn(`Failed to publish process failure ${record.id}: ${errorMessage(error)}`); }
   }
 
   private async markChildExited(id: string, pid: number, code: number | null, signal: NodeJS.Signals | null) {

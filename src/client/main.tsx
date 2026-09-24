@@ -16,6 +16,16 @@ import "./styles/app-10.css";
 import "./styles/app-11.css";
 import "./codexFollowup.css";
 
+const chunkReloadKey = "threadex:chunk-reload";
+window.addEventListener("vite:preloadError", (event) => {
+  event.preventDefault();
+  const now = Date.now();
+  const lastReload = Number(window.sessionStorage.getItem(chunkReloadKey) ?? 0);
+  if (now - lastReload < 30_000) return;
+  window.sessionStorage.setItem(chunkReloadKey, String(now));
+  window.location.reload();
+});
+
 function registerServiceWorker() {
   if (!window.isSecureContext || !("serviceWorker" in navigator)) return;
     void ensureNotificationWorker().catch((error: unknown) => {

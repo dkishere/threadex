@@ -299,9 +299,9 @@ export function isSkillSuggestion(ctx, value) {
 
 export function isDisplayableMessageSegment(ctx, segment) {
     const { isDisplayableLiveItem } = ctx;
-    return segment.type === "text" || segment.type === "steer" || (segment.item.itemType === "file_change" && segment.item.authoritative === true
+    return segment.type === "text" || (segment.type === "steer" && !segment.id.startsWith("steer:async:")) || (segment.type === "live" && (segment.item.itemType === "file_change" && segment.item.authoritative === true
         ? false
-        : isDisplayableLiveItem(segment.item));
+        : isDisplayableLiveItem(segment.item)));
 
 }
 

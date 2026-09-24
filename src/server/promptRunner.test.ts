@@ -7,6 +7,7 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { CONTEXT_FORK_USER_SUFFIX } from "../contextFork";
+import { WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS } from "./workspaceManagerRouting";
 import {
   CONTINUE_TODO_PLAN_USER_SUFFIX,
   FORCE_TODO_PLAN_DEVELOPER_INSTRUCTIONS,
@@ -2090,7 +2091,10 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5_000, diagnostics:
   throw new Error(`Timed out waiting for test condition. ${diagnostics()}`.trim());
 }
 
-test("lightweight runner enables outcome tools without planner mutation or grill gates", async () => {
+for (const variant of ["ordinary", "manager-direct", "manager-resume", "manager-event", "manager-recovery"]) test(variant !== "ordinary"
+  ? `workspace manager runner restricts execution and fixes Luna max for ${variant}`
+  : "lightweight runner enables outcome tools without planner mutation or grill gates", async () => {
+  const workspaceManagerRole = variant !== "ordinary";
   const root = mkdtempSync(resolve(tmpdir(), "prompt-runner-todo-language-"));
   const fakeCodexPath = resolve(root, "fake-codex.mjs");
   const jobPath = resolve(root, "job.json");
@@ -2107,7 +2111,11 @@ const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
 createInterface({ input: process.stdin }).on("line", (line) => {
   const request = JSON.parse(line);
   if (request.method === "initialize") send({ id: request.id, result: {} });
-  if (request.method === "thread/start") {
+  if (request.method === "thread/resume" && process.env.FAIL_RESUME === "1") {
+    send({ id: request.id, error: { code: -32000, message: "no rollout found for thread id thread-old" } });
+    return;
+  }
+  if (request.method === "thread/start" || request.method === "thread/resume") {
     writeFileSync(process.env.CAPTURED_THREAD_PATH, JSON.stringify(request.params));
     send({ id: request.id, result: { thread: { id: "thread-1" } } });
   }
@@ -2126,7 +2134,16 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     sessionId: "session-1",
     turnId: "turn-1",
     message: "請建立 todo plan，todo language 要跟返用戶 prompt",
-    lightweightTodo: true,
+    lightweightTodo: !workspaceManagerRole,
+    workspaceManager: workspaceManagerRole,
+    model: "gpt-6-astra",
+    modelReasoningEffort: "high",
+    autoModelEnabled: workspaceManagerRole,
+    ...(["manager-resume", "manager-event", "manager-recovery"].includes(variant) ? { threadId: "thread-old" } : {}),
+    ...(variant === "manager-recovery" ? { recoveryContext: {
+      reason: "thread_resume_failed", sourceThreadId: "thread-old", handoff: "Existing manager objectives and decisions."
+    } } : {}),
+    ...(variant === "manager-event" ? { turnId: "manager_activity_test", message: "Workspace activity notification. A task finished." } : {}),
     executionMode: "default",
     approvalPolicy: "on-request",
     logPath,
@@ -2141,7 +2158,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       CODEX_PATH: fakeCodexPath,
       CAPTURED_ARGS_PATH: capturedArgsPath,
       CAPTURED_THREAD_PATH: capturedThreadPath,
-      CAPTURED_TURN_PATH: capturedTurnPath
+      CAPTURED_TURN_PATH: capturedTurnPath,
+      FAIL_RESUME: variant === "manager-recovery" ? "1" : "0"
     },
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -2155,7 +2173,34 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   const thread = JSON.parse(readFileSync(capturedThreadPath, "utf8"));
   const turn = JSON.parse(readFileSync(capturedTurnPath, "utf8"));
   const config = thread.config.mcp_servers.session_inspector;
+  if (workspaceManagerRole) {
+    assert.equal(thread.threadId, ["manager-resume", "manager-event"].includes(variant) ? "thread-old" : undefined);
+    for (const instructions of [thread.developerInstructions, turn.settings.developer_instructions]) {
+      assert.ok(instructions.includes(WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS), `${variant} must install the current routing policy`);
+    }
+    assert.equal(config.env.THREADEX_WORKSPACE_MANAGER, "1");
+    assert.equal(config.env.THREADEX_CONTINUITY_ONLY, "0");
+    assert.equal(config.env.THREADEX_AUTO_MODEL, "0");
+    assert.equal(thread.model, "gpt-6-luna");
+    assert.equal(turn.model, "gpt-6-luna");
+    assert.equal(turn.effort, "max");
+    assert.equal(thread.sandbox, "read-only");
+    assert.equal(turn.sandboxPolicy.type, "readOnly");
+    assert.equal(thread.config.features.shell_tool, false);
+    assert.equal(thread.config.features.multi_agent, false);
+    assert.equal(config.tools.workspace_create_task.approval_mode, "approve");
+    assert.equal(config.tools.workspace_fork_task.approval_mode, "approve");
+    assert.equal(config.tools.workspace_stop_task.approval_mode, "approve");
+    assert.match(turn.settings.developer_instructions, /dedicated manager/);
+    assert.match(turn.settings.developer_instructions, /ordinary session history is your memory/);
+    assert.doesNotMatch(turn.settings.developer_instructions, /MUST use these tools instead of update_plan/);
+    return;
+  }
   assert.equal(config.env.THREADEX_LIGHTWEIGHT_TODO, "1");
+  assert.doesNotMatch(thread.developerInstructions, /Workspace manager task routing policy/);
+  assert.doesNotMatch(turn.settings.developer_instructions, /Workspace manager task routing policy/);
+  assert.equal(turn.model, "gpt-6-astra");
+  assert.equal(turn.effort, "high");
   assert.equal(config.env.THREADEX_TODO_AGENT_ROLE, "default");
   assert.equal(config.env.THREADEX_CONTINUITY_ONLY, "0");
   assert.ok(config.tools.outcome_plan_set);

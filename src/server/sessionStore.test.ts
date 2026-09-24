@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
 import { parseSessionListSearchTerms, SessionStore } from "./sessionStore.js";
+import { buildTurnGrillMidTurnInputs } from "./turnGrill.js";
+import { USER_INPUT_METHOD } from "../userInputRequest.js";
 
 test("default workspace migrates legacy codex home to workspace-specific home", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "session-default-home-test-"));
@@ -330,6 +332,34 @@ test("session turn effort falls back to a recorded setting when the preferred to
     const [turn] = await store.listSessionTurns("session-1");
     assert.equal(turn?.usageSample?.source, "native_token_count");
     assert.equal(turn?.reasoningEffort, "xhigh");
+  } finally {
+    await store.close();
+  }
+});
+
+test("session turn model falls back when the preferred usage sample has no model", async () => {
+  const store = await createStore();
+  try {
+    await store.recordTokenUsage([
+      { id: "agent:turn:turn-1", usageType: "agent", source: "turn_started", sessionId: "session-1",
+        turnId: "turn-1", model: "gpt-6-luna", metadata: { reasoningEffort: "max" } },
+      { id: "agent:sample:turn-1:app-server", usageType: "agent", source: "app_server", sessionId: "session-1",
+        turnId: "turn-1", sourceTimestamp: "2026-09-03T09:06:33.000Z", primaryUsedPercent: 2 }
+    ]);
+    const [turn] = await store.listSessionTurns("session-1");
+    assert.equal(turn?.usageSample?.source, "app_server");
+    assert.equal(turn?.model, "gpt-6-luna");
+    assert.equal(turn?.reasoningEffort, "max");
+    await store.recordTokenUsage([{
+      id: "agent:sample:turn-1:native", usageType: "agent", source: "native_token_count",
+      sessionId: "session-1", turnId: "turn-1", model: "gpt-6-sol",
+      sourceTimestamp: "2026-09-03T09:06:32.000Z", primaryUsedPercent: 1,
+      metadata: { reasoningEffort: "xhigh" }
+    }]);
+    const [updated] = await store.listSessionTurns("session-1");
+    assert.equal(updated?.usageSample?.source, "app_server");
+    assert.equal(updated?.model, "gpt-6-sol");
+    assert.equal(updated?.reasoningEffort, "xhigh");
   } finally {
     await store.close();
   }
@@ -755,6 +785,87 @@ test("persists accepted steer messages for session snapshots", async () => {
       steers["turn-1"]?.[1] && { ...steers["turn-1"]?.[1], created: undefined }
     );
     assert.ok(restoredCurrentSteer?.created);
+  } finally {
+    await store.close();
+  }
+});
+
+test("grill orders a QA answer after a manual steer made while the question was pending", async () => {
+  const store = await createStore();
+  const params = { questions: [{ id: "scope", header: "Scope", question: "Which endpoint?" }] };
+  const decision = { answers: { scope: { answers: ["The existing endpoint"] } } };
+  try {
+    await store.recordSessionTurnEvent({
+      id: "approval.requested:qa",
+      turnId: "turn-1", sessionId: "session-1", eventName: "approval.requested",
+      payload: { approvalId: "qa", method: USER_INPUT_METHOD, params }
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await store.recordSessionTurnEvent({
+      id: "steer:manual",
+      turnId: "turn-1", sessionId: "session-1", eventName: "steer",
+      payload: { id: "manual", content: "Use the existing endpoint" }
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await store.recordSessionTurnEvent({
+      id: "approval.decision:qa",
+      turnId: "turn-1", sessionId: "session-1", eventName: "approval.decision",
+      payload: { approvalId: "qa", method: USER_INPUT_METHOD, decision }
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await store.recordSessionTurnEvent({
+      id: "approval.resolved:qa",
+      turnId: "turn-1", sessionId: "session-1", eventName: "approval.resolved",
+      payload: { approvalId: "qa", method: USER_INPUT_METHOD, params, decision }
+    });
+
+    const [approvalsByTurn, steersByTurn] = await Promise.all([
+      store.listSessionApprovalLiveItems("session-1"), store.listSessionSteerMessages("session-1")
+    ]);
+    const approvals = approvalsByTurn["turn-1"] as Array<Record<string, unknown>>;
+    const steers = steersByTurn["turn-1"];
+    assert.equal(approvals[0].status, "resolved");
+    assert.ok(Date.parse(approvals[0].answerSubmittedAt as string) > Date.parse(steers[0].created));
+    assert.ok(Date.parse(approvals[0].sortCreated as string) > Date.parse(approvals[0].answerSubmittedAt as string));
+    assert.ok(Date.parse(approvals[0].sortCreated as string) > Date.parse(steers[0].created));
+    assert.deepEqual(buildTurnGrillMidTurnInputs(approvals, steers).map((entry) => entry.kind), ["steer", "qa"]);
+  } finally {
+    await store.close();
+  }
+});
+
+test("grill uses QA submission time when a manual steer arrives before resolution", async () => {
+  const store = await createStore();
+  const params = { questions: [{ id: "scope", header: "Scope", question: "Which endpoint?" }] };
+  const decision = { answers: { scope: { answers: ["The existing endpoint"] } } };
+  try {
+    await store.recordSessionTurnEvent({
+      id: "approval.requested:qa", turnId: "turn-1", sessionId: "session-1", eventName: "approval.requested",
+      payload: { approvalId: "qa", method: USER_INPUT_METHOD, params }
+    });
+    await store.recordSessionTurnEvent({
+      id: "approval.decision:qa", turnId: "turn-1", sessionId: "session-1", eventName: "approval.decision",
+      payload: { approvalId: "qa", method: USER_INPUT_METHOD, decision }
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await store.recordSessionTurnEvent({
+      id: "steer:manual", turnId: "turn-1", sessionId: "session-1", eventName: "steer",
+      payload: { id: "manual", content: "Use the existing endpoint" }
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await store.recordSessionTurnEvent({
+      id: "approval.resolved:qa", turnId: "turn-1", sessionId: "session-1", eventName: "approval.resolved",
+      payload: { approvalId: "qa", method: USER_INPUT_METHOD, params, decision }
+    });
+
+    const [approvalsByTurn, steersByTurn] = await Promise.all([
+      store.listSessionApprovalLiveItems("session-1"), store.listSessionSteerMessages("session-1")
+    ]);
+    const approvals = approvalsByTurn["turn-1"] as Array<Record<string, unknown>>;
+    const steers = steersByTurn["turn-1"];
+    assert.ok(Date.parse(approvals[0].answerSubmittedAt as string) < Date.parse(steers[0].created));
+    assert.ok(Date.parse(approvals[0].sortCreated as string) > Date.parse(steers[0].created));
+    assert.deepEqual(buildTurnGrillMidTurnInputs(approvals, steers).map((entry) => entry.kind), ["qa", "steer"]);
   } finally {
     await store.close();
   }

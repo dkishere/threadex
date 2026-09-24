@@ -1,4 +1,5 @@
 import { AUTO_MODEL_ORDER } from "../modelCatalog";
+import { WORKSPACE_MANAGER_TOOLS, WORKSPACE_MANAGER_ACTIONS } from "./workspaceManagerTools";
 import { createInterface } from "node:readline";
 import { createTurnGrillHistoryReader } from "./turnGrillContext";
 import {
@@ -51,6 +52,7 @@ type SessionPromptInput = {
 
 const apiBaseUrl = process.env.SESSION_INSPECTOR_SERVER_URL?.replace(/\/$/, "") || null;
 const managerSessionId = process.env.THREADEX_SESSION_ID?.trim() || null;
+const workspaceManager = process.env.THREADEX_WORKSPACE_MANAGER === "1";
 const managerThreadId = process.env.THREADEX_THREAD_ID?.trim() || null;
 const managerTurnId = process.env.THREADEX_TURN_ID?.trim() || null;
 const autoModelEnabled = process.env.THREADEX_AUTO_MODEL === "1";
@@ -724,6 +726,7 @@ tools.push({
 });
 
 function toolsForAgent() {
+  if (workspaceManager) return WORKSPACE_MANAGER_TOOLS;
   if (todoAgentRole === "turn_grill") return tools.filter((tool) => tool.name === "get_session");
   if (lightweightTodo) return tools.filter((tool) => !tool.name.startsWith("todo_"));
   if (continuityOnly) {
@@ -828,6 +831,13 @@ async function callTool(params: unknown) {
 
   if (!name || !isToolExposed(name)) {
     throw new Error(`Tool is not available to this ${todoAgentRole} agent: ${name ?? "unknown"}`);
+  }
+
+  if (workspaceManager && WORKSPACE_MANAGER_ACTIONS[name]) {
+    if (!managerSessionId) throw new Error("Workspace manager session is unavailable.");
+    return toolResult(await postJson(`/api/workspace-manager/${encodeURIComponent(managerSessionId)}/action`, {
+      ...args, action: WORKSPACE_MANAGER_ACTIONS[name]
+    }));
   }
 
   if (name === "outcome_plan_get" || name === "outcome_plan_set") {

@@ -1,5 +1,6 @@
 // @ts-nocheck
 import { eventStore } from "./eventStore";
+import { acknowledgeSubmissionEvent } from "./pendingSubmissions";
 export async function openLinkedSession(ctx, record) {
     const { activeWorkspace, switchSession, switchWorkspace } = ctx;
         if (record.url) {
@@ -197,6 +198,7 @@ export async function forkFromAgentMessage(ctx, message) {
 }
 
 export function handleStreamEvent(ctx, event, target) {
+    acknowledgeSubmissionEvent(event, target.turnId);
     if (event.type === "grill_ack") {
         eventStore.reportGrill(event.data.sessionId, event.data.turnId, event.data.grill);
         return;
@@ -310,7 +312,8 @@ export function handleStreamEvent(ctx, event, target) {
                     model: event.data.model,
                     reasoningEffort: event.data.effort,
                     autoModel: true,
-                    autoModelProvider: event.data.provider
+                    autoModelProvider: event.data.provider,
+                    autoModelConfidence: event.data.confidence
                 }
                 : message));
             if (isTargetVisible(target)) {

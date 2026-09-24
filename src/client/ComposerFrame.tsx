@@ -1,5 +1,5 @@
 import { Cog } from "lucide-react";
-import { useEffect, useRef, useState, type DragEvent, type ReactNode } from "react";
+import { useEffect, useRef, useState, type DragEvent, type MouseEvent, type ReactNode } from "react";
 import type { ModelReasoningEffort } from "./appTypes";
 import { COMPACT_FILE_DROP_QUERY } from "./globalFileDrop";
 
@@ -61,7 +61,17 @@ function compactModelLabel(model: string, label: string, isAuto: boolean) {
 }
 
 export function ComposerFrame({ children }: ComposerFrameProps) {
-  return <div className="composer-layout">{children}</div>;
+  function preserveEditorFocus(event: MouseEvent<HTMLDivElement>) {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const button = target.closest("button");
+    if (!button && !target.closest(".composer-gear-radio")) return;
+    if (button?.classList.contains("send-button")) return;
+    const editor = event.currentTarget.querySelector(".composer-editor");
+    if (editor?.contains(document.activeElement)) event.preventDefault();
+  }
+
+  return <div className="composer-layout" onMouseDownCapture={preserveEditorFocus}>{children}</div>;
 }
 
 export function ComposerSurface({ children, onDropFiles: onDesktopDropFiles }: ComposerSurfaceProps) {
@@ -217,7 +227,14 @@ export function ComposerGearSelector({
             const gearLabel = isAuto ? "Auto" : `${compactModelLabel(gear.model, modelOptionLabel(gear.model), isAuto)}·${COMPACT_EFFORT_LABELS[selectedEffort]}`;
 
             return (
-              <label className="composer-gear-radio" data-active={isActive ? "true" : undefined} title={gearTitle} key={index}>
+              <label className="composer-gear-radio" data-active={isActive ? "true" : undefined} title={gearTitle} key={index} onClick={(event) => {
+                if (disabled) return;
+                if (event.target instanceof HTMLInputElement) return;
+                const editor = event.currentTarget.closest(".composer-layout")?.querySelector(".composer-editor");
+                if (!editor?.contains(document.activeElement)) return;
+                event.preventDefault();
+                onActivateGear(index);
+              }}>
                 <input
                   id={`${idPrefix}-${index + 1}`}
                   type="radio"

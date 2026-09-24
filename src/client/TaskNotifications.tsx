@@ -74,19 +74,22 @@ export function TaskNotifications({ runningCount }: { runningCount: number }) {
 
   useEffect(() => eventStore.subscribeTo(["runner.result", "runner.error"], (event) => {
     if (!event.sessionId || !event.turnId || Date.parse(event.timestamp) < startedAt.current) return;
+    const payload = record(event.payload);
+    if (payload.silent === true || payload.workspaceManaged === true) return;
     const key = `${event.workspaceId}:${event.turnId}`;
     if (seen.current.has(key)) return;
     seen.current.add(key);
     if (seen.current.size > 500) seen.current.delete(seen.current.values().next().value!);
-    const text = event.type === "runner.error" ? "Task failed" : "Task completed";
-    const url = navigationUrl({ workspaceId: event.workspaceId, sessionId: event.sessionId }, `${location.origin}/`);
+    const text = payload.workspaceManager === true ? "Workspace update" : event.type === "runner.error" ? "Task failed" : "Task completed";
+    const url = navigationUrl({ workspaceId: event.workspaceId, sessionId: payload.workspaceManager === true ? null : event.sessionId, view: payload.workspaceManager === true ? "workspace-chat" : null },
+      `${location.origin}/${payload.workspaceManager === true ? "?view=workspace-chat" : ""}`);
     void registration().then(async (worker) => {
       if (!worker) return;
       const name = await notificationTaskName(event.sessionId!);
       const tag = `threadex-turn-${key}`;
       const expiresAt = Date.now() + NOTIFICATION_TTL_MS;
       await worker.showNotification(`Threadex · ${text}`, {
-        body: name, icon: "/icons/threadex-192.png",
+        body: payload.workspaceManager === true && typeof payload.reply === "string" ? payload.reply.slice(0, 220) : name, icon: "/icons/threadex-192.png",
         tag, requireInteraction: true, data: { url, expiresAt }
       });
       scheduleExpiry(worker, tag, expiresAt);

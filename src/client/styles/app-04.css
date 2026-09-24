@@ -801,7 +801,8 @@
   white-space: nowrap;
 }
 .prompt-turn-auto-prefix { color: #1d4ed8; font-weight: 850; }
-.prompt-turn-auto-prefix[data-provider="typesafe"] { color: #dc2626; }
+.prompt-turn-auto-prefix[data-provider="typesafe"] { color: #16a34a; }
+.prompt-turn-auto-prefix[data-provider="typesafe"][data-low-confidence="true"] { color: #dc2626; }
 .prompt-turn-toolbar-model-group {
   display: inline-flex;
   align-items: center;
@@ -822,6 +823,11 @@
   line-height: 1;
 }
 .prompt-turn-auto-badge[data-provider="typesafe"] {
+  border-color: #86efac;
+  background: #dcfce7;
+  color: #16a34a;
+}
+.prompt-turn-auto-badge[data-provider="typesafe"][data-low-confidence="true"] {
   border-color: #fca5a5;
   background: #fee2e2;
   color: #dc2626;

@@ -1,5 +1,16 @@
 // @ts-nocheck
 import { DEFAULT_MODEL } from "../modelCatalog";
+import { savePendingSubmission, removePendingSubmission, beginSubmission, finishSubmission, isSubmissionSending } from "./pendingSubmissions";
+
+function preserveSubmission(ctx, entry) {
+    try {
+        savePendingSubmission({ createdAt: new Date().toISOString(), ...entry });
+        return true;
+    } catch {
+        ctx.setStatus("Prompt not sent: unable to save locally. Free browser storage and try again.");
+        return false;
+    }
+}
 export function currentClientLayout() {
     return window.matchMedia("(width < 768px)").matches ? "mobile"
         : window.matchMedia("(width < 1080px)").matches ? "tablet" : "desktop";
@@ -250,6 +261,7 @@ export function askAboutResponseQuote(ctx, quote) {
 export async function submit(ctx, event, modeOverride?: string) {
     const { attachments, commitQueuedPromptEdit, composerLinkToken, composerMode, composerResponseQuote, composerSessionLinks, composerTodoPlanModeEnabled, currentSessionIsRunning, enqueuePrompt, executionMode, forkNextPrompt, formatComposerLinkMarkdown, formatResponseAnnotationsPrompt, input, queuePrompt, queuedPromptEditRef, replaceComposerLinkTokens, selectedSkills, sessionIdRef, setComposerExecutionMode, setComposerForkNextPrompt, startChatTurn, steerPrompt } = ctx;
         event?.preventDefault();
+        if (isSubmissionSending(sessionIdRef.current)) return;
         if (queuedPromptEditRef?.current) {
             const editedMessage = input.trim();
             if (editedMessage) {
@@ -286,7 +298,7 @@ export async function submit(ctx, event, modeOverride?: string) {
         if (forkNextPrompt && submissionMode !== "steer" && sessionIdRef.current) {
             setComposerForkNextPrompt(false);
             if (currentSessionIsRunning) {
-                enqueuePrompt(message, "queue", executionMode, turnSkills, attachments, true, forcePlan);
+                await enqueuePrompt(message, "queue", executionMode, turnSkills, attachments, true, forcePlan);
             }
             else {
                 await startChatTurn(message, attachments, executionMode, turnSkills, true, forcePlan);
@@ -298,7 +310,7 @@ export async function submit(ctx, event, modeOverride?: string) {
                 await steerPrompt(message, attachments, true, turnSkills, forcePlan);
             }
             else {
-                queuePrompt(message, executionMode, turnSkills, forcePlan);
+                await queuePrompt(message, executionMode, turnSkills, forcePlan);
             }
             return;
         }
@@ -306,9 +318,37 @@ export async function submit(ctx, event, modeOverride?: string) {
     
 }
 
-export async function startChatTurn(ctx, message, turnAttachments, turnExecutionMode, turnSkills, contextForkRequest, forcePlan, clearComposer, grillOrigin = undefined) {
+export async function startChatTurn(ctx, message, turnAttachments, turnExecutionMode, turnSkills, contextForkRequest, forcePlan, clearComposer, grillOrigin = undefined, submissionId: string | undefined = undefined) {
     const { AUTO_MODEL_VALUE, activeAccount, activeWorkspace, activeWorkspaceIdRef, approvalPolicy, clearComposerInputDraft, clearComposerSessionLinks, composerDraftSessionIdRef, currentModelPreferences, explicitNewSessionRef, handleStreamEvent, isLikelyBackendDisconnect, markTurnFinished, markTurnRunning, modelPreferencesWorkspaceIdRef, moveStoredComposerDraft, newSessionBaseSessionIdRef, newSessionProjectRef, noteBackendDisconnect, noteBackendRequestSucceeded, patchAssistantMessage, persistedModelPreferencesWorkspaceIdRef, readEventStream, reconnectRunner, registerStreamTarget, restoreKnownActiveSessionBeforeSend, resumeThreadId, scheduleLoadSessions, selectedModel, sessionAutoModel, sessionIdRef, setActiveSessionId, setActiveTurnId, setAttachments, setComposerResponseQuote, setMessages, setResponseQuotePopover, setSelectedSkills, setSessionId, setSlashTrigger, setStatus, stickToMessageBottomRef, streamTargetsRef, unregisterStreamTarget, updateNavigationUrl, useLoadBalanceInWorkspace, viewKeyRef } = ctx;
         const workspaceId = currentWorkspaceId(activeWorkspaceIdRef, activeWorkspace);
+        if (isSubmissionSending(sessionIdRef.current)) return false;
+        stickToMessageBottomRef.current = true;
+        setStatus(contextForkRequest ? "Preparing child task handoff" : "Connecting to Codex");
+        const turnId = submissionId ?? crypto.randomUUID();
+        const provisionalSessionId = sessionIdRef.current ?? `tx_${crypto.randomUUID()}`;
+        const submission = {
+            id: turnId, turnId, sessionId: provisionalSessionId, workspaceId, kind: "prompt", message,
+            attachments: turnAttachments,
+            settings: { executionMode: turnExecutionMode, skills: turnSkills, contextFork: contextForkRequest,
+                forcePlan, grillOrigin, modelPreferences: currentModelPreferences(), approvalPolicy }
+        };
+        // Even restoring the selected session can make a network request.
+        // Preserve the input before the first await, then rebind it if necessary.
+        if (!preserveSubmission(ctx, submission)) return false;
+        beginSubmission(turnId, sessionIdRef.current);
+        try {
+        // Allocate the local session id before opening the stream. This keeps the
+        // turn associated with a durable session even if the user switches views
+        // before the runner's first SSE event arrives.
+        const restoredSessionId = sessionIdRef.current ?? await restoreKnownActiveSessionBeforeSend();
+        if (restoredSessionId === false) {
+            return false;
+        }
+        const currentSessionId = restoredSessionId;
+        const targetSessionId = currentSessionId ?? provisionalSessionId;
+        if (targetSessionId !== provisionalSessionId &&
+            !preserveSubmission(ctx, { ...submission, sessionId: targetSessionId })) return false;
+        beginSubmission(turnId, targetSessionId);
         if (clearComposer) {
             clearComposerInputDraft();
             setAttachments([]);
@@ -318,18 +358,6 @@ export async function startChatTurn(ctx, message, turnAttachments, turnExecution
             setSelectedSkills([]);
             setSlashTrigger(null);
         }
-        stickToMessageBottomRef.current = true;
-        setStatus(contextForkRequest ? "Preparing child task handoff" : "Connecting to Codex");
-        const turnId = crypto.randomUUID();
-        // Allocate the local session id before opening the stream. This keeps the
-        // turn associated with a durable session even if the user switches views
-        // before the runner's first SSE event arrives.
-        const restoredSessionId = sessionIdRef.current ?? await restoreKnownActiveSessionBeforeSend();
-        if (restoredSessionId === false) {
-            return;
-        }
-        const currentSessionId = restoredSessionId;
-        const targetSessionId = currentSessionId ?? `tx_${crypto.randomUUID()}`;
         if (!currentSessionId) {
             moveStoredComposerDraft(null, targetSessionId);
             composerDraftSessionIdRef.current = targetSessionId;
@@ -443,12 +471,15 @@ export async function startChatTurn(ctx, message, turnAttachments, turnExecution
         finally {
             unregisterStreamTarget(target, turnId);
         }
+        } finally {
+            finishSubmission(turnId);
+        }
     
 }
 
 export function queuePrompt(ctx, message, mode, skills, forcePlan) {
     const { attachments, enqueuePrompt } = ctx;
-        enqueuePrompt(message, "queue", mode, skills, attachments, false, forcePlan);
+        return enqueuePrompt(message, "queue", mode, skills, attachments, false, forcePlan);
     
 }
 
@@ -456,12 +487,19 @@ export async function steerPrompt(ctx, message, steerAttachments, clearComposer,
     const { addSteerMessage, clearComposerInputDraft, clearComposerSessionLinks, currentRunningTurnId, enqueuePrompt, executionMode, isInactiveSteerResponse, isLikelyBackendDisconnect, isSteering, noteBackendDisconnect, noteBackendRequestSucceeded, parseResponseAnnotations, refreshSelectedSessionSnapshot, sessionIdRef, setAttachments, setComposerForcePlanNextPrompt, setComposerInput, setComposerResponseQuote, setIsSteering, setResponseQuotePopover, setSelectedSkills, setSlashTrigger, setStatus, showToast } = ctx;
         const turnId = currentRunningTurnId;
         const targetSessionId = sessionIdRef.current;
-        if (!turnId || !targetSessionId || isSteering) {
+        if (!turnId || !targetSessionId || isSteering || isSubmissionSending(targetSessionId)) {
             if (!isSteering) {
                 showToast("No active agent turn to steer.");
             }
             return false;
         }
+        const submissionId = crypto.randomUUID();
+        if (!preserveSubmission(ctx, {
+            id: submissionId, turnId, sessionId: targetSessionId,
+            workspaceId: ctx.activeWorkspaceIdRef?.current ?? null, kind: "steer", message,
+            attachments: steerAttachments, settings: { skills: steerSkills, forcePlan }
+        })) return false;
+        beginSubmission(submissionId, targetSessionId);
         if (clearComposer) {
             clearComposerInputDraft();
             setAttachments([]);
@@ -489,7 +527,7 @@ export async function steerPrompt(ctx, message, steerAttachments, clearComposer,
                 })
             });
             const payload = (await response.json().catch(() => null));
-            if (!response.ok) {
+            if (!response.ok || payload?.ok !== true) {
                 const detail = typeof payload?.error === "string" ? payload.error : `API returned ${response.status}`;
                 if (isInactiveSteerResponse(response.status, detail)) {
                     noteBackendRequestSucceeded();
@@ -500,6 +538,7 @@ export async function steerPrompt(ctx, message, steerAttachments, clearComposer,
             }
             noteBackendRequestSucceeded();
             const savedAttachments = Array.isArray(payload?.attachments) ? payload.attachments : steerAttachments;
+            removePendingSubmission(submissionId);
             addSteerMessage(targetSessionId, turnId, message, savedAttachments, steerCreatedAt, forcePlan, typeof payload?.commandId === "string" ? payload.commandId : undefined);
             setStatus(typeof payload?.message === "string" ? payload.message : "Agent steered.");
             return "sent";
@@ -522,6 +561,7 @@ export async function steerPrompt(ctx, message, steerAttachments, clearComposer,
             return false;
         }
         finally {
+            finishSubmission(submissionId);
             setIsSteering(false);
         }
     
@@ -557,55 +597,70 @@ export function addSteerMessage(ctx, sessionId, turnId, content, steerAttachment
     
 }
 
-export function enqueuePrompt(ctx, message, kind, mode, skills, promptAttachments, contextFork, forcePlan, clearComposer) {
-    const { clearComposerInputDraft, clearComposerSessionLinks, setAttachments, setComposerResponseQuote, setQueuedPrompts, setResponseQuotePopover, setSelectedSkills, setSlashTrigger, setStatus } = ctx;
-        if (clearComposer) {
-            clearComposerInputDraft();
-            setAttachments([]);
-            setComposerResponseQuote(null);
-            setResponseQuotePopover(null);
-            clearComposerSessionLinks();
-            setSelectedSkills([]);
-            setSlashTrigger(null);
-        }
-        const queuedAttachments = promptAttachments;
-        const prompt = {
-            id: crypto.randomUUID(),
-            kind,
-            content: message,
-            attachments: queuedAttachments,
-            executionMode: mode,
-            skills,
-            contextFork,
-            forcePlan,
-            requestSettings: ctx.requestSettings
-        };
-        setQueuedPrompts((current) => {
-            if (kind === "queue") {
-                return [...current, prompt];
-            }
-            const firstQueuedIndex = current.findIndex((candidate) => candidate.kind === "queue");
-            if (firstQueuedIndex < 0) {
-                return [...current, prompt];
-            }
-            return [...current.slice(0, firstQueuedIndex), prompt, ...current.slice(firstQueuedIndex)];
-        });
-        setStatus(contextFork ? "Child task handoff queued" : kind === "steer" ? "Steer queued" : "Prompt queued");
-    
-}
+export function enqueuePrompt(ctx, message, kind, mode, skills, promptAttachments, contextFork, forcePlan, clearComposer = true) {
+    const {
+        activeWorkspaceIdRef, clearComposerInputDraft, clearComposerSessionLinks,
+        isLikelyBackendDisconnect, noteBackendDisconnect, noteBackendRequestSucceeded,
+        refreshSelectedSessionSnapshot, sessionIdRef, setAttachments,
+        setComposerResponseQuote, setResponseQuotePopover, setSelectedSkills,
+        setSlashTrigger, setStatus
+    } = ctx;
+    const sessionId = sessionIdRef.current;
+    const id = crypto.randomUUID();
+    if (!sessionId || !preserveSubmission(ctx, {
+        id, turnId: id, sessionId,
+        workspaceId: activeWorkspaceIdRef.current, kind: "prompt", message,
+        attachments: promptAttachments,
+        settings: { queued: true, executionMode: mode, skills, contextFork, forcePlan, ...ctx.requestSettings }
+    })) return false;
 
-export async function runQueuedPrompt(ctx, ) {
-    const { currentSessionIsRunning, queuedPromptsRef, setQueuedPrompts, startChatTurn } = ctx;
-        if (currentSessionIsRunning) {
-            return;
+    beginSubmission(id, sessionId);
+    return (async () => {
+        try {
+            const response = await fetch("/api/pending-turns", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    ...ctx.requestSettings,
+                    sessionId,
+                    turnId: id,
+                    workspaceId: activeWorkspaceIdRef.current ?? undefined,
+                    message,
+                    attachments: promptAttachments,
+                    executionMode: mode,
+                    skills,
+                    contextFork,
+                    forcePlan
+                })
+            });
+            const payload = await response.json().catch(() => null);
+            if (!response.ok || !payload?.ok || !payload.turn) {
+                throw new Error(payload?.error || `API returned ${response.status}`);
+            }
+            noteBackendRequestSucceeded?.();
+            removePendingSubmission(id);
+            if (clearComposer) {
+                clearComposerInputDraft();
+                setAttachments([]);
+                setComposerResponseQuote(null);
+                setResponseQuotePopover(null);
+                clearComposerSessionLinks();
+                setSelectedSkills([]);
+                setSlashTrigger(null);
+            }
+            setStatus(contextFork ? "Child task handoff queued" : kind === "steer" ? "Steer queued" : "Prompt queued");
+            await refreshSelectedSessionSnapshot?.(sessionId, id);
+            return true;
         }
-        const nextPrompt = queuedPromptsRef.current[0];
-        if (!nextPrompt) {
-            return;
+        catch (error) {
+            if (isLikelyBackendDisconnect?.(error)) noteBackendDisconnect?.();
+            setStatus(`Queue failed: ${error instanceof Error ? error.message : "Unknown error"}`);
+            return false;
         }
-        setQueuedPrompts((current) => current.filter((prompt) => prompt.id !== nextPrompt.id));
-        await startChatTurn(nextPrompt.content, nextPrompt.attachments, nextPrompt.executionMode ?? "default", nextPrompt.skills ?? [], nextPrompt.contextFork === true, nextPrompt.forcePlan === true);
-    
+        finally {
+            finishSubmission(id);
+        }
+    })();
 }
 
 export async function loadSessionSearchPage(ctx, offset = 0, signal) {

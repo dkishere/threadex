@@ -1,4 +1,5 @@
 export type NavigationTarget = {
+  view?: "workspace-chat" | null;
   workspaceId: string | null;
   sessionId: string | null;
   turnId?: string | null;
@@ -14,6 +15,7 @@ export function readNavigationTarget(href = window.location.href): NavigationTar
   return {
     workspaceId: nonEmptyQueryValue(url.searchParams.get(WORKSPACE_QUERY_KEY)),
     sessionId: nonEmptyQueryValue(url.searchParams.get(SESSION_QUERY_KEY)),
+    ...(url.searchParams.get("view") === "workspace-chat" ? { view: "workspace-chat" as const } : {}),
     ...(url.searchParams.get("turnId") ? { turnId: nonEmptyQueryValue(url.searchParams.get("turnId")) } : {}),
     ...(url.searchParams.get("turnNumbers") ? { turnNumbers: nonEmptyQueryValue(url.searchParams.get("turnNumbers")) } : {}),
     ...(url.searchParams.get("threadId") ? { threadId: nonEmptyQueryValue(url.searchParams.get("threadId")) } : {})
@@ -33,6 +35,7 @@ export function navigationUrl(target: NavigationTarget, href = window.location.h
   const url = new URL(href, window.location.origin);
   setQueryValue(url, WORKSPACE_QUERY_KEY, target.workspaceId);
   setQueryValue(url, SESSION_QUERY_KEY, target.sessionId);
+  setQueryValue(url, "view", target.view ?? null);
   setQueryValue(url, "turnId", target.turnId ?? null);
   setQueryValue(url, "turnNumbers", target.turnNumbers ?? null);
   setQueryValue(url, "threadId", target.threadId ?? null);

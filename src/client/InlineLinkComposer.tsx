@@ -84,6 +84,7 @@ function keepFocusAtEnd(editor: Editor) {
 }
 
 type Props = {
+  disabled?: boolean;
   value: string;
   links: ComposerInlineLink[];
   placeholder: string;
@@ -125,8 +126,10 @@ function serializedCaretOffset(nodes: ComposerNode[], path: number[], offset: nu
   return "text" in node ? result + Math.min(offset, node.text.length) : result;
 }
 
-export const InlineLinkComposer = forwardRef<InlineLinkComposerHandle, Props>(function InlineLinkComposer({ value, links, placeholder, onChange, onPasteLink, onRemoveLink, onOpenLink, onUnhandledPaste, onKeyDown, onBlur }, ref) {
+export const InlineLinkComposer = forwardRef<InlineLinkComposerHandle, Props>(function InlineLinkComposer({ value, links, placeholder, disabled = false, onChange, onPasteLink, onRemoveLink, onOpenLink, onUnhandledPaste, onKeyDown, onBlur }, ref) {
   const editableRef = useRef<HTMLDivElement | null>(null);
+  const disabledRef = useRef(disabled);
+  disabledRef.current = disabled;
   const onChangeRef = useRef(onChange);
   const pasteLinkRef = useRef(onPasteLink);
   onChangeRef.current = onChange;
@@ -135,6 +138,7 @@ export const InlineLinkComposer = forwardRef<InlineLinkComposerHandle, Props>(fu
     const nextEditor = withHistory(withInlineLinks(withReact(createEditor())));
     const { insertData } = nextEditor;
     nextEditor.insertData = (data) => {
+      if (disabledRef.current) return;
       const id = pasteLinkRef.current(data.getData("text/plain"));
       if (id) {
         insertInlineLink(nextEditor, id);
@@ -166,6 +170,10 @@ export const InlineLinkComposer = forwardRef<InlineLinkComposerHandle, Props>(fu
     if (!element) return;
     const handlePaste = (event: ClipboardEvent) => {
       if (!(event.target instanceof Node) || !element.contains(event.target)) return;
+      if (disabledRef.current) {
+        event.preventDefault();
+        return;
+      }
       const text = event.clipboardData?.getData("text/plain") ?? "";
       const id = pasteLinkRef.current(text);
       if (!id) return;
@@ -205,14 +213,14 @@ export const InlineLinkComposer = forwardRef<InlineLinkComposerHandle, Props>(fu
     return <span {...attributes} contentEditable={false} className="composer-inline-link" title={link.uri}>
       <UrlTagIcon url={link.uri} />
       <button type="button" className="composer-inline-link-title" onMouseDown={(event) => event.preventDefault()} onClick={() => onOpenLink(link)}>{link.status === "loading" ? "Loading link…" : link.title}</button>
-      <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => {
+      <button type="button" disabled={disabled} onMouseDown={(event) => event.preventDefault()} onClick={() => {
         const path = ReactEditor.findPath(editor, element);
         Transforms.removeNodes(editor, { at: path });
         onRemoveLink(link.id);
       }} aria-label={`Remove ${link.title}`}>×</button>
       {children}
     </span>;
-  }, [editor, linksById, onOpenLink, onRemoveLink]);
+  }, [disabled, editor, linksById, onOpenLink, onRemoveLink]);
 
   return <Slate editor={editor} initialValue={deserialize(value, links) as never} onValueChange={(nextValue) => {
     const nodes = nextValue as ComposerNode[];
@@ -226,10 +234,13 @@ export const InlineLinkComposer = forwardRef<InlineLinkComposerHandle, Props>(fu
       ref={editableRef}
       style={{ minHeight: 42 }}
       aria-label="Message"
+      readOnly={disabled}
+      aria-disabled={disabled}
       data-placeholder={placeholder}
       placeholder={placeholder}
       renderElement={renderElement}
       onPasteCapture={(event) => {
+        if (disabled) { event.preventDefault(); return; }
         const id = onPasteLink(event.clipboardData.getData("text/plain"));
         if (!id) return;
         event.preventDefault();
@@ -239,12 +250,13 @@ export const InlineLinkComposer = forwardRef<InlineLinkComposerHandle, Props>(fu
         keepFocusAtEnd(editor);
       }}
       onPaste={(event) => {
+        if (disabled) { event.preventDefault(); return; }
         onUnhandledPaste(event);
         if (!event.defaultPrevented) {
           window.requestAnimationFrame(() => onChange(serialize(editor.children as ComposerNode[])));
         }
       }}
-      onKeyDown={onKeyDown}
+      onKeyDown={(event) => { if (!disabled) onKeyDown(event); }}
       onBlur={onBlur}
     />
   </Slate>;

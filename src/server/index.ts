@@ -1,10 +1,15 @@
 import { DEFAULT_MODEL } from "../modelCatalog";
+import { createHash } from "node:crypto";
+import { WorkspaceManagerService } from "./workspaceManager";
+import { isSilentManagerResponse, WORKSPACE_MANAGER_MODEL, WORKSPACE_MANAGER_EFFORT } from "../workspaceManager";
+import { readZipDirectory } from "./zipPreview";
 import { recordLiveGitProvenance } from "./gitProvenance";
 import { changedFilePaths } from "./changedFilePaths";
 import { USER_INPUT_METHOD, inputResponse } from "../userInputRequest";
 import { isAutoModel, isAutoEffort } from "../autoModelCatalog";
-import { buildAutoModelState, selectAutoModel } from "./autoModelSelector";
+import { buildAutoModelState, selectAutoModel, shouldEnableAutoModel } from "./autoModelSelector";
 import { AutoModelSettings, createAutoModelSettingsRouter } from "./autoModelSettings";
+import { GlobalAgentInstructions, createGlobalAgentInstructionsRouter } from "./globalAgentInstructions";
 import { RunnerProcessRegistry } from "./runnerProcessRegistry";
 import { clientLayoutInstructions } from "./clientLayoutInstructions";
 import { createTurnGrillHandler } from "./turnGrillRoute";
@@ -152,6 +157,8 @@ import {
   isPathInsideOrEqual,
   safeFileName,
   saveUploadedAttachments,
+  loadSavedAttachments,
+  removeSavedAttachments,
   type SavedAttachment,
   type UploadedAttachment
 } from "./attachmentUploads";
@@ -266,6 +273,8 @@ type ForkSessionRequest = {
 };
 
 type CreateSessionTaskRequest = {
+  managerRequestId?: string;
+  cwd?: string;
   parentSessionId?: string;
   /** Internal caller identity supplied by the managed Session Inspector MCP. */
   sourceSessionId?: string;
@@ -440,6 +449,7 @@ type ManagedSession = {
 };
 
 type RunnerJob = {
+  workspaceManager?: boolean;
   sessionId: string;
   turnId: string;
   turnNumber?: number;
@@ -476,6 +486,7 @@ type RunnerJob = {
   todoParentSessionId?: string;
   todoItemId?: string;
   developerInstructions?: string;
+  globalAgentInstructions?: string;
   recoveryContext?: SessionRecoveryContext;
   forceRecoveryOnResume?: boolean;
 };
@@ -791,6 +802,7 @@ const categoryClassifier = new CategoryClassifier(sessionStore, sessionCategorie
   categoryContextPools.schedule(workspaceId);
 });
 const autoModelSettings = new AutoModelSettings(resolve(dataDir, "typesafe-api-key"));
+const globalAgentInstructions = new GlobalAgentInstructions(resolve(dataDir, "global-agent-instructions.md"));
 const runnerPath = resolve(serverDir, "promptRunner.ts");
 const tsxPath = resolve(projectRoot, "node_modules/tsx/dist/cli.mjs");
 const runnerJobDir = resolve(dataDir, "runner-jobs");
@@ -841,10 +853,37 @@ const pendingRetryFallbackMs = parseDurationMs(
 );
 const eventRingCapacity = Math.max(1, Number.parseInt(process.env.EVENT_RING_CAPACITY ?? "4096", 10) || 4096);
 const eventRingLog = new EventRingLog(eventRingLogPath, eventRingCapacity);
+const workspaceManager = new WorkspaceManagerService(sessionStore, {
+  schedule: schedulePendingTurnsForSession,
+  platform: async (workspaceId) => {
+    const workspace = await sessionStore.getWorkspace(workspaceId);
+    const approvals = await Promise.all([...pendingApprovals.values()].filter(item => item.decision === undefined).map(async item => {
+      const session = await sessionStore.getSession(item.sessionId);
+      return session?.workspaceId === workspaceId ? { ...publicApprovalRecord(item), title: session.title } : null;
+    }));
+    return {
+      workspaceId, workspaceName: workspace?.name,
+      projects: workspace ? [...new Set([workspace.cwd, ...listCodexProjects(workspace.codexHome).flatMap(project => project.roots)])] : [],
+      processes: (await sessionStore.listProcessMonitors(workspaceId)).map(monitor => ({ id: monitor.id, label: monitor.label,
+        status: monitor.status, pid: monitor.pid, error: monitor.error, lastExitCode: monitor.lastExitCode })),
+      approvals: approvals.filter(item => item !== null)
+    };
+  },
+  post: async (path, body) => {
+    const response = await fetch(`${serverUrl.replace(/\/$/, "")}${path}`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(30_000)
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error ?? `Threadex returned HTTP ${response.status}`);
+    return result;
+  }
+});
 type EventPollSupplement = {
   statusMonitor: WorkspaceMonitorStatus[];
   processMonitors: ProcessMonitorRecord[];
   grillSummaries: Awaited<ReturnType<SessionStore["listGrillSummaries"]>>;
+  waitEvents: WaitEventRecord[];
+  waitSubscriptions: WaitSubscriptionRecord[];
   versions: EventStateVersions;
 };
 let eventPollSupplementCache: EventPollSupplement & { workspaceId: string; expiresAt: number } | null = null;
@@ -864,8 +903,10 @@ let shuttingDown = false;
 app.use("/api", createSecurity(resolve(dataDir, "security.json")));
 app.use("/api", createHtmlPreviewRouter());
 app.use(express.json({ limit: "32mb" }));
+app.use("/api/workspace-manager", workspaceManager.router());
 app.use("/api/experimental/session-categories", createSessionCategoriesRouter(sessionStore, sessionCategories, categoryContextPools, categoryClassifier));
 app.use("/api/settings/auto-model", createAutoModelSettingsRouter(autoModelSettings));
+app.use("/api/settings/global-instructions", createGlobalAgentInstructionsRouter(globalAgentInstructions));
 app.use("/api/quick-chat", createQuickChatRouter(resolve(dataDir, "quick-chat-sessions.json")));
 app.use(express.static(resolve(projectRoot, "dist"), { index: "index.html" }));
 
@@ -1177,7 +1218,7 @@ app.post(
         workspaceId: workspace.id,
         sessionId: null,
         turnId: null,
-        payload: { monitorId: monitor.id }
+        payload: { ...processExitPayload(monitor), action: "registered" }
       });
       res.status(201).json({ monitor, waitEvent });
     } catch (error) {
@@ -1207,6 +1248,8 @@ app.post(["/api/process-monitors/:monitorId/restart", "/api/process-monitors/:mo
       res.once("finish", () => {
         void restartVirtualProcess(virtualMonitor.restartAction!);
       });
+      await publishRingEvent({ eventId: crypto.randomUUID(), type: "process.monitor.changed", workspaceId: workspace.id,
+        sessionId: null, turnId: null, payload: { ...processExitPayload(virtualMonitor.monitor), action: "restart_requested" } });
       res.status(202).json({ monitor: virtualMonitor.monitor, restarting: true });
       return;
     }
@@ -1225,7 +1268,7 @@ app.post(["/api/process-monitors/:monitorId/restart", "/api/process-monitors/:mo
       workspaceId: workspace.id,
       sessionId: null,
       turnId: null,
-      payload: { monitorId: monitor.id }
+      payload: { ...processExitPayload(monitor), action: req.path.endsWith("/run") ? "started" : "restarted" }
     });
     res.json({ monitor, waitEvent });
   } catch (error) {
@@ -1252,7 +1295,7 @@ app.post(
         workspaceId: workspace.id,
         sessionId: null,
         turnId: null,
-        payload: { monitorId: monitor.id }
+        payload: { ...processExitPayload(monitor), action: "adopted" }
       });
       res.json({ monitor, waitEvent });
     } catch (error) {
@@ -1274,7 +1317,7 @@ app.post("/api/process-monitors/:monitorId/stop", async (req: Request<{ monitorI
       workspaceId: workspace.id,
       sessionId: null,
       turnId: null,
-      payload: { monitorId: monitor.id }
+      payload: { ...processExitPayload(monitor), action: "stopped" }
     });
     res.json({ monitor });
   } catch (error) {
@@ -1295,7 +1338,7 @@ app.delete("/api/process-monitors/:monitorId", async (req: Request<{ monitorId: 
       workspaceId: workspace.id,
       sessionId: null,
       turnId: null,
-      payload: { monitorId: req.params.monitorId }
+      payload: { ...(monitor ? processExitPayload(monitor) : { monitorId: req.params.monitorId }), action: "removed" }
     });
     res.json({ ok: true });
   } catch (error) {
@@ -1328,7 +1371,9 @@ app.get("/api/events", async (req, res) => {
       resetRequired,
       statusMonitor: supplement.statusMonitor,
       processMonitors: supplement.processMonitors,
-      grillSummaries: supplement.grillSummaries
+      grillSummaries: supplement.grillSummaries,
+      waitEvents: supplement.waitEvents,
+      waitSubscriptions: supplement.waitSubscriptions
     });
   } catch (error) {
     res.status(500).json({ error: errorMessage(error) });
@@ -1421,9 +1466,11 @@ async function getEventPollSupplement(workspace: WorkspaceRecord) {
   const promise = Promise.all([
     getWorkspaceStatusMonitor(workspace.id, { releaseDeadRunningTurns: false }),
     listProcessMonitors(workspace),
-    sessionStore.listGrillSummaries(workspace.id)
-  ]).then(([statusMonitor, processMonitors, grillSummaries]) => {
-    const value = versionEventState(workspace.id, { statusMonitor, processMonitors, grillSummaries });
+    sessionStore.listGrillSummaries(workspace.id),
+    sessionStore.listWaitEvents({ workspaceId: workspace.id, activeSubscriptionsOnly: true }),
+    sessionStore.listWaitSubscriptions({ workspaceId: workspace.id, activeOnly: true })
+  ]).then(([statusMonitor, processMonitors, grillSummaries, waitEvents, waitSubscriptions]) => {
+    const value = versionEventState(workspace.id, { statusMonitor, processMonitors, grillSummaries, waitEvents, waitSubscriptions });
     eventPollSupplementCache = {
       workspaceId: workspace.id,
       expiresAt: Date.now() + 1_000,
@@ -2287,6 +2334,11 @@ app.get("/api/workspaces/file-preview", async (req, res) => {
     const stats = statSync(filePath);
     if (!stats.isFile()) {
       res.status(400).json({ error: "path is not a file." });
+      return;
+    }
+
+    if (/\.zip$/i.test(filePath)) {
+      res.json({ path: requestedPath, exists: true, archive: { format: "zip", entries: await readZipDirectory(filePath) } });
       return;
     }
 
@@ -3187,7 +3239,8 @@ async function getSessionSnapshot(session: SessionRecord, replayRunningTurns = f
       ]),
       developerInstructions: developerInstructionsByTurn[turn.id] ?? [],
       steerMessages: steerMessagesByTurn[turn.id] ?? [],
-      autoModelProvider: autoModelProvidersByTurn[turn.id]
+      autoModelProvider: autoModelProvidersByTurn[turn.id]?.provider,
+      autoModelConfidence: autoModelProvidersByTurn[turn.id]?.confidence
     }))
   };
 }
@@ -4486,6 +4539,8 @@ app.post("/api/runner/stop", async (req: Request<object, object, RunnerStopReque
               runnerLogPath: pendingTurn.runnerLogPath
             }
           });
+          await publishRunnerUpdateEvent({ id: `cancelled:${pendingTurn.id}`, sessionId: pendingTurn.sessionId,
+            turnId: pendingTurn.id, event: "pending", data: { stopped: true, reason: "stopped", message } });
           res.json({
             ok: true,
             stopped: true,
@@ -4695,7 +4750,8 @@ app.post("/api/pending-turns", async (req: Request<object, object, PendingTurnCr
       tokenOut: 0,
       status: "todo",
       pendingReason: "queued",
-      pendingLoadBalance: chatRequest.loadBalanceInWorkspace === true
+      pendingLoadBalance: chatRequest.loadBalanceInWorkspace === true,
+      requestMetadata: buildPendingRequestMetadata(chatRequest, attachments)
     }, "pending.create");
 
     const turn = await sessionStore.getSessionTurn(turnId);
@@ -4728,10 +4784,12 @@ app.patch("/api/pending-turns/:turnId", async (
   }
 
   try {
+    const attachments = loadSavedAttachments(uploadDir, turnId);
     const turn = await sessionStore.updatePendingSessionTurn({
       id: turnId,
       sessionId,
-      userInput: message
+      userInput: attachments.length > 0 ? formatStoredUserInput(message, attachments) : message,
+      message
     });
     await turnRingLog.appendUserPrompt({
       eventId: `prompt:${turnId}:pending.edit:${crypto.randomUUID()}`,
@@ -4764,6 +4822,124 @@ app.post("/api/pending-turns/:turnId/move", async (
     res.json({ ok: true, turns });
   } catch (error) {
     res.status(400).json({ error: errorMessage(error) });
+  }
+});
+
+app.delete("/api/pending-turns/:turnId", async (
+  req: Request<{ turnId: string }, object, { sessionId?: string }>, res: Response
+) => {
+  const turnId = req.params.turnId.trim();
+  const sessionId = req.body?.sessionId?.trim();
+  if (!turnId || !sessionId) {
+    res.status(400).json({ error: "turnId and sessionId are required." });
+    return;
+  }
+  try {
+    if (!await sessionStore.deleteQueuedSessionTurn(turnId, sessionId) &&
+        !await sessionStore.deleteQueuedSessionTurn(turnId, sessionId, true)) {
+      res.status(409).json({ error: "This prompt is no longer queued." });
+      return;
+    }
+    const timer = pendingTurnTimers.get(turnId);
+    if (timer) clearTimeout(timer);
+    pendingTurnTimers.delete(turnId);
+    try { removeSavedAttachments(uploadDir, turnId); }
+    catch (error) { console.warn(`Failed to remove attachments for deleted queued prompt ${turnId}: ${errorMessage(error)}`); }
+    void schedulePendingTurnsForSession(sessionId).catch((error) => console.warn(`Failed to reschedule queue after deleting ${turnId}: ${errorMessage(error)}`));
+    res.json({ ok: true, turnId, sessionId });
+  } catch (error) {
+    res.status(500).json({ error: errorMessage(error) });
+  }
+});
+
+app.post("/api/pending-turns/:turnId/steer", async (
+  req: Request<{ turnId: string }, object, { sessionId?: string }>, res: Response
+) => {
+  const turnId = req.params.turnId.trim();
+  const sessionId = req.body?.sessionId?.trim();
+  if (!turnId || !sessionId) {
+    res.status(400).json({ error: "turnId and sessionId are required." });
+    return;
+  }
+  let reserved = false;
+  let delivered = false;
+  let deliveryAttempted = false;
+  const restoreQueue = async () => {
+    if (!reserved || delivered) return;
+    if (!await sessionStore.restoreQueuedSessionTurnAfterSteerFailure(turnId, sessionId)) {
+      throw new Error("The queued prompt could not be restored after the steer failed.");
+    }
+    reserved = false;
+    void schedulePendingTurnsForSession(sessionId).catch((error) =>
+      console.warn(`Failed to reschedule queue after steer error ${turnId}: ${errorMessage(error)}`));
+  };
+  try {
+    const active = await sessionStore.getLatestRunningTurn(sessionId);
+    if (!active?.runnerPid || !isProcessAlive(active.runnerPid)) {
+      res.status(409).json({ error: "No active agent turn to steer." });
+      return;
+    }
+    const queued = await sessionStore.reserveQueuedSessionTurnForSteer(turnId, sessionId, active.id);
+    if (!queued) {
+      res.status(409).json({ error: "This prompt is no longer queued." });
+      return;
+    }
+    reserved = true;
+    if (queued.requestMetadata?.contextFork === true) {
+      await restoreQueue();
+      res.status(409).json({ error: "A child task handoff cannot be converted to a steer." });
+      return;
+    }
+    const attachments = loadSavedAttachments(uploadDir, turnId);
+    const metadata = queued.requestMetadata ?? {};
+    const storedAttachmentMarker = "\n\n[Attached files]\n";
+    const markerIndex = attachments.length > 0 ? queued.userInput.lastIndexOf(storedAttachmentMarker) : -1;
+    const message = typeof metadata.message === "string"
+      ? metadata.message
+      : markerIndex >= 0 ? queued.userInput.slice(0, markerIndex) : queued.userInput;
+    deliveryAttempted = true;
+    const steerResponse = await fetch(`${serverUrl.replace(/\/$/, "")}/api/runner/steer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        turnId: active.id, sessionId, message,
+        attachments: attachments.map(({ id, name, mimeType, size, path }) => ({ id, name, type: mimeType, size, path })),
+        skills: Array.isArray(metadata.skills) ? metadata.skills : [],
+        forcePlan: metadata.forcePlan === true,
+        clientLayout: metadata.clientLayout === "mobile" || metadata.clientLayout === "tablet" || metadata.clientLayout === "desktop"
+          ? metadata.clientLayout : undefined
+      } satisfies RunnerSteerRequest)
+    });
+    const steer = await steerResponse.json().catch(() => null);
+    if (!steerResponse.ok && steerResponse.status < 500) {
+      await restoreQueue();
+      res.status(steerResponse.status).json({ error: steer?.error || "The agent did not accept the steer." });
+      return;
+    }
+    if (!steerResponse.ok || steer?.ok !== true) {
+      throw new Error(steer?.error || "Steer delivery could not be confirmed.");
+    }
+    delivered = true;
+    if (!await sessionStore.deleteQueuedSessionTurn(turnId, sessionId, true)) {
+      throw new Error("Steer was delivered, but the queued prompt could not be removed.");
+    }
+    const timer = pendingTurnTimers.get(turnId);
+    if (timer) clearTimeout(timer);
+    pendingTurnTimers.delete(turnId);
+    try { removeSavedAttachments(uploadDir, turnId); }
+    catch (error) { console.warn(`Failed to remove attachments for steered queued prompt ${turnId}: ${errorMessage(error)}`); }
+    reserved = false;
+    res.json({ ...steer, queuedTurnId: turnId });
+  } catch (error) {
+    let detail = errorMessage(error);
+    if (reserved && !delivered && !deliveryAttempted) {
+      try { await restoreQueue(); }
+      catch (restoreError) { detail += ` Queue recovery failed: ${errorMessage(restoreError)}`; }
+    }
+    if (reserved && deliveryAttempted && !delivered) {
+      detail += " The queued prompt is held to prevent duplicate delivery. Check the active turn before deleting it.";
+    }
+    res.status(reserved && deliveryAttempted && !delivered ? 503 : 500).json({ error: detail, steered: delivered });
   }
 });
 
@@ -4880,6 +5056,27 @@ app.post("/api/session-tasks", async (req: Request<object, object, CreateSession
     const sourceSessionId = requestedSourceSessionId
       ? await resolveRequestedSessionId(requestedSourceSessionId)
       : null;
+    const managingWorkspace = await sessionStore.getSessionWorkspaceManager(sourceSessionId ?? parentSessionId);
+    const managerRequestId = typeof req.body.managerRequestId === "string" ? req.body.managerRequestId.trim() : "";
+    if (req.body.managerRequestId !== undefined && (!managingWorkspace || !managerRequestId || managerRequestId.length > 100)) {
+      res.status(400).json({ error: "A valid manager request ID requires a workspace manager source." }); return;
+    }
+    if (managingWorkspace && parentSession.workspaceId !== managingWorkspace.workspaceId) {
+      res.status(403).json({ error: "Choose a parent session in this manager's workspace." }); return;
+    }
+    const creationSource = managingWorkspace ? (await sessionStore.getSession(managingWorkspace.sessionId))! : parentSession;
+    let childCwd = creationSource.cwd;
+    if (req.body.cwd !== undefined) {
+      const workspace = managingWorkspace ? await sessionStore.getWorkspace(managingWorkspace.workspaceId) : null;
+      const requestedCwd = typeof req.body.cwd === "string" ? resolve(req.body.cwd) : "";
+      const allowed = workspace ? [workspace.cwd, ...listCodexProjects(workspace.codexHome).flatMap(project => project.roots),
+        ...(await sessionStore.listSessions(workspace.id)).map(session => session.cwd)] : [];
+      if (!workspace || !allowed.some(cwd => resolve(cwd) === requestedCwd)) {
+        res.status(400).json({ error: "Choose a project directory already registered in this workspace." }); return;
+      }
+      childCwd = requestedCwd;
+    }
+
     const workerAssignment = sourceSessionId
       ? await sessionStore.getTodoWorkerAssignment(sourceSessionId)
       : null;
@@ -4917,30 +5114,41 @@ app.post("/api/session-tasks", async (req: Request<object, object, CreateSession
       return;
     }
 
-    const sessionId = createLocalSessionId();
+    const sessionId = managerRequestId
+      ? `tx_${createHash("sha256").update(`${managingWorkspace!.sessionId}:${managerRequestId}`).digest("hex").slice(0, 32)}`
+      : createLocalSessionId();
     const startImmediately = req.body.startImmediately === true;
-    const turnId = startImmediately ? crypto.randomUUID() : null;
+    const turnId = startImmediately ? managerRequestId ? `manager_task_${sessionId}` : crypto.randomUUID() : null;
     const requestedTitle = req.body.title?.trim();
     const metadata = sessionStore.normalizeMetadata({
       title: requestedTitle,
       parentSessionId
     }, prompt);
-    const childSession = await sessionStore.upsertSession({
+    const existingManagerTask = managerRequestId ? await sessionStore.getSession(sessionId) : null;
+    if (existingManagerTask && existingManagerTask.parentSessionId !== parentSessionId) {
+      res.status(409).json({ error: "This manager request already created a task with a different parent. Reuse its original parent when retrying.", sessionId }); return;
+    }
+    const childSession = existingManagerTask ?? await sessionStore.upsertSession({
       id: sessionId,
       threadId: null,
       workspaceId: parentSession.workspaceId,
-      cwd: parentSession.cwd,
-      accountId: parentSession.accountId,
+      cwd: childCwd,
+      accountId: creationSource.accountId,
       keywordWeights: metadata.keywordWeights,
       title: requestedTitle ? metadata.title : markCodexSessionTitlePending(metadata.title),
       titleSource: requestedTitle ? "user" : "initial",
       description: metadata.description,
       parentSessionId
-    });
-    const childModel = normalizeModel(req.body.model);
-    const childModelReasoningEffort = normalizeReasoningEffort(req.body.modelReasoningEffort);
-    if (childModel) {
-      const parentPreferences = await sessionStore.getSessionModelPreferences(parentSessionId);
+    }, { createOnly: Boolean(managerRequestId) });
+    if (managerRequestId && childSession.parentSessionId !== parentSessionId) {
+      res.status(409).json({ error: "This manager request already created a task with a different parent. Reuse its original parent when retrying.", sessionId }); return;
+    }
+    if (managingWorkspace) await sessionStore.setSessionTaskManager(childSession.id, managingWorkspace.sessionId);
+    const managerPreferences = managingWorkspace ? await sessionStore.getWorkspaceModelPreferences(managingWorkspace.workspaceId) : null;
+    const childModel = normalizeModel(req.body.model ?? managerPreferences?.selectedModel);
+    const childModelReasoningEffort = normalizeReasoningEffort(req.body.modelReasoningEffort ?? managerPreferences?.selectedEffort);
+    if (childModel && !existingManagerTask) {
+      const parentPreferences = await sessionStore.getSessionModelPreferences(creationSource.id);
       const activeGearIndex = parentPreferences.activeGearIndex;
       const gearProfiles = parentPreferences.gearProfiles.map((profile, index) => index === activeGearIndex
         ? { model: childModel, effort: childModelReasoningEffort ?? profile.effort }
@@ -4955,7 +5163,7 @@ app.post("/api/session-tasks", async (req: Request<object, object, CreateSession
     }
 
     await publishRingEvent({
-      eventId: crypto.randomUUID(),
+      eventId: managerRequestId ? `manager-task:${sessionId}` : crypto.randomUUID(),
       type: "session.task.created",
       workspaceId: childSession.workspaceId,
       sessionId: childSession.id,
@@ -4998,7 +5206,15 @@ app.post("/api/session-tasks", async (req: Request<object, object, CreateSession
     }
 
     if (startImmediately && turnId) {
-      void runCreatedSessionTask({
+      if (managerRequestId) {
+        // A stable pending-turn ID makes manager retries safe, including a crash after session creation.
+        const response = await fetch(`${serverUrl.replace(/\/$/, "")}/api/pending-turns`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId: childSession.id, turnId, workspaceId: childSession.workspaceId,
+            message: taskPrompt, approvalPolicy: req.body.approvalPolicy, backgroundTask: true })
+        });
+        if (!response.ok) throw new Error(`Unable to queue manager task: ${await response.text()}`);
+      } else void runCreatedSessionTask({
         sessionId: childSession.id,
         turnId,
         parentSession,
@@ -5105,6 +5321,7 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
   // this before getOrCreateSession(): otherwise a stale scheduler request can
   // create an empty session titled "Retry pending turn" and then discover it
   // has nothing to run.
+  let retryTurn: SessionTurnRecord | null = null;
   if (retryPending) {
     const retrySessionId = req.body.sessionId?.trim();
     const retryTurnId = req.body.turnId?.trim();
@@ -5117,7 +5334,7 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
       res.status(404).json({ error: "Pending retry session not found." });
       return;
     }
-    const retryTurn = await sessionStore.getSessionTurn(retryTurnId);
+    retryTurn = await sessionStore.getSessionTurn(retryTurnId);
     if (!retryTurn || retryTurn.sessionId !== retrySession.id || retryTurn.status !== "todo") {
       res.status(409).json({ error: "Pending retry turn is no longer available." });
       return;
@@ -5135,8 +5352,21 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
   let claimedTurnId: string | null = null;
   try {
     const sessionMessage = requestedMessage || "Retry pending turn";
-    const chatRequest = await prepareAutoLoadBalancedChatRequest(req.body);
+    const requestForPreparation = retryPending && retryTurn?.requestMetadata
+      ? { ...retryTurn.requestMetadata, ...req.body } as ChatRequest
+      : req.body;
+    const chatRequest = await prepareAutoLoadBalancedChatRequest(requestForPreparation);
     const session = await getOrCreateSession(chatRequest, sessionMessage);
+    const workspaceManagerRole = await sessionStore.getSessionWorkspaceManager(session.id);
+    if (workspaceManagerRole) {
+      chatRequest.model = WORKSPACE_MANAGER_MODEL;
+      chatRequest.modelReasoningEffort = WORKSPACE_MANAGER_EFFORT;
+      chatRequest.autoModel = false;
+      chatRequest.forcePlan = false;
+      chatRequest.contextFork = false;
+      chatRequest.executionMode = "default";
+      await sessionStore.setSessionModelPreferences(session.id, { selectedModel: WORKSPACE_MANAGER_MODEL, selectedEffort: WORKSPACE_MANAGER_EFFORT });
+    }
     // A Todo worker keeps owning the same item for every later turn in its child
     // session. The browser follow-up request does not carry these internal fields,
     // so recover them from the task-to-item link instead of treating it as a new
@@ -5147,9 +5377,7 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
     // Always claim the exact turn selected by the scheduler. A stop can race
     // this request after the initial validation, and falling back to the next
     // Todo would otherwise start a different queued prompt unexpectedly.
-    const pendingTurn = retryPending && req.body.turnId
-      ? await sessionStore.getSessionTurn(req.body.turnId.trim())
-      : null;
+    const pendingTurn = retryPending ? retryTurn : null;
 
     if (
       retryPending &&
@@ -5215,7 +5443,7 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
     const runnerAttemptId = runnerFileName(pendingTurn ? `${turnId}.${crypto.randomUUID()}` : turnId);
     const logPath = resolve(runnerLogDir, `${runnerAttemptId}.ndjson`);
     const pendingLogPath = resolve(pendingRunnerLogDir, `${runnerAttemptId}.ndjson`);
-    const attachments = pendingTurn ? [] : saveUploadedAttachments(uploadDir, turnId, chatRequest.attachments);
+    const attachments = pendingTurn ? loadSavedAttachments(uploadDir, turnId) : saveUploadedAttachments(uploadDir, turnId, chatRequest.attachments);
     const messageForStorage = attachments.length > 0 ? formatStoredUserInput(message, attachments) : message;
     if (!pendingTurn) {
       const claim = await sessionStore.claimSessionTurn({
@@ -5234,7 +5462,8 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
         // This survives an API restart while the externally managed runner is
         // still executing, so a later rate-limit callback can choose another
         // workspace account.
-        pendingLoadBalance: chatRequest.loadBalanceInWorkspace === true
+        pendingLoadBalance: chatRequest.loadBalanceInWorkspace === true,
+        requestMetadata: buildPendingRequestMetadata(chatRequest, attachments)
       });
       if (claim.disposition === "reconnected") {
         emit(res, "session", {
@@ -5367,10 +5596,16 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
       accountExternalUserId: session.accountExternalUserId
     });
 
-    let autoModel = retryPending
-      ? await sessionStore.getSessionAutoModel(session.id)
-      : await sessionStore.setSessionAutoModelEnabled(session.id, chatRequest.autoModel === true);
     const recoverySession = await sessionStore.getSession(session.id);
+    const managedTask = workspaceManagerRole || await sessionStore.getSessionTaskManager(session.id);
+    const managerModelPreferences = managedTask ? await sessionStore.getSessionModelPreferences(session.id) : null;
+    const selectedModel = chatRequest.model ?? managerModelPreferences?.selectedModel;
+    const enableAutoModel = shouldEnableAutoModel(selectedModel, chatRequest.autoModel);
+    let autoModel = workspaceManagerRole
+      ? await sessionStore.setSessionAutoModelEnabled(session.id, false)
+      : retryPending && !enableAutoModel
+      ? await sessionStore.getSessionAutoModel(session.id)
+      : await sessionStore.setSessionAutoModelEnabled(session.id, enableAutoModel);
     const recoveryTurns = recoverySession ? await sessionStore.listSessionTurns(session.id) : [];
     const typeSafeApiKey = autoModel.enabled ? autoModelSettings.apiKey() : undefined;
     if (autoModel.enabled && recoverySession) {
@@ -5393,17 +5628,17 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
       await sessionStore.recordSessionTurnEvent({ sessionId: session.id, turnId, eventName: "auto_model.selected", payload: selectionEvent });
       emit(res, "auto_model.selected", selectionEvent);
     }
-    await sessionStore.setWorkspaceModelPreferences(
+    if (!workspaceManagerRole) await sessionStore.setWorkspaceModelPreferences(
       session.workspaceId,
       chatRequest.modelPreferences ?? {}
     );
     const autoModelPromptFullVersion = autoModel.enabled
       ? await sessionStore.claimSessionAutoModelPrompt(session.id)
       : false;
-    const model = autoModel.enabled ? autoModel.model : normalizeModel(chatRequest.model);
+    const model = autoModel.enabled ? autoModel.model : normalizeModel(selectedModel);
     const modelReasoningEffort = autoModel.enabled
       ? normalizeReasoningEffort(autoModel.effort)
-      : normalizeReasoningEffort(chatRequest.modelReasoningEffort);
+      : normalizeReasoningEffort(chatRequest.modelReasoningEffort ?? managerModelPreferences?.selectedEffort);
     const requestedSkills = resolveRequestedSkills(chatRequest.skills, session.workspaceId);
     await sessionStore.recordTokenUsage([{
       id: `agent:turn:${turnId}`,
@@ -5471,9 +5706,11 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
     const runnerDeveloperInstructions = [
       chatRequest.developerInstructions,
       clientLayoutInstructions(chatRequest.clientLayout),
-      sessionCategories.context(session.workspaceId, session.id)
+      sessionCategories.context(session.workspaceId, session.id),
+      workspaceManagerRole ? await workspaceManager.context(session.workspaceId) : undefined
     ].filter(Boolean).join("\n\n") || undefined;
     const job: RunnerJob = {
+      workspaceManager: Boolean(workspaceManagerRole),
       sessionId: session.id,
       turnId,
       message,
@@ -5484,7 +5721,7 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
       autoModelEnabled: autoModel.enabled,
       autoModelRevision: autoModel.revision,
       autoModelPromptFullVersion,
-      executionMode: chatRequest.contextFork === true ? "default" : normalizeExecutionMode(chatRequest.executionMode),
+      executionMode: workspaceManagerRole || chatRequest.contextFork === true ? "default" : normalizeExecutionMode(chatRequest.executionMode),
       forcePlan: forcePlanForTurn,
       lightweightTodo,
       todoPlanClarificationPending,
@@ -5507,13 +5744,14 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
         chatRequest.taskChild === true && !session.threadId
           ? session.parentSessionId ?? undefined
           : undefined,
-      contextForkRequest: chatRequest.contextFork === true,
+      contextForkRequest: !workspaceManagerRole && chatRequest.contextFork === true,
       childExecutionMode: chatRequest.contextFork === true
         ? normalizeExecutionMode(chatRequest.executionMode)
         : undefined,
       todoParentSessionId: todoWorkerAssignment?.parentSessionId,
       todoItemId: todoWorkerAssignment?.itemId,
       developerInstructions: runnerDeveloperInstructions,
+      globalAgentInstructions: globalAgentInstructions.read(),
       recoveryContext: recoveryContext ?? undefined,
       forceRecoveryOnResume
     };
@@ -5634,6 +5872,7 @@ async function shutdown(signal: string) {
   stopCodexSessionFilePollJob();
   stopAccountQuotaRefreshJob();
   waitEvents.stop();
+  workspaceManager.stop();
   processMonitor.stop();
   for (const timer of pendingTurnTimers.values()) {
     clearTimeout(timer);
@@ -5707,6 +5946,12 @@ async function startApiServer() {
 
   apiServer = app.listen(port, () => {
     console.log(`Threadex API listening on http://localhost:${port}`);
+    workspaceManager.start(() => eventRingLog.entries);
+    void sessionStore.listWorkspaceManagers().then(async managers => {
+      for (const manager of managers) await publishRingEvent({ eventId: `platform:${serverMonitorStartedAt}:${manager.workspaceId}`,
+        type: "platform.restarted", workspaceId: manager.workspaceId, sessionId: null, turnId: null,
+        payload: { message: "Threadex API restarted. Check current task and process status before taking action." } });
+    }).catch(error => console.warn("Workspace manager restart notification failed:", error));
     startWebVsCodeServer();
     if (sessionSummarizerEnabled) {
       sessionSummarizer.start();
@@ -6345,6 +6590,8 @@ async function schedulePendingTurn(
     return;
   }
 
+  if (await managerActivityPaused(pending)) return;
+
   const runningTurn = await sessionStore.getLatestRunningTurn(pending.session.id);
   if (runningTurn) {
     const released = await diagnoseRunningTurn(runningTurn, "pending_scheduler");
@@ -6435,7 +6682,7 @@ async function runPendingTurnAutomatically(turnId: string) {
   }
 
   const pendingReason = pendingTurnReason(pending.turn);
-  if (pendingReason === "stopped") {
+  if (pendingReason === "stopped" || await managerActivityPaused(pending)) {
     return;
   }
   if (pendingReason === "rate_limit") {
@@ -6515,6 +6762,12 @@ async function ensureProcessExitEvent(monitor: ProcessMonitorRecord) {
   });
 }
 
+async function managerActivityPaused(pending: PendingSessionTurnCandidate) {
+  const manager = await sessionStore.getSessionWorkspaceManager(pending.session.id);
+  return Boolean(manager && !manager.notificationsEnabled &&
+    (await sessionStore.workspaceManagerActivityTurns(manager.sessionId)).includes(pending.turn.id));
+}
+
 async function cancelProcessExitEvent(monitor: ProcessMonitorRecord) {
   const event = await ensureProcessExitEvent(monitor);
   if (event.status === "pending") await waitEvents.cancel(event.id);
@@ -6560,6 +6813,8 @@ async function processWakeApprovalPolicy(monitor: ProcessMonitorRecord) {
 }
 
 async function publishProcessExit(monitor: ProcessMonitorRecord) {
+  await publishRingEvent({ eventId: `process-exit:${monitor.id}:${monitor.startedAt ?? monitor.created}`,
+    type: "process.exited", workspaceId: monitor.workspaceId, sessionId: null, turnId: null, payload: processExitPayload(monitor) });
   const event = await ensureProcessExitEvent(monitor);
   const legacySubscriptionId = await ensureProcessWakeSubscription(monitor, event);
   await waitEvents.fire(event.id, processExitPayload(monitor));
@@ -6734,6 +6989,9 @@ async function getOrCreateSession(request: ChatRequest, message: string): Promis
       ? await sessionStore.getSessionByThreadId(requestedThreadId, activeWorkspace.id)
       : null;
   const storedSession = requestedSession ?? resumedSession;
+  if (storedSession && await sessionStore.isArchivedWorkspaceManagerSession(storedSession.id)) {
+    throw new Error("This workspace manager session is archived. Open the current workspace manager to send a message.");
+  }
   const loadBalanceInWorkspace = request.loadBalanceInWorkspace === true;
   const requestedAccountId = typeof request.accountId === "string" && request.accountId.trim() ? request.accountId.trim() : null;
   const requestedNoAccount = request.accountId === null;
@@ -6819,10 +7077,11 @@ async function getOrCreateSession(request: ChatRequest, message: string): Promis
       ? selectedAccount
       : await sessionStore.getAccount(persistedSession.accountId)
     : null;
-  if (persistedSession.accountId && request.backgroundTask !== true) {
+  const backgroundTask = request.backgroundTask === true || request.retryPending === true;
+  if (persistedSession.accountId && !backgroundTask) {
     await sessionStore.switchAccount(persistedSession.accountId, persistedSession.workspaceId);
   }
-  if (request.backgroundTask !== true) {
+  if (!backgroundTask) {
     await sessionStore.switchSession(persistedSession.id);
   }
   return {
@@ -6889,6 +7148,34 @@ async function getMatchingRunningTurn(sessionId: string, message: string) {
 }
 
 type RecordSessionTurnInput = Parameters<SessionStore["recordSessionTurn"]>[0];
+
+function buildPendingRequestMetadata(request: ChatRequest, attachments: SavedAttachment[] = []): Record<string, unknown> {
+  const metadata = {
+    message: request.message,
+    clientLayout: request.clientLayout,
+    contextFork: request.contextFork,
+    forcePlan: request.forcePlan,
+    lightweightTodo: request.lightweightTodo,
+    taskChild: request.taskChild,
+    backgroundTask: request.backgroundTask,
+    model: request.model,
+    modelReasoningEffort: request.modelReasoningEffort,
+    approvalPolicy: request.approvalPolicy,
+    autoModel: request.autoModel,
+    loadBalanceInWorkspace: request.loadBalanceInWorkspace,
+    executionMode: request.executionMode,
+    skills: request.skills,
+    developerInstructions: request.developerInstructions,
+    todoParentSessionId: request.todoParentSessionId,
+    todoItemId: request.todoItemId,
+    newSessionProjectId: request.newSessionProjectId,
+    resumeThreadId: request.resumeThreadId,
+    baseSessionId: request.baseSessionId,
+    modelPreferences: request.modelPreferences,
+    attachments
+  };
+  return Object.fromEntries(Object.entries(metadata).filter(([, value]) => value !== undefined));
+}
 
 async function recordSessionTurnWithLog(input: RecordSessionTurnInput, source: string) {
   const id = input.id ?? crypto.randomUUID();
@@ -9993,17 +10280,22 @@ function prepareEventStream(res: Response) {
 
 async function publishRingEvent(input: Omit<RingEvent, "pos" | "timestamp"> & { timestamp?: string }) {
   await eventRingLog.append(input);
+  await workspaceManager.observe({ ...input, timestamp: input.timestamp ?? new Date().toISOString() });
 }
 
 async function publishRunnerUpdateEvent(update: Required<Pick<RunnerUpdateRequest, "id" | "sessionId" | "turnId" | "event">> & RunnerUpdateRequest) {
   const session = await sessionStore.getSession(update.sessionId);
+  const manager = session && ["result", "error"].includes(update.event) ? await sessionStore.getWorkspaceManager(session.workspaceId) : null;
+  const managerActivity = manager?.sessionId === update.sessionId && (await sessionStore.workspaceManagerActivityTurns(update.sessionId)).includes(update.turnId);
   await publishRingEvent({
     eventId: update.id,
     type: `runner.${update.event}`,
     workspaceId: session?.workspaceId ?? null,
     sessionId: update.sessionId,
     turnId: update.turnId,
-    payload: update.data ?? null,
+    payload: manager ? { ...readObject(update.data), workspaceManaged: manager.notificationsEnabled && manager.sessionId !== update.sessionId,
+      workspaceManager: manager.sessionId === update.sessionId,
+      silent: managerActivity && isSilentManagerResponse(objectString(update.data, "reply") ?? "") } : update.data ?? null,
     timestamp: update.ts
   });
 }

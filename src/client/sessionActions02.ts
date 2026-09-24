@@ -1,4 +1,5 @@
 // @ts-nocheck
+import { reconcilePendingSubmissions } from "./pendingSubmissions";
 export async function restoreSelectedSessionForWorkspace(ctx, workspaceId) {
     const { sessionIdRef } = ctx;
         const selectedSessionId = sessionIdRef.current;
@@ -260,6 +261,7 @@ export function applySelectedSessionSnapshot(ctx, payload) {
         setActiveSessionId(selectedSession.id);
         setSessionAutoModel(payload.autoModel ?? null);
         setSessionTodo(payload.todo?.sessionId === selectedSession.id ? payload.todo : null);
+        reconcilePendingSubmissions(selectedSession.id, turns);
         setMessages((current) => sessionTurnsToMessages(turns, displaySessionTitle(selectedSession.title), current, selectedSession.threadId));
     
 }

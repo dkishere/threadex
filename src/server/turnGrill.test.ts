@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildTurnGrillPrompt } from "./turnGrill";
+import { buildTurnGrillMidTurnInputs, buildTurnGrillPrompt } from "./turnGrill";
 import { buildTurnGrillInspectorConfig, buildTurnGrillSessionContext, isLongTurnGrill, turnGrillModel, TURN_GRILL_INSTRUCTIONS } from "./turnGrill";
 import { createTurnGrillHistoryReader } from "./turnGrillContext";
+import { USER_INPUT_METHOD, asyncAnswerText, asyncInputParams } from "../userInputRequest";
 import type { SessionRecord } from "./sessionStore";
 
 test("grill supplies a session URL and reuses only the existing inspector read tool", () => {
@@ -65,6 +66,47 @@ test("grill sends compact direct evidence and excludes embedded source, instruct
     agentResponse: input.agentResponse,
     fileChanges: input.fileChanges
   });
+});
+
+test("grill includes answered QA and manual steers in time order without duplicating async answers", () => {
+  const approval = {
+    itemType: "approval", method: USER_INPUT_METHOD, status: "resolved", sortCreated: "2026-09-23T10:02:00Z",
+    params: { questions: [
+      { id: "scope", header: "Scope", question: "Which API should change?" },
+      { id: "token", header: "Token", question: "Which token?", isSecret: true }
+    ] },
+    decision: { answers: { scope: { answers: ["Use the existing API"] }, token: { answers: ["private-token"] } } }
+  };
+  const inputs = buildTurnGrillMidTurnInputs([approval], [
+    { id: "manual", content: "Keep backwards compatibility", attachments: [{ name: "notes.txt" }], forcePlan: false, created: "2026-09-23T10:01:00Z" },
+    { id: "async:thread:question", content: "Which API should change?\nAnswer: Use the existing API", attachments: [], forcePlan: false, created: "2026-09-23T10:03:00Z" }
+  ]);
+  assert.deepEqual(inputs, [
+    { kind: "steer", created: "2026-09-23T10:01:00Z", content: "Keep backwards compatibility", attachmentNames: ["notes.txt"], forcePlan: false },
+    { kind: "qa", created: "2026-09-23T10:02:00Z", questions: [
+      { question: "Which API should change?", answer: "Use the existing API" },
+      { question: "Which token?", answer: "[secret answer redacted]" }
+    ] }
+  ]);
+  assert.equal(JSON.stringify(buildTurnGrillPrompt({ userInput: "Task", midTurnInputs: inputs, agentResponse: "Done", fileChanges: [] })).includes("private-token"), false);
+});
+
+test("grill excludes the real async QA steer even when its message contains a sensitive answer", () => {
+  const questions = [{ title: "Which token?" }];
+  const decision = { answers: { "0": { answers: ["private-token"] } } };
+  const message = asyncAnswerText(questions, decision);
+  const commandId = `async:thread-1:call_question`;
+  assert.equal(message, "Which token?\nAnswer: private-token");
+  assert.equal("isSecret" in asyncInputParams(questions).questions[0], false);
+  const midTurnInputs = buildTurnGrillMidTurnInputs([{
+    itemType: "approval", method: USER_INPUT_METHOD, status: "resolved", sortCreated: "2026-09-23T10:02:00Z",
+    params: asyncInputParams(questions), decision
+  }], [{ id: commandId, content: message, attachments: [], forcePlan: false, created: "2026-09-23T10:02:01Z" }]);
+  assert.equal(midTurnInputs.length, 1);
+  assert.equal(midTurnInputs[0].kind, "qa");
+  const prompt = JSON.parse(buildTurnGrillPrompt({ userInput: "Task", midTurnInputs, agentResponse: "Done", fileChanges: [] }));
+  assert.equal(prompt.midTurnInputs.some((input: { kind: string }) => input.kind === "steer"), false);
+  assert.equal(prompt.midTurnInputs[0].questions[0].answer, "private-token");
 });
 
 test("grill accepts a long final response without a prompt-size cutoff", () => {

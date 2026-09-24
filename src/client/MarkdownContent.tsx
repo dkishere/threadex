@@ -23,6 +23,8 @@ import { UrlTagIcon } from "./UrlTagIcon";
 import { createLinkPreview, isStandaloneApp } from "./linkPreview";
 import { isJsonFilePath, isMarkdownFilePath, resolveWorkspaceMarkdownUrl, threadexNavigationUrl, transformMarkdownUrl, workspaceFileDownloadUrl, workspaceFilePreviewUrl, workspaceFileReferenceFromUrl, workspaceImagePreviewName, type WorkspaceFilePreviewContext } from "./markdownUrls";
 import { advanceMarkdownChunks, type MarkdownChunks } from "./markdownChunks";
+import type { ArchivePreview } from "../archivePreview";
+import { ArchiveFileTree } from "./ArchiveFileTree";
 
 const MonacoTextEditor = lazy(async () => {
   const module = await import("./MonacoDiffEditor");
@@ -290,6 +292,7 @@ function WorkspaceImagePopup({ name, src, onClose }: { name: string; src: string
 
 function WorkspaceFilePopup({ path, line, context, onClose }: { path: string; line?: number; context: WorkspaceFilePreviewContext; onClose: () => void }) {
   const [content, setContent] = useState<string | null>(null);
+  const [archive, setArchive] = useState<ArchivePreview | null>(null);
   const [error, setError] = useState<string | null>(null);
   const fileName = path.split(/[\\/]/).filter(Boolean).at(-1) || path;
   const isMarkdownFile = isMarkdownFilePath(path);
@@ -298,16 +301,20 @@ function WorkspaceFilePopup({ path, line, context, onClose }: { path: string; li
   useEffect(() => {
     const controller = new AbortController();
     setContent(null);
+    setArchive(null);
     setError(null);
     void fetch(workspaceFilePreviewUrl(path, context), { signal: controller.signal })
       .then(async (response) => {
-        const payload = await response.json().catch(() => null) as { exists?: boolean; text?: string; error?: string } | null;
+        const payload = await response.json().catch(() => null) as { exists?: boolean; text?: string; archive?: ArchivePreview; error?: string } | null;
         if (!response.ok) throw new Error(payload?.error || "Could not load this file.");
         if (!payload?.exists) throw new Error("File not found.");
-        return payload.text ?? "";
+        return payload;
       })
-      .then((text) => {
-        if (!controller.signal.aborted) setContent(text);
+      .then((payload) => {
+        if (!controller.signal.aborted) {
+          setArchive(payload.archive ?? null);
+          setContent(payload.text ?? "");
+        }
       })
       .catch((loadError: unknown) => {
         if (!controller.signal.aborted) setError(loadError instanceof Error ? loadError.message : "Could not load this file.");
@@ -324,6 +331,13 @@ function WorkspaceFilePopup({ path, line, context, onClose }: { path: string; li
   }, [onClose]);
 
   const downloadFile = () => {
+    if (/\.zip$/i.test(path)) {
+      const anchor = document.createElement("a");
+      anchor.href = workspaceFileDownloadUrl(workspaceFilePreviewUrl(path, context).replace("/file-preview?", "/file?"));
+      anchor.download = fileName;
+      anchor.click();
+      return;
+    }
     if (content === null) return;
 
     const objectUrl = URL.createObjectURL(new Blob([content], { type: workspaceFileMimeType(path) }));
@@ -349,7 +363,7 @@ function WorkspaceFilePopup({ path, line, context, onClose }: { path: string; li
             {isHtmlFilePath(path) && (
               <HtmlPreviewLink path={path} context={context} />
             )}
-            <button className="icon-button" type="button" onClick={downloadFile} disabled={content === null} aria-label={`Download ${fileName}`} title={`Download ${fileName}`}>
+            <button className="icon-button" type="button" onClick={downloadFile} disabled={content === null && !/\.zip$/i.test(path)} aria-label={`Download ${fileName}`} title={`Download ${fileName}`}>
               <Download aria-hidden="true" />
             </button>
             <button className="icon-button" type="button" onClick={onClose} aria-label="Close file preview">
@@ -359,7 +373,7 @@ function WorkspaceFilePopup({ path, line, context, onClose }: { path: string; li
         </header>
         <div className={isMarkdownFile ? "workspace-file-content workspace-markdown-file-content" : isJsonFile ? "workspace-file-content workspace-json-file-content" : "workspace-file-content"}>
           {error ? <p className="workspace-file-state">{error}</p> : content === null ? <p className="workspace-file-state">Loading file…</p> : (
-            isMarkdownFile ? <MarkdownContent className="workspace-file-markdown" sourcePath={path} children={content} /> : isJsonFile ? <JsonFileViewer content={content} /> : (
+            archive ? <ArchiveFileTree archive={archive} /> : isMarkdownFile ? <MarkdownContent className="workspace-file-markdown" sourcePath={path} children={content} /> : isJsonFile ? <JsonFileViewer content={content} /> : (
               <Suspense fallback={<p className="workspace-file-state">Loading editor…</p>}>
                 <MonacoTextEditor value={content} filePath={path} line={line} />
               </Suspense>

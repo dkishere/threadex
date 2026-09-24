@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { parseBrowserBridgeContext } from "./browserBridgeContext";
-import { handleEditorKeyDown, handleEditorPaste, removeWaitSubscription } from "./sessionActions05";
+import { deletePendingTurn, handleEditorKeyDown, handleEditorPaste, removeWaitSubscription, steerPendingTurn } from "./sessionActions05";
 import { EventStore, type WaitSubscription } from "./eventStore";
 import { buildTurnIssueCopyPayload, parseTurnIssueContext } from "./turnIssueCopy";
 
@@ -13,6 +13,33 @@ const context = {
   selector: "main > button",
   "extension-context-key": "codex-browser-bridge:context:42:test"
 };
+
+for (const [action, method, suffix] of [
+  [deletePendingTurn, "DELETE", ""],
+  [steerPendingTurn, "POST", "/steer"]
+] as const) {
+  test(`${method} submitted queued prompt updates the backend before refreshing the UI`, async (t) => {
+    const events: string[] = [];
+    t.mock.method(globalThis, "fetch", async (url: string, options?: RequestInit) => {
+      assert.equal(url, `/api/pending-turns/queued-1${suffix}`);
+      assert.equal(options?.method, method);
+      assert.deepEqual(JSON.parse(String(options?.body)), { sessionId: "session-1" });
+      events.push("backend");
+      return Response.json({ ok: true });
+    });
+    const changed = await action({
+      sessionId: "session-1",
+      isLikelyBackendDisconnect: () => false,
+      noteBackendDisconnect: () => assert.fail("unexpected disconnect"),
+      noteBackendRequestSucceeded: () => events.push("ack"),
+      refreshSelectedSessionSnapshot: async () => { events.push("snapshot"); },
+      setStatus: () => events.push("status"),
+      showToast: () => assert.fail("unexpected error")
+    }, "queued-1");
+    assert.equal(changed, true);
+    assert.deepEqual(events, ["backend", "ack", "snapshot", "status"]);
+  });
+}
 
 for (const outcome of ["cancelled", "dispatching", "done", "invalid", "error"] as const) {
   test(`removing a wait applies ${outcome} response without waiting for background sync`, async (t) => {

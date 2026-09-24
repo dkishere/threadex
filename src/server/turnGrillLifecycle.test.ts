@@ -5,6 +5,7 @@ import { createServer } from "node:http";
 import { createTurnGrillHandler } from "./turnGrillRoute";
 import type { SessionStore } from "./sessionStore";
 import type { TurnGrill } from "../turnGrill";
+import { USER_INPUT_METHOD } from "../userInputRequest";
 
 test("running Grill remains readable, excludes concurrent writes, preserves failed requests and recovers abandoned work", async () => {
   let saved: TurnGrill | null = null;
@@ -18,8 +19,15 @@ test("running Grill remains readable, excludes concurrent writes, preserves fail
       saved = structuredClone(next); return true;
     },
     getWorkspace: async () => ({ id: "w", codexHome: "/unused" }),
-    listSessionTurnLiveItems: async () => [], listSessionSteerMessages: async () => ({}),
-    listSessionApprovalLiveItems: async () => ({}), listSessionDeveloperInstructions: async () => ({}),
+    listSessionTurnLiveItems: async () => [], listSessionSteerMessages: async () => ({ t: [
+      { id: "manual", content: "Use the existing endpoint", attachments: [], forcePlan: false, created: "2026-09-23T10:01:00Z" },
+      { id: "async:thread:question", content: "Answer echoed as steer", attachments: [], forcePlan: false, created: "2026-09-23T10:03:00Z" }
+    ] }),
+    listSessionApprovalLiveItems: async () => ({ t: [{
+      itemType: "approval", method: USER_INPUT_METHOD, status: "resolved", sortCreated: "2026-09-23T10:02:00Z",
+      params: { questions: [{ id: "scope", header: "Scope", question: "Which endpoint?" }] },
+      decision: { answers: { scope: { answers: ["The existing endpoint"] } } }
+    }] }), listSessionDeveloperInstructions: async () => ({}),
     listSessionTurns: async () => [turn]
   } as unknown as SessionStore;
   let release!: () => void;
@@ -27,7 +35,9 @@ test("running Grill remains readable, excludes concurrent writes, preserves fail
   let started!: () => void;
   const running = new Promise<void>((done) => { started = done; });
   let fail = false;
+  const prompts: Array<Record<string, unknown>> = [];
   const handler = createTurnGrillHandler({ sessionStore: store, serverUrl: "http://unused", recordUsage: async () => {}, runGrill: async (_home, prompt) => {
+    prompts.push(JSON.parse(prompt));
     started(); await gate;
     return { responseText: fail ? "malformed JSON" : JSON.stringify([{ id: "q1", md: "Question", responseMd: JSON.parse(prompt).action === "start" ? "" : "Thread answer", status: "open" }]), usage: null, authIdentity: { externalAccountId: null, externalUserId: null } };
   } });
@@ -48,6 +58,10 @@ test("running Grill remains readable, excludes concurrent writes, preserves fail
     saved = { ...saved!, updated: new Date(Date.now() - 600_000).toISOString() };
     assert.equal((await (await fetch(url)).json()).grill.status, "running");
     release(); assert.equal((await request).status, 200);
+    assert.deepEqual(prompts[0].midTurnInputs, [
+      { kind: "steer", created: "2026-09-23T10:01:00Z", content: "Use the existing endpoint", attachmentNames: [], forcePlan: false },
+      { kind: "qa", created: "2026-09-23T10:02:00Z", questions: [{ question: "Which endpoint?", answer: "The existing endpoint" }] }
+    ]);
     const ready = (await (await fetch(url)).json()).grill;
     assert.equal((await post({ action: "followup", revision: ready.revision, issues: ready.issues })).status, 409);
     assert.equal((await post({ action: "respond", revision: ready.revision, issues: ready.issues, issueId: "q1" })).status, 400);
@@ -64,6 +78,7 @@ test("running Grill remains readable, excludes concurrent writes, preserves fail
     fail = false;
     const retried = await post({ action: "respond", revision: recovered.revision, issues: recovered.issues, prompt: recovered.request.prompt });
     assert.equal(retried.status, 200);
+    assert.deepEqual(prompts.at(-1)?.midTurnInputs, prompts[0].midTurnInputs);
     assert.equal((await retried.json()).grill.issues[0].responseMd, "Thread answer");
   } finally {
     release(); await new Promise<void>((done) => server.close(() => done()));

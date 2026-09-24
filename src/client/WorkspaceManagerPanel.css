@@ -1,0 +1,57 @@
+.workspace-manager-toggle { display: inline-flex; align-items: center; gap: 6px; margin-right: auto; padding: 7px 9px; border-radius: 6px; background: transparent; color: #64748b; cursor: pointer; }
+.workspace-manager-toggle svg { width: 17px; height: 17px; }
+.workspace-manager-toggle[aria-checked="true"] { background: #dbeafe; color: #1d4ed8; }
+.workspace-manager-toggle:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
+.workspace-manager-dashboard { grid-column: 1; grid-row: 3 / 5; display: block; min-width: 0; min-height: 0; padding: 24px; overflow: auto; border-right: 1px solid #e2e8f0; background: #f8fafc; text-align: left; }
+.workspace-manager-dashboard[hidden], .responsive-layout[data-middle-open="false"] .workspace-manager-dashboard { display: none; }
+.workspace-dashboard-content { width: 100%; max-width: 760px; margin: 0 auto; }
+.workspace-dashboard-label { color: #64748b; font-size: 10px; font-weight: 700; letter-spacing: .12em; }
+.workspace-manager-dashboard h2 { margin: 5px 0 18px; color: #0f172a; font-size: 20px; font-weight: 650; }
+.workspace-manager-dashboard p { color: #64748b; font-size: 12px; }
+.workspace-dashboard-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.workspace-dashboard-summary, .workspace-task-card { min-width: 0; padding: 16px; border: 1px solid #dbe3ec; border-radius: 12px; background: white; box-shadow: 0 2px 8px rgb(15 23 42 / 4%); }
+.workspace-dashboard-summary { display: flex; justify-content: space-between; align-items: center; gap: 12px; color: #64748b; font-size: 12px; }
+.workspace-dashboard-summary strong { color: #0f172a; font-size: 20px; font-variant-numeric: tabular-nums; }
+.workspace-task-card { grid-column: span 2; }
+.workspace-task-heading { display: flex; align-items: center; gap: 7px; color: #2563eb; font-size: 10px; font-weight: 700; letter-spacing: .08em; }
+.workspace-task-status-dot { width: 7px; height: 7px; border-radius: 50%; background: #3b82f6; box-shadow: 0 0 0 3px #dbeafe; }
+.workspace-task-title { display: block; max-width: 100%; margin: 12px 0 16px; padding: 0; overflow: hidden; border: 0; background: none; color: #0f172a; font: inherit; font-size: 16px; font-weight: 650; text-align: left; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.workspace-task-title:hover { color: #1d4ed8; }
+.workspace-task-title:focus-visible { outline: 2px solid #2563eb; outline-offset: 3px; }
+.workspace-task-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.workspace-task-metric { min-width: 0; }
+.workspace-task-metric span { display: block; margin-bottom: 3px; color: #64748b; font-size: 11px; }
+.workspace-task-metric strong { display: block; overflow: hidden; color: #334155; font-size: 13px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.workspace-dashboard-empty { margin-top: 20px; }
+.workspace-manager-follow-up { display: flex; align-items: center; gap: 6px; }
+.workspace-manager-follow-up small { color: #64748b; font-size: 11px; }
+.workspace-manager-reset { display: inline-flex; align-items: center; gap: 5px; padding: 5px 7px; border-radius: 5px; color: #64748b; font-size: 11px; }
+.workspace-manager-reset svg { width: 14px; height: 14px; }
+.workspace-manager-reset:hover:not(:disabled) { background: #e2e8f0; color: #334155; }
+.workspace-manager-reset:disabled { opacity: .5; }
+.workspace-manager-question { padding: 16px; }
+.workspace-manager-question > strong { display: block; margin-bottom: 6px; color: #64748b; font-size: 12px; }
+/* A long draft, attachments or queue must not push the composer past the
+   viewport. Keep room for the conversation and scroll the composer itself. */
+.chat[data-workspace-manager="true"] > .composer {
+  min-height: 0;
+  max-height: max(40px, calc(var(--app-height, 100dvh) - var(--workspace-header-height) - var(--chat-header-height) - 40px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+.chat[data-workspace-manager="true"] > .composer .composer-layout { display: grid; grid-template-columns: minmax(0, 1fr); align-items: end; gap: 6px; }
+.chat[data-workspace-manager="true"] > .composer .composer-shell { grid-column: 1; grid-row: 1; width: auto; min-width: 0; margin: 0; }
+/* Keep the ordinary composer and its handlers; this view only hides helpers. */
+.chat[data-workspace-manager="true"] > .composer .composer-gears,
+.chat[data-workspace-manager="true"] > .composer .composer-suggestions,
+.chat[data-workspace-manager="true"] > .composer .composer-bar > button:not(.send-button) { display: none; }
+.chat[data-workspace-manager="true"] > .composer .composer-bar { position: sticky; bottom: 0; z-index: 2; margin-left: -12px; }
+.chat[data-workspace-manager="true"] > .composer .composer-upload:focus-visible { outline: 2px solid #2563eb; border-radius: 4px; }
+.chat[data-workspace-manager="true"] > .composer > .queued-prompts { display: grid; }
+@media (width < 768px) {
+  .workspace-manager-dashboard { padding: 16px; }
+  .workspace-dashboard-grid { grid-template-columns: minmax(0, 1fr); }
+  .workspace-task-card { grid-column: 1; }
+  .workspace-manager-toggle { min-height: 40px; }
+}

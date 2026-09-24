@@ -176,7 +176,7 @@ export function sessionTurnsToMessages(ctx, turns, title, existingMessages = [],
             })
             : undefined;
         const streamItems = turn.liveItems?.filter(isStreamItem) ?? [];
-        const localSteers = existingMessages.filter((message) => message.role === "user" && message.kind === "steer" && message.turnId === turn.id);
+        const localSteers = existingMessages.filter((message) => message.role === "user" && message.kind === "steer" && message.turnId === turn.id && !message.id.startsWith("async:"));
         const persistedSteers = snapshotSteerMessages(turn.steerMessages, turn.id);
         const steerById = new Map();
         for (const steer of localSteers) {
@@ -219,6 +219,7 @@ export function sessionTurnsToMessages(ctx, turns, title, existingMessages = [],
                 reasoningEffort: turn.reasoningEffort ?? existingUserMessage?.reasoningEffort,
                 autoModel: turn.autoModelProvider === "typesafe" || turn.autoModelProvider === "fallback" || existingUserMessage?.autoModel,
                 autoModelProvider: turn.autoModelProvider ?? existingUserMessage?.autoModelProvider,
+                autoModelConfidence: turn.autoModelConfidence ?? existingUserMessage?.autoModelConfidence,
                 tokenIn: Number.isFinite(turn.tokenIn) ? turn.tokenIn : existingUserMessage?.tokenIn,
                 cachedInputTokens: Number.isFinite(turn.usageSample?.cachedInputTokens)
                     ? turn.usageSample.cachedInputTokens
@@ -226,6 +227,8 @@ export function sessionTurnsToMessages(ctx, turns, title, existingMessages = [],
                 tokenOut: Number.isFinite(turn.tokenOut) ? turn.tokenOut : existingUserMessage?.tokenOut,
                 executionDurationMs: turnDurationMs(turn),
                 turnStatus: turn.status,
+                pendingReason: turn.pendingReason ?? null,
+                queueSteerReserved: turn.lastEventName === "queue.steer_reserved",
                 createdAt: turn.created,
                 attachments: storedUserInput.attachments.length > 0 ? storedUserInput.attachments : existingUserMessage?.attachments,
                 startupSnapshot: index === 0 ? existingUserMessage?.startupSnapshot : undefined,
@@ -237,7 +240,13 @@ export function sessionTurnsToMessages(ctx, turns, title, existingMessages = [],
             {
                 id: `${turn.id}:assistant`,
                 role: "assistant",
-                content: turn.agentResponse || (turn.status === "todo" ? "Queued for retry after usage limit reset." : ""),
+                content: turn.agentResponse || (turn.status === "todo"
+                    ? turn.pendingReason === "rate_limit"
+                        ? "Queued for retry after usage limit reset."
+                        : turn.pendingReason === "auth"
+                            ? "Waiting for account login."
+                            : "Queued behind the active turn."
+                    : ""),
                 turnId: turn.id,
                 createdAt: turn.runnerStarted ?? turn.created,
                 pending: turn.status === "running",
@@ -247,6 +256,8 @@ export function sessionTurnsToMessages(ctx, turns, title, existingMessages = [],
                 completedAt: turn.status === "done" ? turn.runnerHeartbeat ?? undefined : undefined,
                 conclusion: turn.status === "done" ? turn.agentResponse : undefined,
                 turnStatus: turn.status,
+                pendingReason: turn.pendingReason ?? null,
+                queueSteerReserved: turn.lastEventName === "queue.steer_reserved",
                 runnerStarted: turn.status === "running"
                     ? Boolean(turn.runnerStarted || turn.runnerPid || turn.runnerLogPath)
                     : true
@@ -266,7 +277,8 @@ export function snapshotSteerMessages(value, turnId) {
             return [];
         }
         const steer = candidate;
-        if (typeof steer.id !== "string" || !steer.id || typeof steer.content !== "string" || !steer.content) {
+        // Async QA answers are already shown in their question cards.
+        if (typeof steer.id !== "string" || !steer.id || steer.id.startsWith("async:") || typeof steer.content !== "string" || !steer.content) {
             return [];
         }
         return [{

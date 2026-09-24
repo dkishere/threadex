@@ -4,7 +4,7 @@ import type { ProcessCommandParameter, ProcessCommandValues } from "../processCo
 import { AUTO_MODEL_CHOICES, AUTO_EFFORT_CHOICES, isAutoModel, isAutoEffort, normalizeAutoModel } from "../autoModelCatalog";
 import { acknowledgeGrill, grillAwaitingAck, type GrillSummary, type TurnGrill } from "../turnGrill";
 import { openPostgresSessionConnection, postgresSchemaFromStoreId, type SessionDbConnection, type SessionDbValue } from "./sessionDb";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, statSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
 import { relative, resolve } from "node:path";
@@ -14,6 +14,8 @@ import { fileChangesFromTurnDiff, normalizeStructuredAgentComment } from "./code
 import { changedFilePaths } from "./changedFilePaths";
 import { canonicalSessionId, isThreadexSessionId, sessionIdAliases } from "../codexReference";
 import { stripContextForkOperationalSuffix } from "../contextFork";
+import { managerActivityPrompt, WORKSPACE_MANAGER_MODEL, WORKSPACE_MANAGER_EFFORT,
+  type WorkspaceManagerRecord, type WorkspaceManagerEvent, type WorkspaceManagerSnapshot } from "../workspaceManager";
 
 export type KeywordWeights = Record<string, number>;
 
@@ -489,6 +491,8 @@ export type SessionTurnRecord = {
   lastEventName: string | null;
   pendingReason: "queued" | "rate_limit" | "auth" | "stopped" | null;
   pendingLoadBalance: boolean | null;
+  /** Original request options retained for durable pending-turn retries. */
+  requestMetadata?: Record<string, unknown>;
   created: string;
 };
 
@@ -807,6 +811,7 @@ type RecordSessionTurnInput = {
   status?: SessionTurnStatus;
   pendingReason?: "queued" | "rate_limit" | "auth" | "stopped" | null;
   pendingLoadBalance?: boolean | null;
+  requestMetadata?: Record<string, unknown> | null;
 };
 
 type RecordSessionSideChatInput = {
@@ -850,6 +855,7 @@ type UpdatePendingSessionTurnInput = {
   id: string;
   sessionId: string;
   userInput: string;
+  message?: string;
 };
 
 type RecordSessionTurnEventInput = {
@@ -990,7 +996,30 @@ const latestUsageSampleJoinSql = `
     )
 `;
 const latestUsageSampleSelectSql = `
-  latest_usage.model AS turn_model,
+  COALESCE(
+    (
+      SELECT model
+      FROM token_usage
+      WHERE turn_id = session_turn.id
+        AND usage_type = 'agent'
+        AND source = 'native_token_count'
+        AND model IS NOT NULL
+        AND model <> 'auto'
+      ORDER BY source_timestamp DESC NULLS LAST, source_index DESC NULLS LAST, created DESC
+      LIMIT 1
+    ),
+    NULLIF(latest_usage.model, 'auto'),
+    (
+      SELECT model
+      FROM token_usage
+      WHERE turn_id = session_turn.id
+        AND usage_type = 'agent'
+        AND model IS NOT NULL
+        AND model <> 'auto'
+      ORDER BY source_timestamp DESC NULLS LAST, source_index DESC NULLS LAST, created DESC
+      LIMIT 1
+    )
+  ) AS turn_model,
   COALESCE(
     json_extract_string(latest_usage.metadata, '$.reasoningEffort'),
     json_extract_string(latest_effort_usage.metadata, '$.reasoningEffort')
@@ -1119,6 +1148,7 @@ type SessionTurnRow = {
   last_event_name?: unknown;
   pending_reason?: unknown;
   pending_load_balance?: unknown;
+  request_metadata?: unknown;
   created?: unknown;
   usage_sample_id?: unknown;
   usage_sample_source?: unknown;
@@ -1631,6 +1661,7 @@ export class SessionStore {
           CAST(updated AS VARCHAR) AS updated
         FROM sessions
         WHERE workspace_id = $workspaceId
+          AND NOT EXISTS (SELECT 1 FROM workspace_manager_archive a WHERE a.session_id = sessions.id)
         ORDER BY updated DESC, created DESC
       `,
             { workspaceId }
@@ -1652,6 +1683,7 @@ export class SessionStore {
           CAST(created AS VARCHAR) AS created,
           CAST(updated AS VARCHAR) AS updated
         FROM sessions
+        WHERE NOT EXISTS (SELECT 1 FROM workspace_manager_archive a WHERE a.session_id = sessions.id)
         ORDER BY updated DESC, created DESC
       `);
       return (await result.getRowObjectsJS()).map(toSessionRecord);
@@ -1823,6 +1855,7 @@ export class SessionStore {
           FROM sessions
           WHERE workspace_id = $workspaceId
             AND achieved_at IS NULL
+            AND NOT EXISTS (SELECT 1 FROM workspace_manager_archive a WHERE a.session_id = sessions.id)
             ${projectSql}
             ${searchSql}
             AND NOT ${emptyNativeSessionAliasSql}
@@ -1843,6 +1876,7 @@ export class SessionStore {
           FROM sessions
           WHERE workspace_id = $workspaceId
             AND achieved_at IS NULL
+            AND NOT EXISTS (SELECT 1 FROM workspace_manager_archive a WHERE a.session_id = sessions.id)
             ${projectSql}
             ${searchSql}
             AND NOT ${emptyNativeSessionAliasSql}
@@ -1872,6 +1906,7 @@ export class SessionStore {
           FROM sessions
           WHERE workspace_id = $workspaceId
             AND achieved_at IS NULL
+            AND NOT EXISTS (SELECT 1 FROM workspace_manager_archive a WHERE a.session_id = sessions.id)
             AND NOT ${emptyNativeSessionAliasSql}
           GROUP BY cwd
           ORDER BY latest_updated DESC, cwd ASC
@@ -3737,6 +3772,7 @@ export class SessionStore {
             session_turn.last_event_name,
             session_turn.pending_reason,
             session_turn.pending_load_balance,
+            CAST(session_turn.request_metadata AS VARCHAR) AS request_metadata,
             CAST(session_turn.created AS VARCHAR) AS created,
             ${resultExecutionDurationSelectSql},
             ${latestUsageSampleSelectSql}
@@ -3819,6 +3855,7 @@ export class SessionStore {
             session_turn.last_event_name,
             session_turn.pending_reason,
             session_turn.pending_load_balance,
+            CAST(session_turn.request_metadata AS VARCHAR) AS request_metadata,
             CAST(session_turn.created AS VARCHAR) AS created,
             ${resultExecutionDurationSelectSql},
             ${latestUsageSampleSelectSql}
@@ -4218,7 +4255,7 @@ export class SessionStore {
     return this.read(async (connection) => this.listSessionSteerMessagesWithConnection(connection, sessionId));
   }
 
-  async listSessionAutoModelProviders(sessionId: string): Promise<Record<string, SessionAutoModelProvider>> {
+  async listSessionAutoModelProviders(sessionId: string): Promise<Record<string, { provider: SessionAutoModelProvider; confidence?: number }>> {
     return this.read(async (connection) => this.listSessionAutoModelProvidersWithConnection(connection, sessionId));
   }
 
@@ -4242,11 +4279,13 @@ export class SessionStore {
             runner_exit_code,
             last_event_name,
             pending_reason,
+            CAST(request_metadata AS VARCHAR) AS request_metadata,
             CAST(created AS VARCHAR) AS created
           FROM session_turn
           WHERE session_id = $sessionId
             AND status = 'todo'
             AND coalesce(pending_reason, 'queued') <> 'stopped'
+            AND last_event_name IS DISTINCT FROM 'queue.steer_reserved'
           ORDER BY created ASC, id ASC
           LIMIT 1
         `,
@@ -4281,6 +4320,7 @@ export class SessionStore {
           session_turn.last_event_name AS turn_last_event_name,
           session_turn.pending_reason AS turn_pending_reason,
           session_turn.pending_load_balance AS turn_pending_load_balance,
+          CAST(session_turn.request_metadata AS VARCHAR) AS turn_request_metadata,
           CAST(session_turn.created AS VARCHAR) AS turn_created,
           sessions.id AS session_id,
           sessions.thread_id,
@@ -4312,6 +4352,7 @@ export class SessionStore {
         INNER JOIN sessions ON sessions.id = session_turn.session_id
         LEFT JOIN accounts ON accounts.id = session_turn.account_id
         WHERE session_turn.status = 'todo'
+          AND session_turn.last_event_name IS DISTINCT FROM 'queue.steer_reserved'
         ORDER BY session_turn.created ASC, session_turn.id ASC
       `);
       return (await result.getRowObjectsJS()).map((row) => ({
@@ -4332,6 +4373,7 @@ export class SessionStore {
           last_event_name: row.turn_last_event_name,
           pending_reason: row.turn_pending_reason,
           pending_load_balance: row.turn_pending_load_balance,
+          request_metadata: row.turn_request_metadata,
           created: row.turn_created
         }),
         session: toSessionRecord({
@@ -4391,6 +4433,7 @@ export class SessionStore {
             last_event_name,
             pending_reason,
             pending_load_balance,
+            CAST(request_metadata AS VARCHAR) AS request_metadata,
             CAST(created AS VARCHAR) AS created,
             ${resultExecutionDurationSelectSql}
           FROM session_turn AS session_turn
@@ -4429,9 +4472,10 @@ export class SessionStore {
     });
   }
 
-  async upsertSession(input: UpsertSessionInput): Promise<SessionRecord> {
+  async upsertSession(input: UpsertSessionInput, options: { createOnly?: boolean } = {}): Promise<SessionRecord> {
     return this.write(async (connection) => {
       const existing = await this.getSessionWithConnection(connection, input.id);
+      if (existing && options.createOnly) return existing;
       if (!existing && input.threadId) {
         // Client-generated local ids can race with a stale resumeThreadId.
         // Coalesce that request onto the existing local session while still
@@ -4748,6 +4792,307 @@ export class SessionStore {
 
   async getWorkspace(id: string): Promise<WorkspaceRecord | null> {
     return this.read(async (connection) => this.getWorkspaceWithConnection(connection, id));
+  }
+
+  async getWorkspaceManager(workspaceId: string): Promise<WorkspaceManagerRecord | null> {
+    return this.read(async (connection) => {
+      const rows = await (await connection.run(`SELECT * FROM workspace_manager WHERE workspace_id = $workspaceId`, { workspaceId })).getRowObjectsJS();
+      return rows[0] ? toWorkspaceManager(rows[0]) : null;
+    });
+  }
+
+  async getSessionWorkspaceManager(sessionId: string): Promise<WorkspaceManagerRecord | null> {
+    return this.read(async (connection) => {
+      const rows = await (await connection.run(`SELECT * FROM workspace_manager WHERE session_id = $sessionId`, { sessionId })).getRowObjectsJS();
+      return rows[0] ? toWorkspaceManager(rows[0]) : null;
+    });
+  }
+
+  async setSessionTaskManager(sessionId: string, managerSessionId: string) {
+    return this.write(async connection => {
+      const result = await connection.run(`UPDATE sessions s SET created_by_manager_session_id = m.session_id
+        FROM workspace_manager m WHERE s.id = $sessionId AND m.session_id = $managerSessionId
+        AND s.workspace_id = m.workspace_id AND s.id <> m.session_id
+        AND (s.created_by_manager_session_id IS NULL OR s.created_by_manager_session_id = m.session_id)`, { sessionId, managerSessionId });
+      if (!result.rowCount) throw new Error("Task and originating manager must belong to the same workspace.");
+    });
+  }
+
+  async getSessionTaskManager(sessionId: string): Promise<WorkspaceManagerRecord | null> {
+    return this.read(async connection => {
+      const rows = await (await connection.run(`SELECT m.* FROM sessions s JOIN workspace_manager m
+        ON m.session_id = COALESCE(s.created_by_manager_session_id, s.parent_session_id)
+        AND m.workspace_id = s.workspace_id WHERE s.id = $sessionId`, { sessionId })).getRowObjectsJS();
+      return rows[0] ? toWorkspaceManager(rows[0]) : null;
+    });
+  }
+
+  async ensureWorkspaceManager(workspaceId: string): Promise<WorkspaceManagerRecord> {
+    return this.transaction(async (connection) => {
+      const workspace = await this.getWorkspaceWithConnection(connection, workspaceId);
+      if (!workspace) throw new Error("Workspace not found.");
+      const current = (await (await connection.run(`SELECT * FROM workspace_manager
+        WHERE workspace_id = $workspaceId FOR UPDATE`, { workspaceId })).getRowObjectsJS())[0];
+      if (current) return toWorkspaceManager(current);
+      const originalId = `tx_manager_${createHash("sha256").update(workspaceId).digest("hex").slice(0, 24)}`;
+      const archived = (await (await connection.run(`SELECT 1 FROM workspace_manager_archive
+        WHERE session_id = $sessionId`, { sessionId: originalId })).getRowObjectsJS()).length > 0;
+      const sessionId = archived ? `tx_manager_${randomUUID()}` : originalId;
+      await connection.run(`INSERT INTO sessions (id, workspace_id, cwd, title, title_source, description)
+        VALUES ($sessionId, $workspaceId, $cwd, $title, 'user', 'Workspace communication, task coordination and follow-up.')
+        ON CONFLICT (id) DO NOTHING`, { sessionId, workspaceId, cwd: workspace.cwd, title: `${workspace.name} · Manager` });
+      await connection.run(`INSERT INTO workspace_manager (workspace_id, session_id) VALUES ($workspaceId, $sessionId)
+        ON CONFLICT (workspace_id) DO NOTHING`, { workspaceId, sessionId });
+      const rows = await (await connection.run(`SELECT * FROM workspace_manager WHERE workspace_id = $workspaceId`, { workspaceId })).getRowObjectsJS();
+      return toWorkspaceManager(rows[0]);
+    });
+  }
+
+  async rotateWorkspaceManager(workspaceId: string, expectedSessionId: string) {
+    return this.transaction(async connection => {
+      const rows = await (await connection.run(`SELECT * FROM workspace_manager
+        WHERE workspace_id = $workspaceId FOR UPDATE`, { workspaceId })).getRowObjectsJS();
+      if (!rows[0]) throw new Error("Workspace manager has not been created.");
+      const previous = toWorkspaceManager(rows[0]);
+      if (previous.sessionId !== expectedSessionId) throw new Error("Workspace manager changed. Reload before clearing it.");
+      const active = await (await connection.run(`SELECT 1 FROM session_turn WHERE session_id = $sessionId
+        AND (status = 'running' OR (status = 'todo' AND pending_reason IS DISTINCT FROM 'stopped')) LIMIT 1`,
+        { sessionId: previous.sessionId })).getRowObjectsJS();
+      if (active.length) throw new Error("Wait for the current manager turn to finish or stop it before clearing.");
+      const workspace = await this.getWorkspaceWithConnection(connection, workspaceId);
+      const previousSession = await this.getSessionWithConnection(connection, previous.sessionId);
+      if (!workspace || !previousSession) throw new Error("Workspace manager session is missing.");
+      const sessionId = `tx_manager_${randomUUID()}`;
+      await connection.run(`INSERT INTO sessions (id, workspace_id, cwd, account_id, title, title_source, description)
+        VALUES ($sessionId, $workspaceId, $cwd, $accountId, $title, 'user',
+          'Workspace communication, task coordination and follow-up.')`, {
+        sessionId, workspaceId, cwd: workspace.cwd, accountId: previousSession.accountId,
+        title: `${workspace.name} · Manager`
+      });
+      await connection.run(`INSERT INTO session_model_preferences (session_id, selected_model, selected_effort)
+        VALUES ($sessionId, $model, $effort)`, {
+        sessionId, model: WORKSPACE_MANAGER_MODEL, effort: WORKSPACE_MANAGER_EFFORT
+      });
+      await connection.run(`INSERT INTO session_auto_model (session_id, enabled) VALUES ($sessionId, false)`, { sessionId });
+      await connection.run(`INSERT INTO execution_approval_policy (owner_id, policy)
+        SELECT $newOwner, policy FROM execution_approval_policy WHERE owner_id = $oldOwner`, {
+        newOwner: `session:${sessionId}`, oldOwner: `session:${previous.sessionId}`
+      });
+      // Keep task ancestry intact while transferring manager ownership/routing.
+      await connection.run(`UPDATE sessions SET created_by_manager_session_id = $sessionId
+        WHERE workspace_id = $workspaceId AND
+          (created_by_manager_session_id = $previousSessionId OR
+            (created_by_manager_session_id IS NULL AND parent_session_id = $previousSessionId))`, {
+        workspaceId, sessionId, previousSessionId: previous.sessionId
+      });
+      await connection.run(`INSERT INTO workspace_manager_archive
+        (session_id, workspace_id, replaced_by_session_id) VALUES ($previousSessionId, $workspaceId, $sessionId)`, {
+        previousSessionId: previous.sessionId, workspaceId, sessionId
+      });
+      const current = await (await connection.run(`UPDATE workspace_manager
+        SET session_id = $sessionId, created = now(), updated = now()
+        WHERE workspace_id = $workspaceId RETURNING *`, { workspaceId, sessionId })).getRowObjectsJS();
+      await connection.run(`UPDATE active_session SET session_id = $sessionId, updated = now()
+        WHERE key = $workspaceId AND session_id = $previousSessionId`, {
+        workspaceId, sessionId, previousSessionId: previous.sessionId
+      });
+      return { manager: toWorkspaceManager(current[0]), archivedSessionId: previous.sessionId };
+    });
+  }
+
+  async isArchivedWorkspaceManagerSession(sessionId: string): Promise<boolean> {
+    return this.read(async connection => (await (await connection.run(
+      `SELECT 1 FROM workspace_manager_archive WHERE session_id = $sessionId`, { sessionId }
+    )).getRowObjectsJS()).length > 0);
+  }
+
+  async listWorkspaceManagerArchives(workspaceId: string) {
+    return this.read(async connection => (await (await connection.run(`SELECT session_id, replaced_by_session_id,
+      CAST(archived_at AS VARCHAR) AS archived_at FROM workspace_manager_archive
+      WHERE workspace_id = $workspaceId ORDER BY archived_at DESC`, { workspaceId })).getRowObjectsJS())
+      .map(row => ({ sessionId: String(row.session_id), replacedBySessionId: String(row.replaced_by_session_id),
+        archivedAt: managerTimestamp(row.archived_at) })));
+  }
+
+  async updateWorkspaceManager(workspaceId: string, input: { notificationsEnabled: boolean }) {
+    return this.write(async (connection) => {
+      const updated = await (await connection.run(`UPDATE workspace_manager SET notifications_enabled = $enabled,
+        updated = now() WHERE workspace_id = $workspaceId RETURNING *`, { workspaceId, enabled: input.notificationsEnabled })).getRowObjectsJS();
+      if (!updated[0]) throw new Error("Workspace manager has not been created.");
+      return toWorkspaceManager(updated[0]);
+    });
+  }
+
+  async recordWorkspaceManagerEvent(event: WorkspaceManagerEvent) {
+    return this.transaction(async (connection) => {
+      if (event.type === "platform.restarted") {
+        // Only the latest undelivered restart matters. Preserve old rows for
+        // audit while preventing dev restarts from filling the manager inbox.
+        await connection.run(`UPDATE workspace_manager_event SET dismissed_at = now(),
+          dismissed_reason = 'superseded by a later platform restart'
+          WHERE workspace_id = $workspaceId AND type = 'platform.restarted'
+            AND delivery_turn_id IS NULL AND dismissed_at IS NULL AND created < $created::timestamptz`,
+          { workspaceId: event.workspaceId, created: event.created });
+      }
+      await connection.run(`INSERT INTO workspace_manager_event
+        (id, workspace_id, session_id, turn_id, type, summary, created, dismissed_at, dismissed_reason)
+        SELECT $id, m.workspace_id, $sessionId, $turnId, $type, $summary, $created::timestamptz,
+          CASE WHEN $type = 'platform.restarted' AND EXISTS (
+            SELECT 1 FROM workspace_manager_event newer WHERE newer.workspace_id = m.workspace_id
+              AND newer.type = 'platform.restarted' AND newer.delivery_turn_id IS NULL
+              AND newer.dismissed_at IS NULL AND newer.created > $created::timestamptz
+          ) THEN now() ELSE NULL END,
+          CASE WHEN $type = 'platform.restarted' AND EXISTS (
+            SELECT 1 FROM workspace_manager_event newer WHERE newer.workspace_id = m.workspace_id
+              AND newer.type = 'platform.restarted' AND newer.delivery_turn_id IS NULL
+              AND newer.dismissed_at IS NULL AND newer.created > $created::timestamptz
+          ) THEN 'superseded by a later platform restart' ELSE NULL END
+        FROM workspace_manager m
+        WHERE m.workspace_id = $workspaceId AND ($sessionId::varchar IS NULL OR (m.session_id <> $sessionId AND
+          EXISTS (SELECT 1 FROM sessions s WHERE s.id = $sessionId AND s.workspace_id = m.workspace_id)))
+          AND m.created <= $created::timestamptz
+        ON CONFLICT (id) DO NOTHING`, { ...event, summary: event.summary.slice(0, 1800) });
+    });
+  }
+
+  async listWorkspaceManagerEvents(workspaceId: string, pendingOnly = true): Promise<Array<WorkspaceManagerEvent & {
+    deliveryTurnId: string | null;
+    dismissedAt: string | null;
+    dismissedReason: string | null;
+    taskStatus: string | null;
+    taskPendingReason: string | null;
+    taskRunnerExitCode: number | null;
+  }>> {
+    return this.read(async connection => {
+      const rows = await (await connection.run(`SELECT e.*, t.status AS task_status,
+        t.pending_reason AS task_pending_reason, t.runner_exit_code AS task_runner_exit_code
+        FROM workspace_manager_event e LEFT JOIN session_turn t ON t.id = e.turn_id
+        WHERE e.workspace_id = $workspaceId AND ($pendingOnly = false OR
+          (e.delivery_turn_id IS NULL AND e.dismissed_at IS NULL))
+        ORDER BY e.created, e.id LIMIT 500`, { workspaceId, pendingOnly })).getRowObjectsJS();
+      return rows.map(row => ({ id: String(row.id), workspaceId,
+        sessionId: nullableString(row.session_id), turnId: nullableString(row.turn_id),
+        type: String(row.type), summary: String(row.summary), created: managerTimestamp(row.created),
+        deliveryTurnId: nullableString(row.delivery_turn_id), taskStatus: nullableString(row.task_status),
+        dismissedAt: row.dismissed_at == null ? null : managerTimestamp(row.dismissed_at),
+        dismissedReason: nullableString(row.dismissed_reason),
+        taskPendingReason: nullableString(row.task_pending_reason),
+        taskRunnerExitCode: row.task_runner_exit_code == null ? null : Number(row.task_runner_exit_code) }));
+    });
+  }
+
+  async dismissWorkspaceManagerEvents(workspaceId: string, eventIds: string[], reason: string): Promise<string[]> {
+    return this.transaction(async connection => {
+      const dismissed: string[] = [];
+      for (const id of new Set(eventIds)) {
+        const rows = await (await connection.run(`UPDATE workspace_manager_event SET dismissed_at = now(), dismissed_reason = $reason
+          WHERE workspace_id = $workspaceId AND id = $id AND delivery_turn_id IS NULL AND dismissed_at IS NULL
+          RETURNING id`, { workspaceId, id, reason })).getRowObjectsJS();
+        if (rows[0]) dismissed.push(String(rows[0].id));
+      }
+      return dismissed;
+    });
+  }
+
+  async listWorkspaceManagers(): Promise<WorkspaceManagerRecord[]> {
+    return this.read(async (connection) => (await (await connection.run(`SELECT * FROM workspace_manager`)).getRowObjectsJS()).map(toWorkspaceManager));
+  }
+
+  async workspaceManagerActivityTurns(sessionId: string): Promise<string[]> {
+    return this.read(async (connection) => {
+      const rows = await (await connection.run(`SELECT DISTINCT e.delivery_turn_id FROM workspace_manager_event e
+        JOIN workspace_manager m ON m.workspace_id = e.workspace_id
+        WHERE m.session_id = $sessionId AND e.delivery_turn_id IS NOT NULL`, { sessionId })).getRowObjectsJS();
+      return rows.map(row => String(row.delivery_turn_id));
+    });
+  }
+
+  async workspaceManagerSnapshot(workspaceId: string): Promise<WorkspaceManagerSnapshot> {
+    const manager = await this.getWorkspaceManager(workspaceId);
+    return this.read(async (connection) => {
+      const rows = await (await connection.run(`SELECT s.id, s.title, s.cwd, s.description, s.parent_session_id, s.updated,
+        t.id AS turn_id, t.status, t.pending_reason, t.runner_exit_code,
+        CAST(t.runner_started AS VARCHAR) AS runner_started, CAST(t.created AS VARCHAR) AS turn_created,
+        metrics.turn_number, metrics.queued_turns, metrics.updated_files,
+        left(t.user_input, 600) AS latest_request, left(t.agent_response, 1200) AS latest_response,
+        count(*) OVER () AS total_count,
+        count(*) FILTER (WHERE t.status = 'running') OVER () AS running_count,
+        count(*) FILTER (WHERE t.status = 'todo' AND t.pending_reason IS DISTINCT FROM 'stopped') OVER () AS pending_count
+        FROM sessions s LEFT JOIN LATERAL (
+          SELECT id, status, pending_reason, runner_exit_code, runner_started, created, user_input, agent_response FROM session_turn
+          WHERE session_id = s.id ORDER BY (status = 'running') DESC,
+            (status = 'todo' AND pending_reason IS DISTINCT FROM 'stopped') DESC, created DESC, id DESC LIMIT 1
+        ) t ON true
+        LEFT JOIN LATERAL (
+          SELECT count(*) FILTER (WHERE st.created < t.created OR (st.created = t.created AND st.id <= t.id)) AS turn_number,
+            count(*) FILTER (WHERE st.status = 'todo' AND st.pending_reason IS DISTINCT FROM 'stopped') AS queued_turns,
+            (SELECT count(DISTINCT path) FROM session_turn edits
+              CROSS JOIN LATERAL unnest(edits.changed_files) AS changed(path)
+              WHERE edits.session_id = s.id AND t.status = 'running') AS updated_files
+          FROM session_turn st WHERE st.session_id = s.id AND t.status = 'running'
+        ) metrics ON true
+        WHERE s.workspace_id = $workspaceId AND s.id <> $managerSessionId
+          AND NOT EXISTS (SELECT 1 FROM workspace_manager_archive a WHERE a.session_id = s.id)
+        ORDER BY (t.status = 'running') DESC NULLS LAST,
+          (t.status = 'todo' AND t.pending_reason IS DISTINCT FROM 'stopped') DESC NULLS LAST, s.updated DESC
+        LIMIT 100`, { workspaceId, managerSessionId: manager?.sessionId ?? "" })).getRowObjectsJS();
+      const pending = await (await connection.run(`SELECT count(*) AS count FROM workspace_manager_event
+        WHERE workspace_id = $workspaceId AND delivery_turn_id IS NULL AND dismissed_at IS NULL`, { workspaceId })).getRowObjectsJS();
+      const runningModels = new Map<string, string | null>();
+      for (const row of rows) {
+        if (row.status !== "running" || !row.turn_id) continue;
+        const turnId = String(row.turn_id);
+        const turn = await this.getSessionTurnWithConnection(connection, turnId);
+        const requestedModel = turn?.requestMetadata?.model;
+        runningModels.set(turnId,
+          turn?.model ?? (typeof requestedModel === "string" && requestedModel !== "auto" ? `${requestedModel} (requested)` : null));
+      }
+      return {
+        manager, capturedAt: new Date().toISOString(), totalTasks: Number(rows[0]?.total_count ?? 0),
+        runningTasks: Number(rows[0]?.running_count ?? 0), pendingTasks: Number(rows[0]?.pending_count ?? 0),
+        pendingEvents: Number(pending[0]?.count ?? 0),
+        tasks: rows.map(row => ({ sessionId: String(row.id), title: String(row.title), cwd: String(row.cwd),
+          description: String(row.description).slice(0, 600), parentSessionId: nullableString(row.parent_session_id),
+          updated: managerTimestamp(row.updated), turnId: nullableString(row.turn_id),
+          status: row.status === "running" ? "running" : row.status === "todo" ? String(row.pending_reason ?? "queued")
+            : row.runner_exit_code ? "failed" : "idle",
+          pendingReason: nullableString(row.pending_reason), latestRequest: String(row.latest_request ?? ""),
+          latestResponse: String(row.latest_response ?? ""),
+          ...(row.status === "running" ? {
+            runningSince: nullableString(row.runner_started),
+            turnNumber: numberValue(row.turn_number), queuedTurns: numberValue(row.queued_turns),
+            updatedFiles: numberValue(row.updated_files),
+            runningModel: runningModels.get(String(row.turn_id)) ?? null
+          } : {}) }))
+      };
+    });
+  }
+
+  /** A batch and its pending turn commit together, so restarts cannot lose or double-deliver a wake-up. */
+  async queueWorkspaceManagerEvents(workspaceId: string): Promise<{ sessionId: string; turnId: string } | null> {
+    return this.transaction(async (connection) => {
+      const managers = await (await connection.run(`SELECT * FROM workspace_manager WHERE workspace_id = $workspaceId FOR UPDATE`, { workspaceId })).getRowObjectsJS();
+      if (!managers[0] || managers[0].notifications_enabled !== true) return null;
+      const manager = toWorkspaceManager(managers[0]);
+      const active = await (await connection.run(`SELECT 1 FROM session_turn WHERE session_id = $sessionId
+        AND (status = 'running' OR (status = 'todo' AND pending_reason IS DISTINCT FROM 'stopped')) LIMIT 1`, { sessionId: manager.sessionId })).getRowObjectsJS();
+      if (active.length) return null;
+      const rows = await (await connection.run(`SELECT * FROM workspace_manager_event
+        WHERE workspace_id = $workspaceId AND delivery_turn_id IS NULL AND dismissed_at IS NULL
+        ORDER BY created, id LIMIT 40 FOR UPDATE`, { workspaceId })).getRowObjectsJS();
+      if (!rows.length) return null;
+      const events: WorkspaceManagerEvent[] = rows.map(row => ({ id: String(row.id), workspaceId,
+        sessionId: nullableString(row.session_id), turnId: nullableString(row.turn_id), type: String(row.type),
+        summary: String(row.summary), created: managerTimestamp(row.created) }));
+      const turnId = `manager_${createHash("sha256").update(events[0].id).digest("hex").slice(0, 32)}`;
+      await this.insertSessionTurnWithConnection(connection, {
+        id: turnId, sessionId: manager.sessionId, userInput: managerActivityPrompt(events),
+        agentResponse: "Workspace activity awaiting review.", tokenIn: 0, tokenOut: 0,
+        status: "todo", pendingReason: "queued"
+      }, true);
+      for (const event of events) await connection.run(`UPDATE workspace_manager_event SET delivery_turn_id = $turnId WHERE id = $id`, { turnId, id: event.id });
+      return { sessionId: manager.sessionId, turnId };
+    });
   }
 
   async getActiveWorkspace(): Promise<WorkspaceRecord> {
@@ -5460,6 +5805,8 @@ export class SessionStore {
             WHERE pending_turn.id = $turnId
               AND pending_turn.session_id = $sessionId
               AND pending_turn.status = 'todo'
+              AND pending_turn.pending_reason IS DISTINCT FROM 'stopped'
+              AND pending_turn.last_event_name IS DISTINCT FROM 'queue.steer_reserved'
               AND NOT EXISTS (
                 SELECT 1
                 FROM session_turn AS active_turn
@@ -6129,19 +6476,20 @@ export class SessionStore {
       if (!existing || existing.sessionId !== input.sessionId) {
         throw new Error(`Pending turn not found: ${input.id}`);
       }
-      if (existing.status !== "todo") {
+      if (existing.status !== "todo" || existing.lastEventName === "queue.steer_reserved") {
         throw new Error("Only pending turns can be edited.");
       }
 
       await connection.run(
         `
           UPDATE session_turn
-          SET user_input = $userInput
+          SET user_input = $userInput, request_metadata = $requestMetadata
           WHERE id = $id
         `,
         {
           id: input.id,
-          userInput: input.userInput
+          userInput: input.userInput,
+          requestMetadata: JSON.stringify({ ...existing.requestMetadata, message: input.message ?? input.userInput })
         }
       );
       await this.syncSessionUpdatedWithLastTurn(connection, input.sessionId);
@@ -6154,6 +6502,62 @@ export class SessionStore {
     });
   }
 
+  async deleteQueuedSessionTurn(id: string, sessionId: string, reservedForSteer = false): Promise<boolean> {
+    return this.write(async (connection) => {
+      const result = await connection.run(
+        `DELETE FROM session_turn
+         WHERE id = $id AND session_id = $sessionId AND status = 'todo'
+           AND pending_reason = 'queued'
+           AND (($reservedForSteer = true AND last_event_name = 'queue.steer_reserved')
+             OR ($reservedForSteer = false AND last_event_name IS DISTINCT FROM 'queue.steer_reserved'))
+         RETURNING id`,
+        { id, sessionId, reservedForSteer }
+      );
+      if ((await result.getRowObjectsJS()).length === 0) return false;
+      await connection.run("DELETE FROM session_turn_reference WHERE session_id = $sessionId AND turn_id = $id", { id, sessionId });
+      await connection.run("DELETE FROM execution_approval_policy WHERE owner_id = $ownerId", { ownerId: `turn:${sessionId}:${id}` });
+      await this.syncSessionUpdatedWithLastTurn(connection, sessionId);
+      await this.refreshSessionTurnFtsIndex(connection);
+      return true;
+    });
+  }
+
+  async reserveQueuedSessionTurnForSteer(id: string, sessionId: string, runningTurnId: string): Promise<SessionTurnRecord | null> {
+    return this.write(async (connection) => {
+      const result = await connection.run(
+        `UPDATE session_turn AS pending_turn
+         SET last_event_name = 'queue.steer_reserved'
+         WHERE pending_turn.id = $id AND pending_turn.session_id = $sessionId
+           AND pending_turn.status = 'todo' AND pending_turn.pending_reason = 'queued'
+           AND pending_turn.last_event_name IS DISTINCT FROM 'queue.steer_reserved'
+           AND EXISTS (
+             SELECT 1 FROM session_turn AS active_turn
+             WHERE active_turn.id = $runningTurnId
+               AND active_turn.session_id = pending_turn.session_id
+               AND active_turn.status = 'running'
+           )
+         RETURNING pending_turn.id`,
+        { id, sessionId, runningTurnId }
+      );
+      if ((await result.getRowObjectsJS()).length === 0) return null;
+      return this.getSessionTurnWithConnection(connection, id);
+    });
+  }
+
+  async restoreQueuedSessionTurnAfterSteerFailure(id: string, sessionId: string): Promise<boolean> {
+    return this.write(async (connection) => {
+      const result = await connection.run(
+        `UPDATE session_turn
+         SET last_event_name = 'queue.steer_failed'
+         WHERE id = $id AND session_id = $sessionId AND status = 'todo'
+           AND pending_reason = 'queued' AND last_event_name = 'queue.steer_reserved'
+         RETURNING id`,
+        { id, sessionId }
+      );
+      return (await result.getRowObjectsJS()).length > 0;
+    });
+  }
+
   async movePendingSessionTurn(input: {
     id: string;
     sessionId: string;
@@ -6161,7 +6565,7 @@ export class SessionStore {
   }): Promise<SessionTurnRecord[]> {
     return this.write(async (connection) => {
       const turns = await this.listSessionTurnsWithConnection(connection, input.sessionId);
-      const pendingTurns = turns.filter((turn) => turn.status === "todo");
+      const pendingTurns = turns.filter((turn) => turn.status === "todo" && turn.lastEventName !== "queue.steer_reserved");
       const currentIndex = pendingTurns.findIndex((turn) => turn.id === input.id);
       if (currentIndex < 0) {
         throw new Error(`Pending turn not found: ${input.id}`);
@@ -6989,6 +7393,31 @@ export class SessionStore {
         updated TIMESTAMPTZ NOT NULL DEFAULT current_timestamp
       )
     `);
+    await connection.run(`CREATE TABLE IF NOT EXISTS workspace_manager (
+      workspace_id VARCHAR PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
+      session_id VARCHAR NOT NULL UNIQUE REFERENCES sessions(id) ON DELETE CASCADE,
+      notifications_enabled BOOLEAN NOT NULL DEFAULT true,
+      created TIMESTAMPTZ NOT NULL DEFAULT now(), updated TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+    await connection.run(`CREATE TABLE IF NOT EXISTS workspace_manager_archive (
+      session_id VARCHAR PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+      workspace_id VARCHAR NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      replaced_by_session_id VARCHAR NOT NULL REFERENCES sessions(id),
+      archived_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+    await connection.run(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS created_by_manager_session_id VARCHAR`);
+    await connection.run(`CREATE TABLE IF NOT EXISTS workspace_manager_event (
+      id VARCHAR PRIMARY KEY, workspace_id VARCHAR NOT NULL REFERENCES workspace_manager(workspace_id) ON DELETE CASCADE,
+      session_id VARCHAR, turn_id VARCHAR, type VARCHAR NOT NULL, summary TEXT NOT NULL,
+      created TIMESTAMPTZ NOT NULL DEFAULT now(), delivery_turn_id VARCHAR,
+      dismissed_at TIMESTAMPTZ, dismissed_reason VARCHAR
+    )`);
+    // Early manager schemas required a task session; platform/process events have none.
+    await connection.run(`ALTER TABLE workspace_manager_event ALTER COLUMN session_id DROP NOT NULL`);
+    await connection.run(`ALTER TABLE workspace_manager_event ALTER COLUMN turn_id DROP NOT NULL`);
+    await connection.run(`ALTER TABLE workspace_manager_event ADD COLUMN IF NOT EXISTS dismissed_at TIMESTAMPTZ`);
+    await connection.run(`ALTER TABLE workspace_manager_event ADD COLUMN IF NOT EXISTS dismissed_reason VARCHAR`);
+    await connection.run(`CREATE INDEX IF NOT EXISTS workspace_manager_inbox ON workspace_manager_event(workspace_id, created) WHERE delivery_turn_id IS NULL AND dismissed_at IS NULL`);
     await connection.run(`
       CREATE TABLE IF NOT EXISTS accounts (
         id VARCHAR PRIMARY KEY,
@@ -7175,6 +7604,7 @@ export class SessionStore {
         status VARCHAR NOT NULL DEFAULT 'done',
         pending_reason VARCHAR,
         pending_load_balance BOOLEAN,
+        request_metadata VARCHAR,
         runner_pid BIGINT,
         runner_started TIMESTAMPTZ,
         runner_heartbeat TIMESTAMPTZ,
@@ -7750,6 +8180,27 @@ export class SessionStore {
     `);
     await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS pending_reason VARCHAR");
     await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS pending_load_balance BOOLEAN");
+    await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS request_metadata VARCHAR");
+    // A direct prompt and its manager notification commit in the same INSERT.
+    // Automatic task/manager turns carry backgroundTask and never self-notify.
+    await connection.run(`CREATE OR REPLACE FUNCTION threadex_manager_direct_prompt_event() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.request_metadata IS NOT NULL
+          AND COALESCE((NEW.request_metadata::jsonb ->> 'backgroundTask')::boolean, false) = false THEN
+          INSERT INTO workspace_manager_event (id, workspace_id, session_id, turn_id, type, summary, created)
+          SELECT md5('task.prompted:' || NEW.id), m.workspace_id, NEW.session_id, NEW.id,
+            'task.prompted', jsonb_build_object('source', 'direct_prompt', 'status', NEW.status,
+              'promptPreview', left(NEW.user_input, 300))::text, NEW.created
+          FROM sessions s JOIN workspace_manager m ON m.workspace_id = s.workspace_id
+          WHERE s.id = NEW.session_id AND m.session_id <> NEW.session_id AND m.created <= NEW.created
+          ON CONFLICT (id) DO NOTHING;
+        END IF;
+        RETURN NEW;
+      END;
+    $$ LANGUAGE plpgsql`);
+    await connection.run(`DROP TRIGGER IF EXISTS threadex_manager_direct_prompt_event ON session_turn`);
+    await connection.run(`CREATE TRIGGER threadex_manager_direct_prompt_event AFTER INSERT ON session_turn
+      FOR EACH ROW EXECUTE FUNCTION threadex_manager_direct_prompt_event()`);
     await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS runner_pid BIGINT");
     await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS runner_started TIMESTAMPTZ");
     await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS runner_heartbeat TIMESTAMPTZ");
@@ -8179,6 +8630,7 @@ export class SessionStore {
           status,
           pending_reason,
           pending_load_balance,
+          request_metadata,
           created
         )
         VALUES (
@@ -8196,6 +8648,7 @@ export class SessionStore {
           $status,
           $pendingReason,
           $pendingLoadBalance,
+          $requestMetadata,
           now()
         )
         ${ignoreConflicts ? "ON CONFLICT DO NOTHING" : ""}
@@ -8215,7 +8668,8 @@ export class SessionStore {
         tokenOut: input.tokenOut,
         status: input.status ?? "done",
         pendingReason: input.pendingReason ?? null,
-        pendingLoadBalance: input.pendingLoadBalance ?? null
+        pendingLoadBalance: input.pendingLoadBalance ?? null,
+        requestMetadata: input.requestMetadata ? JSON.stringify(input.requestMetadata) : null
       }
     );
     return (await result.getRowObjectsJS()).length > 0;
@@ -8260,6 +8714,7 @@ export class SessionStore {
           session_turn.last_event_name,
           session_turn.pending_reason,
           session_turn.pending_load_balance,
+          CAST(session_turn.request_metadata AS VARCHAR) AS request_metadata,
           CAST(session_turn.created AS VARCHAR) AS created,
           ${resultExecutionDurationSelectSql},
           ${latestUsageSampleSelectSql}
@@ -8296,6 +8751,7 @@ export class SessionStore {
           session_turn.last_event_name,
           session_turn.pending_reason,
           session_turn.pending_load_balance,
+          CAST(session_turn.request_metadata AS VARCHAR) AS request_metadata,
           CAST(session_turn.created AS VARCHAR) AS created,
           ${resultExecutionDurationSelectSql},
           ${latestUsageSampleSelectSql}
@@ -8648,16 +9104,30 @@ export class SessionStore {
             ) AS row_number
           FROM approval_events
           WHERE approval_id IS NOT NULL
+        ),
+        answer_events AS (
+          SELECT
+            turn_id,
+            json_extract_string(payload, '$.approvalId') AS approval_id,
+            min(created) AS submitted_at
+          FROM session_turn_event
+          WHERE session_id = $sessionId
+            AND event_name = 'approval.decision'
+          GROUP BY turn_id, json_extract_string(payload, '$.approvalId')
         )
         SELECT
-          event_id,
-          turn_id,
-          event_name,
-          CAST(payload AS VARCHAR) AS payload_json,
-          CAST(created AS VARCHAR) AS created
+          ranked.event_id,
+          ranked.turn_id,
+          ranked.event_name,
+          CAST(ranked.payload AS VARCHAR) AS payload_json,
+          CAST(ranked.created AS VARCHAR) AS created,
+          CAST(answer_events.submitted_at AS VARCHAR) AS answer_submitted_at
         FROM ranked
-        WHERE row_number = 1
-        ORDER BY created ASC, event_id ASC
+        LEFT JOIN answer_events
+          ON answer_events.turn_id = ranked.turn_id
+          AND answer_events.approval_id = ranked.approval_id
+        WHERE ranked.row_number = 1
+        ORDER BY ranked.created ASC, ranked.event_id ASC
       `,
       { sessionId }
     );
@@ -8720,7 +9190,7 @@ export class SessionStore {
   private async listSessionAutoModelProvidersWithConnection(
     connection: SessionDbConnection,
     sessionId: string
-  ): Promise<Record<string, SessionAutoModelProvider>> {
+  ): Promise<Record<string, { provider: SessionAutoModelProvider; confidence?: number }>> {
     const result = await connection.run(
       `
         SELECT turn_id, CAST(payload AS VARCHAR) AS payload_json
@@ -8731,13 +9201,14 @@ export class SessionStore {
       `,
       { sessionId }
     );
-    const providers: Record<string, SessionAutoModelProvider> = {};
+    const providers: Record<string, { provider: SessionAutoModelProvider; confidence?: number }> = {};
     for (const row of await result.getRowObjectsJS()) {
       const turnId = stringValue((row as { turn_id?: unknown }).turn_id);
       const payload = parseJsonObject((row as { payload_json?: unknown }).payload_json);
       const provider = (payload as Record<string, unknown> | null)?.provider;
       if (turnId && (provider === "typesafe" || provider === "fallback")) {
-        providers[turnId] = provider;
+        const confidence = (payload as Record<string, unknown>).confidence;
+        providers[turnId] = { provider, ...(typeof confidence === "number" ? { confidence } : {}) };
       }
     }
     return providers;
@@ -8930,7 +9401,7 @@ export class SessionStore {
   }
 
   private async sessionSearchFilter(connection: SessionDbConnection, input: SessionSearchInput) {
-    const where: string[] = [];
+    const where: string[] = ["NOT EXISTS (SELECT 1 FROM workspace_manager_archive a WHERE a.session_id = sessions.id)"];
     const params: Record<string, SessionDbValue> = {};
     const workspaceId = normalizeText(input.workspaceId);
     if (workspaceId) {
@@ -9933,6 +10404,16 @@ export class SessionStore {
   }
 }
 
+function managerTimestamp(value: unknown) {
+  return value instanceof Date ? value.toISOString() : String(value);
+}
+
+function toWorkspaceManager(row: Record<string, unknown>): WorkspaceManagerRecord {
+  return { workspaceId: String(row.workspace_id), sessionId: String(row.session_id),
+    notificationsEnabled: row.notifications_enabled === true,
+    created: managerTimestamp(row.created), updated: managerTimestamp(row.updated) };
+}
+
 function localCodexSessionFile(path: string, codexHome?: string | null): LocalCodexSessionFile {
   const resolvedPath = resolveUserPath(path);
   const resolvedCodexHome = codexHome ? resolveUserPath(codexHome) : defaultCodexHome();
@@ -10822,6 +11303,7 @@ function toSessionTurnRecord(row: SessionTurnRow): SessionTurnRecord {
   const status = sessionTurnStatusValue(row.status);
   const reasoningEffort = nullableString(row.turn_reasoning_effort);
   const executionDurationMs = nullableNumber(row.execution_duration_ms);
+  const requestMetadata = parseJsonRecord(row.request_metadata);
   return {
     id: stringValue(row.id),
     sessionId: stringValue(row.session_id),
@@ -10845,6 +11327,7 @@ function toSessionTurnRecord(row: SessionTurnRow): SessionTurnRecord {
       ? row.pending_reason
       : null,
     pendingLoadBalance: typeof row.pending_load_balance === "boolean" ? row.pending_load_balance : null,
+    ...(requestMetadata ? { requestMetadata } : {}),
     created: stringValue(row.created)
   };
 }
@@ -11344,6 +11827,13 @@ function parseJsonObject(value: unknown): unknown {
   }
 }
 
+function parseJsonRecord(value: unknown): Record<string, unknown> | null {
+  const parsed = parseJsonObject(value);
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    ? parsed as Record<string, unknown>
+    : null;
+}
+
 function parseSessionModelTokenUsage(value: unknown): SessionModelTokenUsage[] {
   const parsed = parseJsonObject(value);
   if (!Array.isArray(parsed)) {
@@ -11769,6 +12259,7 @@ function approvalLiveItemFromRow(row: Record<string, unknown>): unknown | null {
     method,
     params: record.params ?? null,
     status: resolved ? "resolved" : "pending",
+    ...(resolved && row.answer_submitted_at ? { answerSubmittedAt: stringValue(row.answer_submitted_at) } : {}),
     ...(resolved ? { decision: record.decision, error: record.error } : {})
   };
 }

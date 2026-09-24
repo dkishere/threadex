@@ -40,6 +40,7 @@ export type ChatMessage = {
   autoModel?: boolean;
   /** Provider that selected an Auto turn's model. */
   autoModelProvider?: "typesafe" | "fallback";
+  autoModelConfidence?: number;
   /** Token usage recorded for this turn, when the runner reports it. */
   tokenIn?: number;
   /** Cached portion of the input-token usage, when the runner reports it. */
@@ -54,6 +55,8 @@ export type ChatMessage = {
   completedAt?: string;
   conclusion?: string;
   turnStatus?: "done" | "todo" | "running";
+  pendingReason?: "queued" | "rate_limit" | "auth" | "stopped" | null;
+  queueSteerReserved?: boolean;
   /** False while the chat request is waiting for the backend to start a runner. */
   runnerStarted?: boolean;
   attachments?: MessageAttachment[];

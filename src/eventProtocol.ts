@@ -19,7 +19,7 @@ export const CLIENT_EVENT_TYPES = [
   "workspace.switched"
 ] as const;
 
-export const EVENT_STATE_FIELDS = ["statusMonitor", "processMonitors", "grillSummaries"] as const;
+export const EVENT_STATE_FIELDS = ["statusMonitor", "processMonitors", "grillSummaries", "waitEvents", "waitSubscriptions"] as const;
 export type EventStateVersions = Record<typeof EVENT_STATE_FIELDS[number], string>;
 
 export function encodeEventStateVersions(versions: EventStateVersions): string {

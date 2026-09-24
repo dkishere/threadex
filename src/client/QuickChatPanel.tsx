@@ -103,7 +103,14 @@ export function QuickChatPanel({ active }: { active: boolean }) {
     <form className="side-chat-composer" onSubmit={event => void submit(event)}><ComposerFrame>
       <aside className="composer-gears quick-chat-gears" aria-label="ChatGPT model options">
         <div className="composer-gear-radios" role="radiogroup" aria-label="ChatGPT model">
-          {status.models.map(option => <label className="composer-gear-radio" key={option.id} data-active={model === option.id ? "true" : undefined} title={option.label}>
+          {status.models.map(option => <label className="composer-gear-radio" key={option.id} data-active={model === option.id ? "true" : undefined} title={option.label} onClick={event => {
+            if (sending || loading) return;
+            if (event.target instanceof HTMLInputElement) return;
+            const editor = event.currentTarget.closest(".composer-layout")?.querySelector(".composer-editor");
+            if (!editor?.contains(document.activeElement)) return;
+            event.preventDefault();
+            setModel(option.id);
+          }}>
             <input type="radio" name="quick-chat-model" value={option.id} checked={model === option.id} disabled={sending || loading} onChange={() => setModel(option.id)} /><span>{option.label}</span>
           </label>)}
         </div>

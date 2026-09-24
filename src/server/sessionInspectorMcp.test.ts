@@ -7,6 +7,47 @@ import test from "node:test";
 
 const mcpPath = resolve(import.meta.dirname, "sessionInspectorMcp.ts");
 
+test("workspace manager exposes only scoped management tools and routes actions through its own session", { timeout: 15000 }, async () => {
+  const requests: Array<{ url: string; body: unknown }> = [];
+  const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    requests.push({ url: request.url!, body: JSON.parse(Buffer.concat(chunks).toString()) });
+    response.writeHead(200, { "Content-Type": "application/json" }); response.end(JSON.stringify({ ok: true }));
+  });
+  await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
+  const address = server.address(); assert.ok(address && typeof address === "object");
+  const child = spawn(process.execPath, ["--import", "tsx", mcpPath], {
+    env: { ...process.env, SESSION_INSPECTOR_SERVER_URL: `http://127.0.0.1:${address.port}`,
+      THREADEX_WORKSPACE_MANAGER: "1", THREADEX_SESSION_ID: "tx_manager", THREADEX_CONTINUITY_ONLY: "1" },
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  const lines = createInterface({ input: child.stdout });
+  const pending = new Map<number, (value: any) => void>();
+  lines.on("line", line => { const message = JSON.parse(line); pending.get(message.id)?.(message); });
+  let id = 0;
+  const rpc = (method: string, params?: unknown) => new Promise<any>(done => {
+    pending.set(++id, done); child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+  });
+  try {
+    await rpc("initialize");
+    const exposed = (await rpc("tools/list")).result.tools.map((tool: any) => tool.name);
+    assert.deepEqual(exposed, ["workspace_status", "workspace_search_tasks", "workspace_inspect_task", "workspace_create_task", "workspace_prompt_task", "workspace_stop_task"]);
+    const forbidden = await rpc("tools/call", { name: "prompt_session", arguments: { sessionId: "another-workspace", message: "go" } });
+    assert.equal(forbidden.result.isError, true);
+    assert.equal(requests.length, 0);
+    const allowed = await rpc("tools/call", { name: "workspace_prompt_task", arguments: { sessionId: "tx_task", message: "go", requestId: "same-action" } });
+    assert.equal(allowed.result.isError, undefined);
+    assert.deepEqual(requests, [{ url: "/api/workspace-manager/tx_manager/action", body: { action: "prompt", sessionId: "tx_task", message: "go", requestId: "same-action" } }]);
+    const create = { title: "Child", message: "Independent task brief", cwd: "/tmp", requestId: "new-task", parentSessionId: "tx_parent" };
+    assert.equal((await rpc("tools/call", { name: "workspace_create_task", arguments: create })).result.isError, undefined);
+    assert.deepEqual(requests.at(-1), { url: "/api/workspace-manager/tx_manager/action", body: { action: "create", ...create } });
+    const inspect = { sessionId: "tx_task", turnId: "dispatched-turn" };
+    assert.equal((await rpc("tools/call", { name: "workspace_inspect_task", arguments: inspect })).result.isError, undefined);
+    assert.deepEqual(requests.at(-1), { url: "/api/workspace-manager/tx_manager/action", body: { action: "inspect", ...inspect } });
+  } finally { child.kill("SIGTERM"); lines.close(); await new Promise<void>(done => server.close(() => done())); }
+});
+
 test("agents can register commands without starting them and run by id", { timeout: 15_000 }, async () => {
   const requests: { url: string; body: any }[] = [];
   const server = createServer(async (request, response) => {

@@ -12,7 +12,7 @@ for (const requestId of [500, "question-request", "canceled-request", "async-mes
   const root = mkdtempSync(resolve(tmpdir(), "threadex-input-runner-"));
   const project = resolve(import.meta.dirname, "../..");
   const script = resolve(root, "fake-codex.mjs");
-  const answer = { answers: { [asyncMessage ? "0" : "scope"]: { answers: ["Both"] } } };
+  const answer = { answers: { [asyncMessage ? "0" : "scope"]: { answers: [asyncMessage ? "private-token" : "Both"] } } };
   let questionRequests = 0;
   let wait: ServerResponse | undefined;
   let progressed = false;
@@ -57,7 +57,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   if (${asyncMessage} ? r.method === "turn/steer" : r.id === ${JSON.stringify(requestId)}) {
     if (${cancel}) process.exit(3);
     if (${asyncMessage}) {
-      if (r.params.expectedTurnId !== "turn-1" || r.params.input[0].text !== "Which?\\nAnswer: Both") process.exit(2);
+      if (r.params.expectedTurnId !== "turn-1" || r.params.input[0].text !== "Which?\\nAnswer: private-token") process.exit(2);
       send({ id: r.id, result: { turnId: "turn-1" } });
     } else if (JSON.stringify(r.result) !== ${JSON.stringify(JSON.stringify(answer))}) process.exit(2);
     send({ method: "item/completed", params: { item: { id: "answer", type: "agentMessage", text: "native answer received" } } });
@@ -77,14 +77,15 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     assert.equal(code, 0, stderr + readFileSync(resolve(root, "log.ndjson"), "utf8"));
     assert.equal(progressed, true);
     assert.equal(receivedNativeAnswer, !cancel);
-    assert.equal(canceled, cancel);
+    if (!asyncMessage) assert.equal(canceled, cancel);
     assert.equal(questionRequests, 1);
     if (asyncMessage) {
       const log = readFileSync(resolve(root, "log.ndjson"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
       const item = log.find((e) => e.event === "item" && e.data.id === "call_question").data;
       assert.equal(item.delivery, "async");
       assert.deepEqual(item.questions, [{ title: "Which?", options: ["Both"] }]);
-      assert.ok(log.some((e) => e.event === "steer.accepted"));
+      assert.ok(log.some((e) => e.event === "steer.accepted" && e.data.commandId === "async:thread-1:call_question" && e.data.message === "Which?\nAnswer: private-token"));
+      assert.ok(log.some((e) => e.event === "approval.resolved" && JSON.stringify(e.data.decision) === JSON.stringify(answer)));
     }
   } finally {
     clearTimeout(timeout); child.kill(); server.closeAllConnections();

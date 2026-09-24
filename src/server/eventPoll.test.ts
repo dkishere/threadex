@@ -69,7 +69,8 @@ test("client pages keep workspace isolation, global notifications and reset sema
 });
 
 test("state versions omit unchanged sections and send explicit empty arrays for removals", () => {
-  const state = { statusMonitor: [{ id: "other" }], processMonitors: [{ command: "large command" }], grillSummaries: [{ revision: 1 }] };
+  const state = { statusMonitor: [{ id: "other" }], processMonitors: [{ command: "large command" }], grillSummaries: [{ revision: 1 }],
+    waitEvents: [{ id: "event", status: "pending" }], waitSubscriptions: [{ id: "subscription", status: "waiting" }] };
   const initial = versionEventState("one", state);
   const full = changedEventState(initial);
   assert.deepEqual(full.statusMonitor, state.statusMonitor);
@@ -77,7 +78,20 @@ test("state versions omit unchanged sections and send explicit empty arrays for 
   const next = changedEventState(versionEventState("one", { ...state, grillSummaries: [] }), full.stateVersion);
   assert.deepEqual(Object.keys(next).sort(), ["grillSummaries", "stateVersion"]);
   assert.deepEqual(next.grillSummaries, []);
+  const dispatching = versionEventState("one", { ...state,
+    waitEvents: [{ id: "event", status: "fired" }], waitSubscriptions: [{ id: "subscription", status: "dispatching" }] });
+  assert.deepEqual(changedEventState(dispatching, full.stateVersion), {
+    waitEvents: dispatching.waitEvents, waitSubscriptions: dispatching.waitSubscriptions,
+    stateVersion: changedEventState(dispatching).stateVersion
+  });
+  const completed = changedEventState(versionEventState("one", { ...state, waitEvents: [], waitSubscriptions: [] }), changedEventState(dispatching).stateVersion);
+  assert.deepEqual(Object.keys(completed).sort(), ["stateVersion", "waitEvents", "waitSubscriptions"]);
+  assert.deepEqual(completed.waitEvents, []);
+  assert.deepEqual(completed.waitSubscriptions, []);
+  // Existing clients can present the old three-section token after deployment.
+  assert.deepEqual(Object.keys(changedEventState(initial, full.stateVersion.split(".").slice(0, 3).join("."))).sort(),
+    ["stateVersion", "waitEvents", "waitSubscriptions"]);
   assert.deepEqual(Object.keys(changedEventState(versionEventState("two", state), full.stateVersion)).sort(),
-    ["grillSummaries", "processMonitors", "stateVersion", "statusMonitor"]);
+    ["grillSummaries", "processMonitors", "stateVersion", "statusMonitor", "waitEvents", "waitSubscriptions"]);
   assert.deepEqual(Object.keys(changedEventState(initial, "invalid")).sort(), Object.keys(full).sort());
 });

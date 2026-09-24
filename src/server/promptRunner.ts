@@ -1,4 +1,7 @@
 import { DEFAULT_MODEL, AUTO_MODEL_ORDER } from "../modelCatalog";
+import { WORKSPACE_MANAGER_TOOLS } from "./workspaceManagerTools";
+import { WORKSPACE_MANAGER_INSTRUCTIONS } from "./workspaceManager";
+import { WORKSPACE_MANAGER_MODEL, WORKSPACE_MANAGER_EFFORT } from "../workspaceManager";
 import { recordLiveGitProvenance } from "./gitProvenance";
 import { USER_INPUT_METHOD, inputQuestions, inputResponse, asyncInputQuestions, asyncInputParams, asyncAnswerText } from "../userInputRequest";
 import { LIGHTWEIGHT_TODO_INSTRUCTIONS } from "./lightweightTodo";
@@ -65,6 +68,7 @@ import {
 } from "./sessionRecovery";
 
 type RunnerJob = {
+  workspaceManager?: boolean;
   sessionId: string;
   workspaceId?: string;
   turnId: string;
@@ -103,6 +107,7 @@ type RunnerJob = {
   todoPlanAlreadyExists?: boolean;
   goalObjectiveFilePath?: string;
   developerInstructions?: string;
+  globalAgentInstructions?: string;
   recoveryContext?: SessionRecoveryContext;
   forceRecoveryOnResume?: boolean;
 };
@@ -216,6 +221,12 @@ if (!jobPath) {
 }
 
 const job = JSON.parse(readFileSync(jobPath, "utf8")) as RunnerJob;
+if (job.workspaceManager) {
+  job.model = WORKSPACE_MANAGER_MODEL;
+  job.modelReasoningEffort = WORKSPACE_MANAGER_EFFORT;
+  job.autoModelEnabled = false;
+  job.executionMode = "default";
+}
 const logPath = resolve(job.logPath);
 const pendingLogPath = job.pendingLogPath ? resolve(job.pendingLogPath) : null;
 const serverDir = dirname(fileURLToPath(import.meta.url));
@@ -522,6 +533,12 @@ async function run() {
     await appServer.start();
     await appServer.initialize();
 
+    // Install the current policy even when resuming a long-lived manager whose
+    // original thread predates it. Turn-level injection below also survives
+    // recovery/compaction; ordinary task startup instructions stay unchanged.
+    const threadDeveloperInstructions = job.workspaceManager
+      ? `${THREADEX_DEVELOPER_INSTRUCTIONS}\n\n${WORKSPACE_MANAGER_INSTRUCTIONS}`
+      : THREADEX_DEVELOPER_INSTRUCTIONS;
     let recoveryContextForTurn = !threadId || job.forceRecoveryOnResume === true
       ? job.recoveryContext ?? null
       : null;
@@ -530,7 +547,7 @@ async function run() {
       try {
         const response = await appServer.rpc(
           "thread/resume",
-          buildThreadResumeParams(threadId, job, THREADEX_DEVELOPER_INSTRUCTIONS)
+          buildThreadResumeParams(threadId, job, threadDeveloperInstructions)
         );
         threadId = readThreadIdFromPayload(response) ?? threadId;
         if (recoveryContextForTurn) {
@@ -549,7 +566,7 @@ async function run() {
         }
         const response = await appServer.rpc(
           "thread/start",
-          buildThreadStartParams(job, THREADEX_DEVELOPER_INSTRUCTIONS)
+          buildThreadStartParams(job, threadDeveloperInstructions)
         );
         threadId = readThreadIdFromPayload(response) ?? undefined;
         recoveryContextForTurn = {
@@ -568,7 +585,7 @@ async function run() {
     } else {
       const response = await appServer.rpc(
         "thread/start",
-        buildThreadStartParams(job, THREADEX_DEVELOPER_INSTRUCTIONS)
+        buildThreadStartParams(job, threadDeveloperInstructions)
       );
       threadId = readThreadIdFromPayload(response) ?? threadId;
     }
@@ -1417,7 +1434,7 @@ function buildThreadStartParams(job: RunnerJob, developerInstructions?: string) 
   const approvalSettings = runnerApprovalSettings(job);
   return {
     cwd: job.cwd ?? defaultThreadOptions.cwd,
-    sandbox: defaultThreadOptions.sandbox,
+    sandbox: job.workspaceManager ? "read-only" : defaultThreadOptions.sandbox,
     ...approvalSettings,
     config: buildThreadConfig(job),
     developerInstructions: developerInstructions ?? null,
@@ -1430,7 +1447,7 @@ function buildThreadResumeParams(threadId: string, job: RunnerJob, developerInst
   return {
     threadId,
     cwd: job.cwd ?? defaultThreadOptions.cwd,
-    sandbox: defaultThreadOptions.sandbox,
+    sandbox: job.workspaceManager ? "read-only" : defaultThreadOptions.sandbox,
     ...approvalSettings,
     config: buildThreadConfig(job),
     developerInstructions: developerInstructions ?? null,
@@ -1663,12 +1680,14 @@ function buildThreadConfig(job: RunnerJob) {
   const sessionInspectorConfig = buildSessionInspectorMcpServerConfig(job);
   if (!sessionInspectorConfig) return {};
 
-  return { mcp_servers: { session_inspector: sessionInspectorConfig } };
+  return { mcp_servers: { session_inspector: sessionInspectorConfig },
+    ...(job.workspaceManager ? { features: { shell_tool: false, unified_exec: false, apps: false, multi_agent: false } } : {}) };
 }
 
 function buildPromptRunnerAppServerArgs(job: RunnerJob) {
   return [
     ...buildAppServerArgs(planningTurnIsReadOnly(job) ? "never" : job.approvalPolicy),
+    ...(job.workspaceManager ? ["-c", 'sandbox_mode="read-only"', "-c", "features.shell_tool=false", "-c", "features.unified_exec=false", "-c", "features.apps=false", "-c", "features.multi_agent=false"] : []),
     ...buildSessionInspectorMcpCliConfigArgs(job)
   ];
 }
@@ -1699,6 +1718,7 @@ function buildSessionInspectorMcpServerConfig(job: RunnerJob) {
   }
 
   const approvedTools = {
+    ...(job.workspaceManager ? Object.fromEntries(WORKSPACE_MANAGER_TOOLS.map(tool => [tool.name, { approval_mode: "approve" }])) : {}),
     ...(job.lightweightTodo ? { outcome_plan_get: { approval_mode: "approve" }, outcome_plan_set: { approval_mode: "approve" } } : {}),
     ...(job.autoModelEnabled ? { upgrade_model: { approval_mode: "approve" } } : {}),
     ...(job.contextForkRequest ? { create_task: { approval_mode: "approve" } } : {}),
@@ -1718,6 +1738,7 @@ function buildSessionInspectorMcpServerConfig(job: RunnerJob) {
       TMPDIR: process.env.THREADEX_MCP_TMPDIR ?? (process.platform === "darwin" ? "/private/tmp" : tmpdir()),
       SESSION_INSPECTOR_SERVER_URL: job.serverUrl ?? "",
       THREADEX_SESSION_ID: job.sessionId,
+      THREADEX_WORKSPACE_MANAGER: job.workspaceManager ? "1" : "0",
       THREADEX_TURN_ID: job.turnId,
       THREADEX_THREAD_ID: job.threadId ?? "",
       THREADEX_AUTO_MODEL: job.autoModelEnabled ? "1" : "0",
@@ -1751,6 +1772,7 @@ function tomlStringArray(values: string[]) {
 }
 
 function sessionInspectorDeveloperInstructions(job: RunnerJob) {
+  if (job.workspaceManager) return WORKSPACE_MANAGER_INSTRUCTIONS;
   if (!sessionInspectorMcpEnabled(job)) {
     return undefined;
   }
@@ -1814,7 +1836,7 @@ function todoAgentRole(job: RunnerJob) {
 }
 
 function planningTurnIsReadOnly(job: RunnerJob) {
-  return job.forcePlan === true ||
+  return job.workspaceManager === true || job.forcePlan === true ||
     job.executionMode === "plan" ||
     todoAgentRole(job) === "planner";
 }
@@ -1832,6 +1854,9 @@ function todoPlanningRequested(job: RunnerJob) {
 
 function runnerDeveloperInstructions(job: RunnerJob, includeStartupSnapshot = true) {
   const instructions = [
+    job.globalAgentInstructions?.trim()
+      ? `User's global agent instructions (apply across Threadex workspaces):\n${job.globalAgentInstructions}`
+      : undefined,
     sessionInspectorDeveloperInstructions(job),
     autoModelDeveloperInstructions(job),
     serverContextDeveloperInstructions(job, includeStartupSnapshot)
@@ -1887,6 +1912,7 @@ function threadexMcpEnabled(job: RunnerJob) {
 }
 
 function sessionInspectorMcpEnabled(job: RunnerJob) {
+  if (job.workspaceManager) return true;
   if (job.contextParentSessionId || job.contextForkRequest) {
     return true;
   }
@@ -1919,6 +1945,7 @@ function sessionInspectorMcpEnabled(job: RunnerJob) {
 }
 
 function sessionInspectorContinuityOnly(job: RunnerJob) {
+  if (job.workspaceManager) return false;
   if (!job.threadId || job.contextParentSessionId || job.contextForkRequest) {
     return false;
   }

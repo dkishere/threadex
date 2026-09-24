@@ -3,7 +3,33 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, truncateSync,
 import test from "node:test";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
-import { saveUploadedAttachments } from "./attachmentUploads";
+import { loadSavedAttachments, removeSavedAttachments, saveUploadedAttachments } from "./attachmentUploads";
+
+test("queued and retried turns recover uploaded bytes and metadata", () => {
+  const root = mkdtempSync(resolve(tmpdir(), "threadex-queued-attachment-"));
+  try {
+    const saved = saveUploadedAttachments(root, "queued", [{ id: "proof", name: "brief.txt", type: "text/plain",
+      dataUrl: `data:text/plain;base64,${Buffer.from("Attachment verification: mango-42").toString("base64")}` }]);
+    const restored = loadSavedAttachments(root, "queued");
+    assert.deepEqual(restored, saved);
+    assert.equal(readFileSync(restored[0].path, "utf8"), "Attachment verification: mango-42");
+    assert.deepEqual(loadSavedAttachments(root, "no-attachments"), []);
+    rmSync(restored[0].path);
+    assert.throws(() => loadSavedAttachments(root, "queued"), /unavailable/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("deleting a queued turn removes only its attachment directory", () => {
+  const root = mkdtempSync(resolve(tmpdir(), "threadex-delete-attachment-"));
+  try {
+    saveUploadedAttachments(root, "queued-one", [{ name: "one.txt", dataUrl: "data:text/plain,one" }]);
+    saveUploadedAttachments(root, "queued-two", [{ name: "two.txt", dataUrl: "data:text/plain,two" }]);
+    removeSavedAttachments(root, "queued-one");
+    assert.equal(existsSync(resolve(root, "queued-one")), false);
+    assert.equal(loadSavedAttachments(root, "queued-two").length, 1);
+    assert.throws(() => removeSavedAttachments(root, ".."), /Invalid attachment directory/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test("resending a stored browser context copies it into the new turn", () => {
   const root = mkdtempSync(resolve(tmpdir(), "threadex-attachment-uploads-"));

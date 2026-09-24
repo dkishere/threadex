@@ -1,5 +1,5 @@
 import type { RequestHandler } from "express";
-import { buildTurnGrillPrompt, buildTurnGrillSessionContext, grillTurn, isLongTurnGrill, turnGrillModel } from "./turnGrill";
+import { buildTurnGrillMidTurnInputs, buildTurnGrillPrompt, buildTurnGrillSessionContext, grillTurn, isLongTurnGrill, turnGrillModel } from "./turnGrill";
 import { normalizeModelTokenUsage, type ModelTokenUsage } from "./modelTokenUsage";
 import { summarizeSessionFileChanges, type SessionStore } from "./sessionStore";
 import { acknowledgeGrill, grillContentVersion, canFollowUpGrill, parseGrillIssues, type TurnGrill } from "../turnGrill";
@@ -98,9 +98,11 @@ export function createTurnGrillHandler({ sessionStore, serverUrl, recordUsage, r
         res.status(404).json({ error: "Session workspace not found." });
         return;
       }
-      const [turnLiveItems, sessionTurns] = await Promise.all([
+      const [turnLiveItems, sessionTurns, approvalItemsByTurn, steerMessagesByTurn] = await Promise.all([
         sessionStore.listSessionTurnLiveItems(session.id, turn.id),
-        sessionStore.listSessionTurns(session.id)
+        sessionStore.listSessionTurns(session.id),
+        sessionStore.listSessionApprovalLiveItems(session.id),
+        sessionStore.listSessionSteerMessages(session.id)
       ]);
       if (action === "start" && sessionTurns.at(-1)?.id !== turn.id) {
         res.status(409).json({ error: "Grill can only start on the latest turn. Fork this turn first." }); return;
@@ -110,7 +112,9 @@ export function createTurnGrillHandler({ sessionStore, serverUrl, recordUsage, r
       }
       const longTurn = isLongTurnGrill(turn);
       const prompt = buildTurnGrillPrompt({
-        userInput: turn.userInput, agentResponse: turn.agentResponse,
+        userInput: turn.userInput,
+        midTurnInputs: buildTurnGrillMidTurnInputs(approvalItemsByTurn[turn.id] ?? [], steerMessagesByTurn[turn.id] ?? []),
+        agentResponse: turn.agentResponse,
         fileChanges: summarizeSessionFileChanges([turn], { [turn.id]: turnLiveItems }).files.map(({ path, kind, additions, deletions, movePath }) => ({ path, kind, additions, deletions, ...(movePath ? { movePath } : {}) })),
         sessionContext: buildTurnGrillSessionContext(session, turn.id, sessionTurns),
         action, issues: requestedIssues, reservedIssueIds: issues.map((issue) => issue.id), rounds: (saved?.rounds ?? []).map((round) => ({ ...round,

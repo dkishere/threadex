@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, relative, resolve, sep } from "node:path";
 import { MAX_INLINE_ATTACHMENT_BYTES, MAX_PATH_ATTACHMENT_BYTES } from "../attachmentLimits";
 
@@ -32,7 +32,7 @@ export function saveUploadedAttachments(
   const targetDir = resolve(uploadDir, safePathSegment(turnId));
   mkdirSync(targetDir, { recursive: true });
 
-  return attachments.slice(0, 6).map((attachment, index) => {
+  const saved = attachments.slice(0, 6).map((attachment, index) => {
     const name = safeFileName(attachment.name || `attachment-${index + 1}`);
     const dataUrl = typeof attachment.dataUrl === "string" ? attachment.dataUrl : "";
     const parsed = parseDataUrl(dataUrl);
@@ -67,6 +67,34 @@ export function saveUploadedAttachments(
       path
     };
   });
+  // Pending turns and runner retries must receive the same files as the initial request.
+  writeFileSync(resolve(targetDir, "attachments.json"), JSON.stringify(saved), "utf8");
+  return saved;
+}
+
+export function loadSavedAttachments(uploadDir: string, turnId: string): SavedAttachment[] {
+  const targetDir = resolve(uploadDir, safePathSegment(turnId));
+  const manifest = resolve(targetDir, "attachments.json");
+  if (!existsSync(manifest)) return [];
+  const saved: unknown = JSON.parse(readFileSync(manifest, "utf8"));
+  if (!Array.isArray(saved) || saved.length > 6) throw new Error("Invalid saved attachments.");
+  return saved.map(attachment => {
+    if (!attachment || typeof attachment.id !== "string" || typeof attachment.name !== "string" ||
+      typeof attachment.mimeType !== "string" || typeof attachment.path !== "string" ||
+      !isPathInsideOrEqual(resolve(attachment.path), targetDir) || !existsSync(attachment.path) || !statSync(attachment.path).isFile()) {
+      throw new Error("Saved attachment is unavailable.");
+    }
+    return { ...attachment, size: statSync(attachment.path).size };
+  });
+}
+
+export function removeSavedAttachments(uploadDir: string, turnId: string): void {
+  const root = resolve(uploadDir);
+  const target = resolve(root, safePathSegment(turnId));
+  if (target === root || !isPathInsideOrEqual(target, root)) {
+    throw new Error("Invalid attachment directory for queued turn.");
+  }
+  rmSync(target, { recursive: true, force: true });
 }
 
 export function safeFileName(value: string) {
