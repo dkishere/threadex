@@ -42,7 +42,7 @@ type SessionPromptInput = {
   model?: string;
   modelReasoningEffort?: string;
   approvalPolicy?: string;
-  executionMode?: "default" | "plan" | "goal";
+  executionMode?: "default" | "plan" | "goal" | "loop";
   skills?: unknown[];
   forcePlan?: boolean;
   autoModel?: boolean;
@@ -216,7 +216,7 @@ const tools: ToolSpec[] = [
         model: { type: "string" },
         modelReasoningEffort: { type: "string" },
         approvalPolicy: { type: "string", description: "Defaults to the calling parent runner's approval policy when omitted." },
-        executionMode: { type: "string", enum: ["default", "plan", "goal"], default: "default" },
+        executionMode: { type: "string", enum: ["default", "plan", "goal", "loop"], default: "default" },
         skills: {
           type: "array",
           items: {

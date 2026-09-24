@@ -298,6 +298,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     send({ method: "turn/completed", params: { turn: { id: "app-turn-1", status: "completed", items: [{ id: "message-1", type: "agentMessage", text: "finished after truncated output" }] } } });
   }
 });
+
 `, "utf8");
     chmodSync(fakeCodexPath, 0o755);
 
@@ -2208,4 +2209,72 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.match(turn.settings.developer_instructions, /Lightweight Todo harness is active/);
   assert.doesNotMatch(turn.settings.developer_instructions, /MUST conduct exactly one|Create the Todo MCP plan and execute it in a later turn/);
   assert.notEqual(turn.settings.sandbox_policy?.type, "read-only");
+});
+
+test("prompt runner keeps a long context compaction alive until it completes", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "prompt-runner-compaction-"));
+  const spawnShimPath = resolve(root, "spawn-shim.mjs");
+  const fakeCodexPath = resolve(root, "fake-codex.mjs");
+  const jobPath = resolve(root, "job.json");
+  const logPath = resolve(root, "runner.ndjson");
+  try {
+    writeFileSync(spawnShimPath, `
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+const originalSpawn = childProcess.spawn;
+childProcess.spawn = function (command, args, options) {
+  return command === process.env.CODEX_PATH
+    ? originalSpawn(process.execPath, [command, ...args], options)
+    : originalSpawn(command, args, options);
+};
+syncBuiltinESMExports();
+`, "utf8");
+    writeFileSync(fakeCodexPath, `#!/usr/bin/env node
+import { createInterface } from "node:readline";
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method === "initialize") send({ id: request.id, result: {} });
+  if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "thread-1" } } });
+  if (request.method === "thread/goal/clear") send({ id: request.id, result: {} });
+  if (request.method === "turn/start") {
+    send({ id: request.id, result: { turn: { id: "app-turn-1" } } });
+    send({ method: "item/started", params: { threadId: "thread-1", item: { id: "compact-1", type: "contextCompaction" } } });
+    setTimeout(() => {
+      send({ method: "item/completed", params: { threadId: "thread-1", item: { id: "compact-1", type: "contextCompaction" } } });
+      send({ method: "item/completed", params: { threadId: "thread-1", item: { id: "answer-1", type: "agentMessage", text: "done" } } });
+      send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "app-turn-1", status: "completed" } } });
+    }, 1300);
+  }
+});
+`, "utf8");
+    chmodSync(fakeCodexPath, 0o755);
+    writeFileSync(jobPath, JSON.stringify({
+      sessionId: "session-1",
+      turnId: "turn-1",
+      message: "continue",
+      logPath,
+      codexHome: resolve(root, "codex-home"),
+      cwd: projectRoot
+    }), "utf8");
+
+    const child = spawn(process.execPath, ["--import", "tsx", "--import", pathToFileURL(spawnShimPath).href, runnerPath, jobPath], {
+      cwd: projectRoot,
+      env: { ...process.env, CODEX_PATH: fakeCodexPath, RUNNER_COMPACTION_HEARTBEAT_MS: "1000" },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const exitCode = await new Promise<number | null>((resolveExit) => child.once("exit", resolveExit));
+    assert.equal(exitCode, 0, `${stderr}\n${existsSync(logPath) ? readFileSync(logPath, "utf8") : ""}`);
+    const entries = readFileSync(logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    const heartbeatIndex = entries.findIndex((entry) => entry.event === "runner.compaction_heartbeat");
+    const completedIndex = entries.findIndex((entry) => entry.event === "item" && entry.data?.itemType === "context_compaction" && entry.data?.eventType === "item.completed");
+    assert.ok(heartbeatIndex > 0, "compaction should refresh runner liveness");
+    assert.ok(completedIndex > heartbeatIndex, "heartbeat should stop when compaction completes");
+    assert.equal(entries.slice(completedIndex + 1).some((entry) => entry.event === "runner.compaction_heartbeat"), false);
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
 });

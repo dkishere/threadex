@@ -256,7 +256,7 @@ export function toChatMessage(ctx, value) {
         developerInstructions: normalizeDeveloperInstructionRecords(candidate.developerInstructions),
         forcePlan: candidate.forcePlan === true,
         contextFork: candidate.contextFork === true,
-        executionMode: candidate.executionMode === "plan" || candidate.executionMode === "goal" || candidate.executionMode === "default"
+        executionMode: candidate.executionMode === "plan" || candidate.executionMode === "goal" || candidate.executionMode === "loop" || candidate.executionMode === "default"
             ? candidate.executionMode
             : undefined
     };
@@ -277,7 +277,8 @@ export function isQueuedPrompt(ctx, value) {
         (candidate.executionMode === undefined ||
             candidate.executionMode === "default" ||
             candidate.executionMode === "plan" ||
-            candidate.executionMode === "goal") &&
+            candidate.executionMode === "goal" ||
+            candidate.executionMode === "loop") &&
         (candidate.contextFork === undefined || typeof candidate.contextFork === "boolean") &&
         (candidate.forcePlan === undefined || typeof candidate.forcePlan === "boolean") &&
         (candidate.skills === undefined ||

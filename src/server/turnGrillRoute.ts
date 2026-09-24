@@ -104,7 +104,7 @@ export function createTurnGrillHandler({ sessionStore, serverUrl, recordUsage, r
         sessionStore.listSessionApprovalLiveItems(session.id),
         sessionStore.listSessionSteerMessages(session.id)
       ]);
-      if (action === "start" && sessionTurns.at(-1)?.id !== turn.id) {
+      if (action === "start" && req.body?.autoLoop !== true && sessionTurns.at(-1)?.id !== turn.id) {
         res.status(409).json({ error: "Grill can only start on the latest turn. Fork this turn first." }); return;
       }
       if (action === "start" && saved?.rounds.length) {
@@ -118,14 +118,16 @@ export function createTurnGrillHandler({ sessionStore, serverUrl, recordUsage, r
         fileChanges: summarizeSessionFileChanges([turn], { [turn.id]: turnLiveItems }).files.map(({ path, kind, additions, deletions, movePath }) => ({ path, kind, additions, deletions, ...(movePath ? { movePath } : {}) })),
         sessionContext: buildTurnGrillSessionContext(session, turn.id, sessionTurns),
         action, issues: requestedIssues, reservedIssueIds: issues.map((issue) => issue.id), rounds: (saved?.rounds ?? []).map((round) => ({ ...round,
-          issues: round.issues.filter((issue) => requestedIssues.some((current) => current.id === issue.id)) })), followup, longTurn
+        issues: round.issues.filter((issue) => requestedIssues.some((current) => current.id === issue.id)) })), followup, longTurn,
+        autoLoop: req.body?.autoLoop === true || saved?.automatic === true
       });
       let acknowledged = saved;
       if (saved && req.body.observedVersion !== undefined) {
         try { acknowledged = acknowledgeGrill(saved, req.body.observedVersion); }
         catch (error) { res.status(400).json({ error: String(error) }); return; }
       }
-      const next: TurnGrill = { ...acknowledged, revision: (saved?.revision ?? 0) + 1, status: "running", updated: new Date().toISOString(), issues, rounds: saved?.rounds ?? [], error: null, request: { action, prompt: followup } };
+      const next: TurnGrill = { ...acknowledged, revision: (saved?.revision ?? 0) + 1, status: "running", updated: new Date().toISOString(), issues, rounds: saved?.rounds ?? [], error: null,
+        automatic: saved?.automatic === true || req.body?.autoLoop === true, request: { action, prompt: followup } };
       if (!await sessionStore.saveTurnGrill(sessionId, turnId, saved?.revision ?? 0, next)) {
         res.status(409).json({ error: "Grill changed. Reload before retrying." }); return;
       }

@@ -115,7 +115,7 @@ export type QueuedPrompt = {
 };
 
 export type ComposerMode = "queue" | "steer";
-export type ExecutionMode = "default" | "plan" | "goal";
+export type ExecutionMode = "default" | "plan" | "goal" | "loop";
 
 export type SkillSuggestion = {
   name: string;
@@ -564,6 +564,7 @@ export type ProfileAnalytics = {
 export type SessionTurnRecord = {
   id: string;
   sessionId: string;
+  loopMode?: boolean;
   accountId: string | null;
   userInput: string;
   agentResponse: string;

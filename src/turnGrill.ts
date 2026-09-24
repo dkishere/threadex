@@ -1,4 +1,4 @@
-export type GrillIssue = { id: string; md: string; responseMd: string; status: "open" | "resolved"; selected: boolean; dropped?: boolean };
+export type GrillIssue = { id: string; md: string; responseMd: string; status: "open" | "resolved"; selected: boolean; dropped?: boolean; impact?: "blocking" | "non_blocking"; todoId?: string };
 export type GrillRound = { id: string; created: string; action: "start" | "respond" | "followup" | "save"; prompt: string; issues: GrillIssue[] };
 export type TurnGrill = {
   revision: number; status: "running" | "ready" | "error"; updated: string;
@@ -6,6 +6,7 @@ export type TurnGrill = {
   contentVersion?: number;
   acknowledgedVersion?: number;
   workTurns?: Record<string, "pending" | "completed">;
+  automatic?: boolean;
   request?: { action: "start" | "respond" | "followup"; prompt: string; issueId?: string };
 };
 
@@ -55,9 +56,14 @@ export function parseGrillIssues(value: unknown): GrillIssue[] {
       || typeof item.md !== "string" || !item.md.trim() || item.md.length > 16000
       || typeof item.responseMd !== "string" || item.responseMd.length > 32000
       || !["open", "resolved"].includes(item.status)
-      || (item.dropped !== undefined && typeof item.dropped !== "boolean")) throw new Error("Invalid Grill issue format or duplicate ID.");
+      || (item.dropped !== undefined && typeof item.dropped !== "boolean")
+      || (item.impact !== undefined && item.impact !== "blocking" && item.impact !== "non_blocking")
+      || (item.todoId !== undefined && typeof item.todoId !== "string")) throw new Error("Invalid Grill issue format or duplicate ID.");
     ids.add(item.id);
-    return { id: item.id, md: item.md.trim(), responseMd: item.responseMd, status: item.status, selected: item.dropped === true ? false : item.selected !== false, ...(item.dropped !== undefined ? { dropped: item.dropped } : {}) };
+    return { id: item.id, md: item.md.trim(), responseMd: item.responseMd, status: item.status, selected: item.dropped === true ? false : item.selected !== false,
+      ...(item.dropped !== undefined ? { dropped: item.dropped } : {}),
+      ...(item.impact !== undefined ? { impact: item.impact } : {}),
+      ...(item.todoId !== undefined ? { todoId: item.todoId } : {}) };
   });
 }
 

@@ -24,7 +24,9 @@ test("Grill rejects malformed, duplicate and oversized issues", () => {
   assert.throws(() => parseGrillIssues([{ ...issue, md: " " }]));
   assert.throws(() => parseGrillIssues([{ ...issue, status: "invented" }]));
   assert.throws(() => parseGrillIssues([{ ...issue, dropped: "yes" }]));
+  assert.throws(() => parseGrillIssues([{ ...issue, impact: "minor" }]));
   assert.throws(() => parseGrillIssues([{ ...issue, responseMd: "a".repeat(32001) }]));
+  assert.equal(parseGrillIssues([{ ...issue, impact: "non_blocking" }])[0].impact, "non_blocking");
   assert.deepEqual(parseGrillIssues([]), []);
 });
 

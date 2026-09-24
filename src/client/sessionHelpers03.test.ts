@@ -68,6 +68,7 @@ test("session snapshots carry per-turn run metadata onto the prompt", () => {
     turnDurationMs: () => 3_750
   }, [{
     id: "turn-usage",
+    loopMode: true,
     userInput: "Show the run details",
     agentResponse: "Done",
     model: "gpt-5.6-terra",
@@ -92,7 +93,8 @@ test("session snapshots carry per-turn run metadata onto the prompt", () => {
     turnStatus: prompt?.turnStatus,
     autoModel: prompt?.autoModel,
     autoModelProvider: prompt?.autoModelProvider,
-    autoModelConfidence: prompt?.autoModelConfidence
+    autoModelConfidence: prompt?.autoModelConfidence,
+    executionMode: prompt?.executionMode
   }, {
     model: "gpt-5.6-terra",
     reasoningEffort: "xhigh",
@@ -103,7 +105,8 @@ test("session snapshots carry per-turn run metadata onto the prompt", () => {
     turnStatus: "done",
     autoModel: true,
     autoModelProvider: "typesafe",
-    autoModelConfidence: 0.2
+    autoModelConfidence: 0.2,
+    executionMode: "loop"
   });
 });
 

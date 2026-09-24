@@ -235,7 +235,7 @@ export function sessionTurnsToMessages(ctx, turns, title, existingMessages = [],
                 developerInstructions,
                 forcePlan: existingUserMessage?.forcePlan === true || developerInstructionsIndicateForcePlan(developerInstructions),
                 contextFork: existingUserMessage?.contextFork === true || inferredContextFork || promptMetadata.contextFork,
-                executionMode: hasGoalMode ? "goal" : existingUserMessage?.executionMode
+                executionMode: turn.loopMode ? "loop" : hasGoalMode ? "goal" : existingUserMessage?.executionMode
             },
             {
                 id: `${turn.id}:assistant`,
@@ -835,7 +835,7 @@ export function normalizeComposerDraft(ctx, value) {
         return emptyComposerDraft();
     }
     const candidate = value;
-    const executionMode = candidate.executionMode === "plan" || candidate.executionMode === "goal" || candidate.executionMode === "default"
+    const executionMode = candidate.executionMode === "plan" || candidate.executionMode === "goal" || candidate.executionMode === "loop" || candidate.executionMode === "default"
         ? candidate.executionMode
         : "default";
     return {

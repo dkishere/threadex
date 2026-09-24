@@ -291,10 +291,10 @@ export async function submit(ctx, event, modeOverride?: string) {
             : plainMessage;
         const turnSkills = selectedSkills.filter((skill) => message.includes(`$${skill.name}`));
         const forcePlan = composerTodoPlanModeEnabled;
-        if (executionMode === "goal") {
+        const submissionMode = modeOverride ?? composerMode;
+        if (executionMode === "loop" && !(currentSessionIsRunning && submissionMode === "steer")) {
             setComposerExecutionMode("default");
         }
-        const submissionMode = modeOverride ?? composerMode;
         if (forkNextPrompt && submissionMode !== "steer" && sessionIdRef.current) {
             setComposerForkNextPrompt(false);
             if (currentSessionIsRunning) {

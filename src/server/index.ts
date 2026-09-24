@@ -14,6 +14,8 @@ import { RunnerProcessRegistry } from "./runnerProcessRegistry";
 import { clientLayoutInstructions } from "./clientLayoutInstructions";
 import { createTurnGrillHandler } from "./turnGrillRoute";
 import { createWorkspaceSnapshotHandler } from "./workspaceSnapshotRoute";
+import { acceptLoopTodos, loopWorkInstructions, loopWorkIssues, loopStopReason, shouldAutoGrillTurn } from "./loopMode";
+import { grillContentVersion, grillHandoff, type TurnGrill } from "../turnGrill";
 import { reviseOutcomePlan } from "./lightweightTodo";
 import express from "express";
 import { createSecurity } from "./security";
@@ -207,7 +209,7 @@ type ComposerSuggestionKeywordRequest = {
   keywords?: unknown;
 };
 
-type ExecutionMode = "default" | "plan" | "goal";
+type ExecutionMode = "default" | "plan" | "goal" | "loop";
 
 function combineDeveloperInstructions(...values: Array<string | undefined | null | false>) {
   return values.filter((value): value is string => Boolean(value)).join("\n\n") || undefined;
@@ -4052,6 +4054,85 @@ app.post("/api/session-inspector/search", async (
 const turnGrillHandler = createTurnGrillHandler({
   sessionStore, serverUrl, recordUsage: recordBackgroundModelUsage
 });
+const loopingTurnsBySession = new Map<string, Set<string>>();
+app.get("/api/loop-mode", async (_req, res) => {
+  try { res.json({ enabled: await sessionStore.getGlobalLoopMode() }); }
+  catch (error) { res.status(500).json({ error: errorMessage(error) }); }
+});
+app.put("/api/loop-mode", async (req, res) => {
+  if (typeof req.body?.enabled !== "boolean") {
+    res.status(400).json({ error: "enabled must be a boolean." }); return;
+  }
+  try {
+    await sessionStore.setGlobalLoopMode(req.body.enabled);
+    res.json({ enabled: await sessionStore.getGlobalLoopMode() });
+  } catch (error) { res.status(500).json({ error: errorMessage(error) }); }
+});
+
+async function runLoopForCompletedTurn(sessionId: string, turnId: string): Promise<void> {
+  const [globalEnabled, promptEnabled, workTurn] = await Promise.all([
+    sessionStore.getGlobalLoopMode(), sessionStore.isTurnLoopModeEnabled(turnId), sessionStore.getLoopWorkTurn(turnId)
+  ]);
+  if (!globalEnabled && !promptEnabled) return;
+  const turn = await sessionStore.getSessionTurn(turnId);
+  if (!turn || turn.sessionId !== sessionId || turn.status !== "done" || turn.runnerExitCode !== 0) return;
+  if (workTurn && loopStopReason(turn.agentResponse, workTurn.workCycle)) return;
+  const items = await sessionStore.listSessionTurnLiveItems(sessionId, turnId);
+  if (!shouldAutoGrillTurn(items, Boolean(workTurn))) return;
+  if (await sessionStore.getTurnGrill(sessionId, turnId)) return;
+
+  const reviewResponse = await fetch(`${serverUrl}/api/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/grill`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "start", autoLoop: true })
+  });
+  if (!reviewResponse.ok) throw new Error(`Automatic Grill returned HTTP ${reviewResponse.status}: ${(await reviewResponse.text()).slice(0, 500)}`);
+  const accepted = await acceptLoopTodos(sessionStore, sessionId, turnId, (await reviewResponse.json()).grill as TurnGrill);
+  const review = accepted.review;
+  if (accepted.todoChanged) await publishTodoChanged(sessionId, await sessionStore.getSessionTodo(sessionId));
+  const issues = loopWorkIssues(review);
+  if (!issues.length) {
+    if (review.issues.length) await sessionStore.acknowledgeTurnGrill(sessionId, turnId, grillContentVersion(review));
+    return;
+  }
+  if (!promptEnabled && !await sessionStore.getGlobalLoopMode()) return;
+  const session = await sessionStore.getSession(sessionId);
+  if (!session) return;
+  const preferences = await sessionStore.getSessionModelPreferences(sessionId);
+  const autoModel = await sessionStore.getSessionAutoModel(sessionId);
+  const nextWorkTurnId = crypto.randomUUID();
+  const workCycle = (workTurn?.workCycle ?? 0) + 1;
+  await sessionStore.recordLoopWorkTurn(nextWorkTurnId, workTurn?.rootTurnId ?? turnId, workCycle);
+  if (promptEnabled) await sessionStore.enableTurnLoopMode(nextWorkTurnId);
+  const response = await fetch(`${serverUrl}/api/chat`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sessionId, turnId: nextWorkTurnId, workspaceId: session.workspaceId, message: grillHandoff(issues, "", review.rounds),
+      grillOrigin: { turnId, observedVersion: grillContentVersion(review) },
+      developerInstructions: loopWorkInstructions(workCycle),
+      model: preferences.selectedModel, modelReasoningEffort: preferences.selectedEffort,
+      autoModel: autoModel.enabled,
+      approvalPolicy: normalizeApprovalPolicy(await sessionStore.resolveApprovalPolicy(sessionId)),
+      accountId: session.accountId, loadBalanceInWorkspace: false, backgroundTask: true
+    } satisfies ChatRequest)
+  });
+  if (!response.ok) throw new Error(`Automatic Start work returned HTTP ${response.status}`);
+  await response.arrayBuffer();
+}
+
+function scheduleLoopForCompletedTurn(sessionId: string, turnId: string) {
+  const active = loopingTurnsBySession.get(sessionId) ?? new Set<string>();
+  active.add(turnId);
+  loopingTurnsBySession.set(sessionId, active);
+  void runLoopForCompletedTurn(sessionId, turnId)
+    .catch((error) => console.warn(`Loop mode failed for ${turnId}: ${errorMessage(error)}`))
+    .finally(() => {
+      active.delete(turnId);
+      if (active.size) return;
+      loopingTurnsBySession.delete(sessionId);
+      void schedulePendingTurnsForSession(sessionId).catch((error) => {
+        console.warn(`Failed to schedule pending turns after ${turnId}: ${errorMessage(error)}`);
+      });
+    });
+}
 app.get("/api/sessions/:sessionId/grills", async (req, res) => {
   try {
     const session = await sessionStore.getSession(req.params.sessionId);
@@ -5490,6 +5571,7 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
         return;
       }
       if (claim.disposition === "queued") {
+        if (chatRequest.executionMode === "loop" && chatRequest.contextFork !== true) await sessionStore.enableTurnLoopMode(claim.turn.id);
         if (chatRequest.grillOrigin) {
           const grill = await sessionStore.acknowledgeTurnGrill(session.id, chatRequest.grillOrigin.turnId, chatRequest.grillOrigin.observedVersion, turnId);
           emit(res, "grill_ack", { sessionId: session.id, turnId: chatRequest.grillOrigin.turnId, grill });
@@ -5541,6 +5623,7 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
         return;
       }
       claimedTurnId = claim.turn.id;
+      if (chatRequest.executionMode === "loop" && chatRequest.contextFork !== true) await sessionStore.enableTurnLoopMode(turnId);
       await appendSessionTurnPromptLog(claim.turn, "chat.start");
     } else {
       const claim = await sessionStore.claimPendingSessionTurn(turnId, session.id, logPath);
@@ -5746,7 +5829,7 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
           : undefined,
       contextForkRequest: !workspaceManagerRole && chatRequest.contextFork === true,
       childExecutionMode: chatRequest.contextFork === true
-        ? normalizeExecutionMode(chatRequest.executionMode)
+        ? chatRequest.executionMode === "loop" ? "loop" : normalizeExecutionMode(chatRequest.executionMode)
         : undefined,
       todoParentSessionId: todoWorkerAssignment?.parentSessionId,
       todoItemId: todoWorkerAssignment?.itemId,
@@ -7391,6 +7474,7 @@ function skillPathPriority(path: string) {
 }
 
 function normalizeExecutionMode(value: unknown): ExecutionMode {
+  // Loop is a server-side follow-up workflow; the prompt itself runs normally.
   return value === "plan" || value === "goal" ? value : "default";
 }
 
@@ -8856,9 +8940,7 @@ async function applyRunnerUpdate(
       return false;
     }
     await sessionStore.cancelWaitSubscriptionsForTurn(update.turnId);
-    void schedulePendingTurnsForSession(update.sessionId).catch((error) => {
-      console.warn(`Failed to schedule pending turns after ${update.turnId}: ${errorMessage(error)}`);
-    });
+    scheduleLoopForCompletedTurn(update.sessionId, update.turnId);
     sessionSummarizer.noteSessionActivity(update.sessionId);
     return true;
   }

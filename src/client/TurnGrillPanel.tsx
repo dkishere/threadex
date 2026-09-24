@@ -236,9 +236,9 @@ export function TurnGrillPanel({ sessionId, turnId, latest, mainBusy, onImplemen
     disabled={locked || mainBusy} onClick={() => void act("start")}><Flame aria-hidden="true" /></button>}</div>;
   if (!review && !started) return <>{actions}{error && <p role="alert">{error}</p>}</>;
 
-  return <>{actions}<section className="turn-grill" data-await-ack={grillAwaitingAck(review) || undefined} aria-label="Grill review" aria-busy={locked}>
+  return <>{actions}<section className="turn-grill" data-automatic={review?.automatic || undefined} data-await-ack={grillAwaitingAck(review) || undefined} aria-label={review?.automatic ? "Auto Grill review" : "Grill review"} aria-busy={locked}>
     <header className="grill-header">
-      <div className="grill-title"><span className="grill-mark"><Flame size={15} aria-hidden="true" /></span><strong>Grill</strong>
+      <div className="grill-title"><span className="grill-mark"><Flame size={15} aria-hidden="true" /></span><strong>{review?.automatic ? "Auto Grill" : "Grill"}</strong>
         <span className="grill-stage">{canFollowUp ? "Discussion" : issues.length ? "Questions ready" : locked ? "Reviewing" : "Review"}</span>
         {grillAwaitingAck(review) && <span className="grill-await-ack" role="status">Await ack</span>}
       </div>
@@ -285,7 +285,7 @@ export function TurnGrillPanel({ sessionId, turnId, latest, mainBusy, onImplemen
           <input className="grill-question-select" type="checkbox" aria-label={`Question ${index + 1}`} checked={issue.selected && !issue.dropped} disabled={locked || issue.dropped}
             onChange={(event) => { queueIssues(issuesRef.current.map((candidate) => candidate.id === issue.id ? { ...candidate, selected: event.target.checked } : candidate)); void acknowledge(); }} />
           <div className="grill-issue-body">
-            <div className="grill-issue-label"><span>{String(index + 1).padStart(2, "0")}</span>{issue.dropped ? <span>Dropped</span> : issue.status === "resolved" ? <span className="grill-resolved"><Check size={11} aria-hidden="true" /> Satisfied</span> : null}</div>
+            <div className="grill-issue-label"><span>{String(index + 1).padStart(2, "0")}</span>{issue.dropped ? <span>Dropped</span> : issue.status === "resolved" ? <span className="grill-resolved"><Check size={11} aria-hidden="true" /> Satisfied</span> : issue.impact === "non_blocking" ? <span className="grill-todo-label">{issue.todoId ? "Accepted as Todo" : "Non-blocking"}</span> : review?.automatic ? <span className="grill-blocker-label">Blocker</span> : null}</div>
             {editing?.id === issue.id ? <div className="grill-edit">
               <textarea aria-label={`Edit question ${index + 1}`} value={editing.md} maxLength={16000} disabled={locked} autoFocus
                 onBlur={() => { void flushChanges(); if (editing.md.trim()) setEditing(null); }}

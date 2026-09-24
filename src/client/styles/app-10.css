@@ -15,14 +15,14 @@
 
 .composer-fork-toggle[data-active="true"],
 .composer-plan-prefix[data-active="true"],
-.composer-goal-mode[data-active="true"] {
+.composer-loop-mode[data-active="true"] {
   background: #27272a;
   color: #ffffff;
 }
 
 .composer-fork-toggle[data-active="true"]:hover,
 .composer-plan-prefix[data-active="true"]:hover,
-.composer-goal-mode[data-active="true"]:hover {
+.composer-loop-mode[data-active="true"]:hover {
   background: #3f3f46;
   color: #ffffff;
 }
