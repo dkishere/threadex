@@ -164,7 +164,11 @@ export function createTurnGrillHandler({ sessionStore, serverUrl, recordUsage, r
       while (true) {
         const current = (await sessionStore.getTurnGrill(sessionId, turnId))!;
         completed = { ...completed, revision: current.revision + 1, contentVersion: grillContentVersion(current) + 1,
-          acknowledgedVersion: current.acknowledgedVersion, workTurns: current.workTurns };
+          acknowledgedVersion: current.acknowledgedVersion, workTurns: current.workTurns,
+          issues: completed.issues.map((issue) => {
+            const todoId = current.issues.find((candidate) => candidate.id === issue.id)?.todoId;
+            return todoId ? { ...issue, todoId } : issue;
+          }) };
         if (await sessionStore.saveTurnGrill(sessionId, turnId, current.revision, completed)) break;
       }
       res.json({ grill: completed });

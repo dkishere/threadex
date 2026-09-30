@@ -8,6 +8,8 @@ import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { CONTEXT_FORK_USER_SUFFIX } from "../contextFork";
 import { WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS } from "./workspaceManagerRouting";
+import { WORKSPACE_MANAGER_INSTRUCTIONS, workspaceManagerContext } from "./workspaceManager";
+import { MANAGER_REPLY_LANGUAGE_INSTRUCTIONS } from "./replyLanguage";
 import {
   CONTINUE_TODO_PLAN_USER_SUFFIX,
   FORCE_TODO_PLAN_DEVELOPER_INSTRUCTIONS,
@@ -24,6 +26,7 @@ test("prompt runner serializes burst callbacks so terminal updates are not stran
   const logPath = resolve(root, "runner.ndjson");
   const pendingLogPath = resolve(root, "pending.ndjson");
   const appServerExitMarkerPath = resolve(root, "app-server-exited");
+  const turnParamsPath = resolve(root, "turn-params.json");
   const receivedEvents: string[] = [];
   let appServerExitedBeforeTurnCompletedCallback = false;
   let appServerExitedBeforeResult = false;
@@ -72,6 +75,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "thread-1" } } });
   if (request.method === "thread/goal/clear") send({ id: request.id, result: {} });
   if (request.method === "turn/start") {
+    writeFileSync(process.env.APP_SERVER_TURN_PARAMS_PATH, JSON.stringify(request.params));
     send({ id: request.id, result: { turn: { id: "app-turn-1" } } });
     for (let index = 0; index < 50; index += 1) {
       send({ method: "item/agentMessage/delta", params: { itemId: "answer-1", delta: "x" } });
@@ -87,6 +91,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     sessionId: "session-1",
     turnId: "turn-1",
     message: "test callback burst",
+    fastMode: true,
     serverUrl: `http://127.0.0.1:${address.port}`,
     logPath,
     pendingLogPath,
@@ -99,7 +104,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     env: {
       ...process.env,
       CODEX_PATH: fakeCodexPath,
-      APP_SERVER_EXIT_MARKER_PATH: appServerExitMarkerPath
+      APP_SERVER_EXIT_MARKER_PATH: appServerExitMarkerPath,
+      APP_SERVER_TURN_PARAMS_PATH: turnParamsPath
     },
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -110,6 +116,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
 
   assert.equal(exitCode, 0, stderr);
+  assert.equal(JSON.parse(readFileSync(turnParamsPath, "utf8")).serviceTierForTurn, "fast");
   const entries = readFileSync(logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
   assert.equal(entries.some((entry) => entry.event === "runner.callback_error"), false);
   assert.equal(existsSync(pendingLogPath), false);
@@ -2092,10 +2099,11 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5_000, diagnostics:
   throw new Error(`Timed out waiting for test condition. ${diagnostics()}`.trim());
 }
 
-for (const variant of ["ordinary", "manager-direct", "manager-resume", "manager-event", "manager-recovery"]) test(variant !== "ordinary"
-  ? `workspace manager runner restricts execution and fixes Luna max for ${variant}`
+for (const variant of ["ordinary", "worker-direct", "worker-resume", "worker-recovery", "manager-direct", "manager-resume", "manager-event", "manager-recovery", "manager-loop-alert"]) test(variant !== "ordinary"
+  ? `workspace manager runner installs role policy for ${variant}`
   : "lightweight runner enables outcome tools without planner mutation or grill gates", async () => {
-  const workspaceManagerRole = variant !== "ordinary";
+  const workspaceManagerRole = variant.startsWith("manager-");
+  const managerDelegatedTask = variant.startsWith("worker-");
   const root = mkdtempSync(resolve(tmpdir(), "prompt-runner-todo-language-"));
   const fakeCodexPath = resolve(root, "fake-codex.mjs");
   const jobPath = resolve(root, "job.json");
@@ -2137,11 +2145,22 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     message: "請建立 todo plan，todo language 要跟返用戶 prompt",
     lightweightTodo: !workspaceManagerRole,
     workspaceManager: workspaceManagerRole,
+    managerDelegatedTask,
+    developerInstructions: workspaceManagerRole ? workspaceManagerContext({
+      manager: { workspaceId: "workspace-1", sessionId: "session-1", notificationsEnabled: true, created: "now", updated: "now" },
+      capturedAt: "2026-09-28T12:00:00Z", totalTasks: 1, runningTasks: 1, pendingTasks: 0, pendingEvents: 0,
+      tasks: [{ sessionId: "worker-1", turnId: "worker-turn-1", title: "Active worker", cwd: projectRoot,
+        description: "Historical task description", parentSessionId: null, updated: "now", status: "running",
+        pendingReason: null, latestRequest: "Previous request", latestResponse: "Previous response",
+        requestPrompt: "Full request from dashboard", comments: [{ id: "comment-1", summary: "Old update", detail: "Full commentary", created: "now" }] }]
+    }, { workspaceId: "workspace-1", processes: [], approvals: [] }) : undefined,
+    globalAgentInstructions: "Preserve the user's preferred language.",
+    managerLoopAlert: variant === "manager-loop-alert",
     model: "gpt-6-astra",
     modelReasoningEffort: "high",
     autoModelEnabled: workspaceManagerRole,
-    ...(["manager-resume", "manager-event", "manager-recovery"].includes(variant) ? { threadId: "thread-old" } : {}),
-    ...(variant === "manager-recovery" ? { recoveryContext: {
+    ...(["manager-resume", "manager-event", "manager-recovery", "worker-resume", "worker-recovery"].includes(variant) ? { threadId: "thread-old" } : {}),
+    ...(variant.endsWith("-recovery") ? { recoveryContext: {
       reason: "thread_resume_failed", sourceThreadId: "thread-old", handoff: "Existing manager objectives and decisions."
     } } : {}),
     ...(variant === "manager-event" ? { turnId: "manager_activity_test", message: "Workspace activity notification. A task finished." } : {}),
@@ -2160,7 +2179,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       CAPTURED_ARGS_PATH: capturedArgsPath,
       CAPTURED_THREAD_PATH: capturedThreadPath,
       CAPTURED_TURN_PATH: capturedTurnPath,
-      FAIL_RESUME: variant === "manager-recovery" ? "1" : "0"
+      FAIL_RESUME: variant.endsWith("-recovery") ? "1" : "0"
     },
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -2174,17 +2193,25 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   const thread = JSON.parse(readFileSync(capturedThreadPath, "utf8"));
   const turn = JSON.parse(readFileSync(capturedTurnPath, "utf8"));
   const config = thread.config.mcp_servers.session_inspector;
+  assert.match(turn.settings.developer_instructions, /Threadex automatically installs Git pre-commit\/pre-push hooks/);
+  assert.match(turn.settings.developer_instructions, /THREADEX_WORKTREE_REVIEW/);
+  assert.equal(thread.developerInstructions.includes(MANAGER_REPLY_LANGUAGE_INSTRUCTIONS), workspaceManagerRole || managerDelegatedTask);
+  if (managerDelegatedTask) assert.equal(thread.threadId, variant === "worker-resume" ? "thread-old" : undefined);
   if (workspaceManagerRole) {
     assert.equal(thread.threadId, ["manager-resume", "manager-event"].includes(variant) ? "thread-old" : undefined);
-    for (const instructions of [thread.developerInstructions, turn.settings.developer_instructions]) {
-      assert.ok(instructions.includes(WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS), `${variant} must install the current routing policy`);
-    }
+    assert.equal(thread.developerInstructions, WORKSPACE_MANAGER_INSTRUCTIONS, `${variant} must install the current policy at thread scope`);
+    assert.equal(thread.developerInstructions.split(WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS).length - 1, 1);
+    assert.ok(!turn.settings.developer_instructions.includes(WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS));
+    assert.match(turn.settings.developer_instructions, /worker-turn-1/);
+    assert.match(turn.settings.developer_instructions, /2026-09-28T12:00:00Z/);
+    assert.match(turn.settings.developer_instructions, /Preserve the user's preferred language/);
+    assert.doesNotMatch(turn.settings.developer_instructions, /Historical task description|Previous request|Previous response|Full request from dashboard|Full commentary/);
     assert.equal(config.env.THREADEX_WORKSPACE_MANAGER, "1");
     assert.equal(config.env.THREADEX_CONTINUITY_ONLY, "0");
     assert.equal(config.env.THREADEX_AUTO_MODEL, "0");
-    assert.equal(thread.model, "gpt-6-luna");
-    assert.equal(turn.model, "gpt-6-luna");
-    assert.equal(turn.effort, "max");
+    assert.equal(thread.model, variant === "manager-loop-alert" ? "gpt-6-astra" : "gpt-6-luna");
+    assert.equal(turn.model, variant === "manager-loop-alert" ? "gpt-6-astra" : "gpt-6-luna");
+    assert.equal(turn.effort, variant === "manager-loop-alert" ? "low" : "max");
     assert.equal(thread.sandbox, "read-only");
     assert.equal(turn.sandboxPolicy.type, "readOnly");
     assert.equal(thread.config.features.shell_tool, false);
@@ -2192,8 +2219,9 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     assert.equal(config.tools.workspace_create_task.approval_mode, "approve");
     assert.equal(config.tools.workspace_fork_task.approval_mode, "approve");
     assert.equal(config.tools.workspace_stop_task.approval_mode, "approve");
-    assert.match(turn.settings.developer_instructions, /dedicated manager/);
-    assert.match(turn.settings.developer_instructions, /ordinary session history is your memory/);
+    assert.equal(config.tools.workspace_continue_stronger.approval_mode, "approve");
+    assert.match(thread.developerInstructions, /dedicated manager/);
+    assert.match(thread.developerInstructions, /ordinary session history is your memory/);
     assert.doesNotMatch(turn.settings.developer_instructions, /MUST use these tools instead of update_plan/);
     return;
   }
@@ -2239,9 +2267,11 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   if (request.method === "thread/goal/clear") send({ id: request.id, result: {} });
   if (request.method === "turn/start") {
     send({ id: request.id, result: { turn: { id: "app-turn-1" } } });
+    send({ method: "thread/tokenUsage/updated", params: { threadId: "thread-1", tokenUsage: { last: { inputTokens: 120000, outputTokens: 0, totalTokens: 120000 } } } });
     send({ method: "item/started", params: { threadId: "thread-1", item: { id: "compact-1", type: "contextCompaction" } } });
     setTimeout(() => {
       send({ method: "item/completed", params: { threadId: "thread-1", item: { id: "compact-1", type: "contextCompaction" } } });
+      send({ method: "thread/tokenUsage/updated", params: { threadId: "thread-1", tokenUsage: { last: { inputTokens: 18000, outputTokens: 0, totalTokens: 18000 } } } });
       send({ method: "item/completed", params: { threadId: "thread-1", item: { id: "answer-1", type: "agentMessage", text: "done" } } });
       send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "app-turn-1", status: "completed" } } });
     }, 1300);
@@ -2273,6 +2303,9 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     const completedIndex = entries.findIndex((entry) => entry.event === "item" && entry.data?.itemType === "context_compaction" && entry.data?.eventType === "item.completed");
     assert.ok(heartbeatIndex > 0, "compaction should refresh runner liveness");
     assert.ok(completedIndex > heartbeatIndex, "heartbeat should stop when compaction completes");
+    const compactedItems = entries.filter((entry) => entry.event === "item" && entry.data?.itemType === "context_compaction");
+    assert.equal(compactedItems.at(-1)?.data?.beforeTokens, 120000);
+    assert.equal(compactedItems.at(-1)?.data?.afterTokens, 18000);
     assert.equal(entries.slice(completedIndex + 1).some((entry) => entry.event === "runner.compaction_heartbeat"), false);
   } finally {
     rmSync(root, { force: true, recursive: true });

@@ -45,3 +45,31 @@ test("manager keeps a long draft and attachment inside the viewport with reachab
   await expect(composer).toBeVisible();
   expect(errors).toEqual([]);
 });
+
+test("manager opens its hidden session as raw history and links back without changing ordinary session navigation", async ({ page }) => {
+  const manager = await checkedJson(await page.request.post(`${apiBaseUrl}/api/workspace-manager`, {
+    data: { workspaceId: "default", notificationsEnabled: false }
+  }));
+  await page.goto(`/?workspaceId=default&sessionId=${manager.sessionId}&view=workspace-chat`);
+  await expect(page.locator('.chat[data-workspace-manager="true"]')).toBeVisible();
+  await expect(page.locator(`.session-row[data-session-id="${manager.sessionId}"]`)).toHaveCount(0);
+
+  const raw = page.getByRole("link", { name: "Raw session" });
+  await expect(raw).toHaveAttribute("href", `/?workspaceId=default&sessionId=${manager.sessionId}`);
+  await raw.click();
+  await expect(page.locator('.chat[data-workspace-manager="true"]')).toHaveCount(0);
+  await expect.poll(() => new URL(page.url()).search).toBe(`?workspaceId=default&sessionId=${manager.sessionId}`);
+  await expect(page.locator(`.session-row[data-session-id="${manager.sessionId}"]`)).toHaveCount(0);
+
+  const back = page.getByRole("link", { name: "Back to Manager" });
+  await expect(back).toHaveAttribute("href", `/?workspaceId=default&sessionId=${manager.sessionId}&view=workspace-chat`);
+  await back.click();
+  await expect(page.locator('.chat[data-workspace-manager="true"]')).toBeVisible();
+  await expect.poll(() => new URL(page.url()).search).toBe(`?workspaceId=default&sessionId=${manager.sessionId}&view=workspace-chat`);
+
+  const ordinary = page.locator(".session-row").first();
+  const ordinaryId = await ordinary.getAttribute("data-session-id");
+  expect(ordinaryId).toBeTruthy();
+  await ordinary.click();
+  await expect.poll(() => new URL(page.url()).search).toBe(`?workspaceId=default&sessionId=${ordinaryId}`);
+});

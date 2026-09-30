@@ -120,7 +120,7 @@ export function ProfileSettingsPanel({
             <div className="profile-card-heading profile-chart-heading">
               <div>
                 <h3 id="profile-token-trend-title">10-day model usage</h3>
-                <p>Uncached input, cached input, and output tokens per recorded model.</p>
+                <p>Uncached input, cached input, and output tokens per recorded model. Manager sessions are shown separately.</p>
               </div>
               <div className="profile-line-key" aria-label="Line styles">
                 <span><i /> Uncached input</span>

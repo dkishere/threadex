@@ -34,12 +34,15 @@ test("context compaction renders progress and completion labels", () => {
     item: { ...completedItem, eventType: "item.started" },
     sessionId: undefined
   }));
-  const completed = renderToStaticMarkup(LiveEvent(ctx, { item: completedItem, sessionId: undefined }));
+  const completed = renderToStaticMarkup(LiveEvent(ctx, {
+    item: { ...completedItem, beforeTokens: 120000, afterTokens: 18000 }, sessionId: undefined
+  }));
 
   assert.match(started, />Compacting context</);
   assert.match(started, /data-state="running"/);
   assert.match(started, /class="spin/);
   assert.match(completed, />Context compacted</);
+  assert.match(completed, /120,000 → 18,000 tokens/);
   assert.match(completed, /data-state="completed"/);
   assert.doesNotMatch(completed, /class="spin/);
   assert.match(completed, /lucide-shrink/);

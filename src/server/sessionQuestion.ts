@@ -1,4 +1,5 @@
 import { DEFAULT_MODEL } from "../modelCatalog";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -101,6 +102,49 @@ export async function answerSessionQuestion(input: {
       sessionQuestionRunners.delete(key);
     }
     throw error;
+  }
+}
+
+/** Run one isolated, read-only side chat and dispose of its temporary runner. */
+export async function answerTransientSessionQuestion(input: {
+  question: string;
+  context: SessionQuestionContext;
+  workspace: WorkspaceRecord;
+  serverUrl: string;
+  model?: string | null;
+  reasoningEffort?: SideChatReasoningEffort | null;
+}) {
+  const question = input.question.trim();
+  if (!question) throw new Error("question is required.");
+
+  const model = input.model?.trim() || process.env.SESSION_QUESTION_MODEL?.trim() || defaultModel;
+  const reasoningEffort = input.reasoningEffort ?? defaultReasoningEffort;
+  const mockResponse = process.env.SESSION_QUESTION_MOCK_RESPONSE?.trim();
+  if (mockResponse) return { model, answer: mockResponse, usage: null };
+
+  const codexHome = resolve(input.workspace.codexHome);
+  const mcpConfig = buildSideChatSessionInspectorConfig({ serverUrl: input.serverUrl, session: input.context.session });
+  const runner = new IsolatedLunaRunner({
+    name: `queued-prompt-fork-${randomUUID()}`,
+    model,
+    reasoningEffort,
+    timeoutMs: parsePositiveInteger(process.env.SESSION_QUESTION_TIMEOUT_MS) ?? defaultTimeoutMs,
+    sourceHomeCandidates: [codexHome],
+    allowMissingAuth: false,
+    baseInstructions: SIDE_CHAT_BASE_INSTRUCTIONS,
+    developerInstructions: buildSessionQuestionDeveloperInstructions(input.context.session),
+    appServerConfigArgs: buildSideChatMcpCliConfigArgs(mcpConfig),
+    threadConfig: { mcp_servers: { session_inspector: mcpConfig } },
+    freshThreadPerRun: true
+  });
+
+  try {
+    const result = await runner.run(question, { model, reasoningEffort });
+    const answer = result.responseText.trim();
+    if (!answer) throw new Error("Temporary side-chat agent produced no output.");
+    return { model, answer, usage: normalizeModelTokenUsage(result.usage) };
+  } finally {
+    runner.stop();
   }
 }
 

@@ -102,3 +102,36 @@ test("global and per-turn Loop settings survive a store restart", { timeout: 30_
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("Loop health checkpoints survive restart, cover stuck startup and exclude the manager", { timeout: 30_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "loop-health-checkpoint-"));
+  const path = join(root, "checkpoint.postgres");
+  let store = new SessionStore(path);
+  try {
+    await store.ready();
+    await store.upsertWorkspace({ id: "loop-workspace", name: "Loop", cwd: root, codexHome: join(root, "home") });
+    const manager = await store.ensureWorkspaceManager("loop-workspace");
+    await store.upsertSession({ id: "task", workspaceId: "loop-workspace", cwd: root, title: "Task" });
+    await store.recordSessionTurn({ id: "startup", sessionId: "task", userInput: "Start", agentResponse: "",
+      tokenIn: 0, tokenOut: 0, status: "running" });
+    await store.recordSessionTurn({ id: "manager-work", sessionId: manager.sessionId, userInput: "Coordinate", agentResponse: "",
+      tokenIn: 0, tokenOut: 0, status: "running" });
+    const firstAt = new Date(Date.now() + 5 * 60_000 + 1000);
+    assert.deepEqual((await store.claimDueLoopHealthChecks(firstAt)).map(check => check.turnId), ["startup"]);
+    await store.close();
+    store = new SessionStore(path);
+    await store.ready();
+    assert.equal((await store.claimDueLoopHealthChecks(firstAt)).length, 0);
+    const retryAt = new Date(firstAt.getTime() + 5 * 60_000 + 1000);
+    const second = await store.claimDueLoopHealthChecks(retryAt);
+    assert.deepEqual(second.map(check => check.turnId), ["startup"]);
+    await store.releaseLoopHealthCheck(second[0].turnId, second[0].checkedAt);
+    assert.deepEqual((await store.claimDueLoopHealthChecks(retryAt)).map(check => check.turnId), ["startup"]);
+    await store.updateSessionTurn({ id: "startup", agentResponse: "Done", tokenIn: 0, tokenOut: 0,
+      status: "done", runnerExitCode: 0 });
+    assert.equal((await store.claimDueLoopHealthChecks(new Date(firstAt.getTime() + 11 * 60_000))).length, 0);
+  } finally {
+    await store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});

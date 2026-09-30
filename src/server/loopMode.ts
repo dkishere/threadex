@@ -16,7 +16,7 @@ export function shouldAutoGrillTurn(items: unknown[], isLoopWorkTurn: boolean): 
 
 export function loopWorkIssues(review: TurnGrill) {
   return review.status === "ready"
-    ? review.issues.filter((issue) => issue.status === "open" && issue.selected && !issue.dropped && issue.impact !== "non_blocking")
+    ? review.issues.filter((issue) => issue.status === "open" && issue.selected && !issue.dropped && !issue.todoId)
     : [];
 }
 
@@ -36,9 +36,9 @@ export function loopStopReason(agentResponse: string, completedWorkCycles: numbe
   return /^Loop stopped:[ \t]*(\S[^\r\n]{0,999})$/i.exec(finalLine)?.[1]?.trim() ?? null;
 }
 
-export function loopWorkInstructions(workCycle: number) {
+export function loopWorkInstructions(workCycle: number, sourceTurnId?: string) {
   return [
-    `This is Auto Grill Start work cycle ${workCycle}. Address the blocking issues with concrete project evidence. Non-blocking issues have been accepted as Todo and do not need to be completed in this cycle.`,
+    `This is Auto Grill Start work cycle ${workCycle}. Evaluate every selected open Grill issue against the user's request and the project evidence. The griller's non-blocking classification is a suggestion, not an accepted Todo. Address issues in this cycle unless you independently judge that an issue is too large or outside the requested scope and can safely be deferred without violating acceptance criteria or leaving a correctness, security, data-loss, or failing-test defect. Only then add it to the session Todo with todo_add_item and explain the decision. Do not defer an issue merely because the griller called it non-blocking.${sourceTurnId ? ` For each accepted issue, pass grillTurnId=${sourceTurnId} and grillIssueId from its Grill heading to todo_add_item so the review links to the new Todo.` : ""}`,
     workCycle >= 2
       ? "If the same blocker remains unresolved after a genuine attempt and you cannot safely make progress, you may terminate this Loop by ending your final response with a line exactly like: Loop stopped: <specific blocker and reason>. Explain the evidence and remaining work. Otherwise omit that line so Loop continues."
       : "This is the first cycle. Do not terminate Loop in this turn; it must complete at least two full turn, Grill, and Start work cycles before an agent can stop it."

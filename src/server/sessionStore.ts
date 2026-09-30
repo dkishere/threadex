@@ -1,5 +1,6 @@
 import { DEFAULT_MODEL, defaultGearProfiles } from "../modelCatalog";
 import type { LightweightTodo } from "../lightweightTodo";
+import type { CollaborationFork, CollaborationGroup } from "../collaboration";
 import type { ProcessCommandParameter, ProcessCommandValues } from "../processCommandParameters";
 import { AUTO_MODEL_CHOICES, AUTO_EFFORT_CHOICES, isAutoModel, isAutoEffort, normalizeAutoModel } from "../autoModelCatalog";
 import { acknowledgeGrill, grillAwaitingAck, type GrillSummary, type TurnGrill } from "../turnGrill";
@@ -15,9 +16,24 @@ import { changedFilePaths } from "./changedFilePaths";
 import { canonicalSessionId, isThreadexSessionId, sessionIdAliases } from "../codexReference";
 import { stripContextForkOperationalSuffix } from "../contextFork";
 import { managerActivityPrompt, WORKSPACE_MANAGER_MODEL, WORKSPACE_MANAGER_EFFORT,
-  type WorkspaceManagerRecord, type WorkspaceManagerEvent, type WorkspaceManagerSnapshot } from "../workspaceManager";
+  type WorkspaceManagerRecord, type WorkspaceManagerEvent, type WorkspaceManagerSnapshot,
+  type WorkspaceManagerTask, type WorkspaceManagerTaskComment, type WorkspaceManagerLineCounts } from "../workspaceManager";
 
 export type KeywordWeights = Record<string, number>;
+
+// Concurrent workers are accessed through their main session's Concurrent panel.
+// Parent links alone also describe ordinary forks and must not hide those sessions.
+function concurrentWorkerSessionPredicate(sessionAlias: string) {
+  return `EXISTS (
+  SELECT 1 FROM collaboration_group AS concurrent_group
+  WHERE concurrent_group.state->'members' @> jsonb_build_array(jsonb_build_object('sessionId', ${sessionAlias}.id))
+    AND EXISTS (
+      SELECT 1 FROM jsonb_array_elements(concurrent_group.state->'members') AS member
+      WHERE member->>'sessionId' = ${sessionAlias}.id AND member->>'localId' <> 'main'
+    )
+)`;
+}
+const concurrentWorkerSessionSql = concurrentWorkerSessionPredicate("sessions");
 
 // The file poller can discover a native rollout before its managed session
 // adopts the thread ID. Keep the resulting empty import out of navigation.
@@ -34,6 +50,17 @@ const emptyNativeSessionAliasSql = `(
       AND EXISTS (SELECT 1 FROM session_turn WHERE session_id = owner.id)
   )
 )`;
+const legacyWatchdogStoppedResponse = /^Prompt runner (?:unknown|\d+) stopped before completion\. Saved as pending for retry\. Check runner\.watchdog\.dead for log tail diagnostics\.$/;
+const legacyWatchdogStoppedResponseSql = "^Prompt runner (unknown|[0-9]+) stopped before completion[.] Saved as pending for retry[.] Check runner[.]watchdog[.]dead for log tail diagnostics[.]$";
+function isLegacyWatchdogStoppedTurn(pendingReason: unknown, response: unknown) {
+  return (pendingReason == null || pendingReason === "queued") &&
+    typeof response === "string" && legacyWatchdogStoppedResponse.test(response);
+}
+function workspacePendingTaskSql(alias: string) {
+  return `${alias}.status = 'todo' AND ${alias}.pending_reason IS DISTINCT FROM 'stopped'
+    AND NOT ((${alias}.pending_reason IS NULL OR ${alias}.pending_reason = 'queued')
+      AND ${alias}.agent_response ~ '${legacyWatchdogStoppedResponseSql}')`;
+}
 export type SessionTitleSource = "initial" | "summarizer" | "user";
 
 export type ComposerSuggestionKeywordRecord = {
@@ -103,6 +130,7 @@ export type SessionAutoModelConfig = {
 export type SessionModelProfile = {
   model: string;
   effort: string;
+  fastMode?: boolean;
 };
 
 export type SessionModelPreferences = {
@@ -300,6 +328,7 @@ export type SessionTodoSnapshot = {
 export type UpsertTodoItemInput = {
   id?: string;
   sessionId: string;
+  grillOrigin?: { turnId: string; issueId: string };
   parentId?: string | null;
   title: string;
   details?: string | null;
@@ -478,6 +507,8 @@ export type SessionTurnRecord = {
   model?: string | null;
   /** The reasoning effort recorded when this turn began, if it is available. */
   reasoningEffort?: string | null;
+  /** Tier sent in a successful app-server turn/start request; not a usage confirmation. */
+  requestedServiceTier?: "fast" | "default";
   tokenIn: number;
   tokenOut: number;
   usageSample: SessionTurnTokenUsageSampleRecord | null;
@@ -495,6 +526,22 @@ export type SessionTurnRecord = {
   /** Original request options retained for durable pending-turn retries. */
   requestMetadata?: Record<string, unknown>;
   created: string;
+};
+
+export type WorkspaceManagerQueueForkStatus = "reserved" | "prepared" | "creating" | "created" | "failed" | "completed";
+
+export type WorkspaceManagerQueueForkJobRecord = {
+  turnId: string;
+  sessionId: string;
+  workspaceId: string;
+  managerSessionId: string;
+  requestId: string;
+  status: WorkspaceManagerQueueForkStatus;
+  title: string | null;
+  prompt: string | null;
+  targetSessionId: string | null;
+  error: string | null;
+  updated: string;
 };
 
 export type SessionTurnClaimResult = {
@@ -857,6 +904,7 @@ type UpdatePendingSessionTurnInput = {
   sessionId: string;
   userInput: string;
   message?: string;
+  editToken?: string;
 };
 
 type RecordSessionTurnEventInput = {
@@ -1060,7 +1108,15 @@ const resultExecutionDurationSelectSql = `
     FROM session_turn_event AS result_event
     WHERE result_event.turn_id = session_turn.id
       AND result_event.event_name = 'result'
-  ) AS execution_duration_ms
+  ) AS execution_duration_ms,
+  (
+    SELECT json_extract_string(tier_event.payload, '$.serviceTier')
+    FROM session_turn_event AS tier_event
+    WHERE tier_event.turn_id = session_turn.id
+      AND tier_event.event_name = 'turn.service_tier_requested'
+    ORDER BY tier_event.created DESC, tier_event.id DESC
+    LIMIT 1
+  ) AS requested_service_tier
 `;
 
 type MarkSessionTurnRunningInput = {
@@ -1138,6 +1194,7 @@ type SessionTurnRow = {
   agent_response?: unknown;
   turn_model?: unknown;
   turn_reasoning_effort?: unknown;
+  requested_service_tier?: unknown;
   token_in?: unknown;
   token_out?: unknown;
   status?: unknown;
@@ -1464,6 +1521,80 @@ export class SessionStore {
     this.duckDbUiStarted = true;
   }
 
+  async listCollaborationGroups(sessionId?: string): Promise<CollaborationGroup[]> {
+    return this.read(async connection => {
+      const result = await connection.run(`SELECT state FROM collaboration_group
+        ${sessionId ? "WHERE state::jsonb->'members' @> $member::jsonb" : ""} ORDER BY id`,
+        sessionId ? { member: JSON.stringify([{ sessionId }]) } : {});
+      return (await result.getRowObjectsJS()).map(row =>
+        (typeof row.state === "string" ? JSON.parse(row.state) : row.state) as CollaborationGroup);
+    });
+  }
+
+  /** Optimistic CAS is atomic across API processes without relying on pooled transaction affinity. */
+  async changeCollaboration<T>(id: string, initial: CollaborationGroup | null,
+    change: (group: CollaborationGroup) => T): Promise<T> {
+    return this.write(async connection => {
+      if (initial) await connection.run(`INSERT INTO collaboration_group (id, state)
+        VALUES ($id, $state::JSONB) ON CONFLICT (id) DO NOTHING`, { id, state: JSON.stringify(initial) });
+      for (let attempt = 0; attempt < 32; attempt++) {
+        const rows = await (await connection.run("SELECT state FROM collaboration_group WHERE id = $id", { id })).getRowObjectsJS();
+        if (!rows[0]) throw new Error("Collaboration group not found.");
+        const group = (typeof rows[0].state === "string" ? JSON.parse(rows[0].state) : rows[0].state) as CollaborationGroup;
+        const previous = JSON.stringify(group);
+        const result = change(group);
+        group.revision++;
+        group.updated = new Date().toISOString();
+        const updated = await connection.run(`UPDATE collaboration_group SET state = $state::JSONB
+          WHERE id = $id AND state = $previous::JSONB`, { id, state: JSON.stringify(group), previous });
+        if (updated.rowCount === 1) return result;
+      }
+      throw new Error("Collaboration changed concurrently; retry with the same request ID.");
+    });
+  }
+
+  async collaborationNativeTurn(sessionId: string, turnId: string, threadId: string): Promise<CollaborationFork | null> {
+    return this.read(async connection => {
+      const rows = await (await connection.run(`SELECT payload FROM session_turn_event
+        WHERE session_id = $sessionId AND turn_id = $turnId AND event_name = 'runner.native_turn_link'
+        ORDER BY created DESC, id DESC`, { sessionId, turnId })).getRowObjectsJS();
+      for (const row of rows) {
+        const payload = (typeof row.payload === "string" ? JSON.parse(row.payload) : row.payload) as Record<string, unknown>;
+        const nativeThreadId = payload.nativeSessionId ?? payload.threadId;
+        if (typeof nativeThreadId === "string" && typeof payload.nativeTurnId === "string")
+          return { threadId: nativeThreadId, lastTurnId: payload.nativeTurnId };
+      }
+      // The local transcript importer stores the exact native turn ID as its primary key.
+      const imported = await this.getSessionTurnWithConnection(connection, turnId);
+      if (imported?.sessionId === sessionId && imported.status === "done" &&
+        ["local.hook_imported", "local.imported", "local.hook_imported_aborted"].includes(imported.lastEventName ?? "") &&
+        /^[a-f0-9-]{36}$/i.test(turnId)) return { threadId, lastTurnId: turnId };
+      return null;
+    });
+  }
+
+  async collaborationSteerReceipt(commandId: string, turnId: string, runnerLogPath?: string | null) {
+    return this.read(async connection => {
+      const rows = await (await connection.run(`SELECT event_name, payload FROM session_turn_event
+        WHERE turn_id = $turnId AND event_name IN ('steer.accepted', 'steer.rejected', 'collaboration.steer_dispatch')
+          AND (payload::jsonb->>'commandId') = $commandId
+        ORDER BY created DESC, id DESC`, { commandId, turnId })).getRowObjectsJS();
+      const accepted = rows.find(row => row.event_name === "steer.accepted");
+      if (accepted) return "delivered" as const;
+      const rejected = rows.find(row => row.event_name === "steer.rejected");
+      if (rejected) {
+        const payload = typeof rejected.payload === "string" ? JSON.parse(rejected.payload) : rejected.payload;
+        return payload?.notSent === true ? "not_sent" as const : "uncertain" as const;
+      }
+      const dispatch = rows.find(row => row.event_name === "collaboration.steer_dispatch");
+      if (dispatch && runnerLogPath !== undefined) {
+        const payload = typeof dispatch.payload === "string" ? JSON.parse(dispatch.payload) : dispatch.payload;
+        if (payload?.runnerLogPath !== runnerLogPath) return "uncertain" as const;
+      }
+      return rows.length ? "dispatching" as const : "new" as const;
+    });
+  }
+
   async close() {
     if (this.closed) {
       return;
@@ -1663,6 +1794,7 @@ export class SessionStore {
           CAST(updated AS VARCHAR) AS updated
         FROM sessions
         WHERE workspace_id = $workspaceId
+          AND NOT EXISTS (SELECT 1 FROM workspace_manager m WHERE m.session_id = sessions.id)
           AND NOT EXISTS (SELECT 1 FROM workspace_manager_archive a WHERE a.session_id = sessions.id)
         ORDER BY updated DESC, created DESC
       `,
@@ -1685,7 +1817,8 @@ export class SessionStore {
           CAST(created AS VARCHAR) AS created,
           CAST(updated AS VARCHAR) AS updated
         FROM sessions
-        WHERE NOT EXISTS (SELECT 1 FROM workspace_manager_archive a WHERE a.session_id = sessions.id)
+        WHERE NOT EXISTS (SELECT 1 FROM workspace_manager m WHERE m.session_id = sessions.id)
+          AND NOT EXISTS (SELECT 1 FROM workspace_manager_archive a WHERE a.session_id = sessions.id)
         ORDER BY updated DESC, created DESC
       `);
       return (await result.getRowObjectsJS()).map(toSessionRecord);
@@ -1857,10 +1990,12 @@ export class SessionStore {
           FROM sessions
           WHERE workspace_id = $workspaceId
             AND achieved_at IS NULL
+            AND NOT EXISTS (SELECT 1 FROM workspace_manager m WHERE m.session_id = sessions.id)
             AND NOT EXISTS (SELECT 1 FROM workspace_manager_archive a WHERE a.session_id = sessions.id)
             ${projectSql}
             ${searchSql}
             AND NOT ${emptyNativeSessionAliasSql}
+            AND NOT ${concurrentWorkerSessionSql}
           ORDER BY ${relevanceSql} created DESC, id DESC
           LIMIT $limitPlusOne OFFSET $offset
         `,
@@ -1878,10 +2013,12 @@ export class SessionStore {
           FROM sessions
           WHERE workspace_id = $workspaceId
             AND achieved_at IS NULL
+            AND NOT EXISTS (SELECT 1 FROM workspace_manager m WHERE m.session_id = sessions.id)
             AND NOT EXISTS (SELECT 1 FROM workspace_manager_archive a WHERE a.session_id = sessions.id)
             ${projectSql}
             ${searchSql}
             AND NOT ${emptyNativeSessionAliasSql}
+            AND NOT ${concurrentWorkerSessionSql}
         `,
         {
           workspaceId,
@@ -1908,8 +2045,10 @@ export class SessionStore {
           FROM sessions
           WHERE workspace_id = $workspaceId
             AND achieved_at IS NULL
+            AND NOT EXISTS (SELECT 1 FROM workspace_manager m WHERE m.session_id = sessions.id)
             AND NOT EXISTS (SELECT 1 FROM workspace_manager_archive a WHERE a.session_id = sessions.id)
             AND NOT ${emptyNativeSessionAliasSql}
+            AND NOT ${concurrentWorkerSessionSql}
           GROUP BY cwd
           ORDER BY latest_updated DESC, cwd ASC
         `,
@@ -2432,9 +2571,23 @@ export class SessionStore {
   }
 
   async upsertTodoItem(input: UpsertTodoItemInput): Promise<SessionTodoSnapshot> {
-    return this.write(async (connection) => {
+    return this.transaction(async (connection) => {
       await this.assertSessionExistsWithConnection(connection, input.sessionId);
       const id = input.id ?? `todo_${crypto.randomUUID()}`;
+      let grill: TurnGrill | null = null;
+      if (input.grillOrigin) {
+        const result = await connection.run(`SELECT document FROM session_turn_grill
+          WHERE session_id = $sessionId AND turn_id = $turnId FOR UPDATE`,
+          { sessionId: input.sessionId, turnId: input.grillOrigin.turnId });
+        const row = (await result.getRowObjectsJS())[0];
+        grill = row ? JSON.parse(String(row.document)) as TurnGrill : null;
+        const issue = grill?.issues.find((candidate) => candidate.id === input.grillOrigin!.issueId);
+        if (todoActorValue(input.actor) !== "agent" || input.status && input.status !== "todo"
+          || !input.turnId || grill?.workTurns?.[input.turnId] !== "pending"
+          || !issue || issue.status !== "open" || !issue.selected || issue.dropped || issue.todoId) {
+          throw new Error("Grill issue is not available for Todo acceptance by this work turn.");
+        }
+      }
       const actor = todoActorValue(input.actor);
       const position = Number.isFinite(input.position) ? Number(input.position) : await this.nextTodoPosition(connection, input.sessionId, input.parentId ?? null);
       const parent = input.parentId ? await this.getTodoItemWithConnection(connection, input.sessionId, input.parentId) : null;
@@ -2476,6 +2629,15 @@ export class SessionStore {
           activeStatus: input.activeStatus ?? null
         }
       );
+      if (grill && input.grillOrigin) {
+        const next: TurnGrill = { ...grill, revision: grill.revision + 1,
+          issues: grill.issues.map((issue) => issue.id === input.grillOrigin!.issueId ? { ...issue, todoId: id } : issue) };
+        await connection.run(`UPDATE session_turn_grill SET revision = $revision, document = $document
+          WHERE session_id = $sessionId AND turn_id = $turnId`, {
+          sessionId: input.sessionId, turnId: input.grillOrigin.turnId,
+          revision: next.revision, document: JSON.stringify(next)
+        });
+      }
       return this.getSessionTodoWithConnection(connection, input.sessionId);
     });
   }
@@ -3107,7 +3269,7 @@ export class SessionStore {
       if (existing.actionType === "retry_turn") {
         if (!existing.turnId) throw new Error("Retry subscription does not reference a pending turn.");
         const turn = await this.getSessionTurnWithConnection(connection, existing.turnId);
-        if (!turn || turn.sessionId !== existing.sessionId || turn.status !== "todo") {
+        if (!turn || turn.sessionId !== existing.sessionId || turn.status !== "todo" || turn.lastEventName === "queue.edit_reserved") {
           throw new Error("Retry subscription no longer references an editable pending turn.");
         }
         await connection.run(
@@ -3161,6 +3323,10 @@ export class SessionStore {
   async claimWaitSubscription(id: string): Promise<WaitSubscriptionRecord | null> {
     return this.write(async (connection) => {
       const subscription = await this.getWaitSubscriptionWithConnection(connection, id);
+      if (subscription?.turnId) {
+        const turn = await this.getSessionTurnWithConnection(connection, subscription.turnId);
+        if (turn?.lastEventName === "queue.edit_reserved") return null;
+      }
       if (subscription?.actionType === "enqueue_prompt") {
         const event = await this.getWaitEventWithConnection(connection, subscription.eventId);
         if (event?.topic === "process.exited") {
@@ -3490,9 +3656,45 @@ export class SessionStore {
   }
 
   async setGlobalLoopMode(enabled: boolean): Promise<void> {
-    await this.write(async (connection) => {
-      await connection.run(`INSERT INTO loop_mode_settings (id, enabled) VALUES ('global', $enabled)
-        ON CONFLICT (id) DO UPDATE SET enabled = excluded.enabled`, { enabled });
+    await this.transaction(async (connection) => {
+      await connection.run("SELECT id FROM loop_mode_settings WHERE id = 'global' FOR UPDATE");
+      await connection.run("UPDATE loop_mode_settings SET enabled = $enabled WHERE id = 'global'", { enabled });
+    });
+  }
+
+  async getSessionLoopMode(sessionId: string): Promise<boolean> {
+    return this.read(async connection => {
+      const result = await connection.run("SELECT enabled FROM session_loop_mode_settings WHERE session_id = $sessionId", { sessionId });
+      return (await result.getRowObjectsJS())[0]?.enabled === true;
+    });
+  }
+
+  async hasAnySessionLoopModeEnabled(): Promise<boolean> {
+    return this.read(async connection => {
+      const result = await connection.run("SELECT session_id FROM session_loop_mode_settings WHERE enabled = TRUE LIMIT 1");
+      return (await result.getRowObjectsJS()).length > 0;
+    });
+  }
+
+  async setSessionLoopMode(sessionId: string, workspaceId: string, enabled: boolean): Promise<{
+    status: "updated" | "global_enabled" | "not_found"; enabled: boolean;
+  }> {
+    return this.transaction(async connection => {
+      await connection.run("SELECT id FROM loop_mode_settings WHERE id = 'global' FOR UPDATE");
+      const sessionRows = await (await connection.run(`SELECT s.workspace_id,
+          EXISTS (SELECT 1 FROM workspace_manager_archive a WHERE a.session_id = s.id) AS archived
+        FROM sessions s WHERE s.id = $sessionId`, { sessionId })).getRowObjectsJS();
+      const session = sessionRows[0];
+      if (!session || String(session.workspace_id) !== workspaceId || session.archived === true) {
+        return { status: "not_found", enabled: false };
+      }
+      const savedRows = await (await connection.run("SELECT enabled FROM session_loop_mode_settings WHERE session_id = $sessionId", { sessionId })).getRowObjectsJS();
+      const savedEnabled = savedRows[0]?.enabled === true;
+      const globalRows = await (await connection.run("SELECT enabled FROM loop_mode_settings WHERE id = 'global'")).getRowObjectsJS();
+      if (globalRows[0]?.enabled === true) return { status: "global_enabled", enabled: savedEnabled };
+      await connection.run(`INSERT INTO session_loop_mode_settings (session_id, enabled) VALUES ($sessionId, $enabled)
+        ON CONFLICT (session_id) DO UPDATE SET enabled = excluded.enabled`, { sessionId, enabled });
+      return { status: "updated", enabled };
     });
   }
 
@@ -3521,6 +3723,70 @@ export class SessionStore {
       const result = await connection.run("SELECT root_turn_id, work_cycle FROM loop_work_turn WHERE turn_id = $turnId", { turnId });
       const row = (await result.getRowObjectsJS())[0];
       return row ? { rootTurnId: String(row.root_turn_id), workCycle: Number(row.work_cycle) } : null;
+    });
+  }
+
+  private async enqueueLoopContinuation(connection: SessionDbConnection, turnId: string): Promise<void> {
+    await connection.run(`INSERT INTO loop_continuation (turn_id, session_id, work_turn_id)
+      SELECT t.id, t.session_id, $workTurnId FROM session_turn t
+      WHERE t.id = $turnId AND t.status = 'done' AND t.runner_exit_code = 0
+        AND COALESCE(t.request_metadata::jsonb -> 'contextFork', 'false'::jsonb) <> 'true'::jsonb
+        AND (EXISTS (SELECT 1 FROM loop_mode_settings WHERE id = 'global' AND enabled = TRUE)
+          OR EXISTS (SELECT 1 FROM session_loop_mode_settings WHERE session_id = t.session_id AND enabled = TRUE)
+          OR EXISTS (SELECT 1 FROM turn_loop_mode WHERE turn_id = t.id))
+      ON CONFLICT (turn_id) DO NOTHING`, { turnId, workTurnId: randomUUID() });
+  }
+
+  async getLoopContinuation(turnId: string): Promise<{ workTurnId: string } | null> {
+    return this.read(async connection => {
+      const rows = await (await connection.run(`SELECT work_turn_id FROM loop_continuation
+        WHERE turn_id = $turnId AND pending = TRUE`, { turnId })).getRowObjectsJS();
+      return rows[0] ? { workTurnId: String(rows[0].work_turn_id) } : null;
+    });
+  }
+
+  async listDueLoopContinuations(): Promise<Array<{ sessionId: string; turnId: string }>> {
+    return this.read(async connection => {
+      const rows = await (await connection.run(`SELECT c.session_id, c.turn_id FROM loop_continuation c
+        JOIN session_turn t ON t.id = c.turn_id JOIN sessions s ON s.id = c.session_id
+        WHERE c.pending = TRUE AND c.retry_at <= now()
+        ORDER BY c.retry_at, c.turn_id LIMIT 100`)).getRowObjectsJS();
+      return rows.map(row => ({ sessionId: String(row.session_id), turnId: String(row.turn_id) }));
+    });
+  }
+
+  async finishLoopContinuation(turnId: string): Promise<void> {
+    await this.write(connection => connection.run(`UPDATE loop_continuation SET pending = FALSE
+      WHERE turn_id = $turnId`, { turnId }).then(() => undefined));
+  }
+
+  async cancelLoopContinuations(sessionId: string): Promise<void> {
+    await this.write(connection => connection.run(`UPDATE loop_continuation SET pending = FALSE
+      WHERE session_id = $sessionId AND pending = TRUE`, { sessionId }).then(() => undefined));
+  }
+
+  async deferLoopContinuation(turnId: string): Promise<void> {
+    await this.write(connection => connection.run(`UPDATE loop_continuation SET retry_at = now() + interval '30 seconds'
+      WHERE turn_id = $turnId AND pending = TRUE`, { turnId }).then(() => undefined));
+  }
+
+  async recoverInterruptedLoopContinuations(): Promise<void> {
+    await this.transaction(async connection => {
+      // Upgrade reviews left behind by the old in-memory scheduler. Only the
+      // latest turn is eligible: a later user turn or Stop must not be replayed.
+      const rows = await (await connection.run(`SELECT g.turn_id, g.document FROM session_turn_grill g
+        JOIN session_turn t ON t.id = g.turn_id
+        WHERE t.status = 'done' AND t.runner_exit_code = 0
+          AND NOT EXISTS (SELECT 1 FROM loop_continuation c WHERE c.turn_id = t.id)
+          AND NOT EXISTS (SELECT 1 FROM session_turn newer WHERE newer.session_id = t.session_id
+            AND (newer.created, newer.id) > (t.created, t.id))`)).getRowObjectsJS();
+      for (const row of rows) {
+        const review = JSON.parse(String(row.document)) as TurnGrill;
+        if (review.automatic && review.status !== "ready" && !review.rounds.length
+          && !Object.keys(review.workTurns ?? {}).length) {
+          await this.enqueueLoopContinuation(connection, String(row.turn_id));
+        }
+      }
     });
   }
 
@@ -4331,6 +4597,7 @@ export class SessionStore {
             AND status = 'todo'
             AND coalesce(pending_reason, 'queued') <> 'stopped'
             AND last_event_name IS DISTINCT FROM 'queue.steer_reserved'
+            AND last_event_name IS DISTINCT FROM 'queue.fork_reserved'
           ORDER BY created ASC, id ASC
           LIMIT 1
         `,
@@ -4398,6 +4665,7 @@ export class SessionStore {
         LEFT JOIN accounts ON accounts.id = session_turn.account_id
         WHERE session_turn.status = 'todo'
           AND session_turn.last_event_name IS DISTINCT FROM 'queue.steer_reserved'
+          AND session_turn.last_event_name IS DISTINCT FROM 'queue.fork_reserved'
         ORDER BY session_turn.created ASC, session_turn.id ASC
       `);
       return (await result.getRowObjectsJS()).map((row) => ({
@@ -4518,8 +4786,8 @@ export class SessionStore {
     });
   }
 
-  async upsertSession(input: UpsertSessionInput, options: { createOnly?: boolean } = {}): Promise<SessionRecord> {
-    return this.write(async (connection) => {
+  async upsertSession(input: UpsertSessionInput, options: { createOnly?: boolean; inheritParentLoopMode?: boolean } = {}): Promise<SessionRecord> {
+    return this.transaction(async (connection) => {
       const existing = await this.getSessionWithConnection(connection, input.id);
       if (existing && options.createOnly) return existing;
       if (!existing && input.threadId) {
@@ -4632,6 +4900,10 @@ export class SessionStore {
         );
       }
 
+      if (!existing && options.inheritParentLoopMode && parentSessionId) {
+        await this.inheritSessionLoopMode(connection, input.id, parentSessionId);
+      }
+
       const session = await this.getSessionWithConnection(connection, input.id);
       if (!session) {
         throw new Error(`Failed to load session after upsert: ${input.id}`);
@@ -4640,8 +4912,17 @@ export class SessionStore {
     });
   }
 
+  private async inheritSessionLoopMode(connection: SessionDbConnection, sessionId: string, parentSessionId: string): Promise<void> {
+    // Copy only the task setting at creation. Global Loop remains global, and
+    // retries must not re-enable a child whose Loop was explicitly switched off.
+    await connection.run(`INSERT INTO session_loop_mode_settings (session_id, enabled)
+      SELECT $sessionId, EXISTS (SELECT 1 FROM session_loop_mode_settings
+        WHERE session_id = $parentSessionId AND enabled = TRUE)
+      ON CONFLICT (session_id) DO NOTHING`, { sessionId, parentSessionId });
+  }
+
   async forkSessionAtTurn(input: ForkSessionInput): Promise<{ session: SessionRecord; turns: SessionTurnRecord[] }> {
-    return this.write(async (connection) => {
+    return this.transaction(async (connection) => {
       const parentSession = await this.getSessionWithConnection(connection, input.parentSessionId);
       if (!parentSession) {
         throw new Error(`Session not found: ${input.parentSessionId}`);
@@ -4765,6 +5046,8 @@ export class SessionStore {
         { id: input.id, parentSessionId: parentSession.id }
       );
 
+      await this.inheritSessionLoopMode(connection, input.id, parentSession.id);
+
       for (const turn of turnsToCopy) {
         await connection.run(
           `
@@ -4852,6 +5135,23 @@ export class SessionStore {
       const rows = await (await connection.run(`SELECT * FROM workspace_manager WHERE session_id = $sessionId`, { sessionId })).getRowObjectsJS();
       return rows[0] ? toWorkspaceManager(rows[0]) : null;
     });
+  }
+
+  /** Execution/action role, including Concurrent forks of the current Manager.
+   * Ordinary delegated tasks do not inherit this role through parentage. */
+  async resolveSessionWorkspaceManager(sessionId: string): Promise<WorkspaceManagerRecord | null> {
+    const direct = await this.getSessionWorkspaceManager(sessionId);
+    if (direct) return direct;
+    const groups = await this.listCollaborationGroups(sessionId);
+    for (const group of groups) {
+      const member = group.members.find(item => item.sessionId === sessionId);
+      if (!member?.fork || member.localId === "main" || member.stopped || member.sourceSessionId !== group.mainSessionId) continue;
+      const manager = await this.getSessionWorkspaceManager(member.sourceSessionId);
+      if (!manager || manager.workspaceId !== group.workspaceId) continue;
+      const session = await this.getSession(sessionId);
+      if (session?.workspaceId === manager.workspaceId) return manager;
+    }
+    return null;
   }
 
   async setSessionTaskManager(sessionId: string, managerSessionId: string) {
@@ -5053,35 +5353,240 @@ export class SessionStore {
     });
   }
 
+  async workspaceManagerBackgroundUpdateStatus(sessionId: string): Promise<"queued" | "running" | null> {
+    return this.read(async connection => {
+      const rows = await (await connection.run(`SELECT CASE
+        WHEN EXISTS (
+          SELECT 1 FROM workspace_manager_event e JOIN session_turn t ON t.id = e.delivery_turn_id
+          WHERE e.workspace_id = m.workspace_id AND t.session_id = m.session_id AND t.status = 'running'
+        ) THEN 'running'
+        WHEN EXISTS (
+          SELECT 1 FROM workspace_manager_event e JOIN session_turn t ON t.id = e.delivery_turn_id
+          WHERE e.workspace_id = m.workspace_id AND t.session_id = m.session_id
+            AND t.status = 'todo' AND t.pending_reason IS DISTINCT FROM 'stopped'
+        ) THEN 'queued'
+        ELSE NULL END AS status
+        FROM workspace_manager m WHERE m.session_id = $sessionId`, { sessionId })).getRowObjectsJS();
+      const status = rows[0]?.status;
+      return status === "running" || status === "queued" ? status : null;
+    });
+  }
+
+  async isWorkspaceManagerLoopAlertTurn(sessionId: string, turnId: string): Promise<boolean> {
+    return this.read(async connection => (await (await connection.run(`SELECT 1 FROM workspace_manager_event e
+      JOIN workspace_manager m ON m.workspace_id = e.workspace_id
+      WHERE m.session_id = $sessionId AND e.delivery_turn_id = $turnId
+        AND e.type = 'task.loop_stalled' LIMIT 1`, { sessionId, turnId })).getRowObjectsJS()).length > 0);
+  }
+
   async workspaceManagerSnapshot(workspaceId: string): Promise<WorkspaceManagerSnapshot> {
-    const manager = await this.getWorkspaceManager(workspaceId);
+    const [manager, globalLoopEnabled] = await Promise.all([
+      this.getWorkspaceManager(workspaceId), this.getGlobalLoopMode()
+    ]);
     return this.read(async (connection) => {
       const rows = await (await connection.run(`SELECT s.id, s.title, s.cwd, s.description, s.parent_session_id, s.updated,
         t.id AS turn_id, t.status, t.pending_reason, t.runner_exit_code,
         CAST(t.runner_started AS VARCHAR) AS runner_started, CAST(t.created AS VARCHAR) AS turn_created,
         metrics.turn_number, metrics.queued_turns, metrics.updated_files,
+        activity.item_type AS activity_type, activity.event_type AS activity_event,
+        CAST(activity.updated AS VARCHAR) AS activity_updated,
         left(t.user_input, 600) AS latest_request, left(t.agent_response, 1200) AS latest_response,
+        CASE WHEN t.status = 'running' THEN t.user_input END AS request_prompt,
+        EXISTS (SELECT 1 FROM session_loop_mode_settings thread_loop
+          WHERE thread_loop.session_id = s.id AND thread_loop.enabled = TRUE) AS session_loop_enabled,
         count(*) OVER () AS total_count,
         count(*) FILTER (WHERE t.status = 'running') OVER () AS running_count,
-        count(*) FILTER (WHERE t.status = 'todo' AND t.pending_reason IS DISTINCT FROM 'stopped') OVER () AS pending_count
+        count(*) FILTER (WHERE ${workspacePendingTaskSql("t")}) OVER () AS pending_count
         FROM sessions s LEFT JOIN LATERAL (
           SELECT id, status, pending_reason, runner_exit_code, runner_started, created, user_input, agent_response FROM session_turn
           WHERE session_id = s.id ORDER BY (status = 'running') DESC,
-            (status = 'todo' AND pending_reason IS DISTINCT FROM 'stopped') DESC, created DESC, id DESC LIMIT 1
+            (${workspacePendingTaskSql("session_turn")}) DESC, created DESC, id DESC LIMIT 1
         ) t ON true
         LEFT JOIN LATERAL (
           SELECT count(*) FILTER (WHERE st.created < t.created OR (st.created = t.created AND st.id <= t.id)) AS turn_number,
-            count(*) FILTER (WHERE st.status = 'todo' AND st.pending_reason IS DISTINCT FROM 'stopped') AS queued_turns,
+            count(*) FILTER (WHERE ${workspacePendingTaskSql("st")}) AS queued_turns,
             (SELECT count(DISTINCT path) FROM session_turn edits
               CROSS JOIN LATERAL unnest(edits.changed_files) AS changed(path)
               WHERE edits.session_id = s.id AND t.status = 'running') AS updated_files
           FROM session_turn st WHERE st.session_id = s.id AND t.status = 'running'
         ) metrics ON true
+        LEFT JOIN LATERAL (
+          SELECT item_type, event_type, updated FROM session_live_item
+          WHERE turn_id = t.id AND t.status = 'running'
+            AND item_type IN ('agent_message', 'reasoning', 'command_execution', 'file_change', 'todo_list', 'web_search', 'subagent', 'context_compaction')
+            AND NOT (item_type = 'agent_message' AND event_type = 'item.started')
+            AND updated >= t.runner_started
+          ORDER BY updated DESC, sequence DESC NULLS LAST, item_id DESC LIMIT 1
+        ) activity ON true
         WHERE s.workspace_id = $workspaceId AND s.id <> $managerSessionId
+          AND NOT ${concurrentWorkerSessionPredicate("s")}
           AND NOT EXISTS (SELECT 1 FROM workspace_manager_archive a WHERE a.session_id = s.id)
         ORDER BY (t.status = 'running') DESC NULLS LAST,
-          (t.status = 'todo' AND t.pending_reason IS DISTINCT FROM 'stopped') DESC NULLS LAST, s.updated DESC
+          (${workspacePendingTaskSql("t")}) DESC NULLS LAST, s.updated DESC
         LIMIT 100`, { workspaceId, managerSessionId: manager?.sessionId ?? "" })).getRowObjectsJS();
+      const recentCompletedRows = await (await connection.run(`SELECT s.id, s.title, s.cwd, s.description, s.parent_session_id,
+          CAST(s.updated AS VARCHAR) AS updated, CAST(completion.completed_at AS VARCHAR) AS completed_at,
+          last_turn.status, last_turn.pending_reason, left(last_turn.agent_response, 1200) AS latest_response,
+          (SELECT completed_turn.user_input FROM session_turn completed_turn
+            WHERE completed_turn.session_id = s.id AND completed_turn.status = 'done'
+              AND completed_turn.created <= completion.completed_at
+            ORDER BY completed_turn.created DESC, completed_turn.id DESC LIMIT 1) AS request_prompt,
+          EXISTS (SELECT 1 FROM session_loop_mode_settings thread_loop
+            WHERE thread_loop.session_id = s.id AND thread_loop.enabled = TRUE) AS session_loop_enabled
+        FROM sessions s
+        LEFT JOIN LATERAL (
+          SELECT id, status, pending_reason, agent_response, runner_exit_code, runner_heartbeat, created
+          FROM session_turn WHERE session_id = s.id
+          ORDER BY created DESC, id DESC LIMIT 1
+        ) last_turn ON true
+        CROSS JOIN LATERAL (
+          SELECT CASE
+            WHEN last_turn.status = 'done' AND (last_turn.runner_exit_code IS NULL OR last_turn.runner_exit_code = 0)
+              THEN greatest(last_turn.runner_heartbeat, s.achieved_at)
+            WHEN s.achieved_at IS NOT NULL AND (last_turn.id IS NULL OR last_turn.created <= s.achieved_at)
+              THEN s.achieved_at
+          END AS completed_at
+        ) completion
+        WHERE s.workspace_id = $workspaceId AND s.id <> $managerSessionId
+          AND NOT ${concurrentWorkerSessionPredicate("s")}
+          AND completion.completed_at >= now() - INTERVAL '120 minutes'
+          AND completion.completed_at <= now()
+          AND NOT EXISTS (SELECT 1 FROM workspace_manager_archive a WHERE a.session_id = s.id)
+          AND NOT EXISTS (SELECT 1 FROM session_turn active_turn
+            WHERE active_turn.session_id = s.id AND (active_turn.status = 'running' OR (${workspacePendingTaskSql("active_turn")})))
+        ORDER BY completion.completed_at DESC, s.id DESC
+        LIMIT 100`, { workspaceId, managerSessionId: manager?.sessionId ?? "" })).getRowObjectsJS();
+      const runningSessionIds = rows.filter(row => row.status === "running").map(row => String(row.id));
+      const runningTurnIds = rows.filter(row => row.status === "running" && row.turn_id).map(row => String(row.turn_id));
+      const lineCountsByTurn = new Map<string, WorkspaceManagerLineCounts | null>();
+      const lineCountsBySession = new Map<string, WorkspaceManagerLineCounts | null>();
+      for (const sessionId of runningSessionIds) {
+        const fileItemsByTurn = await this.listSessionLiveItemsWithConnection(connection, sessionId, undefined, true);
+        const turnRows = await (await connection.run(`SELECT id, cardinality(changed_files) > 0 AS has_file_changes
+          FROM session_turn WHERE session_id = $sessionId`, { sessionId })).getRowObjectsJS();
+        let sessionLines: WorkspaceManagerLineCounts | null = { additions: 0, deletions: 0 };
+        for (const turn of turnRows) {
+          const turnId = stringValue(turn.id);
+          const lines = workspaceTaskTurnLineCounts(fileItemsByTurn[turnId] ?? [], turn.has_file_changes === true);
+          lineCountsByTurn.set(turnId, lines);
+          // Each saved turn contributes once, including the current turn's latest
+          // snapshot. The same file edited in another turn contributes again.
+          sessionLines = sessionLines && lines ? {
+            additions: sessionLines.additions + lines.additions,
+            deletions: sessionLines.deletions + lines.deletions
+          } : null;
+        }
+        lineCountsBySession.set(sessionId, sessionLines);
+      }
+      const commentSessionIds = [...new Set([
+        ...runningSessionIds,
+        ...recentCompletedRows.map(row => String(row.id))
+      ])];
+      const commentsBySession = new Map<string, WorkspaceManagerTaskComment[]>();
+      if (commentSessionIds.length > 0) {
+        const sessionParams = Object.fromEntries(commentSessionIds.map((sessionId, index) => [`taskSession${index}`, sessionId]));
+        const sessionPlaceholders = commentSessionIds.map((_, index) => `$taskSession${index}`).join(", ");
+        const commentRows = await connection.run(`SELECT session_id, item_id, item_type, event_type,
+            CAST(payload AS VARCHAR) AS payload_json, CAST(created AS VARCHAR) AS created
+          FROM session_live_item
+          WHERE item_type = 'agent_message' AND session_id IN (${sessionPlaceholders})
+          ORDER BY created ASC, item_id ASC`, sessionParams);
+        for (const rawRow of await commentRows.getRowObjectsJS()) {
+          const row = rawRow as Record<string, unknown>;
+          const sessionId = stringValue(row.session_id);
+          const item = recordValue(sessionLiveItemFromRow(row));
+          if (!sessionId || item?.itemType !== "agent_message" || item.phase !== "commentary") continue;
+          const comment = normalizeStructuredAgentComment(item.comment, stringValue(item.text));
+          if (!comment) continue;
+          const summary = comment.extracts.find(extract => extract.shortMsg.trim())?.shortMsg.trim() || comment.detail;
+          const comments = commentsBySession.get(sessionId) ?? [];
+          comments.push({ id: stringValue(item.id, stringValue(row.item_id)), summary,
+            detail: comment.detail, created: managerTimestamp(row.created) });
+          commentsBySession.set(sessionId, comments);
+        }
+      }
+      const queuedPromptsBySession = new Map<string, Array<{ id: string; prompt: string; created: string; steerPending: boolean }>>();
+      if (runningSessionIds.length > 0) {
+        const runningParams = Object.fromEntries(runningSessionIds.map((sessionId, index) => [`runningSession${index}`, sessionId]));
+        const runningPlaceholders = runningSessionIds.map((_, index) => `$runningSession${index}`).join(", ");
+        const queuedRows = await connection.run(`SELECT session_id, id, user_input, last_event_name, CAST(created AS VARCHAR) AS created
+          FROM session_turn WHERE session_id IN (${runningPlaceholders})
+            AND ${workspacePendingTaskSql("session_turn")}
+          ORDER BY created ASC, id ASC`, runningParams);
+        for (const rawRow of await queuedRows.getRowObjectsJS()) {
+          const row = rawRow as Record<string, unknown>;
+          const sessionId = stringValue(row.session_id);
+          const prompt = rawWorkspaceUserPrompt(row.user_input);
+          if (!sessionId || !prompt.trim()) continue;
+          const prompts = queuedPromptsBySession.get(sessionId) ?? [];
+          prompts.push({ id: stringValue(row.id), prompt, created: managerTimestamp(row.created),
+            steerPending: row.last_event_name === "queue.steer_reserved" });
+          queuedPromptsBySession.set(sessionId, prompts);
+        }
+      }
+      const contextUsageByTurn = new Map<string, { totalTokens: number | null; modelContextWindow: number | null }>();
+      // Only recent samples plus one predecessor per turn enter the window sort.
+      // Select a single source per turn, including turns that have already finished.
+      const tokenCapturedAt = new Date().toISOString();
+      const activityRows = await (await connection.run(`WITH recent AS MATERIALIZED (
+        SELECT u.turn_id, u.source, u.source_timestamp, u.source_index, u.id, u.cumulative_output_tokens FROM token_usage u
+        WHERE u.workspace_id = $workspaceId AND u.usage_type = 'agent'
+          AND u.source IN ('app_server', 'native_token_count') AND u.turn_id IS NOT NULL
+          AND u.source_timestamp >= date_trunc('minute', CAST($capturedAt AS TIMESTAMPTZ)) - INTERVAL '119 minutes'
+          AND u.source_timestamp <= CAST($capturedAt AS TIMESTAMPTZ)
+      ), sources AS MATERIALIZED (
+        SELECT r.turn_id, CASE WHEN EXISTS (
+          SELECT 1 FROM token_usage p WHERE p.turn_id = r.turn_id AND p.usage_type = 'agent'
+            AND p.source = 'app_server' AND p.source_timestamp IS NOT NULL
+        ) THEN 'app_server' ELSE 'native_token_count' END AS source
+        FROM (SELECT DISTINCT turn_id FROM recent) r
+      ), bounded AS (
+        SELECT r.turn_id, r.source_timestamp, r.source_index, r.id, r.cumulative_output_tokens
+        FROM recent r JOIN sources s ON s.turn_id = r.turn_id AND s.source = r.source
+        UNION ALL
+        SELECT s.turn_id, p.source_timestamp, p.source_index, p.id, p.cumulative_output_tokens
+        FROM sources s CROSS JOIN LATERAL (
+          SELECT u.source_timestamp, u.source_index, u.id, u.cumulative_output_tokens
+          FROM token_usage u WHERE u.turn_id = s.turn_id AND u.usage_type = 'agent' AND u.source = s.source
+            AND u.source_timestamp < date_trunc('minute', CAST($capturedAt AS TIMESTAMPTZ)) - INTERVAL '119 minutes'
+          ORDER BY u.source_timestamp DESC, u.source_index DESC NULLS FIRST, u.id DESC LIMIT 1
+        ) p
+      ), samples AS (
+        SELECT *, lag(cumulative_output_tokens) OVER (PARTITION BY turn_id
+          ORDER BY source_timestamp, source_index NULLS LAST, id) AS previous_tokens FROM bounded
+      )
+      SELECT CAST(date_trunc('minute', source_timestamp) AS VARCHAR) AS minute,
+        CAST(sum(cumulative_output_tokens - previous_tokens) AS BIGINT) AS tokens
+      FROM samples WHERE previous_tokens IS NOT NULL AND cumulative_output_tokens >= previous_tokens
+        AND source_timestamp >= date_trunc('minute', CAST($capturedAt AS TIMESTAMPTZ)) - INTERVAL '119 minutes'
+      GROUP BY date_trunc('minute', source_timestamp) ORDER BY minute`,
+      { workspaceId, capturedAt: tokenCapturedAt })).getRowObjectsJS();
+      const tokenActivity = { capturedAt: tokenCapturedAt, minutes: activityRows.map(row => ({
+        minute: new Date(String(row.minute)).toISOString(), tokens: numberValue(row.tokens)
+      })) };
+      if (runningTurnIds.length > 0) {
+        const turnParams = Object.fromEntries(runningTurnIds.map((turnId, index) => [`contextTurn${index}`, turnId]));
+        const turnPlaceholders = runningTurnIds.map((_, index) => `$contextTurn${index}`).join(", ");
+        // The latest last.totalTokens sample measures the current context load. Do not use
+        // cumulative_total_tokens (historical usage) or primary_used_percent (account quota).
+        const contextRows = await connection.run(`WITH ranked_usage AS (
+            SELECT turn_id, total_tokens, model_context_window,
+              row_number() OVER (PARTITION BY turn_id
+                ORDER BY source_timestamp DESC NULLS LAST, source_index DESC NULLS LAST, created DESC, id DESC) AS sample_rank
+            FROM token_usage
+            WHERE usage_type = 'agent' AND turn_id IN (${turnPlaceholders})
+          )
+          SELECT turn_id, total_tokens, model_context_window FROM ranked_usage WHERE sample_rank = 1`, turnParams);
+        for (const rawRow of await contextRows.getRowObjectsJS()) {
+          const row = rawRow as Record<string, unknown>;
+          const turnId = stringValue(row.turn_id);
+          if (!turnId) continue;
+          contextUsageByTurn.set(turnId, {
+            totalTokens: nullableNumber(row.total_tokens),
+            modelContextWindow: nullableNumber(row.model_context_window)
+          });
+        }
+      }
       const pending = await (await connection.run(`SELECT count(*) AS count FROM workspace_manager_event
         WHERE workspace_id = $workspaceId AND delivery_turn_id IS NULL AND dismissed_at IS NULL`, { workspaceId })).getRowObjectsJS();
       const runningModels = new Map<string, string | null>();
@@ -5094,21 +5599,51 @@ export class SessionStore {
           turn?.model ?? (typeof requestedModel === "string" && requestedModel !== "auto" ? `${requestedModel} (requested)` : null));
       }
       return {
-        manager, capturedAt: new Date().toISOString(), totalTasks: Number(rows[0]?.total_count ?? 0),
+        manager, capturedAt: new Date().toISOString(), globalLoopEnabled, tokenActivity,
+        totalTasks: Number(rows[0]?.total_count ?? 0),
         runningTasks: Number(rows[0]?.running_count ?? 0), pendingTasks: Number(rows[0]?.pending_count ?? 0),
         pendingEvents: Number(pending[0]?.count ?? 0),
+        recentCompletedTasks: recentCompletedRows.map(row => ({
+          sessionId: String(row.id), title: String(row.title), cwd: String(row.cwd),
+          description: String(row.description).slice(0, 600), parentSessionId: nullableString(row.parent_session_id),
+          updated: managerTimestamp(row.updated), turnId: null,
+          // An achieved session can still have a stopped latest turn.
+          status: row.status === "todo" && (row.pending_reason === "stopped" ||
+            isLegacyWatchdogStoppedTurn(row.pending_reason, row.latest_response)) ? "stopped" : "completed",
+          pendingReason: nullableString(row.pending_reason),
+          latestRequest: "", latestResponse: "", requestPrompt: rawWorkspaceUserPrompt(row.request_prompt),
+          sessionLoopEnabled: row.session_loop_enabled === true,
+          completedAt: managerTimestamp(row.completed_at), comments: commentsBySession.get(String(row.id)) ?? []
+        })),
         tasks: rows.map(row => ({ sessionId: String(row.id), title: String(row.title), cwd: String(row.cwd),
           description: String(row.description).slice(0, 600), parentSessionId: nullableString(row.parent_session_id),
           updated: managerTimestamp(row.updated), turnId: nullableString(row.turn_id),
-          status: row.status === "running" ? "running" : row.status === "todo" ? String(row.pending_reason ?? "queued")
+          requestPrompt: rawWorkspaceUserPrompt(row.request_prompt),
+          sessionLoopEnabled: row.session_loop_enabled === true,
+          status: row.status === "running" ? "running" : row.status === "todo" ?
+            (row.pending_reason === "stopped" || isLegacyWatchdogStoppedTurn(row.pending_reason, row.latest_response)
+              ? "stopped" : String(row.pending_reason ?? "queued"))
             : row.runner_exit_code ? "failed" : "idle",
           pendingReason: nullableString(row.pending_reason), latestRequest: String(row.latest_request ?? ""),
           latestResponse: String(row.latest_response ?? ""),
           ...(row.status === "running" ? {
             runningSince: nullableString(row.runner_started),
+            activity: row.activity_updated ? {
+              kind: row.activity_type === "agent_message" ? "text" as const
+                : row.activity_type === "reasoning" ? "thinking" as const
+                : row.activity_type === "command_execution" ? "command" as const
+                : ["web_search", "subagent", "context_compaction"].includes(String(row.activity_type)) ? "tool" as const : "progress" as const,
+              updatedAt: new Date(managerTimestamp(row.activity_updated)).toISOString(),
+              completed: row.activity_event === "item.completed"
+            } : null,
             turnNumber: numberValue(row.turn_number), queuedTurns: numberValue(row.queued_turns),
             updatedFiles: numberValue(row.updated_files),
-            runningModel: runningModels.get(String(row.turn_id)) ?? null
+            currentTurnLines: lineCountsByTurn.get(String(row.turn_id)) ?? null,
+            sessionLines: lineCountsBySession.get(String(row.id)) ?? null,
+            runningModel: runningModels.get(String(row.turn_id)) ?? null,
+            contextPercent: workspaceTaskContextPercent(contextUsageByTurn.get(String(row.turn_id))),
+            comments: commentsBySession.get(String(row.id)) ?? [],
+            queuedPrompts: queuedPromptsBySession.get(String(row.id)) ?? []
           } : {}) }))
       };
     });
@@ -5130,11 +5665,45 @@ export class SessionStore {
       const events: WorkspaceManagerEvent[] = rows.map(row => ({ id: String(row.id), workspaceId,
         sessionId: nullableString(row.session_id), turnId: nullableString(row.turn_id), type: String(row.type),
         summary: String(row.summary), created: managerTimestamp(row.created) }));
+      // Refresh direct-input snapshots at delivery; insertion-time "todo" may
+      // already have become a steer, removal or running turn.
+      for (const event of events) {
+        if (event.type !== "task.prompted" || !event.turnId || !event.sessionId) continue;
+        const current = await this.getSessionTurnWithConnection(connection, event.turnId);
+        let saved: Record<string, unknown> = {};
+        try {
+          const parsed: unknown = JSON.parse(event.summary);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) saved = parsed as Record<string, unknown>;
+        } catch { /* Older event summaries may be plain text. */ }
+        event.summary = JSON.stringify({ ...saved,
+          status: current?.status ?? saved.deliveryState ?? "missing",
+          pendingReason: current?.pendingReason ?? null,
+          deliveryState: current?.lastEventName === "queue.steer_reserved" ? "steer_pending_or_uncertain"
+            : current ? current.status : saved.deliveryState ?? "missing",
+          observedAt: new Date().toISOString(), informationalOnly: true
+        });
+      }
+      // Keep the identifying context with the delivered notification. The
+      // source turn can move on before the manager's reply is read.
+      for (const event of events) {
+        if (!event.sessionId) continue;
+        const session = await this.getSessionWithConnection(connection, event.sessionId);
+        const sourceTurn = event.turnId ? await this.getSessionTurnWithConnection(connection, event.turnId) : null;
+        let details: Record<string, unknown> = {};
+        try {
+          const parsed: unknown = JSON.parse(event.summary);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) details = parsed as Record<string, unknown>;
+        } catch { /* Preserve older plain text summaries below. */ }
+        event.summary = JSON.stringify({ ...details,
+          ...(session ? { threadName: session.title } : {}),
+          ...(sourceTurn ? { turnUserPrompt: rawWorkspaceUserPrompt(sourceTurn.userInput) } : {})
+        });
+      }
       const turnId = `manager_${createHash("sha256").update(events[0].id).digest("hex").slice(0, 32)}`;
       await this.insertSessionTurnWithConnection(connection, {
         id: turnId, sessionId: manager.sessionId, userInput: managerActivityPrompt(events),
         agentResponse: "Workspace activity awaiting review.", tokenIn: 0, tokenOut: 0,
-        status: "todo", pendingReason: "queued"
+        status: "todo", pendingReason: "queued", requestMetadata: { backgroundTask: true }
       }, true);
       for (const event of events) await connection.run(`UPDATE workspace_manager_event SET delivery_turn_id = $turnId WHERE id = $id`, { turnId, id: event.id });
       return { sessionId: manager.sessionId, turnId };
@@ -5853,6 +6422,13 @@ export class SessionStore {
               AND pending_turn.status = 'todo'
               AND pending_turn.pending_reason IS DISTINCT FROM 'stopped'
               AND pending_turn.last_event_name IS DISTINCT FROM 'queue.steer_reserved'
+              AND pending_turn.last_event_name IS DISTINCT FROM 'queue.fork_reserved'
+              AND NOT EXISTS (
+                SELECT 1 FROM session_turn AS editing_turn
+                WHERE editing_turn.session_id = pending_turn.session_id
+                  AND editing_turn.status = 'todo'
+                  AND editing_turn.last_event_name = 'queue.edit_reserved'
+              )
               AND NOT EXISTS (
                 SELECT 1
                 FROM session_turn AS active_turn
@@ -6467,6 +7043,11 @@ export class SessionStore {
       }
       const turn = await this.getSessionTurnWithConnection(connection, input.id);
       if (turn) {
+        if (input.status === "done" && input.runnerExitCode === 0) {
+          // Persist before publishing completion, so a crash cannot lose the
+          // only trigger for Auto Grill or its continuation.
+          await this.enqueueLoopContinuation(connection, turn.id);
+        }
         // Work completion adds no Grill discussion content and must not reopen ACK.
         // Consume the link once in the same transaction as terminal persistence.
         if (input.status === "done" && input.runnerExitCode === 0 && input.agentResponse.trim()) {
@@ -6516,28 +7097,327 @@ export class SessionStore {
     });
   }
 
-  async updatePendingSessionTurn(input: UpdatePendingSessionTurnInput): Promise<SessionTurnRecord> {
+  async reserveWorkspaceManagerQueuedPromptFork(input: {
+    turnId: string;
+    sessionId: string;
+    workspaceId: string;
+    managerSessionId: string;
+    requestId: string;
+    staged?: { message: string; attachmentKey: string; requestMetadata: Record<string, unknown> };
+  }): Promise<{
+    disposition: "reserved" | "completed" | "not_queued";
+    job: WorkspaceManagerQueueForkJobRecord | null;
+    turn: SessionTurnRecord | null;
+    queuedPrompt: string;
+  }> {
+    return this.transaction(async connection => {
+      await connection.run("SELECT id FROM session_turn WHERE id = $turnId FOR UPDATE", { turnId: input.turnId });
+      let turn = await this.getSessionTurnWithConnection(connection, input.turnId);
+      const jobRows = await (await connection.run(`SELECT * FROM workspace_manager_queue_fork
+        WHERE turn_id = $turnId FOR UPDATE`, { turnId: input.turnId })).getRowObjectsJS();
+      let job = jobRows[0] ? toWorkspaceManagerQueueForkJob(jobRows[0] as Record<string, unknown>) : null;
+      if (job && job.requestId !== input.requestId) {
+        return { disposition: "not_queued", job, turn, queuedPrompt: "" };
+      }
+      if (job?.status === "completed") return { disposition: "completed", job, turn, queuedPrompt: "" };
+
+      const sourceRows = await (await connection.run(`SELECT workspace_id FROM sessions WHERE id = $sessionId`, {
+        sessionId: input.sessionId
+      })).getRowObjectsJS();
+      const managerRows = await (await connection.run(`SELECT session_id FROM workspace_manager
+        WHERE workspace_id = $workspaceId AND session_id = $managerSessionId`, {
+        workspaceId: input.workspaceId, managerSessionId: input.managerSessionId
+      })).getRowObjectsJS();
+      if (String(sourceRows[0]?.workspace_id ?? "") !== input.workspaceId ||
+        (managerRows.length === 0 && input.managerSessionId !== input.sessionId)) {
+        return { disposition: "not_queued", job, turn, queuedPrompt: "" };
+      }
+      if (!turn && input.staged) {
+        const inserted = await connection.run(`INSERT INTO session_turn
+          (id, session_id, account_id, user_input, agent_response, token_in, token_out,
+            status, pending_reason, request_metadata, last_event_name, created)
+          SELECT $turnId, id, account_id, $message, 'Held for queued prompt Fork', 0, 0,
+            'todo', 'queued', $requestMetadata, 'queue.fork_reserved', now()
+          FROM sessions WHERE id = $sessionId AND workspace_id = $workspaceId
+          ON CONFLICT DO NOTHING RETURNING id`, {
+          turnId: input.turnId, sessionId: input.sessionId, workspaceId: input.workspaceId,
+          message: input.staged.message,
+          requestMetadata: JSON.stringify({ ...input.staged.requestMetadata, message: input.staged.message,
+            stagedQueueFork: true, forkRequestId: input.requestId, attachmentKey: input.staged.attachmentKey })
+        });
+        if ((await inserted.getRowObjectsJS()).length > 0) {
+          await connection.run(`INSERT INTO workspace_manager_queue_fork
+            (turn_id, session_id, workspace_id, manager_session_id, request_id, status)
+            VALUES ($turnId, $sessionId, $workspaceId, $managerSessionId, $requestId, 'reserved')
+            ON CONFLICT (turn_id) DO NOTHING`, input);
+          await this.syncSessionUpdatedWithLastTurn(connection, input.sessionId);
+          await this.refreshSessionTurnFtsIndex(connection);
+        }
+        turn = await this.getSessionTurnWithConnection(connection, input.turnId);
+        const stagedJobs = await (await connection.run(`SELECT * FROM workspace_manager_queue_fork
+          WHERE turn_id = $turnId`, { turnId: input.turnId })).getRowObjectsJS();
+        job = stagedJobs[0] ? toWorkspaceManagerQueueForkJob(stagedJobs[0] as Record<string, unknown>) : null;
+      }
+      if (!turn || turn.sessionId !== input.sessionId || turn.status !== "todo" || turn.pendingReason === "stopped" ||
+        (input.staged && (typeof turn.requestMetadata?.message !== "string" ||
+          turn.requestMetadata.message !== input.staged.message)) ||
+        (job && job.requestId !== input.requestId)) {
+        return { disposition: "not_queued", job, turn, queuedPrompt: "" };
+      }
+
+      const rawMessage = typeof turn.requestMetadata?.message === "string" ? turn.requestMetadata.message : turn.userInput;
+      const queuedPrompt = rawWorkspaceUserPrompt(rawMessage) || rawWorkspaceUserPrompt(turn.userInput);
+      if (!queuedPrompt) return { disposition: "not_queued", job, turn, queuedPrompt: "" };
+
+      if (turn.lastEventName === "queue.fork_reserved") {
+        if (job?.status === "failed") {
+          await connection.run(`UPDATE workspace_manager_queue_fork SET status = 'reserved', error = NULL, updated = now()
+            WHERE turn_id = $turnId AND session_id = $sessionId`, input);
+          job = { ...job, status: "reserved", error: null };
+        }
+        return job ? { disposition: "reserved", job, turn, queuedPrompt } :
+          { disposition: "not_queued", job: null, turn, queuedPrompt: "" };
+      }
+      if (turn.lastEventName === "queue.steer_reserved" || turn.lastEventName === "queue.edit_reserved" ||
+        (job && job.status !== "failed")) {
+        return { disposition: "not_queued", job, turn, queuedPrompt: "" };
+      }
+
+      const reserved = await connection.run(`UPDATE session_turn SET last_event_name = 'queue.fork_reserved'
+        WHERE id = $turnId AND session_id = $sessionId AND status = 'todo'
+          AND pending_reason IS DISTINCT FROM 'stopped'
+          AND last_event_name IS DISTINCT FROM 'queue.steer_reserved'
+          AND last_event_name IS DISTINCT FROM 'queue.fork_reserved'
+        RETURNING id`, { turnId: input.turnId, sessionId: input.sessionId });
+      if ((await reserved.getRowObjectsJS()).length === 0) {
+        return { disposition: "not_queued", job, turn, queuedPrompt: "" };
+      }
+
+      if (!job) {
+        await connection.run(`INSERT INTO workspace_manager_queue_fork
+          (turn_id, session_id, workspace_id, manager_session_id, request_id, status)
+          VALUES ($turnId, $sessionId, $workspaceId, $managerSessionId, $requestId, 'reserved')`, input);
+      } else {
+        await connection.run(`UPDATE workspace_manager_queue_fork SET
+          status = CASE WHEN prompt IS NOT NULL AND title IS NOT NULL THEN 'prepared' ELSE 'reserved' END,
+          error = NULL, updated = now()
+          WHERE turn_id = $turnId AND status = 'failed'`, { turnId: input.turnId });
+      }
+      const updatedRows = await (await connection.run(`SELECT * FROM workspace_manager_queue_fork
+        WHERE turn_id = $turnId`, { turnId: input.turnId })).getRowObjectsJS();
+      job = updatedRows[0] ? toWorkspaceManagerQueueForkJob(updatedRows[0] as Record<string, unknown>) : null;
+      if (!job) throw new Error(`Failed to persist queue fork reservation for ${input.turnId}.`);
+      return { disposition: "reserved", job, turn, queuedPrompt };
+    });
+  }
+
+  async saveWorkspaceManagerQueuedPromptForkDraft(input: {
+    turnId: string;
+    sessionId: string;
+    title: string;
+    prompt: string;
+  }): Promise<boolean> {
+    return this.write(async connection => {
+      const result = await connection.run(`UPDATE workspace_manager_queue_fork SET
+        title = $title, prompt = $prompt, status = 'prepared', error = NULL, updated = now()
+        WHERE turn_id = $turnId AND session_id = $sessionId AND status IN ('reserved', 'prepared')
+          AND EXISTS (SELECT 1 FROM session_turn WHERE id = $turnId AND session_id = $sessionId
+            AND status = 'todo' AND last_event_name = 'queue.fork_reserved')`, input);
+      return result.rowCount > 0;
+    });
+  }
+
+  async markWorkspaceManagerQueuedPromptForkCreating(turnId: string, sessionId: string): Promise<boolean> {
+    return this.write(async connection => {
+      const result = await connection.run(`UPDATE workspace_manager_queue_fork SET
+        status = 'creating', error = NULL, updated = now()
+        WHERE turn_id = $turnId AND session_id = $sessionId AND prompt IS NOT NULL AND title IS NOT NULL
+          AND status IN ('prepared', 'creating', 'created')
+          AND EXISTS (SELECT 1 FROM session_turn WHERE id = $turnId AND session_id = $sessionId
+            AND status = 'todo' AND last_event_name = 'queue.fork_reserved')`, { turnId, sessionId });
+      return result.rowCount > 0;
+    });
+  }
+
+  async markWorkspaceManagerQueuedPromptForkCreated(input: {
+    turnId: string;
+    sessionId: string;
+    targetSessionId: string;
+  }): Promise<boolean> {
+    return this.write(async connection => {
+      const result = await connection.run(`UPDATE workspace_manager_queue_fork SET
+        status = 'created', target_session_id = $targetSessionId, error = NULL, updated = now()
+        WHERE turn_id = $turnId AND session_id = $sessionId
+          AND status IN ('creating', 'created')
+          AND EXISTS (SELECT 1 FROM session_turn WHERE id = $turnId AND session_id = $sessionId
+            AND status = 'todo' AND last_event_name = 'queue.fork_reserved')`, input);
+      return result.rowCount > 0;
+    });
+  }
+
+  async releaseWorkspaceManagerQueuedPromptFork(turnId: string, sessionId: string, error: string): Promise<void> {
+    await this.transaction(async connection => {
+      const turn = await this.getSessionTurnWithConnection(connection, turnId);
+      if (turn?.sessionId === sessionId && turn.requestMetadata?.stagedQueueFork === true) {
+        await connection.run(`DELETE FROM session_turn
+          WHERE id = $turnId AND session_id = $sessionId AND status = 'todo'
+            AND last_event_name = 'queue.fork_reserved'`, { turnId, sessionId });
+        await connection.run("DELETE FROM session_turn_reference WHERE session_id = $sessionId AND turn_id = $turnId", { turnId, sessionId });
+        await connection.run("DELETE FROM execution_approval_policy WHERE owner_id = $ownerId", {
+          ownerId: `turn:${sessionId}:${turnId}`
+        });
+        await this.syncSessionUpdatedWithLastTurn(connection, sessionId);
+        await this.refreshSessionTurnFtsIndex(connection);
+      } else {
+        await connection.run(`UPDATE session_turn SET last_event_name = 'queue.fork_failed'
+          WHERE id = $turnId AND session_id = $sessionId AND status = 'todo'
+            AND last_event_name = 'queue.fork_reserved'`, { turnId, sessionId });
+      }
+      await connection.run(`UPDATE workspace_manager_queue_fork SET
+        status = 'failed', error = $error, updated = now()
+        WHERE turn_id = $turnId AND session_id = $sessionId AND status <> 'completed'`, {
+        turnId, sessionId, error: error.slice(0, 1200)
+      });
+    });
+  }
+
+  async completeWorkspaceManagerQueuedPromptFork(input: {
+    turnId: string;
+    sessionId: string;
+    targetSessionId: string;
+    targetTurnId: string;
+  }): Promise<boolean> {
+    return this.transaction(async connection => {
+      const jobRows = await (await connection.run(`SELECT status FROM workspace_manager_queue_fork
+        WHERE turn_id = $turnId AND session_id = $sessionId FOR UPDATE`, input)).getRowObjectsJS();
+      if (jobRows[0]?.status === "completed") return true;
+      if (jobRows[0]?.status !== "created") return false;
+      const targetRows = await (await connection.run(`SELECT 1 FROM session_turn target_turn
+        JOIN sessions target_session ON target_session.id = target_turn.session_id
+        WHERE target_turn.id = $targetTurnId AND target_turn.session_id = $targetSessionId
+          AND target_session.workspace_id = (SELECT workspace_id FROM sessions WHERE id = $sessionId)`, input)).getRowObjectsJS();
+      if (targetRows.length === 0) return false;
+
+      const deleted = await connection.run(`DELETE FROM session_turn
+        WHERE id = $turnId AND session_id = $sessionId AND status = 'todo'
+          AND pending_reason IS DISTINCT FROM 'stopped' AND last_event_name = 'queue.fork_reserved'
+        RETURNING id`, input);
+      if ((await deleted.getRowObjectsJS()).length === 0) return false;
+      await connection.run("DELETE FROM session_turn_reference WHERE session_id = $sessionId AND turn_id = $turnId", input);
+      await connection.run("DELETE FROM execution_approval_policy WHERE owner_id = $ownerId", {
+        ownerId: `turn:${input.sessionId}:${input.turnId}`
+      });
+      await connection.run(`UPDATE workspace_manager_queue_fork SET status = 'completed',
+        target_session_id = $targetSessionId, error = NULL, updated = now()
+        WHERE turn_id = $turnId AND session_id = $sessionId`, input);
+      await this.syncSessionUpdatedWithLastTurn(connection, input.sessionId);
+      await this.refreshSessionTurnFtsIndex(connection);
+      return true;
+    });
+  }
+
+  async listRecoverableWorkspaceManagerQueueForks(): Promise<Array<{
+    job: WorkspaceManagerQueueForkJobRecord;
+    turn: SessionTurnRecord;
+    queuedPrompt: string;
+  }>> {
+    return this.read(async connection => {
+      const rows = await (await connection.run(`SELECT fork.* FROM workspace_manager_queue_fork fork
+        JOIN session_turn queued ON queued.id = fork.turn_id AND queued.session_id = fork.session_id
+        WHERE fork.status IN ('reserved', 'prepared', 'creating', 'created')
+          AND queued.status = 'todo' AND queued.last_event_name = 'queue.fork_reserved'
+        ORDER BY fork.created ASC, fork.turn_id ASC`)).getRowObjectsJS();
+      const result = [];
+      for (const raw of rows) {
+        const row = raw as Record<string, unknown>;
+        const job = toWorkspaceManagerQueueForkJob(row);
+        const turn = await this.getSessionTurnWithConnection(connection, job.turnId);
+        if (!turn) continue;
+        const rawMessage = typeof turn.requestMetadata?.message === "string" ? turn.requestMetadata.message : turn.userInput;
+        const queuedPrompt = rawWorkspaceUserPrompt(rawMessage) || rawWorkspaceUserPrompt(turn.userInput);
+        if (queuedPrompt) result.push({ job, turn, queuedPrompt });
+      }
+      return result;
+    });
+  }
+
+  async reservePendingSessionTurnForEdit(id: string, sessionId: string, token: string): Promise<SessionTurnRecord> {
     return this.write(async (connection) => {
+      const turn = await this.getSessionTurnWithConnection(connection, id);
+      if (!turn || turn.sessionId !== sessionId || turn.status !== "todo" ||
+        turn.lastEventName === "queue.steer_reserved" || turn.lastEventName === "queue.fork_reserved") {
+        throw new Error("This prompt is no longer available for editing.");
+      }
+      if (turn.lastEventName === "queue.edit_reserved") {
+        if (turn.requestMetadata?.queueEditToken !== token) throw new Error("This prompt is already being edited.");
+        return turn;
+      }
+      const dispatching = await connection.run(
+        "SELECT id FROM wait_subscription WHERE turn_id = $id AND status = 'dispatching' LIMIT 1", { id });
+      if ((await dispatching.getRowObjectsJS()).length) throw new Error("This prompt is being dispatched.");
+      await connection.run(`UPDATE session_turn SET last_event_name = 'queue.edit_reserved',
+        request_metadata = $metadata WHERE id = $id`, {
+        id, metadata: JSON.stringify({ ...turn.requestMetadata, queueEditToken: token,
+          queueEditPreviousEvent: turn.lastEventName })
+      });
+      return (await this.getSessionTurnWithConnection(connection, id))!;
+    });
+  }
+
+  async releasePendingSessionTurnEdit(id: string, sessionId: string, token: string): Promise<void> {
+    await this.write(async (connection) => {
+      const turn = await this.getSessionTurnWithConnection(connection, id);
+      if (!turn || turn.sessionId !== sessionId) throw new Error("Pending turn not found.");
+      if (turn.lastEventName !== "queue.edit_reserved") return;
+      if (turn.requestMetadata?.queueEditToken !== token) throw new Error("This prompt is being edited elsewhere.");
+      const { queueEditToken, queueEditPreviousEvent, ...metadata } = turn.requestMetadata ?? {};
+      await connection.run(`UPDATE session_turn SET last_event_name = $event, request_metadata = $metadata
+        WHERE id = $id`, { id, event: typeof queueEditPreviousEvent === "string" ? queueEditPreviousEvent : null,
+        metadata: JSON.stringify(metadata) });
+    });
+  }
+
+  async updatePendingSessionTurn(input: UpdatePendingSessionTurnInput): Promise<SessionTurnRecord> {
+    return this.transaction(async (connection) => {
       const existing = await this.getSessionTurnWithConnection(connection, input.id);
       if (!existing || existing.sessionId !== input.sessionId) {
         throw new Error(`Pending turn not found: ${input.id}`);
       }
-      if (existing.status !== "todo" || existing.lastEventName === "queue.steer_reserved") {
+      // Retrying a response lost after commit must not create or edit another turn.
+      if (input.editToken && existing.requestMetadata?.queueEditCompletedToken === input.editToken) {
+        if (existing.requestMetadata.message !== (input.message ?? input.userInput)) {
+          throw new Error("The earlier version was already saved. Your newer draft has been kept in the composer.");
+        }
+        return existing;
+      }
+      if ((existing.lastEventName === "queue.edit_reserved" || input.editToken) &&
+        (existing.lastEventName !== "queue.edit_reserved" || existing.requestMetadata?.queueEditToken !== input.editToken)) {
+        throw new Error("The queued prompt edit is no longer owned by this composer.");
+      }
+      if (existing.status !== "todo" || existing.lastEventName === "queue.steer_reserved" ||
+        existing.lastEventName === "queue.fork_reserved") {
         throw new Error("Only pending turns can be edited.");
       }
 
+      const { queueEditToken, queueEditPreviousEvent, ...metadata } = existing.requestMetadata ?? {};
       await connection.run(
         `
           UPDATE session_turn
-          SET user_input = $userInput, request_metadata = $requestMetadata
+          SET user_input = $userInput, request_metadata = $requestMetadata, last_event_name = $event
           WHERE id = $id
         `,
         {
           id: input.id,
           userInput: input.userInput,
-          requestMetadata: JSON.stringify({ ...existing.requestMetadata, message: input.message ?? input.userInput })
+          event: input.editToken ? (typeof queueEditPreviousEvent === "string" ? queueEditPreviousEvent : null) : existing.lastEventName,
+          requestMetadata: JSON.stringify({ ...metadata, message: input.message ?? input.userInput,
+            ...(input.editToken ? { queueEditCompletedToken: input.editToken } : {}) })
         }
       );
+      await connection.run(`UPDATE wait_subscription
+        SET action_payload = (coalesce(action_payload::JSONB, '{}'::JSONB) || $patch::JSONB)::JSON, updated = now()
+        WHERE turn_id = $id AND action_type = 'retry_turn' AND status IN ('waiting', 'error')`,
+        { id: input.id, patch: JSON.stringify({ prompt: input.message ?? input.userInput }) });
       await this.syncSessionUpdatedWithLastTurn(connection, input.sessionId);
       await this.refreshSessionTurnFtsIndex(connection);
       const updated = await this.getSessionTurnWithConnection(connection, input.id);
@@ -6548,19 +7428,31 @@ export class SessionStore {
     });
   }
 
-  async deleteQueuedSessionTurn(id: string, sessionId: string, reservedForSteer = false): Promise<boolean> {
+  async deleteQueuedSessionTurn(id: string, sessionId: string, reservedForSteer = false, reservedForFork = false, steerDelivered = false): Promise<boolean> {
     return this.write(async (connection) => {
       const result = await connection.run(
         `DELETE FROM session_turn
          WHERE id = $id AND session_id = $sessionId AND status = 'todo'
-           AND pending_reason = 'queued'
+           AND last_event_name IS DISTINCT FROM 'queue.edit_reserved'
+           AND (($reservedForFork = true AND pending_reason IS DISTINCT FROM 'stopped'
+               AND last_event_name = 'queue.fork_reserved')
+             OR (pending_reason = 'queued'
            AND (($reservedForSteer = true AND last_event_name = 'queue.steer_reserved')
-             OR ($reservedForSteer = false AND last_event_name IS DISTINCT FROM 'queue.steer_reserved'))
+             OR ($reservedForSteer = false AND $reservedForFork = false
+               AND last_event_name IS DISTINCT FROM 'queue.steer_reserved'
+               AND last_event_name IS DISTINCT FROM 'queue.fork_reserved'))))
          RETURNING id`,
-        { id, sessionId, reservedForSteer }
+        { id, sessionId, reservedForSteer, reservedForFork }
       );
       if ((await result.getRowObjectsJS()).length === 0) return false;
       await connection.run("DELETE FROM session_turn_reference WHERE session_id = $sessionId AND turn_id = $id", { id, sessionId });
+      // Preserve the delivery outcome after removing the queued source turn.
+      // Removing an uncertain steer reservation is not proof of delivery.
+      await connection.run(`UPDATE workspace_manager_event
+        SET summary = (summary::jsonb || jsonb_build_object(
+          'status', $outcome, 'deliveryState', $outcome, 'informationalOnly', true))::text
+        WHERE session_id = $sessionId AND turn_id = $id AND type = 'task.prompted'`,
+        { id, sessionId, outcome: steerDelivered ? "steered" : reservedForFork ? "forked" : "removed" });
       await connection.run("DELETE FROM execution_approval_policy WHERE owner_id = $ownerId", { ownerId: `turn:${sessionId}:${id}` });
       await this.syncSessionUpdatedWithLastTurn(connection, sessionId);
       await this.refreshSessionTurnFtsIndex(connection);
@@ -6576,6 +7468,8 @@ export class SessionStore {
          WHERE pending_turn.id = $id AND pending_turn.session_id = $sessionId
            AND pending_turn.status = 'todo' AND pending_turn.pending_reason = 'queued'
            AND pending_turn.last_event_name IS DISTINCT FROM 'queue.steer_reserved'
+           AND pending_turn.last_event_name IS DISTINCT FROM 'queue.fork_reserved'
+           AND pending_turn.last_event_name IS DISTINCT FROM 'queue.edit_reserved'
            AND EXISTS (
              SELECT 1 FROM session_turn AS active_turn
              WHERE active_turn.id = $runningTurnId
@@ -6611,7 +7505,11 @@ export class SessionStore {
   }): Promise<SessionTurnRecord[]> {
     return this.write(async (connection) => {
       const turns = await this.listSessionTurnsWithConnection(connection, input.sessionId);
-      const pendingTurns = turns.filter((turn) => turn.status === "todo" && turn.lastEventName !== "queue.steer_reserved");
+      const pendingTurns = turns.filter((turn) => turn.status === "todo" &&
+        turn.lastEventName !== "queue.steer_reserved" && turn.lastEventName !== "queue.fork_reserved");
+      if (pendingTurns.some(turn => turn.lastEventName === "queue.edit_reserved")) {
+        throw new Error("Finish editing the queued prompt before changing queue order.");
+      }
       const currentIndex = pendingTurns.findIndex((turn) => turn.id === input.id);
       if (currentIndex < 0) {
         throw new Error(`Pending turn not found: ${input.id}`);
@@ -6724,7 +7622,8 @@ export class SessionStore {
             UPDATE session_turn
             SET
               runner_heartbeat = now(),
-              last_event_name = $eventName
+              last_event_name = CASE WHEN last_event_name = 'queue.edit_reserved'
+                THEN last_event_name ELSE $eventName END
             WHERE id = $turnId
           `,
           {
@@ -7070,6 +7969,80 @@ export class SessionStore {
     });
   }
 
+  /** Claim at most one five-minute Loop review per running ordinary turn. */
+  async claimDueLoopHealthChecks(at = new Date(), limit = 500, globalLoopEnabled = true): Promise<Array<{
+    turnId: string; sessionId: string; workspaceId: string; checkedAt: string;
+  }>> {
+    const checkedAt = at.toISOString();
+    return this.transaction(async connection => {
+      const rows = await (await connection.run(`WITH due AS (
+        SELECT t.id, s.workspace_id FROM session_turn t JOIN sessions s ON s.id = t.session_id
+        WHERE t.status = 'running'
+          AND COALESCE(t.runner_started, t.created) <= $checkedAt::timestamptz - interval '5 minutes'
+          AND (t.loop_health_checked_at IS NULL OR
+            t.loop_health_checked_at <= $checkedAt::timestamptz - interval '5 minutes')
+          AND ($globalLoopEnabled OR EXISTS (SELECT 1 FROM session_loop_mode_settings thread_loop
+            WHERE thread_loop.session_id = t.session_id AND thread_loop.enabled = TRUE))
+          AND NOT EXISTS (SELECT 1 FROM workspace_manager m WHERE m.session_id = t.session_id)
+          AND NOT EXISTS (SELECT 1 FROM workspace_manager_archive a WHERE a.session_id = t.session_id)
+        ORDER BY COALESCE(t.loop_health_checked_at, t.runner_started, t.created), t.id
+        FOR UPDATE OF t SKIP LOCKED LIMIT $limit
+      ) UPDATE session_turn t SET loop_health_checked_at = $checkedAt::timestamptz
+        FROM due WHERE t.id = due.id RETURNING t.id, t.session_id, due.workspace_id`, {
+        checkedAt, limit: Math.max(1, Math.min(1000, limit)), globalLoopEnabled
+      })).getRowObjectsJS();
+      return rows.map(row => ({ turnId: String(row.id), sessionId: String(row.session_id),
+        workspaceId: String(row.workspace_id), checkedAt }));
+    });
+  }
+
+  async releaseLoopHealthCheck(turnId: string, checkedAt: string): Promise<void> {
+    await this.write(async connection => {
+      await connection.run(`UPDATE session_turn SET loop_health_checked_at = NULL
+        WHERE id = $turnId AND status = 'running' AND loop_health_checked_at = $checkedAt::timestamptz`,
+      { turnId, checkedAt });
+    });
+  }
+
+  async getLoopHealthEvidence(turnId: string): Promise<{
+    turnId: string; sessionId: string; workspaceId: string; title: string; request: string;
+    status: string; runnerStarted: string | null; runnerHeartbeat: string | null;
+    lastOutputAt: string | null;
+    recentItems: Array<{ at: string; type: string; event: string; text: string }>;
+    recentEvents: Array<{ at: string; type: string; text: string }>;
+  } | null> {
+    return this.read(async connection => {
+      const base = (await (await connection.run(`SELECT t.id, t.session_id, s.workspace_id, s.title,
+        left(t.user_input, 1200) AS request, t.status,
+        CAST(t.runner_started AS VARCHAR) AS runner_started,
+        CAST(t.runner_heartbeat AS VARCHAR) AS runner_heartbeat
+        FROM session_turn t JOIN sessions s ON s.id = t.session_id WHERE t.id = $turnId`, { turnId })).getRowObjectsJS())[0];
+      if (!base) return null;
+      const items = await connection.run(`SELECT CAST(updated AS VARCHAR) AS at, item_type, event_type,
+          left(CAST(payload AS VARCHAR), 900) AS text FROM session_live_item
+          WHERE turn_id = $turnId ORDER BY updated DESC, item_id DESC LIMIT 24`, { turnId });
+      const itemRows = await items.getRowObjectsJS();
+      const events = await connection.run(`SELECT CAST(created AS VARCHAR) AS at, event_name,
+          left(CAST(payload AS VARCHAR), 600) AS text FROM session_turn_event
+          WHERE turn_id = $turnId ORDER BY created DESC, id DESC LIMIT 24`, { turnId });
+      const eventRows = await events.getRowObjectsJS();
+      const output = await connection.run(`SELECT CAST(max(updated) AS VARCHAR) AS at FROM session_live_item
+        WHERE turn_id = $turnId AND item_type IN ('agent_message', 'command_execution', 'file_change')
+          AND event_type <> 'item.started'`, { turnId });
+      const outputRows = await output.getRowObjectsJS();
+      return {
+        turnId: String(base.id), sessionId: String(base.session_id), workspaceId: String(base.workspace_id),
+        title: String(base.title), request: String(base.request ?? ""), status: String(base.status),
+        runnerStarted: nullableString(base.runner_started), runnerHeartbeat: nullableString(base.runner_heartbeat),
+        lastOutputAt: nullableString(outputRows[0]?.at),
+        recentItems: itemRows.map(row => ({ at: managerTimestamp(row.at), type: String(row.item_type),
+          event: String(row.event_type), text: String(row.text ?? "") })),
+        recentEvents: eventRows.map(row => ({ at: managerTimestamp(row.at), type: String(row.event_name),
+          text: String(row.text ?? "") }))
+      };
+    });
+  }
+
   async getActiveSessionId(): Promise<string | null> {
     return this.read(async (connection) => {
       const workspaceId = await this.getActiveWorkspaceIdWithConnection(connection);
@@ -7404,6 +8377,11 @@ export class SessionStore {
   private async open() {
     const connection = await openPostgresSessionConnection(undefined, this.postgresSchema);
     this.connection = connection;
+    await connection.run(`CREATE TABLE IF NOT EXISTS collaboration_group (
+      id VARCHAR PRIMARY KEY, state JSONB NOT NULL
+    )`);
+    await connection.run(`CREATE INDEX IF NOT EXISTS collaboration_group_members
+      ON collaboration_group USING GIN ((state->'members'))`);
     await connection.run(`
       CREATE TABLE IF NOT EXISTS sessions (
         id VARCHAR PRIMARY KEY,
@@ -7458,6 +8436,15 @@ export class SessionStore {
       created TIMESTAMPTZ NOT NULL DEFAULT now(), delivery_turn_id VARCHAR,
       dismissed_at TIMESTAMPTZ, dismissed_reason VARCHAR
     )`);
+    await connection.run(`CREATE TABLE IF NOT EXISTS workspace_manager_queue_fork (
+      turn_id VARCHAR PRIMARY KEY, session_id VARCHAR NOT NULL, workspace_id VARCHAR NOT NULL,
+      manager_session_id VARCHAR NOT NULL, request_id VARCHAR NOT NULL, status VARCHAR NOT NULL,
+      title VARCHAR, prompt TEXT, target_session_id VARCHAR, error VARCHAR,
+      created TIMESTAMPTZ NOT NULL DEFAULT now(), updated TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (manager_session_id, request_id)
+    )`);
+    await connection.run(`CREATE INDEX IF NOT EXISTS workspace_manager_queue_fork_status_idx
+      ON workspace_manager_queue_fork(status, created)`);
     // Early manager schemas required a task session; platform/process events have none.
     await connection.run(`ALTER TABLE workspace_manager_event ALTER COLUMN session_id DROP NOT NULL`);
     await connection.run(`ALTER TABLE workspace_manager_event ALTER COLUMN turn_id DROP NOT NULL`);
@@ -7637,12 +8624,21 @@ export class SessionStore {
     await connection.run(`CREATE TABLE IF NOT EXISTS loop_mode_settings (
       id VARCHAR PRIMARY KEY, enabled BOOLEAN NOT NULL
     )`);
+    await connection.run("INSERT INTO loop_mode_settings (id, enabled) VALUES ('global', FALSE) ON CONFLICT (id) DO NOTHING");
+    await connection.run(`CREATE TABLE IF NOT EXISTS session_loop_mode_settings (
+      session_id VARCHAR PRIMARY KEY, enabled BOOLEAN NOT NULL
+    )`);
     await connection.run(`CREATE TABLE IF NOT EXISTS turn_loop_mode (
       turn_id VARCHAR PRIMARY KEY
     )`);
     await connection.run(`CREATE TABLE IF NOT EXISTS loop_work_turn (
       turn_id VARCHAR PRIMARY KEY, root_turn_id VARCHAR NOT NULL, work_cycle INTEGER NOT NULL
     )`);
+    await connection.run(`CREATE TABLE IF NOT EXISTS loop_continuation (
+      turn_id VARCHAR PRIMARY KEY, session_id VARCHAR NOT NULL, work_turn_id VARCHAR NOT NULL,
+      pending BOOLEAN NOT NULL DEFAULT TRUE, retry_at TIMESTAMPTZ NOT NULL DEFAULT current_timestamp
+    )`);
+    await connection.run("CREATE INDEX IF NOT EXISTS loop_continuation_due_idx ON loop_continuation(pending, retry_at)");
     await connection.run(`
       CREATE TABLE IF NOT EXISTS session_turn (
         id VARCHAR PRIMARY KEY,
@@ -8116,6 +9112,9 @@ export class SessionStore {
       WHERE usage.workspace_id IS NULL AND usage.session_id = session.id
     `);
     await connection.run("CREATE INDEX IF NOT EXISTS token_usage_workspace_idx ON token_usage(workspace_id)");
+    await connection.run(`CREATE INDEX IF NOT EXISTS token_usage_workspace_report_time_idx
+      ON token_usage(workspace_id, source_timestamp)
+      WHERE usage_type = 'agent' AND source IN ('app_server', 'native_token_count') AND turn_id IS NOT NULL`);
     await connection.run("CREATE INDEX IF NOT EXISTS token_usage_session_idx ON token_usage(session_id)");
     await connection.run("CREATE INDEX IF NOT EXISTS token_usage_turn_idx ON token_usage(turn_id)");
     await connection.run("CREATE INDEX IF NOT EXISTS token_usage_account_idx ON token_usage(account_id)");
@@ -8258,6 +9257,8 @@ export class SessionStore {
       FOR EACH ROW EXECUTE FUNCTION threadex_manager_direct_prompt_event()`);
     await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS runner_pid BIGINT");
     await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS runner_started TIMESTAMPTZ");
+    await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS loop_health_checked_at TIMESTAMPTZ");
+    await connection.run("CREATE INDEX IF NOT EXISTS session_turn_loop_health_idx ON session_turn(status, loop_health_checked_at, runner_started, created)");
     await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS runner_heartbeat TIMESTAMPTZ");
     await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS runner_log_path VARCHAR");
     await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS runner_exit_code BIGINT");
@@ -8668,6 +9669,13 @@ export class SessionStore {
     input: RecordSessionTurnInput & { id: string },
     ignoreConflicts = false
   ): Promise<boolean> {
+    if (input.status === "todo") {
+      const forkRows = await (await connection.run(`SELECT status FROM workspace_manager_queue_fork
+        WHERE turn_id = $turnId FOR UPDATE`, { turnId: input.id })).getRowObjectsJS();
+      if (forkRows[0] && forkRows[0].status !== "failed") {
+        throw new Error("This queued prompt is held or was already forked.");
+      }
+    }
     const result = await connection.run(
       `
         INSERT INTO session_turn (
@@ -8993,7 +10001,8 @@ export class SessionStore {
   private async listSessionLiveItemsWithConnection(
     connection: SessionDbConnection,
     sessionId: string,
-    turnId?: string
+    turnId?: string,
+    fileChangesOnly = false
   ): Promise<Record<string, unknown[]>> {
     const turnFilter = turnId ? "AND turn_id = $turnId" : "";
     const queryParams = turnId ? { sessionId, turnId } : { sessionId };
@@ -9010,6 +10019,7 @@ export class SessionStore {
         FROM session_live_item
         WHERE session_id = $sessionId
           ${turnFilter}
+          ${fileChangesOnly ? "AND item_type = 'file_change'" : ""}
         ORDER BY created ASC, item_id ASC
       `,
       queryParams
@@ -9458,7 +10468,10 @@ export class SessionStore {
   }
 
   private async sessionSearchFilter(connection: SessionDbConnection, input: SessionSearchInput) {
-    const where: string[] = ["NOT EXISTS (SELECT 1 FROM workspace_manager_archive a WHERE a.session_id = sessions.id)"];
+    const where: string[] = [
+      "NOT EXISTS (SELECT 1 FROM workspace_manager m WHERE m.session_id = sessions.id)",
+      "NOT EXISTS (SELECT 1 FROM workspace_manager_archive a WHERE a.session_id = sessions.id)"
+    ];
     const params: Record<string, SessionDbValue> = {};
     const workspaceId = normalizeText(input.workspaceId);
     if (workspaceId) {
@@ -10471,6 +11484,16 @@ function toWorkspaceManager(row: Record<string, unknown>): WorkspaceManagerRecor
     created: managerTimestamp(row.created), updated: managerTimestamp(row.updated) };
 }
 
+function toWorkspaceManagerQueueForkJob(row: Record<string, unknown>): WorkspaceManagerQueueForkJobRecord {
+  return {
+    turnId: stringValue(row.turn_id), sessionId: stringValue(row.session_id),
+    workspaceId: stringValue(row.workspace_id), managerSessionId: stringValue(row.manager_session_id),
+    requestId: stringValue(row.request_id), status: stringValue(row.status) as WorkspaceManagerQueueForkStatus,
+    title: nullableString(row.title), prompt: nullableString(row.prompt), targetSessionId: nullableString(row.target_session_id),
+    error: nullableString(row.error), updated: managerTimestamp(row.updated)
+  };
+}
+
 function localCodexSessionFile(path: string, codexHome?: string | null): LocalCodexSessionFile {
   const resolvedPath = resolveUserPath(path);
   const resolvedCodexHome = codexHome ? resolveUserPath(codexHome) : defaultCodexHome();
@@ -11370,6 +12393,8 @@ function toSessionTurnRecord(row: SessionTurnRow): SessionTurnRecord {
     agentResponse: stringValue(row.agent_response),
     model: nullableString(row.turn_model),
     ...(reasoningEffort ? { reasoningEffort } : {}),
+    ...(row.requested_service_tier === "fast" || row.requested_service_tier === "default"
+      ? { requestedServiceTier: row.requested_service_tier } : {}),
     tokenIn: numberValue(row.token_in),
     tokenOut: numberValue(row.token_out),
     usageSample: toSessionTurnTokenUsageSampleRecord(row),
@@ -11566,6 +12591,33 @@ export function summarizeSessionFileChanges(
 function isAuthoritativeFileChangeItem(value: unknown) {
   const record = recordValue(value);
   return record?.itemType === "file_change" && record.authoritative === true && Array.isArray(record.changes);
+}
+
+function workspaceTaskTurnLineCounts(items: unknown[], hasRecordedChanges: boolean): WorkspaceManagerLineCounts | null {
+  const fileItems = items.filter(item => recordValue(item)?.itemType === "file_change");
+  // Snapshots replace earlier snapshots within a turn; only its final saved
+  // authoritative diff contributes to the session's cumulative line counts.
+  const snapshot = recordValue(fileItems.filter(isAuthoritativeFileChangeItem).at(-1));
+  if (!snapshot) {
+    return hasRecordedChanges || fileItems.length > 0 ? null : { additions: 0, deletions: 0 };
+  }
+  const totals = { additions: 0, deletions: 0 };
+  for (const value of snapshot.changes as unknown[]) {
+    const change = recordValue(value);
+    const diff = [change?.unifiedDiff, change?.patch, change?.diff].find(value => typeof value === "string");
+    if (typeof diff !== "string") return null;
+    let inHunk = false;
+    for (const line of diff.split(/\r?\n/)) {
+      if (line.startsWith("diff --git ")) { inHunk = false; continue; }
+      if (line.startsWith("@@")) { inHunk = true; continue; }
+      if (!inHunk) continue;
+      // Count hunk lines, including content starting with ++ or --, without
+      // counting the +++/--- file headers. Binary/mode-only diffs add no lines.
+      if (line.startsWith("+")) totals.additions += 1;
+      else if (line.startsWith("-")) totals.deletions += 1;
+    }
+  }
+  return totals;
 }
 
 function summarizeFileChangeItems(items: unknown[]) {
@@ -11923,9 +12975,10 @@ function parseSessionModelProfiles(value: unknown): SessionModelProfile[] | unde
     const candidate = profile as Record<string, unknown>;
     return {
       model: typeof candidate.model === "string" ? candidate.model : "",
-      effort: typeof candidate.effort === "string" ? candidate.effort : ""
+      effort: typeof candidate.effort === "string" ? candidate.effort : "",
+      ...(typeof candidate.fastMode === "boolean" ? { fastMode: candidate.fastMode } : {})
     };
-  }).filter((profile): profile is SessionModelProfile => profile !== null);
+  }).filter((profile): profile is NonNullable<typeof profile> => profile !== null);
 }
 
 function defaultSessionModelPreferences(sessionId: string): SessionModelPreferences {
@@ -11955,7 +13008,9 @@ function normalizeSessionModelPreferences(
       const profile = inputProfiles[index];
       return {
         model: typeof profile?.model === "string" && profile.model.trim() ? profile.model.trim() : fallbackProfile.model,
-        effort: typeof profile?.effort === "string" && profile.effort.trim() ? profile.effort.trim() : fallbackProfile.effort
+        effort: typeof profile?.effort === "string" && profile.effort.trim() ? profile.effort.trim() : fallbackProfile.effort,
+        ...(typeof profile?.fastMode === "boolean" ? { fastMode: profile.fastMode }
+          : typeof fallbackProfile.fastMode === "boolean" ? { fastMode: fallbackProfile.fastMode } : {})
       };
     })
     : fallbackProfiles.map((profile) => ({ ...profile }));
@@ -12265,7 +13320,13 @@ function sessionLiveItemFromRow(row: Record<string, unknown>): unknown | null {
   }
 
   if (itemType === "context_compaction") {
-    return { id, eventType, itemType, ...origin };
+    return {
+      id, eventType, itemType,
+      ...(isPlainObject(storedPayload) && typeof storedPayload.beforeTokens === "number" ? { beforeTokens: storedPayload.beforeTokens } : {}),
+      ...(isPlainObject(storedPayload) && typeof storedPayload.afterTokens === "number" ? { afterTokens: storedPayload.afterTokens } : {}),
+      ...(isPlainObject(storedPayload) && typeof storedPayload.modelContextWindow === "number" ? { modelContextWindow: storedPayload.modelContextWindow } : {}),
+      ...origin
+    };
   }
 
   if (itemType === "subagent") {
@@ -13034,4 +14095,23 @@ function nullableNumber(value: unknown): number | null {
   }
 
   return null;
+}
+
+function workspaceTaskContextPercent(sample: { totalTokens: number | null; modelContextWindow: number | null } | undefined) {
+  const totalTokens = sample?.totalTokens;
+  const modelContextWindow = sample?.modelContextWindow;
+  if (totalTokens === null || totalTokens === undefined || totalTokens <= 0 ||
+    modelContextWindow === null || modelContextWindow === undefined || modelContextWindow <= 0) {
+    return null;
+  }
+  return Math.round((totalTokens / modelContextWindow) * 100);
+}
+
+function rawWorkspaceUserPrompt(value: unknown) {
+  const prompt = typeof value === "string" ? value.trim() : "";
+  if (!prompt) return "";
+  const canonical = prompt.match(/(?:Canonical user (?:request|correction)[^\n:：]*|用[戶户]原句[（(]canonical request[^）)]*[）)])[:：]\s*[「“\"]([\s\S]*?)[」”\"]/i);
+  if (canonical) return canonical[1].trim();
+  if (/(?:Canonical user (?:request|correction)|用[戶户]原句[（(]canonical request|Attached Browser Bridge context:|Manager interpretation \(may be wrong\):)/i.test(prompt)) return "";
+  return prompt;
 }

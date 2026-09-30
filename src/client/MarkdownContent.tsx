@@ -1,3 +1,4 @@
+import { ConcurrentMessage, parseConcurrentMessage } from "./ConcurrentMessage";
 import {
   createContext,
   useContext,
@@ -58,6 +59,9 @@ export const MarkdownContent = memo(function MarkdownContent({ children, classNa
   const chunks = advanceMarkdownChunks(previous.current, children);
   previous.current = chunks;
   const workspaceFileContext = useContext(MarkdownWorkspaceContext) ?? workspaceFilePreviewContextFromPage();
+  if (parseConcurrentMessage(children)) return <div className={className ? `markdown-content ${className}` : "markdown-content"} id={id}>
+    <ConcurrentMessage text={children} renderContent={text => <MarkdownPart source={text} context={workspaceFileContext} sourcePath={sourcePath} />} />
+  </div>;
   return (
     <div className={className ? `markdown-content ${className}` : "markdown-content"} id={id}>
       {[...chunks.frozen, chunks.tail].map((source, index) => <Fragment key={index}>{index > 0 ? "\n" : null}<MarkdownPart source={source} context={workspaceFileContext} sourcePath={sourcePath} /></Fragment>)}

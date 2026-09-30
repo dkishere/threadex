@@ -30,15 +30,17 @@ export async function restoreSelectedSessionForWorkspace(ctx, workspaceId) {
 
 export async function loadWorkspaceSnapshot(ctx, options = {}) {
     const { activeTurnIdRef, activeWorkspaceIdRef, applyAccountPayload, applySelectedSessionSnapshot, approvalRecordToLiveItem, clearNewSessionProjectSelection, createSystemMessage, eventStore, isApprovalLiveItem, isLikelyBackendDisconnect, navigationRequestIdRef, noteBackendDisconnect, noteBackendRequestSucceeded, prepareNewLocalModelPreferences, replaceComposerDraftForSession, replaceNavigationUrl, replaceRunningTurns, restoreSelectedSessionForWorkspace, sessionIdRef, setActiveSessionId, setActiveTurnId, setActiveWorkspace, setIsBootstrapped, setMessages, setParentSessionTodo, setPendingApprovalItems, setPendingApprovalSessionIds, setSessionExecutionStatuses, setSessionId, setSessionTodo, setStatus, setThreadId, setWorkspaceList, toSessionPageState, updateNavigationUrl, viewKeyRef } = ctx;
-        const requestId = ++navigationRequestIdRef.current;
         let navigationTarget = options.navigationTarget;
-        const expectedViewKey = typeof options.viewKey === "number" ? options.viewKey : null;
-        const previousWorkspaceId = activeWorkspaceIdRef.current;
         const preserveSelectedSession = options.preserveSelectedSession === true && !navigationTarget;
+        // Background reconciliation must not cancel an explicit navigation.
+        // Both kinds of request still become stale when the user changes views.
+        const requestId = preserveSelectedSession ? navigationRequestIdRef.current : ++navigationRequestIdRef.current;
+        const expectedViewKey = options.viewKey ?? viewKeyRef.current;
+        const snapshotUrl = options.includeActiveSession === false || preserveSelectedSession
+            ? "/api/workspace/snapshot?includeActiveSession=false"
+            : "/api/workspace/snapshot";
+        const previousWorkspaceId = activeWorkspaceIdRef.current;
         const preservedWorkspaceId = preserveSelectedSession ? activeWorkspaceIdRef.current : null;
-        const preservedSelectedSnapshot = preserveSelectedSession
-            ? eventStore.getState().selectedSessionSnapshot
-            : null;
         try {
             if (navigationTarget?.threadId || navigationTarget?.turnNumbers) {
                 const params = new URLSearchParams({ target: navigationTarget.threadId || navigationTarget.sessionId });
@@ -50,7 +52,7 @@ export async function loadWorkspaceSnapshot(ctx, options = {}) {
                 navigationTarget = { ...navigationTarget, sessionId: result.session.id, workspaceId: result.session.workspaceId, threadId: null,
                     turnId: result.turns?.[0]?.turnId ?? navigationTarget.turnId };
             }
-            let response = await fetch("/api/workspace/snapshot", { cache: "no-store" });
+            let response = await fetch(snapshotUrl, { cache: "no-store" });
             if (!response.ok)
                 throw new Error(`API returned ${response.status}`);
             noteBackendRequestSucceeded();
@@ -65,7 +67,7 @@ export async function loadWorkspaceSnapshot(ctx, options = {}) {
                     throw new Error(`Workspace API returned ${switchResponse.status}`);
                 }
                 noteBackendRequestSucceeded();
-                response = await fetch("/api/workspace/snapshot", { cache: "no-store" });
+                response = await fetch(snapshotUrl, { cache: "no-store" });
                 if (!response.ok)
                     throw new Error(`API returned ${response.status}`);
                 payload = (await response.json());
@@ -86,6 +88,11 @@ export async function loadWorkspaceSnapshot(ctx, options = {}) {
                 clearNewSessionProjectSelection();
             }
             const sessionPage = toSessionPageState(payload.sessions ?? [], payload.sessionPage);
+            // Navigation may have finished while this background request waited.
+            // Preserve the current selection, not the one captured before fetch.
+            const preservedSelectedSnapshot = preserveSelectedSession
+                ? eventStore.getState().selectedSessionSnapshot
+                : null;
             eventStore.setWorkspaceSnapshot(payload, sessionPage, preserveSelectedSession ? preservedSelectedSnapshot : payload.activeSession, payload.eventCursor);
             setWorkspaceList(Array.isArray(payload.workspaces) ? payload.workspaces : []);
             setActiveWorkspace(payload.activeWorkspace ?? null);
@@ -108,6 +115,18 @@ export async function loadWorkspaceSnapshot(ctx, options = {}) {
                     // The workspace response already contains the selected transcript.
                     // Avoid reading it again and switching to the already-active session.
                     selectedSnapshot = payload.activeSession;
+                }
+                else if (navigationTarget.sessionId &&
+                    options.trustedTargetSessionId === navigationTarget.sessionId &&
+                    options.trustedTargetWorkspaceId === payload.activeWorkspace.id) {
+                    const switchResponse = await fetch("/api/sessions/switch", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ sessionId: navigationTarget.sessionId })
+                    });
+                    if (switchResponse.ok) {
+                        selectedSnapshot = await switchResponse.json();
+                    }
                 }
                 else if (navigationTarget.sessionId) {
                     const snapshotResponse = await fetch(`/api/sessions/${encodeURIComponent(navigationTarget.sessionId)}/snapshot`, { cache: "no-store" });
@@ -540,6 +559,27 @@ export async function openProcessMonitorLog(ctx, monitor) {
     
 }
 
+export async function stopProcessMonitor(ctx, monitor) {
+    const { eventStore, readApiError, setProcessMonitorAction, setStatus } = ctx;
+    if (!window.confirm(`Stop process "${monitor.label}"? The monitor and restart settings will be kept.`)) {
+        return;
+    }
+    setProcessMonitorAction(`stop:${monitor.id}`);
+    try {
+        const response = await fetch(`/api/process-monitors/${encodeURIComponent(monitor.id)}/stop`, { method: "POST" });
+        if (!response.ok)
+            throw new Error(await readApiError(response));
+        setStatus(`Stopped ${monitor.label}`);
+        await eventStore.poll();
+    }
+    catch (error) {
+        setStatus(error instanceof Error ? `Stop failed: ${error.message}` : "Stop failed");
+    }
+    finally {
+        setProcessMonitorAction(null);
+    }
+}
+
 export async function removeProcessMonitor(ctx, monitor) {
     const { eventStore, readApiError, setProcessMonitorAction, setStatus } = ctx;
         if (!window.confirm(`Remove monitor "${monitor.label}"?${monitor.pid ? " The process will be stopped." : ""}`)) {
@@ -574,6 +614,25 @@ export async function switchWorkspace(ctx, workspaceId, options = {}) {
         const previousParentSessionTodo = parentSessionTodo;
         clearTodoPanelState();
         try {
+            let managerSessionId = null;
+            if (options.directManager === true) {
+                const managerResponse = await fetch("/api/workspace-manager", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ workspaceId })
+                });
+                if (!managerResponse.ok) {
+                    throw new Error(`Workspace manager API returned ${managerResponse.status}`);
+                }
+                const manager = await managerResponse.json();
+                managerSessionId = typeof manager.sessionId === "string" ? manager.sessionId : null;
+                if (!managerSessionId || manager.workspaceId !== workspaceId) {
+                    throw new Error("Workspace manager did not return a session ID.");
+                }
+                if (!isCurrentViewKey(viewKey)) {
+                    return false;
+                }
+            }
             const response = await fetch("/api/workspaces/switch", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -590,6 +649,9 @@ export async function switchWorkspace(ctx, workspaceId, options = {}) {
             const switchedWorkspace = payload.activeWorkspace ?? payload.workspace ?? null;
             clearNewSessionProjectSelection();
             setActiveWorkspace(switchedWorkspace);
+            if (managerSessionId) {
+                options.onManagerTarget?.(managerSessionId);
+            }
             eventStore.setSessionPage(toSessionPageState([], undefined));
             eventStore.setSelectedSessionSnapshot(null);
             setSessionExecutionStatuses({});
@@ -607,9 +669,20 @@ export async function switchWorkspace(ctx, workspaceId, options = {}) {
                 applyAccountPayload(payload);
             }
             setMessages([createSystemMessage(`Switched workspace. The next message starts a fresh Codex thread.`)]);
-            await loadWorkspaceSnapshot({ viewKey });
+            await loadWorkspaceSnapshot({
+                viewKey,
+                navigationTarget: managerSessionId
+                    ? { workspaceId: switchedWorkspace?.id ?? workspaceId, sessionId: managerSessionId }
+                    : options.navigationTarget,
+                includeActiveSession: managerSessionId ? false : options.includeActiveSession,
+                trustedTargetSessionId: managerSessionId,
+                trustedTargetWorkspaceId: managerSessionId ? switchedWorkspace?.id ?? workspaceId : null
+            });
             if (!isCurrentViewKey(viewKey)) {
                 return false;
+            }
+            if (managerSessionId && eventStore.getState().selectedSessionSnapshot?.session?.id !== managerSessionId) {
+                throw new Error("Workspace switched, but its manager session could not be loaded.");
             }
             if (options.history !== "none") {
                 updateNavigationUrl({

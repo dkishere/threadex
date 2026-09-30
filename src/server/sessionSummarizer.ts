@@ -630,6 +630,28 @@ export class SessionSummarizer {
     return result.responseText;
   }
 
+  /** A bounded, read-only health assessment for a running Loop task. */
+  async assessLoopTask(workspaceId: string, prompt: string): Promise<string> {
+    const workspace = await this.store.getWorkspace(workspaceId);
+    if (!workspace) throw new Error("Loop task workspace no longer exists");
+    const model = this.config.model;
+    const result = this.config.provider === "mock"
+      ? { responseText: this.config.mockResponse ?? "{}", usage: null, accountId: null }
+      : await this.runSummarizerLuna(prompt, workspace.codexHome, model, "loop-health");
+    if (result.usage) {
+      try {
+        await this.store.recordTokenUsage([{
+          id: `loop_task_health:${randomUUID()}`, usageType: "background", source: "app_server", workspaceId,
+          accountId: result.accountId, model,
+          inputTokens: result.usage.inputTokens, cachedInputTokens: result.usage.cachedInputTokens,
+          outputTokens: result.usage.outputTokens, reasoningOutputTokens: result.usage.reasoningOutputTokens,
+          totalTokens: result.usage.totalTokens, metadata: { task: "loop_task_health", promptChars: prompt.length }
+        }]);
+      } catch (error) { console.warn(`Failed to record Loop task health usage: ${errorMessage(error)}`); }
+    }
+    return result.responseText;
+  }
+
   private async runSummarizerLuna(prompt: string, workspaceCodexHome: string | null, model?: string, lane = "summary") {
     const key = JSON.stringify([workspaceCodexHome, lane]);
     const previous = this.lunaQueues.get(key) ?? Promise.resolve();

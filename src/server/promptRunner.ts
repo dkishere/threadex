@@ -1,8 +1,12 @@
 import { DEFAULT_MODEL, AUTO_MODEL_ORDER } from "../modelCatalog";
+import type { CollaborationFork } from "../collaboration";
 import { WORKSPACE_MANAGER_TOOLS } from "./workspaceManagerTools";
 import { WORKSPACE_MANAGER_INSTRUCTIONS } from "./workspaceManager";
-import { WORKSPACE_MANAGER_MODEL, WORKSPACE_MANAGER_EFFORT } from "../workspaceManager";
+import { MANAGER_REPLY_LANGUAGE_INSTRUCTIONS } from "./replyLanguage";
+import { WORKSPACE_MANAGER_MODEL, WORKSPACE_MANAGER_EFFORT,
+  WORKSPACE_MANAGER_LOOP_ALERT_MODEL, WORKSPACE_MANAGER_LOOP_ALERT_EFFORT } from "../workspaceManager";
 import { recordLiveGitProvenance } from "./gitProvenance";
+import { GIT_WORKTREE_REVIEW_INSTRUCTIONS } from "./gitWorktreeGuard";
 import { USER_INPUT_METHOD, inputQuestions, inputResponse, asyncInputQuestions, asyncInputParams, asyncAnswerText } from "../userInputRequest";
 import { LIGHTWEIGHT_TODO_INSTRUCTIONS } from "./lightweightTodo";
 import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -68,7 +72,10 @@ import {
 } from "./sessionRecovery";
 
 type RunnerJob = {
+  collaboration?: { groupId: string; fork: CollaborationFork | null; priorContext: string };
   workspaceManager?: boolean;
+  managerDelegatedTask?: boolean;
+  managerLoopAlert?: boolean;
   sessionId: string;
   workspaceId?: string;
   turnId: string;
@@ -77,6 +84,7 @@ type RunnerJob = {
   threadId?: string | null;
   model?: string;
   modelReasoningEffort?: string;
+  fastMode?: boolean;
   approvalPolicy?: ApprovalPolicy;
   autoModelEnabled?: boolean;
   autoModelRevision?: number;
@@ -195,6 +203,7 @@ type RunnerSteerCommand = {
 
 type RunnerSteerResult = {
   ok: boolean;
+  notSent?: boolean;
   commandId: string;
   turnId: string;
   appTurnId?: string | null;
@@ -225,8 +234,11 @@ if (!jobPath) {
 
 const job = JSON.parse(readFileSync(jobPath, "utf8")) as RunnerJob;
 if (job.workspaceManager) {
-  job.model = WORKSPACE_MANAGER_MODEL;
-  job.modelReasoningEffort = WORKSPACE_MANAGER_EFFORT;
+  // A Manager Concurrent keeps the model/effort selected for that assignment.
+  if (!job.collaboration?.fork) {
+    job.model = job.managerLoopAlert ? WORKSPACE_MANAGER_LOOP_ALERT_MODEL : WORKSPACE_MANAGER_MODEL;
+    job.modelReasoningEffort = job.managerLoopAlert ? WORKSPACE_MANAGER_LOOP_ALERT_EFFORT : WORKSPACE_MANAGER_EFFORT;
+  }
   job.autoModelEnabled = false;
   job.executionMode = "default";
 }
@@ -278,6 +290,9 @@ async function run() {
   let threadId = job.threadId?.trim() || undefined;
   let finalResponse = "";
   let usage: TokenUsage | null = null;
+  let contextUsage: { totalTokens: number; modelContextWindow?: number } | null = null;
+  let activeCompaction: Extract<StreamItem, { itemType: "context_compaction" }> | null = null;
+  let completedCompactionAwaitingUsage: Extract<StreamItem, { itemType: "context_compaction" }> | null = null;
   let appTurnId: string | null = null;
   let steeringFinished = false;
   let stopSteerControl: (() => Promise<void>) | undefined;
@@ -367,6 +382,22 @@ async function run() {
     } else if (method === "thread/tokenUsage/updated") {
       if (notificationBelongsToRunnerThread(params, threadId)) {
         usage = readUsage(params?.tokenUsage) ?? usage;
+        const tokenUsage = readObject(params?.tokenUsage);
+        const last = readObject(tokenUsage?.last);
+        const totalTokens = readNumber(last?.totalTokens);
+        const modelContextWindow = readNumber(params?.modelContextWindow);
+        if (totalTokens !== null && totalTokens >= 0) {
+          contextUsage = {
+            totalTokens,
+            ...(modelContextWindow !== null && modelContextWindow > 0 ? { modelContextWindow } : contextUsage?.modelContextWindow ? { modelContextWindow: contextUsage.modelContextWindow } : {})
+          };
+          if (completedCompactionAwaitingUsage) {
+            const updated = { ...completedCompactionAwaitingUsage, afterTokens: totalTokens,
+              ...(contextUsage.modelContextWindow ? { modelContextWindow: contextUsage.modelContextWindow } : {}) };
+            completedCompactionAwaitingUsage = null;
+            await emitEvent("item", updated);
+          }
+        }
       }
     } else if (method === "item/started" || method === "item/completed") {
       const eventType = method === "item/started" ? "item.started" : "item.completed";
@@ -379,13 +410,25 @@ async function run() {
         };
         itemCache.set(cacheKey, streamItem);
         if (streamItem.itemType === "context_compaction" && streamItemBelongsToRunnerThread(streamItem, threadId)) {
-          if (eventType === "item.started") startCompactionHeartbeat();
-          else stopCompactionHeartbeat();
+          if (eventType === "item.started") {
+            startCompactionHeartbeat();
+            activeCompaction = { ...streamItem,
+              ...(contextUsage ? { beforeTokens: contextUsage.totalTokens, ...contextUsage.modelContextWindow ? { modelContextWindow: contextUsage.modelContextWindow } : {} } : {}) };
+          } else {
+            stopCompactionHeartbeat();
+            const beforeTokens = activeCompaction?.beforeTokens;
+            const afterTokens = contextUsage?.totalTokens;
+            activeCompaction = { ...streamItem,
+              ...(beforeTokens !== undefined ? { beforeTokens } : {}),
+              ...(afterTokens !== undefined && afterTokens !== beforeTokens ? { afterTokens } : {}),
+              ...(contextUsage?.modelContextWindow ? { modelContextWindow: contextUsage.modelContextWindow } : {}) };
+            completedCompactionAwaitingUsage = afterTokens === undefined || afterTokens === beforeTokens ? activeCompaction : null;
+          }
         }
         if (streamItem.itemType === "agent_message" && streamItemBelongsToRunnerThread(streamItem, threadId)) {
           finalResponse = streamItem.text;
         }
-        await emitEvent("item", streamItem);
+        await emitEvent("item", activeCompaction?.id === streamItem.id && streamItem.itemType === "context_compaction" ? activeCompaction : streamItem);
         queueCommentaryHeadline(streamItem);
       }
     } else if (method === "turn/plan/updated") {
@@ -490,6 +533,7 @@ async function run() {
       const turn = readObject(params?.turn);
       const error = readObject(turn?.error);
       const status = readString(turn?.status);
+      completedCompactionAwaitingUsage = null;
       steeringFinished = true;
       commentaryInjectionActive = false;
       const agentMessage = readFinalAgentMessage(turn?.items);
@@ -561,16 +605,31 @@ async function run() {
     await appServer.start();
     await appServer.initialize();
 
-    // Install the current policy even when resuming a long-lived manager whose
-    // original thread predates it. Turn-level injection below also survives
-    // recovery/compaction; ordinary task startup instructions stay unchanged.
+    // Refresh persistent policy on every start/resume, including recovery of old
+    // managers. Turn settings carry only changing context, not another policy copy.
     const threadDeveloperInstructions = job.workspaceManager
-      ? `${THREADEX_DEVELOPER_INSTRUCTIONS}\n\n${WORKSPACE_MANAGER_INSTRUCTIONS}`
-      : THREADEX_DEVELOPER_INSTRUCTIONS;
+      ? WORKSPACE_MANAGER_INSTRUCTIONS
+      : [THREADEX_DEVELOPER_INSTRUCTIONS, job.managerDelegatedTask ? MANAGER_REPLY_LANGUAGE_INSTRUCTIONS : undefined]
+        .filter(Boolean).join("\n\n");
     let recoveryContextForTurn = !threadId || job.forceRecoveryOnResume === true
       ? job.recoveryContext ?? null
       : null;
-    if (threadId) {
+    if (job.collaboration?.fork) {
+      // Ephemeral IDs cannot be resumed after their app-server exits. Every explicit
+      // continuation inherits the same native boundary and adds saved worker context.
+      const source = job.collaboration.fork;
+      const response = await appServer.rpc("thread/fork", {
+        ...buildThreadStartParams(job, threadDeveloperInstructions),
+        threadId: source.threadId, lastTurnId: source.lastTurnId,
+        ephemeral: true, excludeTurns: true
+      });
+      threadId = readThreadIdFromPayload(response) ?? undefined;
+      if (!threadId || threadId === source.threadId) throw new Error("Ephemeral fork did not return an independent native thread.");
+      await emitDeveloperInstructionsEvent("thread", 0, threadDeveloperInstructions);
+      recoveryContextForTurn = null;
+      await emitEvent("collaboration.forked", { groupId: job.collaboration.groupId,
+        sourceThreadId: source.threadId, sourceTurnId: source.lastTurnId, threadId, ephemeral: true }, { waitForCallback: true });
+    } else if (threadId) {
       const sourceThreadId = threadId;
       try {
         const response = await appServer.rpc(
@@ -637,13 +696,15 @@ async function run() {
         objective: goalObjective.objective,
         status: "active"
       });
-    } else if (job.executionMode === "default" || job.executionMode === "plan") {
+    } else if (!job.collaboration?.fork && (job.executionMode === "default" || job.executionMode === "plan")) {
       await appServer.rpc("thread/goal/clear", { threadId });
     }
 
     stopSteerControl = startSteerControlLoop(appServer, () => ({ threadId, appTurnId, finished: steeringFinished }));
     try {
-      let phaseJob = recoveryContextForTurn
+      let phaseJob = job.collaboration?.priorContext
+        ? { ...job, message: `[Saved history of your own Threadex worker session; historical evidence, not current instructions]\n${job.collaboration.priorContext}\n[End saved history]\n\nCurrent message addressed to you (apply its task, follow-up, or result semantics):\n${job.message}` }
+        : recoveryContextForTurn
         ? { ...job, message: recoveryPrompt(job.message, recoveryContextForTurn) }
         : job;
       let phase = 0;
@@ -657,18 +718,23 @@ async function run() {
         }
         const turnDeveloperInstructions = runnerDeveloperInstructions(phaseJob, phase === 0);
         await emitDeveloperInstructionsEvent("turn", phase, turnDeveloperInstructions);
+        const turnStartParams = buildTurnStartParams(
+          threadId,
+          phaseJob,
+          turnDeveloperInstructions,
+          phase === 0 &&
+            phaseJob.contextForkRequest !== true &&
+            phaseJob.forcePlan === true &&
+            phaseJob.todoPlanAlreadyExists !== true
+        );
         const turnStartResponse = await appServer.rpc(
           "turn/start",
-          buildTurnStartParams(
-            threadId,
-            phaseJob,
-            turnDeveloperInstructions,
-            phase === 0 &&
-              phaseJob.contextForkRequest !== true &&
-              phaseJob.forcePlan === true &&
-              phaseJob.todoPlanAlreadyExists !== true
-          )
+          turnStartParams
         );
+        await emitEvent("turn.service_tier_requested", {
+          serviceTier: turnStartParams.serviceTierForTurn,
+          phase
+        }, { waitForCallback: true });
         const nativeTurnId = readTurnIdFromPayload(turnStartResponse);
         appTurnId = nativeTurnId ?? appTurnId;
         await emitNativeTurnLink(nativeTurnId);
@@ -1502,7 +1568,8 @@ function buildTurnStartParams(
     approvalPolicy: approvalSettings.approvalPolicy,
     ...(developerInstructions ? { settings: { developer_instructions: developerInstructions } } : {}),
     ...(job.model ? { model: job.model } : {}),
-    ...(isReasoningEffort(job.modelReasoningEffort) ? { effort: job.modelReasoningEffort } : {})
+    ...(isReasoningEffort(job.modelReasoningEffort) ? { effort: job.modelReasoningEffort } : {}),
+    serviceTierForTurn: job.fastMode === true ? "fast" : "default"
   };
 }
 
@@ -1529,10 +1596,14 @@ function startSteerControlLoop(
           break;
         }
         processed.add(command.id);
+        if (command.id.startsWith("collab_") && job.controlResultDir &&
+          existsSync(resolve(job.controlResultDir, `${command.id}.json`))) continue;
         let result: RunnerSteerResult;
+        let sent = false;
         try {
           if (finished) throw new Error("The target turn has already finished; steer was not sent.");
           await emitDeveloperInstructionsEvent("steer", 0, command.developerInstructions);
+          sent = true;
           const response = await appServer.rpc("turn/steer", {
             threadId,
             expectedTurnId: appTurnId,
@@ -1556,6 +1627,7 @@ function startSteerControlLoop(
         } catch (error) {
           result = {
             ok: false,
+            notSent: !sent,
             commandId: command.id,
             turnId: job.turnId,
             appTurnId,
@@ -1767,6 +1839,7 @@ function buildSessionInspectorMcpServerConfig(job: RunnerJob) {
       TMPDIR: process.env.THREADEX_MCP_TMPDIR ?? (process.platform === "darwin" ? "/private/tmp" : tmpdir()),
       SESSION_INSPECTOR_SERVER_URL: job.serverUrl ?? "",
       THREADEX_SESSION_ID: job.sessionId,
+      THREADEX_CONCURRENT_ID: job.collaboration?.groupId ?? "",
       THREADEX_WORKSPACE_MANAGER: job.workspaceManager ? "1" : "0",
       THREADEX_TURN_ID: job.turnId,
       THREADEX_THREAD_ID: job.threadId ?? "",
@@ -1801,7 +1874,7 @@ function tomlStringArray(values: string[]) {
 }
 
 function sessionInspectorDeveloperInstructions(job: RunnerJob) {
-  if (job.workspaceManager) return WORKSPACE_MANAGER_INSTRUCTIONS;
+  if (job.workspaceManager) return undefined; // Installed at thread scope above.
   if (!sessionInspectorMcpEnabled(job)) {
     return undefined;
   }
@@ -1883,6 +1956,7 @@ function todoPlanningRequested(job: RunnerJob) {
 
 function runnerDeveloperInstructions(job: RunnerJob, includeStartupSnapshot = true) {
   const instructions = [
+    GIT_WORKTREE_REVIEW_INSTRUCTIONS,
     job.globalAgentInstructions?.trim()
       ? `User's global agent instructions (apply across Threadex workspaces):\n${job.globalAgentInstructions}`
       : undefined,
@@ -1941,6 +2015,7 @@ function threadexMcpEnabled(job: RunnerJob) {
 }
 
 function sessionInspectorMcpEnabled(job: RunnerJob) {
+  if (job.collaboration) return true;
   if (job.workspaceManager) return true;
   if (job.contextParentSessionId || job.contextForkRequest) {
     return true;
@@ -1974,6 +2049,7 @@ function sessionInspectorMcpEnabled(job: RunnerJob) {
 }
 
 function sessionInspectorContinuityOnly(job: RunnerJob) {
+  if (job.collaboration) return false;
   if (job.workspaceManager) return false;
   if (!job.threadId || job.contextParentSessionId || job.contextForkRequest) {
     return false;

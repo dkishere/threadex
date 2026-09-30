@@ -9,31 +9,26 @@ import { WorkspaceManagerService, WORKSPACE_MANAGER_INSTRUCTIONS } from "./works
 import { WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS } from "./workspaceManagerRouting";
 import { WORKSPACE_MANAGER_TOOLS } from "./workspaceManagerTools";
 
-test("manager startup policy follows demand, project, clarification, known-thread, search, fork and create order", () => {
+test("manager policy preserves routing order, ownership and minimal handoffs without historical examples", () => {
   assert.ok(WORKSPACE_MANAGER_INSTRUCTIONS.includes(WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS));
-  // These are policy-contract assertions, not an LLM behavior simulation.
   const policy = WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS;
-  const ordered = ["1. Is this an actionable request?", "2. Establish the project and workspace",
-    "3. Confirm the requirement", "4. Choose the thread in this order", "5. If a suitable thread has more than 15",
-    "6. Only if no suitable thread exists", "7. Preserve the canonical request", "8. Verify dispatch"];
+  const ordered = ["1. Is this an actionable request?", "2. Establish the intended project",
+    "3. Confirm the requirement", "4. Prefer a suitable thread already known",
+    "5. For new work continuing a suitable thread", "6. Only if no suitable thread exists",
+    "7. Forward the user's wording verbatim", "8. Verify dispatch"];
   const positions = ordered.map(step => policy.indexOf(step));
   assert.ok(positions.every(position => position >= 0));
   assert.deepEqual(positions, [...positions].sort((a, b) => a - b));
-  assert.match(policy, /「manager做事順序：是需求？》項目》確認需求（問清楚）》揀thread實作，優先：\n1\. context中已知thread\n2\. 查找已有thread\n如現有thread已很長（來回超過15T\)，帶fork badge要現thread fork\n都沒有就開新」/);
-  assert.match(policy, /An attachment without a clear actionable request is context only/);
-  assert.match(policy, /explicit 'do not create a task'/);
-  assert.match(policy, /candidate thread belongs to the intended project/);
-  assert.match(policy, /If multiple plausible projects or workspaces would change where work goes, ask a focused question/);
-  assert.match(policy, /First check a relevant thread already explicitly known in current manager context/);
-  assert.match(policy, /use it without searching again/);
-  assert.match(policy, /If no suitable thread is already known, call workspace_search_tasks/);
-  assert.match(policy, /including completed and older work/);
+  assert.match(policy, /Supervise only work delegated through the manager or explicitly entrusted by the user/);
+  assert.match(policy, /Direct user input in another task is informational/);
   assert.match(policy, /completedRoundTrips > 15/);
-  assert.match(policy, /same Context Fork\/Fork badge handoff as the ordinary composer/);
-  assert.match(policy, /Only if no suitable thread exists, use workspace_create_task/);
-  assert.match(policy, /original user wording verbatim as 'Canonical user request'/);
-  assert.match(policy, /carry the canonical original wording verbatim into its child handoff/);
-  assert.match(policy, /inspect the handoff result and resulting child session separately/);
+  assert.match(policy, /parentSessionId only changes hierarchy/);
+  assert.match(policy, /Add only prerequisite facts unavailable to the destination/);
+  assert.match(policy, /silence is not confirmation/);
+  assert.match(policy, /full verbatim request and actual original files/);
+  assert.match(policy, /including the child/);
+  assert.doesNotMatch(policy, /Loop\/Grill failure task|Workspace dashboard visual-design task|59%|彈左/);
+
   const tool = (name: string) => WORKSPACE_MANAGER_TOOLS.find(item => item.name === name)!;
   assert.match(tool("workspace_search_tasks").description, /When no suitable thread is already known/);
   assert.match(tool("workspace_prompt_task").description, /at most 15 completed user\/agent round trips/);
@@ -41,31 +36,23 @@ test("manager startup policy follows demand, project, clarification, known-threa
   assert.match(tool("workspace_create_task").description, /Only when no suitable context-known or searched thread exists/);
   assert.ok(tool("workspace_create_task").inputSchema.properties.parentSessionId);
   assert.ok(tool("workspace_inspect_task").inputSchema.properties.turnId);
+  assert.ok((tool("workspace_create_task").inputSchema.properties.model as { enum: string[] }).enum.includes("gpt-6.1-sol"));
 });
 
-test("persistent manager policy clarifies material ambiguity, preserves user wording and supersedes wrong assumptions", () => {
+test("compact manager policy retains continuation gates and workload/escalation requirements", () => {
   const policy = WORKSPACE_MANAGER_INSTRUCTIONS;
-  assert.match(policy, /ask the user a focused clarification question before dispatching or executing dependent actions/);
-  assert.match(policy, /Clear, directly actionable requests do not need extra questions/);
-  assert.match(policy, /uncertainty about a technical cause are not by themselves ambiguity about the user's intent/);
-  assert.match(policy, /original user wording verbatim as 'Canonical user request'/);
-  assert.match(policy, /Manager interpretation \(may be wrong\)/);
-  assert.match(policy, /first verify the original request and supplied context/);
-  assert.match(policy, /promptly deliver the verbatim correction to affected work/);
-  assert.match(policy, /explicitly supersede the old assumption/);
-  assert.match(policy, /never duplicate a correction already received by its owning task/);
-  assert.match(policy, /report queued rather than assuming a child exists/);
-  assert.match(policy, /'彈左去外面'/);
-  assert.match(policy, /'我指既係layout 彈左出去'/);
-  assert.match(policy, /do not invent a file-picker task/);
-  assert.match(policy, /This clarified request is actionable and does not need the same question again/);
-  for (const name of ["workspace_create_task", "workspace_prompt_task", "workspace_fork_task"]) {
-    const tool = WORKSPACE_MANAGER_TOOLS.find(item => item.name === name)!;
-    const message = tool.inputSchema.properties.message as { description: string };
-    assert.match(message.description, /original words verbatim as the canonical request/);
-    assert.match(message.description, /interpretation of meaning\/cause as possibly wrong/);
-    assert.match(message.description, /explicitly supersede the old assumption/);
-  }
+  assert.ok(policy.length < 9_500, "fixed manager policy, including reply language, should stay compact");
+  assert.match(policy, /compare the user's request and confirmed corrections with the agent's conclusion/);
+  assert.match(policy, /clear unmet requirement it can continue without a blocker/);
+  assert.match(policy, /Do not independently audit, invent requirements or request optional improvements/);
+  assert.match(policy, /Never restart user-stopped work without authorization/);
+  assert.match(policy, /gpt-6-luna: only tightly scoped mechanical work/);
+  assert.match(policy, /gpt-6\.1-sol or higher/);
+  assert.match(policy, /gpt-6-astra: 3D, security, large reviews/);
+  assert.match(policy, /next stronger supported model/);
+  assert.match(policy, /never use workspace_continue_stronger to bypass rate limits/);
+  assert.match(policy, /begin the final response with \[workspace-note\]/);
+  assert.match(policy, /never use it for direct user requests/);
 });
 
 async function managerFixture(t: TestContext) {
@@ -111,6 +98,23 @@ async function managerFixture(t: TestContext) {
   return { root, store, manager, service, posts, action, baseUrl: "http://127.0.0.1:" + address.port + "/manager" };
 }
 
+test("manager steers only the inspected running turn without queuing a notification", async t => {
+  const { root, store, posts, action } = await managerFixture(t);
+  await store.upsertSession({ id: "steer-task", workspaceId: "routing", cwd: root, title: "Integration" });
+  await store.recordSessionTurn({ id: "active-steer", sessionId: "steer-task", userInput: "Integrate CSV",
+    agentResponse: "Working", status: "running", tokenIn: 0, tokenOut: 0 });
+  const update = { action: "steer", sessionId: "steer-task", turnId: "active-steer", message: "Review finding: use @<snap_ms> citations." };
+  await action(update);
+  assert.deepEqual(posts, [{ path: "/api/runner/steer", body: {
+    sessionId: update.sessionId, turnId: update.turnId, message: update.message, attachments: []
+  } }]);
+  assert.equal((await store.listSessionTurns("steer-task")).length, 1);
+  await store.updateSessionTurn({ id: "active-steer", status: "done", agentResponse: "Done", tokenIn: 0, tokenOut: 0 });
+  await action(update, 409);
+  await action({ ...update, turnId: "missing" }, 409);
+  assert.equal(posts.length, 1, "ended or missing turns must not fall back to queued work");
+});
+
 test("read-only and attachment-only manager messages stay in the manager session without automatic task creation", async t => {
   const { manager, store, posts, baseUrl } = await managerFixture(t);
   const status = await fetch(baseUrl + "/?workspaceId=routing");
@@ -126,7 +130,9 @@ test("read-only and attachment-only manager messages stay in the manager session
   assert.equal(posts[0].path, "/api/pending-turns");
   assert.equal(posts[0].body.sessionId, manager.sessionId);
   assert.match(String(posts[0].body.message), /Review the attached file/);
-  assert.equal((await store.listSessions("routing")).length, 1);
+  assert.equal((await store.listSessions("routing")).length, 0, "manager stays hidden from the ordinary task list");
+  assert.ok(await store.getSession(manager.sessionId));
+  assert.equal((await store.getSessionTurn("attachment-only"))?.sessionId, manager.sessionId);
   assert.match(WORKSPACE_MANAGER_INSTRUCTIONS, /An attachment without a clear actionable request is context only/);
 });
 
@@ -149,7 +155,7 @@ test("routing tools find older completed results outside the startup snapshot an
     agentResponse: "Different workspace result", status: "done", tokenIn: 0, tokenOut: 0 });
 
   const context = await service.context("routing");
-  assert.ok(context.includes(WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS));
+  assert.ok(!context.includes(WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS));
   assert.equal(context.includes('"sessionId":"old-export"'), false, "old work must be outside the bounded snapshot fixture");
   const history = await action({ action: "search", query: "CSV" });
   assert.deepEqual(history.results.map((item: any) => item.session.id), ["old-export"]);

@@ -618,7 +618,8 @@ export function compactTimelineEntries(ctx, segments) {
     const subagentItems = segments.flatMap((segment) => segment.type === "live" && segment.item.itemType === "subagent"
         ? [{ id: segment.id, item: segment.item }]
         : []);
-    let emittedSubagentGroup = false;
+    const subagentGroups = groupSubagentItems(subagentItems);
+    let emittedSubagentGroups = false;
     let index = 0;
     while (index < segments.length) {
         const segment = segments[index];
@@ -633,14 +634,9 @@ export function compactTimelineEntries(ctx, segments) {
             continue;
         }
         if (segment.item.itemType === "subagent") {
-            if (!emittedSubagentGroup) {
-                entries.push({
-                    kind: "action_group",
-                    id: `subagent-group:${subagentItems[0].id}`,
-                    groupType: "subagent",
-                    items: subagentItems
-                });
-                emittedSubagentGroup = true;
+            if (!emittedSubagentGroups) {
+                entries.push(...subagentGroups.map(({ id, item }) => ({ kind: "item", id, item })));
+                emittedSubagentGroups = true;
             }
             index += 1;
             continue;
@@ -663,6 +659,125 @@ export function compactTimelineEntries(ctx, segments) {
         entries.push({ kind: "action_group", id: `${groupType}-group:${items[0].id}`, groupType, items });
     }
     return entries;
+
+}
+
+function groupSubagentItems(items) {
+    const records = items.flatMap(({ id, item }) => {
+        const agents = Array.isArray(item.agents) ? item.agents : [];
+        const receiverThreadIds = [...new Set((item.receiverThreadIds ?? []).filter(Boolean))];
+        if (receiverThreadIds.length > 0) {
+            return receiverThreadIds.map((threadId) => {
+                const agent = agents.find((candidate) => candidate.id === threadId) ??
+                    (receiverThreadIds.length === 1 && agents.length === 1 ? agents[0] : undefined);
+                const label = agent?.name?.trim() || (receiverThreadIds.length === 1 ? item.label?.trim() : "") ||
+                    (agent?.id && agent.id !== threadId ? agent.id : threadId);
+                const aliases = [`identity:${threadId}`];
+                if (agent?.id) aliases.push(`identity:${agent.id}`);
+                if (label) aliases.push(`name:${label}`);
+                return {
+                    segmentId: id,
+                    aliases,
+                    item: { ...item, label, receiverThreadIds: [threadId], agents: agent ? [agent] : agents }
+                };
+            });
+        }
+
+        const isListAgents = /list[_ -]?agents/i.test(item.tool ?? "");
+        if (agents.length > 0 && (!item.label || isListAgents)) {
+            return agents.flatMap((agent) => {
+                const label = agent.name?.trim() || agent.id?.trim();
+                if (!label) return [];
+                return [{
+                    segmentId: id,
+                    aliases: [`identity:${agent.id}`, `name:${label}`],
+                    item: { ...item, label, status: agent.status || item.status, receiverThreadIds: [], agents: [agent] }
+                }];
+            });
+        }
+
+        const label = item.label?.trim();
+        if (!label) return [];
+        const agent = agents.find((candidate) => candidate.name === label || candidate.id === label);
+        const aliases = [`name:${label}`];
+        if (agent?.id) aliases.push(`identity:${agent.id}`);
+        return [{
+            segmentId: id,
+            aliases,
+            item: { ...item, label, receiverThreadIds: [], agents: agent ? [agent] : [] }
+        }];
+    });
+
+    const parents = records.map((_, index) => index);
+    const find = (index) => {
+        while (parents[index] !== index) {
+            parents[index] = parents[parents[index]];
+            index = parents[index];
+        }
+        return index;
+    };
+    const union = (left, right) => {
+        const leftRoot = find(left);
+        const rightRoot = find(right);
+        if (leftRoot !== rightRoot) parents[rightRoot] = leftRoot;
+    };
+    const recordForAlias = new Map();
+    records.forEach((record, index) => {
+        for (const alias of record.aliases) {
+            const existingIndex = recordForAlias.get(alias);
+            if (existingIndex === undefined) recordForAlias.set(alias, index);
+            else union(index, existingIndex);
+        }
+    });
+
+    const groupedRecords = new Map();
+    records.forEach((record, index) => {
+        const root = find(index);
+        const group = groupedRecords.get(root) ?? [];
+        group.push(record);
+        groupedRecords.set(root, group);
+    });
+
+    return [...groupedRecords.values()].map((group) => {
+        const activityUpdates = group.map(({ item }) => item);
+        const latestItem = activityUpdates.at(-1);
+        const labels = activityUpdates.map((item) => item.label?.trim()).filter(Boolean);
+        const receiverThreadIds = [...new Set(activityUpdates.flatMap((item) => item.receiverThreadIds ?? []))];
+        const agentUpdates = new Map();
+        for (const item of activityUpdates) {
+            for (const agent of item.agents ?? []) {
+                const key = agent.id || agent.name || "agent";
+                const previous = agentUpdates.get(key);
+                const messages = [...new Set([previous?.message, agent.message].filter(Boolean))];
+                agentUpdates.set(key, {
+                    ...previous,
+                    ...agent,
+                    status: agent.status || previous?.status,
+                    ...(messages.length > 0 ? { message: messages.join("\n\n") } : {})
+                });
+            }
+        }
+        const displayName = labels.at(-1) || [...agentUpdates.values()].find((agent) => agent.name)?.name || "Subagent";
+        const agentSummaries = [...agentUpdates.values()];
+        const currentAgent = agentSummaries.find((agent) => receiverThreadIds.includes(agent.id)) ||
+            agentSummaries.find((agent) => agent.name === displayName) ||
+            (agentSummaries.length === 1 ? agentSummaries[0] : undefined);
+        const first = group[0];
+        const identity = first.aliases.find((alias) => alias.startsWith("identity:")) ?? first.aliases[0];
+        const id = `subagent:${first.segmentId}:${identity}`;
+        return {
+            id,
+            item: {
+                ...latestItem,
+                id,
+                label: displayName,
+                status: currentAgent?.status || latestItem.status,
+                receiverThreadIds,
+                agents: agentSummaries,
+                activityUpdates
+            }
+        };
+    });
 
 }
 
@@ -738,9 +853,16 @@ export function actionGroupTitle(ctx, items, groupType) {
 
 }
 
-export function CompletedTurn(ctx, { message, steerMessages, codexSessionId, sessionId, workspaceId }) {
+export function CompletedTurn(ctx, { message, steerMessages, codexSessionId, sessionId, workspaceId, conclusionOnly = false }) {
     const { MarkdownContent, TimelineEntries, TurnChangeList, TurnIssueTracker, _Fragment, _jsx, _jsxs, appendSteerSegment, collectFileChanges, compactTimelineEntries, compareSteerMessages, isDisplayableLiveItem, isDisplayableMessageSegment, latestTurnIssueTracker, liveItemKey, removeLastTextSegment, withTurnLevelStatus } = ctx;
     const conclusion = message.conclusion || message.content;
+    if (conclusionOnly) {
+        if (!conclusion) return null;
+        return _jsxs(_Fragment, { children: [
+            _jsx("span", { "data-copy-markdown": conclusion, hidden: true }),
+            _jsx(MarkdownContent, { className: "turn-conclusion", children: conclusion })
+        ] });
+    }
     const executionItems = (message.liveItems ?? []).filter(isDisplayableLiveItem);
     let baseSegments = message.segments && message.segments.length > 0
         ? message.segments

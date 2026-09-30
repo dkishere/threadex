@@ -1,4 +1,4 @@
-import { Cog } from "lucide-react";
+import { Cog, Zap } from "lucide-react";
 import { useEffect, useRef, useState, type DragEvent, type MouseEvent, type ReactNode } from "react";
 import type { ModelReasoningEffort } from "./appTypes";
 import { COMPACT_FILE_DROP_QUERY } from "./globalFileDrop";
@@ -6,6 +6,7 @@ import { COMPACT_FILE_DROP_QUERY } from "./globalFileDrop";
 export type ComposerGearProfile = {
   model: string;
   effort: ModelReasoningEffort;
+  fastMode?: boolean;
 };
 
 type ComposerFrameProps = {
@@ -35,6 +36,7 @@ type ComposerGearSelectorProps = {
   onActivateGear: (index: number) => void;
   onModelChange: (index: number, model: string) => void;
   onEffortChange: (index: number, effort: ModelReasoningEffort) => void;
+  onFastModeChange?: (index: number, enabled: boolean) => void;
   autoModelValue?: string;
   autoEffort?: ModelReasoningEffort;
   disabled?: boolean;
@@ -155,6 +157,7 @@ export function ComposerGearSelector({
   onActivateGear,
   onModelChange,
   onEffortChange,
+  onFastModeChange,
   autoModelValue,
   autoEffort,
   disabled = false,
@@ -174,6 +177,7 @@ export function ComposerGearSelector({
     return () => media.removeEventListener("change", update);
   }, []);
   const activeGear = gears[activeGearIndex] ?? gears[0];
+  const fastMode = activeGear?.fastMode === true;
   const activeGearIsAuto = activeGear && autoModelValue !== undefined && activeGear.model === autoModelValue;
   const activeGearEffort = activeGear
     ? activeGearIsAuto && autoEffort ? autoEffort : activeGear.effort
@@ -208,6 +212,7 @@ export function ComposerGearSelector({
           aria-expanded={isMenuOpen}
           aria-label="Configure model gears"
           title="Configure model gears"
+          data-fast-mode={fastMode ? "true" : undefined}
           onClick={() => setIsMenuOpen((open) => !open)}
         >
           <Cog aria-hidden="true" />
@@ -223,7 +228,8 @@ export function ComposerGearSelector({
             const isActive = activeGearIndex === index;
             const isAuto = autoModelValue !== undefined && gear.model === autoModelValue;
             const selectedEffort = isAuto && autoEffort ? autoEffort : gear.effort;
-            const gearTitle = isAuto ? "Auto: Jev selects each turn when configured in Settings; otherwise uses automatic upgrades" : `Gear ${index + 1}: ${modelOptionLabel(gear.model)} · ${effortOptionLabel(selectedEffort)}`;
+            const gearDescription = isAuto ? "Auto: Jev selects each turn when configured in Settings; otherwise uses automatic upgrades" : `Gear ${index + 1}: ${modelOptionLabel(gear.model)} · ${effortOptionLabel(selectedEffort)}`;
+            const gearTitle = gear.fastMode ? `${gearDescription} · Fast mode` : gearDescription;
             const gearLabel = isAuto ? "Auto" : `${compactModelLabel(gear.model, modelOptionLabel(gear.model), isAuto)}·${COMPACT_EFFORT_LABELS[selectedEffort]}`;
 
             return (
@@ -245,6 +251,7 @@ export function ComposerGearSelector({
                   aria-label={gearTitle}
                   onChange={() => onActivateGear(index)}
                 />
+                {gear.fastMode && <Zap className="composer-gear-fast-indicator" aria-hidden="true" />}
                 <span>{gearLabel}</span>
               </label>
             );
@@ -254,10 +261,10 @@ export function ComposerGearSelector({
       {isMenuOpen && (
         <div id={menuId} className="composer-gear-menu" role="group" aria-label="Model gear configuration">
           <div className="composer-gear-menu-title">
-            <Cog aria-hidden="true" />
-            <strong>Model gear configuration</strong>
+            <span className="composer-gear-menu-icon"><Cog aria-hidden="true" /></span>
+            <span><strong>Model gears</strong><small>Choose a model, effort and Fast mode for each gear · Fast uses more quota</small></span>
           </div>
-          <div className="composer-gear-config-list">
+          <div className="composer-gear-config-list" data-fast-controls={onFastModeChange ? "true" : undefined}>
             {gears.map((gear, index) => {
               const isActive = activeGearIndex === index;
               const isAuto = autoModelValue !== undefined && gear.model === autoModelValue;
@@ -289,6 +296,15 @@ export function ComposerGearSelector({
                       </option>
                     ))}
                   </select>
+                  {onFastModeChange && (
+                    <button type="button" className="composer-gear-fast-switch" role="switch"
+                      aria-label={`Gear ${index + 1} fast mode`} aria-checked={gear.fastMode === true}
+                      title="Fast mode · higher usage cost" data-enabled={gear.fastMode ? "true" : undefined}
+                      disabled={disabled} onClick={() => onFastModeChange(index, !gear.fastMode)}>
+                      <Zap aria-hidden="true" />
+                      <span>Fast {gear.fastMode ? "On" : "Off"}</span>
+                    </button>
+                  )}
                 </div>
               );
             })}

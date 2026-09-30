@@ -123,6 +123,9 @@ export type StreamItem = {
       id: string;
       eventType: "item.started" | "item.updated" | "item.completed";
       itemType: "context_compaction";
+      beforeTokens?: number;
+      afterTokens?: number;
+      modelContextWindow?: number;
     }
   | {
       id: string;

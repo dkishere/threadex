@@ -7,7 +7,7 @@ export async function openLinkedSession(ctx, record) {
             window.open(record.url, "_blank", "noopener,noreferrer");
             return;
         }
-        if (record.workspaceId !== activeWorkspace?.id && !(await switchWorkspace(record.workspaceId, { history: "none" }))) {
+        if (record.workspaceId !== activeWorkspace?.id && !(await switchWorkspace(record.workspaceId, { history: "none", preserveTargetSession: true }))) {
             return;
         }
         await switchSession(record);

@@ -8,6 +8,7 @@
     const contextKeyPrefix = "codex-browser-bridge:context:";
     const receiverAttribute = "data-local-browser-bridge-context-receiver";
     const injectionEvent = "local-browser-bridge:inject-context";
+    const injectionResultEvent = "local-browser-bridge:inject-context-result";
     let active = true;
     let menuHost;
     let highlightHost;
@@ -16,11 +17,14 @@
         "auxclick",
         "click",
         "dblclick",
+        "focusin",
+        "focusout",
         "keydown",
         "keypress",
         "keyup",
         "mousedown",
         "mouseup",
+        "pointerdown",
         "pointerup",
         "pointercancel",
         "touchstart",
@@ -67,8 +71,23 @@
             sendResponse({ ok: false });
             return;
         }
-        document.dispatchEvent(new CustomEvent(injectionEvent, { detail: JSON.stringify(context) }));
-        sendResponse({ ok: true });
+        const requestId = crypto.randomUUID();
+        const timeout = setTimeout(() => finish({ ok: false, error: "Threadex did not confirm the attachment. Check its tab before trying again." }), 60000);
+        function onResult(event) {
+            if (!(event instanceof CustomEvent) || typeof event.detail !== "string") return;
+            try {
+                const result = JSON.parse(event.detail);
+                if (result.requestId === requestId) finish(result);
+            } catch { /* Ignore unrelated page events. */ }
+        }
+        function finish(result) {
+            clearTimeout(timeout);
+            document.removeEventListener(injectionResultEvent, onResult);
+            sendResponse({ ok: result.ok === true, error: result.error });
+        }
+        document.addEventListener(injectionResultEvent, onResult);
+        document.dispatchEvent(new CustomEvent(injectionEvent, { detail: JSON.stringify({ requestId, context }) }));
+        return true;
     }
     async function initialize() {
         try {
@@ -135,7 +154,7 @@
     async function showContextMenu(x, y, element, screenshot) {
         closeMenu();
         showElementHighlight(element);
-        const loading = createMenu(x, y);
+        const loading = createMenu(x, y, element);
         loading.shadowRoot?.append(createStatus("Loading page context…"));
         positionMenu(loading, x, y, element);
         try {
@@ -178,12 +197,12 @@
                     setButtonState(button, "Adding…", true);
                     try {
                         await send({ type: "submitPageContext", context: contextWithComment(), receiverTabId: config.receiver.tabId });
-                        setButtonState(button, "Added", true);
-                        setTimeout(closeMenu, 500);
+                        setButtonState(button, "Added to Threadex", true);
+                        showMenuNotice("Page context attached in Threadex. You can keep browsing here.");
                     }
                     catch (error) {
                         setButtonState(button, addLabel, false);
-                        showError(error);
+                        showMenuNotice(errorMessage(error), true);
                     }
                 }));
             }
@@ -273,7 +292,7 @@
         }
         return parts.join(" > ") || null;
     }
-    function createMenu(x, y) {
+    function createMenu(x, y, element) {
         const host = document.createElement("div");
         host.dataset.localBrowserBridgeMenu = "1";
         Object.assign(host.style, { all: "initial", position: "fixed", zIndex: "2147483647", left: `${x}px`, top: `${y}px` });
@@ -282,7 +301,20 @@
         for (const eventName of menuInteractionEvents) {
             host.addEventListener(eventName, interceptMenuEvent);
         }
-        document.documentElement.append(host);
+        // Focus traps also inspect focusout on the page's previously focused control.
+        // Keep the retargeted shadow host inside the selected element's dialog so
+        // that transfer is allowed before the textarea can receive focusin.
+        const dialog = element.closest('dialog, [role="dialog"], [role="alertdialog"]');
+        if (dialog) {
+            // A top-layer popover retains DOM ancestry for the focus trap while escaping
+            // the dialog's transforms and clipping. Positioning stays viewport-relative.
+            host.popover = "manual";
+            dialog.append(host);
+            host.showPopover();
+        }
+        else {
+            document.documentElement.append(host);
+        }
         menuHost = host;
         return host;
     }
@@ -375,6 +407,19 @@
         removeEventListener("resize", updateElementHighlight);
     }
     function showError(error) { window.alert(`Local Browser Bridge: ${errorMessage(error)}`); }
+    function showMenuNotice(message, error = false) {
+        const panel = menuHost?.shadowRoot?.querySelector(".panel");
+        if (!panel) return;
+        let notice = panel.querySelector(".notice");
+        if (!notice) {
+            notice = document.createElement("p");
+            notice.className = "notice";
+            notice.setAttribute("role", "status");
+            panel.append(notice);
+        }
+        notice.textContent = message;
+        notice.style.color = error ? "#f28b82" : "#81c995";
+    }
     function errorMessage(error) { return error instanceof Error ? error.message : String(error); }
     async function copyText(value) {
         if (navigator.clipboard?.writeText) {

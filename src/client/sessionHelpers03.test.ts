@@ -1,6 +1,28 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { developerInstructionRecordFromPayload, mergeDeveloperInstructionRecords, promptDisplayMetadata, sessionTurnsToMessages, turnDurationMs } from "./sessionHelpers03";
+import { developerInstructionRecordFromPayload, getWorkspaceTabSummary, mergeDeveloperInstructionRecords, promptDisplayMetadata, sessionTurnsToMessages, turnDurationMs } from "./sessionHelpers03";
+
+test("workspace activity excludes the current Manager while keeping ordinary tasks", () => {
+  const summary = getWorkspaceTabSummary({ displaySessionTitle: (title: string) => title, shortId: (id: string) => id },
+    "workspace", true, new Map(), [
+      { id: "manager", title: "Manager" }, { id: "task", title: "Task" }
+    ], { manager: "running", task: "running" }, new Set(["manager", "task"]), "manager");
+
+  assert.equal(summary.status, "awaiting_approval");
+  assert.equal(summary.approvalCount, 1);
+  assert.deepEqual(summary.sessions.map((session: { id: string }) => session.id), ["task"]);
+});
+
+test("workspace activity follows a changed Manager session ID", () => {
+  const summarize = (managerSessionId: string) => getWorkspaceTabSummary(
+    { displaySessionTitle: (title: string) => title, shortId: (id: string) => id },
+    "workspace", true, new Map(), [],
+    { previous: "running", current: "running", task: "running" }, new Set<string>(), managerSessionId
+  );
+
+  assert.deepEqual(summarize("previous").sessions.map((session: { id: string }) => session.id), ["current", "task"]);
+  assert.deepEqual(summarize("current").sessions.map((session: { id: string }) => session.id), ["previous", "task"]);
+});
 
 test("developer-instruction groups merge without an extra array layer", () => {
   const instructions = mergeDeveloperInstructionRecords({

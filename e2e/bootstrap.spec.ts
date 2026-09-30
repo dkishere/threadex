@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { test as authenticatedTest } from "./support/authenticated-test";
 import { apiBaseUrl, selectSession } from "./support/mock-runner.js";
 import { scenarioSessions } from "./support/scenarios.js";
 
@@ -430,61 +431,96 @@ test("keeps every compact gear selector active and submits supported model slugs
   });
 });
 
-test("keeps workspace model gears shared across threads and persists the active gear", async ({ page, request }) => {
+authenticatedTest("keeps workspace gears shared and persists independent Fast mode through switching, reload and submission", async ({ page, request }) => {
   const localSession = scenarioSessions.modelGears;
   expect(localSession.id.startsWith("local_")).toBe(true);
   await selectSession(request, localSession.id);
 
   await page.goto(`/?workspaceId=default&sessionId=${localSession.id}`);
-  await expect(page.locator(".content-header h1")).toHaveText(localSession.title);
+  await expect(page.locator(`.session-row[data-session-id="${localSession.id}"]`)).toHaveAttribute("data-active", "true");
 
   await page.getByRole("button", { name: "Configure model gears" }).click();
-  const gearRadios = page.locator(".composer-gear-radio");
+  const gearRadios = page.locator('aside[aria-label="Model gears"] .composer-gear-radio');
   const gear2Model = page.getByLabel("Gear 2 model", { exact: true });
   const gear2Effort = page.getByLabel("Gear 2 effort", { exact: true });
   const gear3Model = page.getByLabel("Gear 3 model", { exact: true });
   const gear3Effort = page.getByLabel("Gear 3 effort", { exact: true });
+  const gear1Fast = page.getByRole("switch", { name: "Gear 1 fast mode", exact: true });
+  const gear2Fast = page.getByRole("switch", { name: "Gear 2 fast mode", exact: true });
+  const gear3Fast = page.getByRole("switch", { name: "Gear 3 fast mode", exact: true });
+  await expect(page.locator('#main-composer-gear-menu [role="switch"]')).toHaveCount(6);
 
-  await expect(gear2Model).toHaveValue("gpt-5.6-luna");
+  await expect(gear2Model).toHaveValue("gpt-6-luna");
   await expect(gear2Effort).toHaveValue("xhigh");
   await expect(gear3Model).toHaveValue("gpt-5.4");
   await expect(gear3Effort).toHaveValue("medium");
   await expect(gearRadios.nth(1)).toHaveAttribute("data-active", "true");
 
-  await gear3Model.selectOption("gpt-5.6-sol");
+  await gear3Model.selectOption("gpt-6-sol");
   await gear3Effort.selectOption("high");
+  await gear3Fast.click();
   await page.getByRole("button", { name: "Activate gear 3" }).click();
 
-  await expect(gear2Model).toHaveValue("gpt-5.6-luna");
+  await expect(gear2Model).toHaveValue("gpt-6-luna");
   await expect(gear2Effort).toHaveValue("xhigh");
-  await expect(gear3Model).toHaveValue("gpt-5.6-sol");
+  await expect(gear3Model).toHaveValue("gpt-6-sol");
   await expect(gear3Effort).toHaveValue("high");
+  await expect(gear3Fast).toHaveAttribute("aria-checked", "true");
+  await expect(gear1Fast).toHaveAttribute("aria-checked", "false");
+  await expect(gear2Fast).toHaveAttribute("aria-checked", "false");
   await expect(gearRadios.nth(2)).toHaveAttribute("data-active", "true");
+  await page.getByRole("button", { name: "Activate gear 2" }).click();
+  await expect(gear2Fast).toHaveAttribute("aria-checked", "false");
+  await expect(page.locator('button[aria-controls="main-composer-gear-menu"]')).not.toHaveAttribute("data-fast-mode", "true");
+  await page.getByRole("button", { name: "Activate gear 3" }).click();
 
   await expect.poll(async () => {
     const response = await request.get(
       `${apiBaseUrl}/api/sessions/${encodeURIComponent(localSession.id)}/snapshot`
     );
-    return (await response.json()).modelPreferences;
+    const preferences = (await response.json()).modelPreferences;
+    return { ...preferences, gearProfiles: preferences.gearProfiles.slice(0, 3) };
   }).toMatchObject({
     gearProfiles: [
-      { model: "gpt-5.6-terra", effort: "low" },
-      { model: "gpt-5.6-luna", effort: "xhigh" },
-      { model: "gpt-5.6-sol", effort: "high" }
+      { model: "gpt-6-luna", effort: "low", fastMode: false },
+      { model: "gpt-6-luna", effort: "xhigh", fastMode: false },
+      { model: "gpt-6-sol", effort: "high", fastMode: true }
     ],
     activeGearIndex: 2
   });
 
-  await page.locator(".session-row", { hasText: scenarioSessions.bootstrap.title }).dispatchEvent("click");
-  await expect(page.locator(".content-header h1")).toHaveText(scenarioSessions.bootstrap.title);
-  await page.locator(".session-row", { hasText: localSession.title }).dispatchEvent("click");
-  await expect(page.locator(".content-header h1")).toHaveText(localSession.title);
+  await page.locator(`.session-row[data-session-id="${scenarioSessions.bootstrap.id}"]`).dispatchEvent("click");
+  await expect(page.locator(`.session-row[data-session-id="${scenarioSessions.bootstrap.id}"]`)).toHaveAttribute("data-active", "true");
+  await page.locator(`.session-row[data-session-id="${localSession.id}"]`).dispatchEvent("click");
+  await expect(page.locator(`.session-row[data-session-id="${localSession.id}"]`)).toHaveAttribute("data-active", "true");
 
-  await expect(gear2Model).toHaveValue("gpt-5.6-luna");
+  await expect(gear2Model).toHaveValue("gpt-6-luna");
   await expect(gear2Effort).toHaveValue("xhigh");
-  await expect(gear3Model).toHaveValue("gpt-5.6-sol");
+  await expect(gear3Model).toHaveValue("gpt-6-sol");
+  await expect(gear3Fast).toHaveAttribute("aria-checked", "true");
   await expect(gear3Effort).toHaveValue("high");
   await expect(gearRadios.nth(2)).toHaveAttribute("data-active", "true");
+
+  await page.reload();
+  await page.getByRole("button", { name: "Configure model gears" }).click();
+  await expect(gear3Fast).toHaveAttribute("aria-checked", "true");
+  await expect(gear1Fast).toHaveAttribute("aria-checked", "false");
+  await expect(gear2Fast).toHaveAttribute("aria-checked", "false");
+
+  let submittedFastMode: boolean | null = null;
+  await page.route("**/api/chat", async (route) => {
+    submittedFastMode = route.request().postDataJSON().fastMode;
+    await route.fulfill({ status: 200, contentType: "text/event-stream; charset=utf-8",
+      body: "event: done\ndata: {\"ok\":true}\n\n" });
+  });
+  await page.getByRole("textbox", { name: "Message" }).fill("Use Gear 3 Fast mode");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect.poll(() => submittedFastMode).toBe(true);
+  await page.getByRole("button", { name: "Configure model gears" }).click();
+  await page.getByRole("button", { name: "Activate gear 1" }).click();
+  await page.getByRole("textbox", { name: "Message" }).fill("Use Gear 1 standard mode");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect.poll(() => submittedFastMode).toBe(false);
 });
 
 test("keeps Auto selected across sessions and submits a Luna high per-session start", async ({ page, request }) => {

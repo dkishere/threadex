@@ -100,20 +100,6 @@ export function dropQueuedPrompt(ctx, targetPromptId) {
     
 }
 
-export async function editPendingTurn(ctx, message) {
-    const { findUserMessageForTurn, latestMessagesRef, sessionId, setPromptEditor } = ctx;
-        if (!sessionId || !message.turnId || message.role !== "assistant" || message.turnStatus !== "todo") {
-            return;
-        }
-        const userMessage = findUserMessageForTurn(latestMessagesRef.current, message.turnId);
-        setPromptEditor({
-            kind: "pending",
-            turnId: message.turnId,
-            title: "Edit pending turn",
-            value: userMessage?.content ?? ""
-        });
-    
-}
 
 export function editWaitSubscription(ctx, subscription) {
     const { pendingPromptForSubscription, setPromptEditor } = ctx;
@@ -175,7 +161,7 @@ export async function removeWaitSubscription(ctx, subscription) {
 }
 
 export async function savePromptEditor(ctx, event) {
-    const { eventStore, findUserMessageForTurn, isLikelyBackendDisconnect, latestMessagesRef, noteBackendDisconnect, noteBackendRequestSucceeded, promptEditor, scheduleLoadSessions, sessionId, sessionIdRef, setMessages, setPromptEditor, setStatus, setWaitSubscriptionAction, showToast } = ctx;
+    const { eventStore, isLikelyBackendDisconnect, noteBackendDisconnect, noteBackendRequestSucceeded, promptEditor, scheduleLoadSessions, sessionIdRef, setMessages, setPromptEditor, setWaitSubscriptionAction, showToast } = ctx;
         event.preventDefault();
         if (!promptEditor) {
             return;
@@ -219,43 +205,6 @@ export async function savePromptEditor(ctx, event) {
                 setWaitSubscriptionAction(null);
             }
             return;
-        }
-        if (!sessionId) {
-            return;
-        }
-        const turnId = promptEditor.turnId;
-        const userMessage = findUserMessageForTurn(latestMessagesRef.current, turnId);
-        setStatus("Editing queued prompt");
-        try {
-            const response = await fetch(`/api/pending-turns/${encodeURIComponent(turnId)}`, {
-                method: "PATCH",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    sessionId,
-                    message: trimmedInput
-                })
-            });
-            const payload = (await response.json().catch(() => null));
-            if (!response.ok || !payload?.turn) {
-                throw new Error(payload?.error || `API returned ${response.status}`);
-            }
-            noteBackendRequestSucceeded();
-            setMessages((current) => current.map((candidate) => candidate.id === `${turnId}:user` || (userMessage && candidate.id === userMessage.id)
-                ? { ...candidate, content: trimmedInput, rawContent: trimmedInput }
-                : candidate));
-            setPromptEditor(null);
-            setStatus("Queued prompt edited");
-            scheduleLoadSessions();
-        }
-        catch (error) {
-            if (isLikelyBackendDisconnect(error)) {
-                noteBackendDisconnect();
-            }
-            else {
-                const content = error instanceof Error ? error.message : "Unknown edit error";
-                setStatus(`Edit failed: ${content}`);
-                showToast(`Edit failed: ${content}`);
-            }
         }
     
 }
@@ -759,7 +708,8 @@ export function updateGearProfile(ctx, index, update) {
             const requestedEffort = nextModel === AUTO_MODEL_VALUE ? "high" : update.effort ?? gear.effort;
             return {
                 model: nextModel,
-                effort: (requestedEffort === "max" || requestedEffort === "ultra") && !supportsUltraEffort(nextModel) ? "xhigh" : requestedEffort
+                effort: (requestedEffort === "max" || requestedEffort === "ultra") && !supportsUltraEffort(nextModel) ? "xhigh" : requestedEffort,
+                fastMode: update.fastMode ?? gear.fastMode ?? false
             };
         }));
     

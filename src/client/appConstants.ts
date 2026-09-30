@@ -17,7 +17,7 @@ export const APPROVAL_POLICY_OPTIONS: Array<{ value: ApprovalPolicy; label: stri
 export { MODEL_OPTIONS } from "../modelCatalog";
 export const EFFORT_OPTIONS: ModelReasoningEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
 export const ULTRA_EFFORT_OPTIONS: ModelReasoningEffort[] = [...EFFORT_OPTIONS, "max", "ultra"];
-export const MAX_ATTACHMENTS = 6;
+export const MAX_ATTACHMENTS = Number.POSITIVE_INFINITY;
 export const MAX_ATTACHMENT_BYTES = MAX_INLINE_ATTACHMENT_BYTES;
 export { MAX_PATH_ATTACHMENT_BYTES };
 export const PASTED_TEXT_COMPACT_THRESHOLD = 2_000;

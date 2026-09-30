@@ -2,6 +2,7 @@
 export const MODEL_CATALOG = {
   luna: { id: "gpt-6-luna", label: "6 Luna", ultra: true, autoLowEffort: false, aliases: ["gpt-5.6-luna", "gpt-5.6 Luna", "gpt-5.6-terra", "gpt-5.6 Terra"] },
   sol: { id: "gpt-6-sol", label: "6 Sol", ultra: true, autoLowEffort: false, aliases: ["gpt-5.6-sol", "gpt-5.6 Sol"] },
+  sol61: { id: "gpt-6.1-sol", label: "6.1 Sol", ultra: true, autoLowEffort: false, aliases: [] },
   astra: { id: "gpt-6-astra", label: "6 Astra", ultra: true, autoLowEffort: true, aliases: [] },
   gpt55: { id: "gpt-5.5", label: "5.5", ultra: false, autoLowEffort: false, aliases: [] },
   gpt54: { id: "gpt-5.4", label: "5.4", ultra: false, autoLowEffort: false, aliases: [] },
@@ -9,6 +10,8 @@ export const MODEL_CATALOG = {
 } as const;
 
 export const AUTO_MODEL_ORDER = [MODEL_CATALOG.luna.id, MODEL_CATALOG.sol.id, MODEL_CATALOG.astra.id] as const;
+/** Manager assignments use 6.1 Sol without changing Auto routing defaults. */
+export const WORKSPACE_MANAGER_MODEL_ORDER = [MODEL_CATALOG.luna.id, MODEL_CATALOG.sol61.id, MODEL_CATALOG.astra.id] as const;
 export const MODEL_OPTIONS: readonly string[] = [...[...AUTO_MODEL_ORDER].reverse(), ...Object.values(MODEL_CATALOG).filter(model => !(AUTO_MODEL_ORDER as readonly string[]).includes(model.id)).map(model => model.id)];
 export const DEFAULT_MODEL = MODEL_CATALOG.luna.id;
 export const REVIEW_MODEL = MODEL_CATALOG.sol.id;

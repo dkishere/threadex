@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import { AUTO_MODEL_ORDER } from "../modelCatalog";
+import type { CollaborationView } from "../collaboration";
 import { WORKSPACE_MANAGER_TOOLS, WORKSPACE_MANAGER_ACTIONS } from "./workspaceManagerTools";
 import { createInterface } from "node:readline";
 import { createTurnGrillHistoryReader } from "./turnGrillContext";
@@ -52,6 +54,7 @@ type SessionPromptInput = {
 
 const apiBaseUrl = process.env.SESSION_INSPECTOR_SERVER_URL?.replace(/\/$/, "") || null;
 const managerSessionId = process.env.THREADEX_SESSION_ID?.trim() || null;
+const collaborationId = process.env.THREADEX_CONCURRENT_ID?.trim() || process.env.THREADEX_COLLABORATION_ID?.trim() || null;
 const workspaceManager = process.env.THREADEX_WORKSPACE_MANAGER === "1";
 const managerThreadId = process.env.THREADEX_THREAD_ID?.trim() || null;
 const managerTurnId = process.env.THREADEX_TURN_ID?.trim() || null;
@@ -450,12 +453,14 @@ if (managerSessionId) {
     },
     {
       name: "todo_add_item",
-      description: "Add one todo item. Use parentId to create nested subtasks. Status may be todo, active, paused, hold, skipped, done, or blocked.",
+      description: "Add one todo item. Use parentId to create nested subtasks. Status may be todo, active, paused, hold, skipped, done, or blocked. When independently accepting an Auto Grill issue as Todo, provide both grillTurnId and grillIssueId to link the item to that issue.",
       inputSchema: {
         type: "object",
         required: ["title"],
         properties: {
           sessionId: { type: "string" },
+          grillTurnId: { type: "string", description: "Source turn ID for an Auto Grill issue accepted after agent evaluation." },
+          grillIssueId: { type: "string", description: "Issue ID in that Grill review." },
           parentId: { type: "string" },
           title: { type: "string", minLength: 1, maxLength: 500 },
           details: { type: "string", maxLength: 12000 },
@@ -631,7 +636,7 @@ if (managerSessionId) {
   tools.push({
     name: "create_task",
     description:
-      "Create a new background Codex task whose parent is the current Threadex session. By default this only creates the child session; set startImmediately=true to run it now. The prompt must be a self-contained handoff assembled from the current thread context.",
+      "Create a new background Codex task whose parent is the current Threadex session. By default this only creates the child session; set startImmediately=true to run it now. Give a concise actionable handoff using verified child-accessible sources plus essential missing context; do not assume parent conversation inheritance.",
     inputSchema: {
       type: "object",
       required: ["prompt"],
@@ -640,7 +645,7 @@ if (managerSessionId) {
           type: "string",
           minLength: 1,
           maxLength: 250000,
-          description: "Self-contained task prompt including all relevant context, constraints, current state, and verification expectations."
+          description: "Current objective, precise references to sources verified accessible to the child, and only necessary context or acceptance criteria absent there. Do not repeat available source contents; preserve required canonical wording and attachment delivery."
         },
         title: { type: "string", minLength: 1, maxLength: 160 },
         startImmediately: { type: "boolean", default: false },
@@ -725,7 +730,23 @@ tools.push({
   inputSchema: { type: "object", required: ["id"], properties: { id: { type: "string" }, parameterValues: { type: "object", additionalProperties: { type: ["string", "number"] }, description: "Values keyed by registered parameter name. Omitted values use their defaults." } }, additionalProperties: false }
 });
 
+const collaborationTools: ToolSpec[] = [{
+  name: "concurrent_status", description: "Refresh this Concurrent group's local IDs, tasks, progress, dependencies, results and delivery receipts.",
+  inputSchema: { type: "object", properties: {}, additionalProperties: false }
+}, {
+  name: "concurrent_send", description: "Send a dependency or follow-up to an existing Concurrent member by local ID. Running targets receive steer; idle targets queue. Reuse requestId on retries. wait=true requests a result notification; end your turn if all remaining work depends on it. Never resend uncertain delivery with another ID.",
+  inputSchema: { type: "object", required: ["requestId", "to", "message", "reason"], additionalProperties: false,
+    properties: { requestId: { type: "string", minLength: 1, maxLength: 100 }, to: { type: "string" },
+      message: { type: "string", minLength: 1, maxLength: 100000 }, reason: { type: "string", minLength: 1, maxLength: 4000 }, wait: { type: "boolean" } } }
+}];
+
 function toolsForAgent() {
+  const base = baseToolsForAgent();
+  return collaborationId && !["side_chat", "turn_grill", "planner"].includes(todoAgentRole)
+    ? [...base, ...collaborationTools] : base;
+}
+
+function baseToolsForAgent() {
   if (workspaceManager) return WORKSPACE_MANAGER_TOOLS;
   if (todoAgentRole === "turn_grill") return tools.filter((tool) => tool.name === "get_session");
   if (lightweightTodo) return tools.filter((tool) => !tool.name.startsWith("todo_"));
@@ -833,10 +854,23 @@ async function callTool(params: unknown) {
     throw new Error(`Tool is not available to this ${todoAgentRole} agent: ${name ?? "unknown"}`);
   }
 
+  if (name === "concurrent_status" || name === "concurrent_send") {
+    if (!managerSessionId || !collaborationId) throw new Error("No active Concurrent group.");
+    const path = `/api/concurrent/sessions/${encodeURIComponent(managerSessionId)}`;
+    if (name === "concurrent_send") return toolResult(await postJson(`${path}/send`, { ...args, turnId: managerTurnId }));
+    const { group } = await getJson(path) as { group: CollaborationView | null };
+    return toolResult(group ? { id: group.id, revision: group.revision, updated: group.updated, mainSessionId: group.mainSessionId,
+      members: group.members.map(member => ({ localId: member.localId, sessionId: member.sessionId, task: member.task.slice(0, 2000), ...group.activity[member.localId] })),
+      conflicts: group.conflicts, error: group.error,
+      pending: group.messages.filter(item => !item.completed && item.state !== "cancelled").slice(-50).map(item => ({ id: item.id, from: item.from, to: item.to, wait: item.wait, state: item.state, turnId: item.targetTurnId, error: item.error })),
+      results: group.results.slice(-10).map(result => ({ ...result, summary: result.summary.slice(0, 2000) }))
+    } : { group: null });
+  }
+
   if (workspaceManager && WORKSPACE_MANAGER_ACTIONS[name]) {
     if (!managerSessionId) throw new Error("Workspace manager session is unavailable.");
     return toolResult(await postJson(`/api/workspace-manager/${encodeURIComponent(managerSessionId)}/action`, {
-      ...args, action: WORKSPACE_MANAGER_ACTIONS[name]
+      ...args, action: WORKSPACE_MANAGER_ACTIONS[name], managerTurnId
     }));
   }
 
@@ -934,6 +968,8 @@ async function callTool(params: unknown) {
   if (name === "todo_add_item") {
     const sessionId = readSessionIdArg(args);
     return toolResult(await postJson(`/api/sessions/${encodeURIComponent(sessionId)}/todos/items`, {
+      grillTurnId: readString(args.grillTurnId) ?? undefined,
+      grillIssueId: readString(args.grillIssueId) ?? undefined,
       id: readString(args.id) ?? undefined,
       parentId: readString(args.parentId) ?? null,
       title: readRequiredString(args, "title"),
@@ -1143,14 +1179,50 @@ async function callTool(params: unknown) {
     if (!managerSessionId) {
       throw new Error("create_task requires a current Threadex session.");
     }
+    const forkTurn = managerContextForkRequest && managerTurnId
+      ? await getStore().getSessionTurn(managerTurnId) : null;
+    if (managerContextForkRequest && (!forkTurn || forkTurn.sessionId !== managerSessionId)) {
+      throw new Error("Context fork source turn is unavailable.");
+    }
+    const sourceAttachments = forkTurn?.requestMetadata?.attachments;
+    if (sourceAttachments !== undefined && !Array.isArray(sourceAttachments)) {
+      throw new Error("Context fork source attachments are invalid.");
+    }
+    const attachments = (sourceAttachments ?? []).map(value => {
+      const attachment = readObject(value);
+      const path = readString(attachment?.path);
+      const name = readString(attachment?.name);
+      const type = readString(attachment?.mimeType);
+      if (!path || !name || !type) {
+        throw new Error("Context fork source attachment is unavailable.");
+      }
+      const id = readString(attachment?.id);
+      return { ...(id ? { id } : {}), name, type, path };
+    });
+    const requestedPrompt = readRequiredString(args, "prompt");
+    const sourceRequest = forkTurn?.requestMetadata?.message;
+    if (attachments.length > 0 && (typeof sourceRequest !== "string" || !sourceRequest.trim())) {
+      throw new Error("The fork source request is unavailable; attached files cannot be handed off without its original wording.");
+    }
+    const childPrompt = attachments.length > 0 && typeof sourceRequest === "string" && !requestedPrompt.includes(sourceRequest)
+      ? `${requestedPrompt}\n\nCanonical source request (verbatim):\n${sourceRequest}`
+      : requestedPrompt;
+    if (childPrompt.length > 250_000) {
+      throw new Error("The fork child brief cannot preserve the attachment source request within the task prompt limit.");
+    }
     const startImmediately = managerContextForkRequest || readBoolean(args.startImmediately) === true;
     const childModel = readString(args.model) ?? managerModel;
     const childModelReasoningEffort = readString(args.modelReasoningEffort) ?? managerModelReasoningEffort;
+    const attachmentForkRequestId = managerContextForkRequest && attachments.length > 0
+      ? `qfork_${createHash("sha256").update(`${managerSessionId}:${managerTurnId}:attachments`).digest("hex").slice(0, 48)}`
+      : null;
     return toolResult(await postJson("/api/session-tasks", {
       parentSessionId: managerSessionId,
       sourceSessionId: managerSessionId,
       ...(managerContextForkRequest ? { contextFork: true } : {}),
-      prompt: readRequiredString(args, "prompt"),
+      ...(attachmentForkRequestId ? { queueForkRequestId: attachmentForkRequestId } : {}),
+      prompt: childPrompt,
+      ...(attachments.length > 0 ? { attachments } : {}),
       ...(readString(args.title) ? { title: readString(args.title) } : {}),
       ...(startImmediately ? { startImmediately } : {}),
       ...(childModel ? { model: childModel } : {}),

@@ -9,6 +9,7 @@ import { eventStore, useEventStore } from "./eventStore";
 import { MonacoDiffEditor } from "./MonacoDiffEditor";
 import { FileEditIcon } from "./FileEditIcon";
 import { MarkdownContent } from "./MarkdownContent";
+import { WorkspaceManagerDisplayContext } from "./WorkspaceManagerPanel";
 import { DeferredDetails } from "./DeferredDetails";
 import { sameTimelineItems } from "./timelineMemo";
 import { InlineLinkComposer } from "./InlineLinkComposer";
@@ -106,7 +107,8 @@ function shouldRenderMessageTimeline(message) { return sessionHelpers01.shouldRe
 const LiveEventList = memo(function LiveEventList({ items, anchorPrefix, sessionId: providedSessionId }) { return sessionHelpers01.LiveEventList({ FileAnnotationComposerContext, TimelineEntries, _jsx, compactTimelineEntries, isDisplayableLiveItem, liveItemKey, useContext }, { items, anchorPrefix, sessionId: providedSessionId }); });
 export const MessageTimeline = memo(function MessageTimeline(props) {
     const annotationContext = useContext(FileAnnotationComposerContext);
-    if (props.message) return sessionHelpers01.CompletedTurn({ MarkdownContent, TimelineEntries, TurnChangeList, TurnIssueTracker, _Fragment, _jsx, _jsxs, appendSteerSegment, collectFileChanges, compactTimelineEntries, compareSteerMessages, isDisplayableLiveItem, isDisplayableMessageSegment, latestTurnIssueTracker, liveItemKey, removeLastTextSegment, withTurnLevelStatus }, props);
+    const managerDisplay = useContext(WorkspaceManagerDisplayContext);
+    if (props.message) return sessionHelpers01.CompletedTurn({ MarkdownContent, TimelineEntries, TurnChangeList, TurnIssueTracker, _Fragment, _jsx, _jsxs, appendSteerSegment, collectFileChanges, compactTimelineEntries, compareSteerMessages, isDisplayableLiveItem, isDisplayableMessageSegment, latestTurnIssueTracker, liveItemKey, removeLastTextSegment, withTurnLevelStatus }, { ...props, conclusionOnly: managerDisplay });
     return sessionHelpers01.MessageTimeline({ annotationContext, TimelineEntries, TurnIssueTracker, _jsx, _jsxs, compactTimelineEntries, finalizePendingReasoningSegments, isDisplayableMessageSegment, latestTurnIssueTracker, withTurnLevelStatus }, props);
 }, (previous, next) => {
     if (previous.message && next.message) return previous.message === next.message && previous.codexSessionId === next.codexSessionId && previous.sessionId === next.sessionId && previous.workspaceId === next.workspaceId && previous.steerMessages.length === next.steerMessages.length && previous.steerMessages.every((message, index) => message === next.steerMessages[index]);
@@ -150,7 +152,7 @@ function serverPrefixBlocks(startupSnapshot, developerInstructions, showStartup 
 function extractServerProvidedBlocks(value) { return sessionHelpers02.extractServerProvidedBlocks({  }, value); }
 function serverPrefixMetadata(text, source) { return sessionHelpers02.serverPrefixMetadata({ isTodoMcpPromptText }, text, source); }
 function TurnChangeList({ changes, sessionId, turnId }) { return sessionHelpers02.TurnChangeList({ FileEditIcon, FileChangeList, Folder, openProjectFiles, _jsx, _jsxs }, { changes, sessionId, turnId }); }
-function FileChangeList({ changes }) { return sessionHelpers02.FileChangeList({ FileEditIcon, FileChangeDiffPopup, _Fragment, _jsx, _jsxs, compactFilePath, fileChangeLabel, fileChangeTone, useState }, { changes }); }
+function FileChangeList({ changes }) { return sessionHelpers02.FileChangeList({ Copy, FileEditIcon, FileChangeDiffPopup, _Fragment, _jsx, _jsxs, compactFilePath, fileChangeLabel, fileChangeTone, useState }, { changes }); }
 function hasVisibleTodoPlan(todo) { return sessionHelpers02.hasVisibleTodoPlan({  }, todo); }
 const LiveEvent = memo(function LiveEvent({ item, sessionId }) { return sessionHelpers02.LiveEvent({ ApprovalEvent, CheckSquare2, ChevronRight, Circle, DeferredDetails, FileChangeEvent, Loader2, MarkdownContent, MessageSquare, Shrink, StatusUpdateIndicator, StructuredCommentEvent, SubagentEvent, _jsx, _jsxs, commandStatus, fileChangeItemFromPatchCommand }, { item, sessionId }); });
 const StructuredCommentEvent = memo(function StructuredCommentEvent({ item, activities = [], id, sessionId }) { return sessionHelpers02.StructuredCommentEvent({ ChevronRight, DeferredDetails, FileEditIcon, LiveEvent, MarkdownContent, Search, TerminalSquare, _jsx, _jsxs, commentaryActivityCounts, commentaryTypeForActivities, structuredCommentIcon, structuredCommentType }, { item, activities, id, sessionId }); }, (previous, next) => previous.item === next.item && previous.id === next.id && previous.sessionId === next.sessionId && sameTimelineItems(previous.activities ?? [], next.activities ?? []));
@@ -205,7 +207,7 @@ function messageIndicatorToneForGroup(groupType) { return sessionHelpers03.messa
 function shortId(value) { return sessionHelpers03.shortId({  }, value); }
 function getSessionExecutionStatus(sessionId, sessionExecutionStatuses, pendingApprovalSessionIds) { return sessionHelpers03.getSessionExecutionStatus({  }, sessionId, sessionExecutionStatuses, pendingApprovalSessionIds); }
 function sessionExecutionStatusLabel(status) { return sessionHelpers03.sessionExecutionStatusLabel({  }, status); }
-function getWorkspaceTabSummary(workspaceId, isActive, statusMonitorById, sessions, sessionExecutionStatuses, pendingApprovalSessionIds) { return sessionHelpers03.getWorkspaceTabSummary({ displaySessionTitle, shortId }, workspaceId, isActive, statusMonitorById, sessions, sessionExecutionStatuses, pendingApprovalSessionIds); }
+function getWorkspaceTabSummary(workspaceId, isActive, statusMonitorById, sessions, sessionExecutionStatuses, pendingApprovalSessionIds, managerSessionId) { return sessionHelpers03.getWorkspaceTabSummary({ displaySessionTitle, shortId }, workspaceId, isActive, statusMonitorById, sessions, sessionExecutionStatuses, pendingApprovalSessionIds, managerSessionId); }
 function approvalShortText(item) { return sessionHelpers03.approvalShortText({ readRecord, readStringField, summarizeCommand }, item); }
 function isNoRolloutFoundMessage(value) { return sessionHelpers03.isNoRolloutFoundMessage({  }, value); }
 function cleanLoginUrlValue(value) { return sessionHelpers03.cleanLoginUrlValue({  }, value); }
@@ -236,7 +238,7 @@ function removePendingModelPreferencesIfMatches(workspaceId, preferences) { retu
 function sameModelPreferences(left, right) { return sessionHelpers04.sameModelPreferences({ normalizeSessionModelPreferences }, left, right); }
 function normalizeStoredModel(value) { return sessionHelpers04.normalizeStoredModel({ AUTO_MODEL_VALUE, MODEL_OPTIONS }, value); }
 function normalizeStoredApprovalPolicy(value) { return sessionHelpers04.normalizeStoredApprovalPolicy({  }, value); }
-function normalizeGearProfiles(value, fallbackModel, fallbackEffort) { return sessionHelpers04.normalizeGearProfiles({ isModelReasoningEffort, normalizeEffortForModel, normalizeStoredModel }, value, fallbackModel, fallbackEffort); }
+function normalizeGearProfiles(value, fallbackModel, fallbackEffort, fallbackFastMode = false) { return sessionHelpers04.normalizeGearProfiles({ isModelReasoningEffort, normalizeEffortForModel, normalizeStoredModel }, value, fallbackModel, fallbackEffort, fallbackFastMode); }
 function normalizeGearIndex(value) { return sessionHelpers04.normalizeGearIndex({  }, value); }
 function normalizeEffortForModel(effort, model) { return sessionHelpers04.normalizeEffortForModel({ AUTO_MODEL_VALUE, supportsUltraEffort }, effort, model); }
 function supportsUltraEffort(model) { return sessionHelpers04.supportsUltraEffort({  }, model); }

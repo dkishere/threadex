@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import type { WorkspaceRecord } from "./sessionStore";
 
 const sessionInspectorSkillName = "session-inspector";
-const builtinSkillNames = [sessionInspectorSkillName, "browser-bridge", "threadex-config", "threadex-author"] as const;
+const builtinSkillNames = [sessionInspectorSkillName, "browser-bridge", "threadex-config", "threadex-author", "threadex-concurrent"] as const;
 
 function injectSkill(workspace: WorkspaceRecord, sourceRoot: string, skillName: string) {
   const source = resolve(sourceRoot, skillName);
@@ -40,6 +40,15 @@ export function injectThreadexAuthorSkills(workspaces: WorkspaceRecord[], source
 }
 
 export function injectBuiltinSkills(workspace: WorkspaceRecord, sourceRoot: string) {
+  const legacy = resolve(workspace.codexHome, "skills", "threadex-collaboration");
+  try {
+    if (lstatSync(legacy).isSymbolicLink() &&
+      resolve(workspace.codexHome, "skills", readlinkSync(legacy)) === resolve(sourceRoot, "threadex-collaboration")) {
+      rmSync(legacy);
+    }
+  } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+  }
   const destinations = builtinSkillNames.map((skillName) => injectSkill(workspace, sourceRoot, skillName));
   injectBrowserBridgeRule(workspace);
   return destinations;

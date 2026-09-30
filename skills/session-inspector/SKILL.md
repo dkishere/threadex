@@ -43,7 +43,21 @@ server remains the owner of process state.
 - `POST /api/process-monitors/:id/restart`: restart an executable-backed monitor.
 - `DELETE /api/process-monitors/:id`: remove a monitor and stop its managed process.
 
-Use `RUNNER_SERVER_URL` or `http://127.0.0.1:8787` unless the runner job provides a different server URL.
+Before the first HTTP request, read `RUNNER_SERVER_URL` from the current runner
+environment and use that exact base URL when set. Do not hard-code or probe the
+default before checking it. Only when it is unset, derive the Express API URL
+from `PORT` (`http://127.0.0.1:${PORT:-8787}`). If that address is unreachable,
+stop and identify the active server URL from the runner or its process monitor;
+do not guess another port. Port `5173` may be a Vite client that proxies `/api`,
+or the unified Express server in `serve` mode, so use it only when the runner
+configuration identifies it as the active URL.
+
+For example, in a shell:
+
+```sh
+server_url="${RUNNER_SERVER_URL:-http://127.0.0.1:${PORT:-8787}}"
+curl -sS "$server_url/api/sessions"
+```
 
 ### Search sessions
 

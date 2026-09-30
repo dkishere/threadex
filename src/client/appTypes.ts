@@ -36,6 +36,8 @@ export type ChatMessage = {
   model?: string;
   /** The reasoning effort actually selected when this turn started. */
   reasoningEffort?: string;
+  /** Tier requested in the successful app-server turn/start call. */
+  requestedServiceTier?: "fast" | "default";
   /** True when the turn was submitted through the Auto gear. */
   autoModel?: boolean;
   /** Provider that selected an Auto turn's model. */
@@ -57,6 +59,7 @@ export type ChatMessage = {
   turnStatus?: "done" | "todo" | "running";
   pendingReason?: "queued" | "rate_limit" | "auth" | "stopped" | null;
   queueSteerReserved?: boolean;
+  queueEditReserved?: boolean;
   /** False while the chat request is waiting for the backend to start a runner. */
   runnerStarted?: boolean;
   attachments?: MessageAttachment[];
@@ -280,6 +283,9 @@ export type LiveItem = LiveItemOrigin & (
       id: string;
       eventType: ItemEventType;
       itemType: "context_compaction";
+      beforeTokens?: number;
+      afterTokens?: number;
+      modelContextWindow?: number;
     }
   | {
       id: string;
@@ -422,6 +428,7 @@ export type StoredSession = {
   selectedModel: string;
   selectedEffort: ModelReasoningEffort;
   approvalPolicy?: ApprovalPolicy;
+  fastMode?: boolean;
   gearProfiles?: GearProfile[];
   activeGearIndex?: number;
   useLoadBalanceInWorkspace?: boolean;
@@ -431,6 +438,7 @@ export type StoredModelSelector = {
   version: 1;
   selectedModel: string;
   selectedEffort: ModelReasoningEffort;
+  fastMode?: boolean;
   gearProfiles: GearProfile[];
   activeGearIndex: number;
 };
@@ -450,11 +458,13 @@ export type ModelReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhig
 export type GearProfile = {
   model: string;
   effort: ModelReasoningEffort;
+  fastMode?: boolean;
 };
 export type WorkspaceModelPreferences = {
   workspaceId: string;
   selectedModel: string;
   selectedEffort: ModelReasoningEffort;
+  fastMode?: boolean;
   gearProfiles: GearProfile[];
   activeGearIndex: number;
   updated: string;
@@ -572,6 +582,7 @@ export type SessionTurnRecord = {
   model?: string | null;
   /** The reasoning effort recorded when this turn began, if it is available. */
   reasoningEffort?: string | null;
+  requestedServiceTier?: "fast" | "default";
   liveItems?: StreamItem[];
   steerMessages?: Array<{
     id: string;

@@ -8,23 +8,31 @@ import {
   prepareWebVsCodeDevLaunch,
   reclaimOrphanedWebVsCodeDevServer,
   removeWebVsCodeSupervisorPid,
+  resolveWebVsCodeDevLaunch,
   writeWebVsCodeSupervisorPid
 } from "./web-vscode-dev.mjs";
 
 const rootDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const webVsCodeOnly = process.argv.includes("--web-vscode-only");
+// code-server treats PORT as its own bind port, even when --bind-addr is set.
+// The serve API uses PORT=5173; its code-server watcher must use WEB_VSCODE_PORT.
+if (webVsCodeOnly) delete process.env.PORT;
 const viteCli = resolve(rootDir, "node_modules/vite/bin/vite.js");
 const supervisorDir = resolve(process.env.SESSION_DATA_DIR ?? resolve(rootDir, "data"), "process-supervisors");
-const supervisorPidPath = resolve(supervisorDir, "client.pid");
-const supervisorLogPath = resolve(supervisorDir, "client.log");
+const supervisorName = webVsCodeOnly ? "web-vscode-launcher" : "client";
+const supervisorPidPath = resolve(supervisorDir, `${supervisorName}.pid`);
+const supervisorLogPath = resolve(supervisorDir, `${supervisorName}.log`);
 
-if (!existsSync(viteCli)) {
+if (!webVsCodeOnly && !existsSync(viteCli)) {
   console.error("Vite is not installed. Run npm install first.");
   process.exit(1);
 }
 
 mkdirSync(supervisorDir, { recursive: true });
-writeFileSync(supervisorPidPath, `${process.pid}\n`, "utf8");
-writeFileSync(supervisorLogPath, "", "utf8");
+if (!webVsCodeOnly) {
+  writeFileSync(supervisorPidPath, `${process.pid}\n`, "utf8");
+  writeFileSync(supervisorLogPath, "", "utf8");
+}
 
 let viteChild = null;
 let webVsCodeChild = null;
@@ -34,12 +42,13 @@ let shuttingDown = false;
 let viteRetryTimer = null;
 let webVsCodeRetryTimer = null;
 let webVsCodeStarting = false;
+let borrowedWebVsCodePid = null;
 
 process.once("SIGINT", () => shutdown(0));
 process.once("SIGTERM", () => shutdown(0));
 process.on("SIGUSR1", () => restartAll());
 
-startVite();
+if (!webVsCodeOnly) startVite();
 void startWebVsCode();
 
 function startVite() {
@@ -68,25 +77,45 @@ function startVite() {
 }
 
 async function startWebVsCode() {
-  if (shuttingDown || webVsCodeStarting) return;
+  if (shuttingDown || webVsCodeStarting || webVsCodeChild) return;
+  if (webVsCodeRetryTimer) clearTimeout(webVsCodeRetryTimer);
+  webVsCodeRetryTimer = null;
   webVsCodeStarting = true;
-  const launch = prepareWebVsCodeDevLaunch(rootDir);
+  let launch = resolveWebVsCodeDevLaunch(rootDir);
   if (!launch.enabled) {
     console.log(`Web VS Code development startup skipped: ${launch.reason}.`);
     webVsCodeStarting = false;
+    if (webVsCodeOnly) void shutdown(0);
     return;
   }
   try {
     const portState = await reclaimOrphanedWebVsCodeDevServer(launch);
+    if (shuttingDown) return;
     if (portState.state === "foreign") {
       console.error(`Web VS Code did not start: port ${launch.port} is in use by another process (PID ${portState.process.pid}).`);
+      if (webVsCodeOnly) void shutdown(0);
       return;
     }
     if (portState.state === "supervised") {
-      console.log(`Web VS Code is already running under another Threadex dev client (PID ${portState.process.pid}).`);
+      if (borrowedWebVsCodePid !== portState.process.pid) {
+        console.log(`Web VS Code is already running under another Threadex supervisor (PID ${portState.process.pid}).`);
+      }
+      borrowedWebVsCodePid = portState.process.pid;
+      if (webVsCodeOnly) {
+        // The owner may be an older API process. Keep the serve watcher alive
+        // so an API restart can release ownership without losing code-server.
+        // Every check still rejects foreign listeners and reclaims only orphans.
+        webVsCodeRetryTimer = setTimeout(() => {
+          webVsCodeRetryTimer = null;
+          void startWebVsCode();
+        }, 1_000);
+      }
       return;
     }
 
+    borrowedWebVsCodePid = null;
+    // Do not rewrite extensions or other launch data while borrowing an owner.
+    launch = prepareWebVsCodeDevLaunch(rootDir);
     const child = spawn(launch.command, launch.args, {
       cwd: rootDir,
       env: launch.env,
@@ -107,6 +136,7 @@ async function startWebVsCode() {
     const finish = (description) => {
       if (settled) return;
       settled = true;
+      signalChild(child, "SIGTERM", true);
       removeWebVsCodeSupervisorPid(launch, child.pid);
       if (webVsCodeChild === child) webVsCodeChild = null;
       if (shuttingDown) return;
@@ -117,10 +147,12 @@ async function startWebVsCode() {
       }
       if (portConflict) {
         console.error(`Web VS Code stopped: port ${launch.port} became occupied. Restarting is paused to avoid an EADDRINUSE loop.`);
+        if (webVsCodeOnly) void shutdown(0);
         return;
       }
       if (isMissingExecutableError(description)) {
         console.error(`Web VS Code startup skipped: ${launch.command} was not found. Install code-server or set CODE_SERVER_COMMAND.`);
+        if (webVsCodeOnly) void shutdown(0);
         return;
       }
       console.error(`Web VS Code exited (${description}). Retrying in 1 second.`);
@@ -137,7 +169,7 @@ async function startWebVsCode() {
 }
 
 function restartAll() {
-  restartVite();
+  if (!webVsCodeOnly) restartVite();
   restartWebVsCode();
 }
 

@@ -217,6 +217,7 @@ export function sessionTurnsToMessages(ctx, turns, title, existingMessages = [],
                 turnId: turn.id,
                 model: turn.model ?? existingUserMessage?.model,
                 reasoningEffort: turn.reasoningEffort ?? existingUserMessage?.reasoningEffort,
+                requestedServiceTier: turn.requestedServiceTier ?? existingUserMessage?.requestedServiceTier,
                 autoModel: turn.autoModelProvider === "typesafe" || turn.autoModelProvider === "fallback" || existingUserMessage?.autoModel,
                 autoModelProvider: turn.autoModelProvider ?? existingUserMessage?.autoModelProvider,
                 autoModelConfidence: turn.autoModelConfidence ?? existingUserMessage?.autoModelConfidence,
@@ -229,6 +230,7 @@ export function sessionTurnsToMessages(ctx, turns, title, existingMessages = [],
                 turnStatus: turn.status,
                 pendingReason: turn.pendingReason ?? null,
                 queueSteerReserved: turn.lastEventName === "queue.steer_reserved",
+                queueEditReserved: turn.lastEventName === "queue.edit_reserved",
                 createdAt: turn.created,
                 attachments: storedUserInput.attachments.length > 0 ? storedUserInput.attachments : existingUserMessage?.attachments,
                 startupSnapshot: index === 0 ? existingUserMessage?.startupSnapshot : undefined,
@@ -258,6 +260,7 @@ export function sessionTurnsToMessages(ctx, turns, title, existingMessages = [],
                 turnStatus: turn.status,
                 pendingReason: turn.pendingReason ?? null,
                 queueSteerReserved: turn.lastEventName === "queue.steer_reserved",
+                queueEditReserved: turn.lastEventName === "queue.edit_reserved",
                 runnerStarted: turn.status === "running"
                     ? Boolean(turn.runnerStarted || turn.runnerPid || turn.runnerLogPath)
                     : true
@@ -325,10 +328,23 @@ export function buildMessageIndicatorMarks(ctx, messages, allMessages = messages
     if (messages.length === 0) {
         return [];
     }
+    const subagentTurnsWithMarker = new Set();
     return messages.flatMap((message, messageIndex) => {
         const tones = [];
         const titles = [];
         const anchorIds = [];
+        let emittedSubagentMarker = false;
+        const addItemMarker = (item, anchorId) => {
+            if (item.itemType === "subagent") {
+                const turnKey = message.turnId ?? message.id;
+                if (emittedSubagentMarker || subagentTurnsWithMarker.has(turnKey)) return;
+                emittedSubagentMarker = true;
+                subagentTurnsWithMarker.add(turnKey);
+            }
+            tones.push(messageIndicatorToneForItem(item));
+            titles.push(messageIndicatorItemTitle(item));
+            anchorIds.push(anchorId);
+        };
         if (message.role === "user") {
             tones.push("user");
             titles.push(compactIndicatorTitle(message.content, "User"));
@@ -367,9 +383,7 @@ export function buildMessageIndicatorMarks(ctx, messages, allMessages = messages
                         anchorIds.push(entry.id);
                     }
                     else {
-                        tones.push(messageIndicatorToneForItem(entry.item));
-                        titles.push(messageIndicatorItemTitle(entry.item));
-                        anchorIds.push(entry.id);
+                        addItemMarker(entry.item, entry.id);
                     }
                 }
             }
@@ -394,9 +408,7 @@ export function buildMessageIndicatorMarks(ctx, messages, allMessages = messages
                         anchorIds.push(entry.id);
                     }
                     else if (entry.kind === "item") {
-                        tones.push(messageIndicatorToneForItem(entry.item));
-                        titles.push(messageIndicatorItemTitle(entry.item));
-                        anchorIds.push(entry.id);
+                        addItemMarker(entry.item, entry.id);
                     }
                 }
             }
@@ -484,7 +496,9 @@ export function messageIndicatorItemTitle(ctx, item) {
         return compactIndicatorTitle(item.items[0]?.text ?? "Plan", "Plan");
     }
     if (item.itemType === "context_compaction") {
-        return "Context compacted";
+        return Number.isFinite(item.beforeTokens) && Number.isFinite(item.afterTokens)
+            ? `Context compacted · ${item.beforeTokens.toLocaleString()} → ${item.afterTokens.toLocaleString()} tokens`
+            : "Context compacted";
     }
     if (item.itemType === "subagent") {
         return compactIndicatorTitle(subagentNames(item).join(", ") || subagentToolLabel(item.tool), "Subagent");
@@ -546,7 +560,7 @@ export function sessionExecutionStatusLabel(ctx, status) {
 
 }
 
-export function getWorkspaceTabSummary(ctx, workspaceId, isActive, statusMonitorById, sessions, sessionExecutionStatuses, pendingApprovalSessionIds) {
+export function getWorkspaceTabSummary(ctx, workspaceId, isActive, statusMonitorById, sessions, sessionExecutionStatuses, pendingApprovalSessionIds, managerSessionId) {
     const { displaySessionTitle, shortId } = ctx;
     if (!isActive) {
         const monitoredSessions = statusMonitorById.get(workspaceId)?.active_sessions ?? [];
@@ -568,6 +582,8 @@ export function getWorkspaceTabSummary(ctx, workspaceId, isActive, statusMonitor
             .map(([sessionId]) => sessionId),
         ...pendingApprovalSessionIds
     ]);
+    if (managerSessionId)
+        activeSessionIds.delete(managerSessionId);
     const sessionNameById = new Map(sessions.map((session) => [session.id, displaySessionTitle(session.title)]));
     const activeSessions = [...activeSessionIds].map((sessionId) => ({
         id: sessionId,

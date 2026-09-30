@@ -7,6 +7,91 @@ import { parseSessionListSearchTerms, SessionStore } from "./sessionStore.js";
 import { buildTurnGrillMidTurnInputs } from "./turnGrill.js";
 import { USER_INPUT_METHOD } from "../userInputRequest.js";
 
+test("sidebar pages hide Concurrent workers but preserve ordinary child sessions", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "session-concurrent-sidebar-"));
+  const store = new SessionStore(resolve(root, "threadex.postgres"));
+  await store.ready();
+  try {
+    await store.upsertWorkspace({ id: "concurrent-sidebar", name: "Sidebar", cwd: root, codexHome: root });
+    for (const id of ["main", "ordinary-child", "worker"]) {
+      await store.upsertSession({ id, workspaceId: "concurrent-sidebar", cwd: root,
+        title: id, parentSessionId: id === "main" ? null : "main" });
+    }
+    await store.changeCollaboration("sidebar-group", {
+      id: "sidebar-group", workspaceId: "concurrent-sidebar", mainSessionId: "main", revision: 0,
+      created: new Date().toISOString(), updated: new Date().toISOString(), lease: null,
+      messages: [], results: [], members: ["main", "worker"].map(id => ({
+        localId: id === "main" ? "main" : "c3", sessionId: id, task: id,
+        sourceSessionId: "main", sourceTurnId: null, fork: null, model: "gpt-6", effort: "medium",
+        stopped: false, observed: {}
+      }))
+    }, () => {});
+    const page = await store.listSessionsPage("concurrent-sidebar", 0, 1);
+    assert.equal(page.total, 2);
+    assert.equal(page.hasMore, true);
+    const next = await store.listSessionsPage("concurrent-sidebar", page.nextOffset!, 1);
+    assert.deepEqual([...page.sessions, ...next.sessions].map(s => s.id).sort(), ["main", "ordinary-child"]);
+    assert.equal((await store.listSessionsPage("concurrent-sidebar", 0, 20, "worker")).total, 0);
+    const projects = await store.listSessionsByProjectPage("concurrent-sidebar");
+    assert.deepEqual(projects.sessions.map(s => s.id).sort(), ["main", "ordinary-child"]);
+    assert.equal(projects.projects[0]?.total, 2);
+    assert.equal((await store.getSession("worker"))?.id, "worker");
+    // The Manager dashboard has its own queries and windowed task counts.
+    for (const [index, status] of ["running", "todo", "done"].entries()) {
+      for (const id of ["ordinary-child", "worker"]) {
+        if (index > 0) await store.updateSessionTurn({ id: `${id}-${index - 1}`, agentResponse: "Completed",
+          tokenIn: 0, tokenOut: 0, status: "done" });
+        await store.recordSessionTurn({ id: `${id}-${index}`, sessionId: id, userInput: "Task",
+          agentResponse: status === "done" ? "Completed" : "", tokenIn: 0, tokenOut: 0,
+          status: status as "running" | "todo" | "done", pendingReason: status === "todo" ? "queued" : null });
+      }
+      const dashboard = await store.workspaceManagerSnapshot("concurrent-sidebar");
+      assert.deepEqual(dashboard.tasks.map(task => task.sessionId).sort(), ["main", "ordinary-child"]);
+      assert.equal(dashboard.totalTasks, 2);
+      assert.equal(dashboard.runningTasks, status === "running" ? 1 : 0);
+      assert.equal(dashboard.pendingTasks, status === "todo" ? 1 : 0);
+      if (status === "done") {
+        for (const id of ["ordinary-child", "worker"]) await store.markSessionAchieved(id);
+        const completed = await store.workspaceManagerSnapshot("concurrent-sidebar");
+        assert.deepEqual(completed.recentCompletedTasks?.map(task => task.sessionId), ["ordinary-child"]);
+      }
+    }
+  } finally {
+    await store.close();
+  }
+});
+
+test("workspace snapshot excludes legacy watchdog stops without rewriting pending turns", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "session-legacy-watchdog-test-"));
+  const dbPath = resolve(root, "threadex.postgres");
+  const store = new SessionStore(dbPath);
+  await store.ready();
+  try {
+    await store.upsertWorkspace({ id: "legacy", name: "Legacy", cwd: root, codexHome: root });
+    for (const [sessionId, pendingReason, runner] of [
+      ["watchdog-queued", "queued", "23682"],
+      ["watchdog-unspecified", null, "unknown"]
+    ] as const) {
+      await store.upsertSession({ id: sessionId, workspaceId: "legacy", cwd: root, title: sessionId });
+      await store.recordSessionTurn({ id: `${sessionId}-turn`, sessionId, userInput: "Continue", tokenIn: 0,
+        tokenOut: 0, status: "todo", pendingReason,
+        agentResponse: `Prompt runner ${runner} stopped before completion. Saved as pending for retry. Check runner.watchdog.dead for log tail diagnostics.` });
+    }
+    await store.upsertSession({ id: "ordinary-queue", workspaceId: "legacy", cwd: root, title: "Ordinary queue" });
+    await store.recordSessionTurn({ id: "ordinary-queue-turn", sessionId: "ordinary-queue", userInput: "Next",
+      agentResponse: "", tokenIn: 0, tokenOut: 0, status: "todo", pendingReason: "queued" });
+    const snapshot = await store.workspaceManagerSnapshot("legacy");
+    assert.equal(snapshot.pendingTasks, 1, "legacy watchdog interruptions are excluded while ordinary queued work counts");
+    assert.equal(snapshot.tasks.find(task => task.sessionId === "watchdog-queued")?.status, "stopped");
+    assert.equal(snapshot.tasks.find(task => task.sessionId === "watchdog-unspecified")?.status, "stopped");
+    assert.equal((await store.getSessionTurn("ordinary-queue-turn"))?.pendingReason, "queued");
+    assert.equal((await store.getSessionTurn("watchdog-queued-turn"))?.pendingReason, "queued");
+    assert.equal((await store.getSessionTurn("watchdog-unspecified-turn"))?.pendingReason, null);
+  } finally {
+    await store.close();
+  }
+});
+
 test("default workspace migrates legacy codex home to workspace-specific home", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "session-default-home-test-"));
   const dbPath = resolve(root, "threadex.postgres");
@@ -577,7 +662,9 @@ test("context compaction live items survive session snapshot storage", async () 
       payload: {
         id: "compact-1",
         itemType: "context_compaction",
-        eventType: "item.completed"
+        eventType: "item.completed",
+        beforeTokens: 120000,
+        afterTokens: 18000
       }
     });
 
@@ -596,6 +683,8 @@ test("context compaction live items survive session snapshot storage", async () 
       eventType: "item.completed",
       itemType: "context_compaction"
     });
+    assert.equal(liveItems[0].beforeTokens, 120000);
+    assert.equal(liveItems[0].afterTokens, 18000);
   } finally {
     await store.close();
   }
@@ -2373,7 +2462,7 @@ test("session model preferences persist the selected gear state", async () => {
       gearProfiles: [
         { model: "gpt-5.6-terra", effort: "medium" },
         { model: "gpt-5.6-luna", effort: "high" },
-        { model: "gpt-5.6-sol", effort: "xhigh" }
+        { model: "gpt-5.6-sol", effort: "xhigh", fastMode: true }
       ]
     });
     assert.equal(saved.selectedModel, "gpt-5.6-sol");
@@ -2382,7 +2471,7 @@ test("session model preferences persist the selected gear state", async () => {
     assert.deepEqual(saved.gearProfiles, [
       { model: "gpt-5.6-terra", effort: "medium" },
       { model: "gpt-5.6-luna", effort: "high" },
-      { model: "gpt-5.6-sol", effort: "xhigh" },
+      { model: "gpt-5.6-sol", effort: "xhigh", fastMode: true },
       { model: "gpt-6-luna", effort: "xhigh" },
       { model: "gpt-6-sol", effort: "high" },
       { model: "gpt-6-astra", effort: "xhigh" }

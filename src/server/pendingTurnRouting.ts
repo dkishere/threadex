@@ -6,16 +6,11 @@ type PendingLoadBalanceInput = {
   workspaceLoadBalanceEnabled: boolean;
 };
 
-/**
- * Keep the routing choice on the turn itself. The server's enabled-workspace
- * set is intentionally ephemeral, so it cannot be the only signal when a
- * runner reports a limit after the server has restarted.
- */
+/** A saved turn preference never overrides the workspace's current LB switch. */
 export function pendingLoadBalanceForUpdate(input: PendingLoadBalanceInput) {
-  // Session/account affinity is intentionally soft. Any usage or credit
-  // exhaustion may fail over to another account in the workspace, even when
-  // the original turn was started with an explicitly selected account.
-  return input.pendingReason === "rate_limit";
+  return input.pendingReason === "rate_limit" &&
+    input.workspaceLoadBalanceEnabled &&
+    input.persistedLoadBalance !== false;
 }
 
 export function pendingUsesWorkspaceAccountPool(input: {
@@ -24,9 +19,9 @@ export function pendingUsesWorkspaceAccountPool(input: {
   pendingLoadBalance: boolean | null;
   workspaceLoadBalanceEnabled: boolean;
 }) {
-  return input.sessionAccountId !== input.turnAccountId ||
-    input.pendingLoadBalance === true ||
-    input.workspaceLoadBalanceEnabled;
+  // Different session/turn accounts can result from a manual account switch.
+  // That rebind authorizes retrying on the selected account, not choosing one.
+  return input.workspaceLoadBalanceEnabled && input.pendingLoadBalance !== false;
 }
 
 export function pendingTurnRunsAutomatically(reason: PendingTurnReason) {

@@ -9,12 +9,14 @@ export function normalizeSessionModelPreferences(ctx, value) {
     const selectedEffort = isModelReasoningEffort(candidate.selectedEffort)
         ? candidate.selectedEffort
         : fallbackEffort;
-    const gearProfiles = normalizeGearProfiles(candidate.gearProfiles, selectedModel, selectedEffort);
+    const gearProfiles = normalizeGearProfiles(candidate.gearProfiles, selectedModel, selectedEffort, candidate.fastMode === true);
     const activeGearIndex = normalizeGearIndex(candidate.activeGearIndex);
+    const fastMode = gearProfiles[activeGearIndex]?.fastMode === true;
     return {
         version: 1,
         selectedModel: gearProfiles[activeGearIndex]?.model ?? selectedModel,
         selectedEffort: gearProfiles[activeGearIndex]?.effort ?? selectedEffort,
+        fastMode,
         gearProfiles,
         activeGearIndex
     };
@@ -27,17 +29,19 @@ export function readStoredModelSelector(ctx, restoredSession) {
     const fallbackEffort = isModelReasoningEffort(restoredSession?.selectedEffort)
         ? restoredSession.selectedEffort
         : "low";
-    const fallbackProfiles = normalizeGearProfiles(restoredSession?.gearProfiles, fallbackModel, fallbackEffort);
+    const fallbackProfiles = normalizeGearProfiles(restoredSession?.gearProfiles, fallbackModel, fallbackEffort, restoredSession?.fastMode === true);
     const fallbackIndex = normalizeGearIndex(restoredSession?.activeGearIndex);
     const pendingPreferences = readPendingModelPreferences(restoredSession?.workspaceId ?? null) ??
         readPendingModelPreferences(restoredSession?.sessionId ?? null);
     if (pendingPreferences) {
         return pendingPreferences;
     }
+    const fastMode = fallbackProfiles[fallbackIndex]?.fastMode === true;
     return {
         version: 1,
         selectedModel: fallbackProfiles[fallbackIndex]?.model ?? fallbackModel,
         selectedEffort: fallbackProfiles[fallbackIndex]?.effort ?? fallbackEffort,
+        fastMode,
         gearProfiles: fallbackProfiles,
         activeGearIndex: fallbackIndex
     };
@@ -169,10 +173,10 @@ export function normalizeStoredApprovalPolicy(ctx, value) {
 
 }
 
-export function normalizeGearProfiles(ctx, value, fallbackModel, fallbackEffort) {
+export function normalizeGearProfiles(ctx, value, fallbackModel, fallbackEffort, fallbackFastMode = false) {
     const { isModelReasoningEffort, normalizeEffortForModel, normalizeStoredModel } = ctx;
-    const defaults = defaultGearProfiles();
-    defaults[0] = { model: fallbackModel, effort: normalizeEffortForModel(fallbackEffort, fallbackModel) };
+    const defaults = defaultGearProfiles().map((gear) => ({ ...gear, fastMode: fallbackFastMode }));
+    defaults[0] = { ...defaults[0], model: fallbackModel, effort: normalizeEffortForModel(fallbackEffort, fallbackModel) };
     // Trim the briefly supported seventh Auto slot without losing manual presets.
     if (!Array.isArray(value) || ![3, 6, 7].includes(value.length)) {
         return defaults;
@@ -185,7 +189,8 @@ export function normalizeGearProfiles(ctx, value, fallbackModel, fallbackEffort)
         const profile = candidate;
         const model = normalizeStoredModel(profile.model);
         const effort = isModelReasoningEffort(profile.effort) ? profile.effort : defaults[index].effort;
-        return { model, effort: normalizeEffortForModel(effort, model) };
+        return { model, effort: normalizeEffortForModel(effort, model),
+            fastMode: typeof profile.fastMode === "boolean" ? profile.fastMode : fallbackFastMode };
     });
 
 }

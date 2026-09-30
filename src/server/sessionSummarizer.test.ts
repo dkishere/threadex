@@ -28,6 +28,24 @@ test("summarizer prompt requests only a Chinese title", () => {
   assert.doesNotMatch(prompt, /keywords?:/i);
 });
 
+test("Loop task health assessment uses the isolated summariser route", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "loop-summarizer-test-"));
+  const store = new SessionStore(resolve(root, "test.postgres"));
+  await store.ready();
+  const summarizer = new SessionSummarizer(store, {
+    model: "gpt-6-luna", idleMs: 60_000, sweepMs: 60_000, pendingRetryMs: 60_000,
+    maxInputChars: 5_000, timeoutMs: 5_000, runnerMaxRuns: 10, runnerMaxAgeMs: 60_000,
+    reasoningEffort: "low", provider: "mock",
+    mockResponse: '{"stalled":true,"reason":"No new output"}', promptDumpDir: null
+  });
+  try {
+    await store.upsertWorkspace({ id: "loop", name: "Loop", cwd: root, codexHome: root });
+    assert.equal(await summarizer.assessLoopTask("loop", "Recent running evidence"),
+      '{"stalled":true,"reason":"No new output"}');
+    await assert.rejects(summarizer.assessLoopTask("missing", "Evidence"), /workspace no longer exists/);
+  } finally { summarizer.close(); await store.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
 test("title language survives short English follow-ups and automated notices", () => {
   const context = buildSummaryContext(session({}), [
     turn("clickhouse 仲係唔得，我想 preview delete"),

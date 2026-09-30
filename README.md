@@ -825,6 +825,34 @@ so a following commit in the same turn can find it. Server callbacks also record
 the same event idempotently for recovery. Non-Git projects still store the DB
 array. This does not stage files or create commits.
 
+Threadex always installs a repository-local Git worktree review dispatcher for
+known session/workspace repositories at startup and before each runner starts.
+There is no settings toggle. `pre-commit` and `pre-push` inspect other registered
+worktrees for staged, unstaged and untracked changes, commits ahead of their
+upstream, unpublished detached commits, missing upstreams and unavailable paths.
+The current worktree is excluded; branch tips already included in the pending
+push are recognized. Remote status uses local tracking refs, without fetching.
+
+When another worktree needs attention, the hook stops the operation and reports
+its path, branch and reasons. The agent decides whether to handle related work
+together within the authorized scope, or asks the user if ownership or intent is
+unclear. To deliberately proceed separately, the agent explains its decision and
+retries that command with the reported `THREADEX_WORKTREE_REVIEW` snapshot token
+and a nonempty `THREADEX_WORKTREE_REASON`. Tokens differ for commit and push and
+change when the inspected state changes. This is a workflow check, not a security
+boundary against deliberate Git hook bypasses.
+
+The dispatcher lives under the common Git directory's
+`threadex/worktree-review-hooks`; enrollment metadata remembers original hook
+directories. Repo-local `core.hooksPath` (and existing per-worktree overrides) is
+pointed at the dispatcher. Original hooks remain at their original paths and
+receive their original arguments, stdin and exit behavior, including Husky and
+provenance hooks. Other Git hooks are forwarded directly. The checks run without
+a live Threadex API; the local Threadex installation and Node executable must
+remain available. Non-Git directories are skipped; setup failures are reported.
+Tests in `src/server/gitWorktreeGuard.test.ts` exercise real commits and pushes
+against disposable local remotes.
+
 Enable commit annotation in each repository by running (from that repository):
 
 ```sh
@@ -1018,6 +1046,9 @@ Important rules:
   ordinary follow-ups never become new tasks merely because of load balancing.
 - Before a runner starts, the selected account snapshot is copied into the
   workspace Codex home.
+- With load balancing disabled, usage-limited turns wait for their selected
+  account's quota reset. Saved pending-turn settings cannot re-enable workspace
+  load balancing; a manual account switch retries using that chosen account.
 - After a runner finishes, refreshed `auth.json` is copied back to the account
   snapshot.
 

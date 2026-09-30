@@ -1,4 +1,4 @@
-import { X } from "lucide-react";
+import { Copy, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { MonacoDiffEditor } from "./MonacoDiffEditor";
 
@@ -87,6 +87,7 @@ export function SessionFileDiffPopup({
 }) {
   const [change, setChange] = useState<SessionFileDiffChange>(file);
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
+  const [copiedPath, setCopiedPath] = useState<string | null>(null);
   const textPair = useMemo(() => buildDiffTextPair(change), [change]);
 
   useEffect(() => {
@@ -126,7 +127,26 @@ export function SessionFileDiffPopup({
             <span className="file-change-badge" data-operation={change.kind === "add" || change.kind === "delete" ? change.kind : "update"}>{fileChangeLabel(change.kind)}</span>
             <div>
               <strong>{fileName(change.path)}</strong>
-              <code>{change.path}</code>
+              <div className="file-diff-path-row">
+                <button
+                  className="file-diff-copy-path"
+                  type="button"
+                  title={copiedPath === change.path ? "Copied path" : "Copy path"}
+                  aria-label={copiedPath === change.path ? "Copied path" : "Copy path"}
+                  onClick={async () => {
+                    if (!navigator.clipboard) return;
+                    try {
+                      await navigator.clipboard.writeText(change.path);
+                      setCopiedPath(change.path);
+                    } catch {
+                      setCopiedPath(null);
+                    }
+                  }}
+                >
+                  <Copy aria-hidden="true" />
+                </button>
+                <code>{change.path}</code>
+              </div>
             </div>
           </div>
           <button className="icon-button" type="button" onClick={onClose} aria-label="Close diff">

@@ -117,11 +117,20 @@ export function TurnChangeList(ctx, { changes, sessionId, turnId }) {
 }
 
 export function FileChangeList(ctx, { changes }) {
-    const { FileEditIcon, FileChangeDiffPopup, _Fragment, _jsx, _jsxs, compactFilePath, fileChangeTone, useState } = ctx;
+    const { Copy, FileEditIcon, FileChangeDiffPopup, _Fragment, _jsx, _jsxs, compactFilePath, fileChangeTone, useState } = ctx;
     const [selectedFileChange, setSelectedFileChange] = useState(null);
+    const [copiedPath, setCopiedPath] = useState(null);
     return (_jsxs(_Fragment, { children: [_jsx("ul", { className: "file-change-list", children: changes.map((change) => {
         const stats = fileChangeLineStats({}, change);
-        return (_jsx("li", { children: _jsxs("button", { className: "file-change-trigger", type: "button", onClick: () => setSelectedFileChange(change), children: [_jsxs("span", { className: "file-change-badge", "data-operation": fileChangeTone(change.kind), "aria-label": `${stats.additions} lines added, ${stats.deletions} lines deleted`, children: [_jsxs("span", { "data-tone": "add", children: ["+", stats.additions] }), _jsxs("span", { "data-tone": "delete", children: ["−", stats.deletions] })] }), _jsx("code", { className: "file-change-path", title: change.path, children: compactFilePath(change.path) }), _jsx(FileEditIcon, { "aria-hidden": "true" })] }) }, `${change.kind}:${change.path}`));
+        return (_jsxs("li", { children: [_jsxs("button", { className: "file-change-trigger", type: "button", onClick: () => setSelectedFileChange(change), children: [_jsxs("span", { className: "file-change-badge", "data-operation": fileChangeTone(change.kind), "aria-label": `${stats.additions} lines added, ${stats.deletions} lines deleted`, children: [_jsxs("span", { "data-tone": "add", children: ["+", stats.additions] }), _jsxs("span", { "data-tone": "delete", children: ["−", stats.deletions] })] }), _jsx("code", { className: "file-change-path", title: change.path, children: compactFilePath(change.path) }), _jsx(FileEditIcon, { "aria-hidden": "true" })] }), _jsx("button", { className: "file-change-copy", type: "button", title: copiedPath === change.path ? "Copied path" : "Copy path", "aria-label": copiedPath === change.path ? "Copied path" : "Copy path", onClick: async () => {
+            if (!navigator.clipboard) return;
+            try {
+                await navigator.clipboard.writeText(change.path);
+                setCopiedPath(change.path);
+            } catch {
+                setCopiedPath(null);
+            }
+        }, children: _jsx(Copy, { "aria-hidden": "true" }) })] }, `${change.kind}:${change.path}`));
     }) }), selectedFileChange && _jsx(FileChangeDiffPopup, { change: selectedFileChange, onClose: () => setSelectedFileChange(null) })] }));
 
 }
@@ -256,7 +265,10 @@ export function LiveEvent(ctx, { item, sessionId }) {
         return (_jsxs("section", { className: "live-item", children: [_jsxs("div", { className: "live-item-header", children: [_jsx(CheckSquare2, { "aria-hidden": "true" }), _jsx("span", { children: "Plan" })] }), _jsx("ul", { className: "todo-list", children: item.items.map((todo, index) => (_jsxs("li", { "data-completed": todo.completed, children: [_jsx(ChevronRight, { "aria-hidden": "true" }), _jsx("span", { children: todo.text })] }, `${index}:${todo.text}`))) })] }));
     }
     if (item.itemType === "context_compaction") {
-        return _jsx(StatusUpdateIndicator, { text: item.eventType === "item.completed" ? "Context compacted" : "Compacting context", spinning: item.eventType !== "item.completed", completedIcon: Shrink });
+        const before = Number.isFinite(item.beforeTokens) ? item.beforeTokens.toLocaleString() : null;
+        const after = Number.isFinite(item.afterTokens) ? item.afterTokens.toLocaleString() : null;
+        const amount = before && after ? ` · ${before} → ${after} tokens` : before ? ` · ${before} tokens before` : "";
+        return _jsx(StatusUpdateIndicator, { text: `${item.eventType === "item.completed" ? "Context compacted" : "Compacting context"}${amount}`, spinning: item.eventType !== "item.completed", completedIcon: Shrink });
     }
     if (item.itemType === "subagent") {
         return _jsx(SubagentEvent, { item: item, sessionId: sessionId });
@@ -345,16 +357,21 @@ export function StatusUpdateIndicator(ctx, { text, spinning = true, completedIco
 }
 
 export function SubagentEvent(ctx, { item, sessionId }) {
-    const { ChevronRight, MarkdownContent, SubagentTranscript, UserPlus, _Fragment, _jsx, _jsxs, fetchSubagentTranscript, formatSubagentStatus, subagentNames, subagentStatusTone, subagentToolLabel, useEffect, useRef, useState, visibleSubagentAgents } = ctx;
-    const [isExpanded, setIsExpanded] = useState(false);
+    const { ChevronRight, MarkdownContent, SubagentTranscript, UserPlus, _jsx, _jsxs, fetchSubagentTranscript, formatSubagentStatus, subagentNames, subagentStatusTone, useEffect, useRef, useState } = ctx;
     const [transcripts, setTranscripts] = useState({});
     const requestedThreadIdsRef = useRef(new Set());
     const requestScopeRef = useRef("");
+    const activityUpdates = item.activityUpdates?.length ? item.activityUpdates : [item];
     const names = subagentNames(item);
-    const threadIds = [...new Set(item.receiverThreadIds.filter(Boolean))];
-    const displayAgents = visibleSubagentAgents(item);
+    const threadIds = [...new Set((item.receiverThreadIds ?? []).filter(Boolean))];
+    const displayName = item.label?.trim() || names.find(Boolean) || "Subagent";
+    const prompts = [...new Set(activityUpdates.map((update) => update.prompt?.trim()).filter(Boolean))];
+    const models = [...new Set(activityUpdates.map((update) => update.model?.trim()).filter(Boolean))];
+    const reasoningEfforts = [...new Set(activityUpdates.map((update) => update.reasoningEffort?.trim()).filter(Boolean))];
+    const returnedMessages = [...new Set(activityUpdates.flatMap((update) => (update.agents ?? [])
+        .map((agent) => agent.message?.trim())
+        .filter(Boolean)))];
     const canViewWork = Boolean(sessionId && threadIds.length > 0);
-    const hasDetails = Boolean(item.prompt || item.model || item.reasoningEffort || threadIds.length || displayAgents.length);
     requestScopeRef.current = sessionId ?? "";
     useEffect(() => {
         requestedThreadIdsRef.current = new Set();
@@ -394,30 +411,79 @@ export function SubagentEvent(ctx, { item, sessionId }) {
             }));
         }
     }
-    const header = _jsxs(_Fragment, { children: [hasDetails && _jsx(ChevronRight, { className: "command-chevron", "aria-hidden": "true" }), _jsx(UserPlus, { "aria-hidden": "true" }), _jsx("span", { children: subagentToolLabel(item.tool) }), names.length > 0 && _jsx("strong", { children: names.join(", ") }), canViewWork && _jsx("span", { className: "subagent-event-view-work", children: isExpanded ? "Hide work" : "View work" }), _jsx("span", { className: "subagent-event-status", children: formatSubagentStatus(item.status) })] });
-    if (!hasDetails) {
-        return (_jsx("section", { className: "subagent-event", "data-status": subagentStatusTone(item.status), children: _jsx("div", { className: "subagent-event-header", children: header }) }));
-    }
-    return (_jsxs("details", { className: "subagent-event", "data-status": subagentStatusTone(item.status), onToggle: (event) => {
-            if (event.target !== event.currentTarget) {
-                return;
-            }
-            const open = event.currentTarget.open;
-            setIsExpanded(open);
-            if (open && canViewWork) {
+    const meta = models.length > 0 || reasoningEfforts.length > 0 || threadIds.length > 0
+        ? _jsxs("div", {
+            className: "subagent-event-meta",
+            children: [
+                ...models.map((model) => _jsxs("span", { children: ["Model: ", model] }, `model:${model}`)),
+                ...reasoningEfforts.map((effort) => _jsxs("span", { children: ["Reasoning: ", effort] }, `reasoning:${effort}`)),
+                ...threadIds.map((threadId) => _jsx("code", { children: threadId }, threadId))
+            ]
+        })
+        : null;
+    const details = [
+        meta,
+        ...prompts.map((prompt, index) => _jsxs("div", {
+            className: "subagent-event-prompt",
+            children: [
+                _jsx("span", { children: index === 0 ? "Delegated task" : "Follow-up task" }),
+                _jsx(MarkdownContent, { children: prompt })
+            ]
+        }, `prompt:${index}`)),
+        returnedMessages.length > 0 && _jsxs("div", {
+            className: "subagent-returned-content",
+            children: [
+                _jsx("strong", { children: "Returned content" }),
+                ...returnedMessages.map((message, index) => _jsx(MarkdownContent, { children: message }, `message:${index}`))
+            ]
+        }),
+        ...(canViewWork ? threadIds.map((threadId) => _jsx(SubagentTranscript, {
+            anchorPrefix: `${item.id}:${threadId}`,
+            onRetry: () => void loadTranscript(threadId, true),
+            sessionId,
+            state: transcripts[threadId] ?? { status: "loading", error: "", payload: null },
+            threadId
+        }, threadId)) : [])
+    ].filter(Boolean);
+    return _jsxs("details", {
+        className: "subagent-event",
+        "data-status": subagentStatusTone(item.status),
+        onToggle: (event) => {
+            if (event.target !== event.currentTarget) return;
+            if (event.currentTarget.open && canViewWork) {
                 threadIds.forEach((childThreadId) => void loadTranscript(childThreadId));
             }
-        }, children: [_jsx("summary", { className: "subagent-event-header", children: header }), _jsxs("div", { className: "subagent-event-body", children: [(item.model || item.reasoningEffort || threadIds.length > 0) && (_jsxs("div", { className: "subagent-event-meta", children: [item.model && _jsxs("span", { children: ["Model: ", item.model] }), item.reasoningEffort && _jsxs("span", { children: ["Reasoning: ", item.reasoningEffort] }), threadIds.map((threadId) => _jsx("code", { children: threadId }, threadId))] })), item.prompt && (_jsxs("div", { className: "subagent-event-prompt", children: [_jsx("span", { children: "Delegated task" }), _jsx(MarkdownContent, { children: item.prompt })] })), displayAgents.length > 0 && (_jsx("div", { className: "subagent-agent-list", children: displayAgents.map((agent) => (_jsxs("section", { className: "subagent-agent", "data-status": subagentStatusTone(agent.status), children: [_jsxs("div", { className: "subagent-agent-header", children: [_jsx("span", { children: agent.name || agent.id }), _jsx("strong", { children: formatSubagentStatus(agent.status) })] }), agent.message && _jsx(MarkdownContent, { children: agent.message })] }, agent.id))) })), canViewWork && (_jsx("div", { className: "subagent-transcript-list", children: threadIds.map((threadId) => (_jsx(SubagentTranscript, { anchorPrefix: `${item.id}:${threadId}`, onRetry: () => void loadTranscript(threadId, true), sessionId: sessionId, state: transcripts[threadId] ?? { status: "loading", error: "", payload: null }, threadId: threadId }, threadId))) }))] })] }));
+        },
+        children: [
+            _jsxs("summary", {
+                className: "subagent-event-header",
+                children: [
+                    _jsx(ChevronRight, { className: "command-chevron", "aria-hidden": "true" }),
+                    _jsx(UserPlus, { "aria-hidden": "true" }),
+                    _jsx("strong", { children: displayName }),
+                    _jsx("span", { className: "subagent-event-status", children: formatSubagentStatus(item.status) })
+                ]
+            }),
+            _jsx("div", { className: "subagent-event-body", children: details })
+        ]
+    });
 
 }
 
 export function SubagentTranscript(ctx, { anchorPrefix, onRetry, state, threadId, sessionId, workspaceId }) {
     const { Loader2, MessageSquare, MessageTimeline, TriangleAlert, _jsx, _jsxs, isStreamItem, shortId, streamItemsToSegments, subagentStatusTone } = ctx;
     if (state.status === "loading") {
-        return (_jsxs("section", { className: "subagent-transcript", "aria-live": "polite", children: [_jsxs("div", { className: "subagent-transcript-header", children: [_jsx(Loader2, { className: "spin", "aria-hidden": "true" }), _jsx("span", { children: "Loading child work…" }), _jsx("code", { children: shortId(threadId) })] }), _jsx("span", { className: "subagent-transcript-note", children: "Messages and tool activity load only when this card is opened." })] }));
+        return [
+            _jsxs("div", { className: "subagent-transcript-header", "aria-live": "polite", children: [_jsx(Loader2, { className: "spin", "aria-hidden": "true" }), _jsx("span", { children: "Loading child work…" }), _jsx("code", { children: shortId(threadId) })] }, `header:${threadId}`),
+            _jsx("span", { className: "subagent-transcript-note", children: "Messages and tool activity load only when this agent is expanded." }, `note:${threadId}`)
+        ];
     }
     if (state.status === "error") {
-        return (_jsxs("section", { className: "subagent-transcript subagent-transcript-error", role: "alert", children: [_jsxs("div", { className: "subagent-transcript-header", children: [_jsx(TriangleAlert, { "aria-hidden": "true" }), _jsx("span", { children: "Couldn’t load child work" }), _jsx("code", { children: shortId(threadId) })] }), _jsx("span", { className: "subagent-transcript-note", children: state.error }), _jsx("button", { type: "button", onClick: onRetry, children: "Retry" })] }));
+        return [
+            _jsxs("div", { className: "subagent-transcript-header subagent-transcript-error", children: [_jsx(TriangleAlert, { "aria-hidden": "true" }), _jsx("span", { children: "Couldn’t load child work" }), _jsx("code", { children: shortId(threadId) })] }, `header:${threadId}`),
+            _jsx("span", { className: "subagent-transcript-note", role: "alert", children: state.error }, `note:${threadId}`),
+            _jsx("button", { className: "subagent-transcript-error-button", type: "button", onClick: onRetry, children: "Retry" }, `retry:${threadId}`)
+        ];
     }
     const turns = state.payload?.turns ?? [];
     const timelines = turns.map((turn) => {
@@ -432,7 +498,10 @@ export function SubagentTranscript(ctx, { anchorPrefix, onRetry, state, threadId
     });
     const itemCount = timelines.reduce((count, timeline) => count + timeline.items.length, 0);
     const visibleTimelines = timelines.filter((timeline) => timeline.segments.length > 0 || !timeline.completed);
-    return (_jsxs("section", { className: "subagent-transcript", children: [_jsxs("div", { className: "subagent-transcript-header", children: [_jsx(MessageSquare, { "aria-hidden": "true" }), _jsx("span", { children: "Child work" }), _jsx("code", { title: threadId, children: shortId(threadId) }), itemCount > 0 && _jsxs("span", { className: "subagent-transcript-count", children: [itemCount, " ", itemCount === 1 ? "event" : "events"] })] }), visibleTimelines.length > 0 ? visibleTimelines.map((timeline) => (_jsx(MessageTimeline, { anchorPrefix: `${anchorPrefix}:${timeline.turn.id}`, completed: timeline.completed, running: !timeline.completed, segments: timeline.segments, codexSessionId: threadId, sessionId: sessionId, turnId: timeline.turn.id, workspaceId: workspaceId }, timeline.turn.id))) : (_jsx("span", { className: "subagent-transcript-note", children: "No messages or tool activity were recorded for this child." }))] }));
+    return [
+        _jsxs("div", { className: "subagent-transcript-header", children: [_jsx(MessageSquare, { "aria-hidden": "true" }), _jsx("span", { children: "Child work" }), _jsx("code", { title: threadId, children: shortId(threadId) }), itemCount > 0 && _jsxs("span", { className: "subagent-transcript-count", children: [itemCount, " ", itemCount === 1 ? "event" : "events"] })] }, `header:${threadId}`),
+        ...(visibleTimelines.length > 0 ? visibleTimelines.map((timeline) => (_jsx(MessageTimeline, { anchorPrefix: `${anchorPrefix}:${timeline.turn.id}`, completed: timeline.completed, running: !timeline.completed, segments: timeline.segments, codexSessionId: threadId, sessionId: sessionId, turnId: timeline.turn.id, workspaceId: workspaceId }, timeline.turn.id))) : [_jsx("span", { className: "subagent-transcript-note", children: "No messages or tool activity were recorded for this child." }, `note:${threadId}`)])
+    ];
 
 }
 

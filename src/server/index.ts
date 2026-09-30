@@ -1,9 +1,12 @@
-import { DEFAULT_MODEL } from "../modelCatalog";
+import { DEFAULT_MODEL, MODEL_CATALOG } from "../modelCatalog";
 import { createHash } from "node:crypto";
-import { WorkspaceManagerService } from "./workspaceManager";
-import { isSilentManagerResponse, WORKSPACE_MANAGER_MODEL, WORKSPACE_MANAGER_EFFORT } from "../workspaceManager";
+import { WorkspaceManagerService, parseWorkspaceManagerQueuedPromptForkDraft,
+  workspaceManagerQueuedPromptForkQuestion } from "./workspaceManager";
+import { isSilentManagerResponse, WORKSPACE_MANAGER_MODEL, WORKSPACE_MANAGER_EFFORT,
+  WORKSPACE_MANAGER_LOOP_ALERT_MODEL, WORKSPACE_MANAGER_LOOP_ALERT_EFFORT } from "../workspaceManager";
 import { readZipDirectory } from "./zipPreview";
 import { recordLiveGitProvenance } from "./gitProvenance";
+import { installGitWorktreeReviewHooks } from "./gitWorktreeGuard";
 import { changedFilePaths } from "./changedFilePaths";
 import { USER_INPUT_METHOD, inputResponse } from "../userInputRequest";
 import { isAutoModel, isAutoEffort } from "../autoModelCatalog";
@@ -14,7 +17,7 @@ import { RunnerProcessRegistry } from "./runnerProcessRegistry";
 import { clientLayoutInstructions } from "./clientLayoutInstructions";
 import { createTurnGrillHandler } from "./turnGrillRoute";
 import { createWorkspaceSnapshotHandler } from "./workspaceSnapshotRoute";
-import { acceptLoopTodos, loopWorkInstructions, loopWorkIssues, loopStopReason, shouldAutoGrillTurn } from "./loopMode";
+import { loopWorkInstructions, loopWorkIssues, loopStopReason } from "./loopMode";
 import { grillContentVersion, grillHandoff, type TurnGrill } from "../turnGrill";
 import { reviseOutcomePlan } from "./lightweightTodo";
 import express from "express";
@@ -77,7 +80,7 @@ import { WaitEventService } from "./waitEvent";
 import { runnerFileName } from "./runnerFileName";
 import { deliverProcessWake } from "./processWakeDelivery";
 import { chooseLoadBalancedAccount } from "./accountPicker";
-import { shouldChooseAccountForNewLoadBalancedThread } from "./loadBalanceRouting";
+import { resolveChatLoadBalance, shouldChooseAccountForNewLoadBalancedThread } from "./loadBalanceRouting";
 import { agentCliExecutable, createEphemeralAgentHome, defaultAgentHomeCandidates, runAgentCliExec, trimAgentCliOutput } from "./agentCli";
 import { normalizeModelTokenUsage, type ModelTokenUsage } from "./modelTokenUsage";
 import { embedSessionText, SessionSummarizer } from "./sessionSummarizer";
@@ -94,6 +97,7 @@ import { LocalBrowserBridgeClient, LocalBrowserBridgeError } from "./localBrowse
 import { buildStartupSnapshot } from "./startupSnapshot";
 import {
   answerSessionQuestion,
+  answerTransientSessionQuestion,
   isSideChatReasoningEffort,
   stopSessionQuestionRunners
 } from "./sessionQuestion";
@@ -161,6 +165,7 @@ import {
   saveUploadedAttachments,
   loadSavedAttachments,
   removeSavedAttachments,
+  removeStagedUploadedAttachmentSources,
   type SavedAttachment,
   type UploadedAttachment
 } from "./attachmentUploads";
@@ -188,8 +193,11 @@ type ChatRequest = {
   turnId?: string;
   model?: string;
   modelReasoningEffort?: string;
+  fastMode?: boolean;
   approvalPolicy?: ApprovalPolicy;
   autoModel?: boolean;
+  /** Explicit worker assignment from a Manager dispatch; applied when its turn starts. */
+  workspaceManagerModelSelection?: boolean;
   attachments?: UploadedAttachment[];
   workspaceId?: string;
   accountId?: string | null;
@@ -276,6 +284,8 @@ type ForkSessionRequest = {
 
 type CreateSessionTaskRequest = {
   managerRequestId?: string;
+  /** Stable identity for a queued-prompt fork when the workspace has no manager. */
+  queueForkRequestId?: string;
   cwd?: string;
   parentSessionId?: string;
   /** Internal caller identity supplied by the managed Session Inspector MCP. */
@@ -294,10 +304,13 @@ type CreateSessionTaskRequest = {
   lightweightTodo?: boolean;
   skills?: RequestedSkill[];
   developerInstructions?: string;
+  attachments?: UploadedAttachment[];
 };
 
 type TodoItemRequest = {
   id?: string;
+  grillTurnId?: string;
+  grillIssueId?: string;
   parentId?: string | null;
   title?: string;
   details?: string | null;
@@ -451,7 +464,10 @@ type ManagedSession = {
 };
 
 type RunnerJob = {
+  collaboration?: { groupId: string; fork: CollaborationFork | null; priorContext: string };
   workspaceManager?: boolean;
+  managerDelegatedTask?: boolean;
+  managerLoopAlert?: boolean;
   sessionId: string;
   turnId: string;
   turnNumber?: number;
@@ -459,6 +475,7 @@ type RunnerJob = {
   threadId?: string | null;
   model?: string;
   modelReasoningEffort?: string;
+  fastMode?: boolean;
   approvalPolicy?: ApprovalPolicy;
   autoModelEnabled?: boolean;
   autoModelRevision?: number;
@@ -543,6 +560,7 @@ type RunnerSteerCommand = {
 
 type RunnerSteerResult = {
   ok: boolean;
+  notSent?: boolean;
   commandId: string;
   turnId: string;
   appTurnId?: string | null;
@@ -557,6 +575,7 @@ type PendingTurnUpdateRequest = {
   sessionId?: string;
   turnId?: string;
   message?: string;
+  editToken?: string;
 };
 
 type PendingTurnMoveRequest = {
@@ -729,6 +748,8 @@ type JsonRpcRequest = {
 import { SessionCategories, createSessionCategoriesRouter } from "./sessionCategories";
 import { CategoryContextPools } from "./categoryContextPools";
 import { CategoryClassifier } from "./categoryClassifier";
+import { CollaborationService, collaborationDeliveryText, createCollaborationRouter } from "./collaborationService";
+import type { CollaborationFork } from "../collaboration";
 
 const app = express();
 const localBrowserBridge = new LocalBrowserBridgeClient();
@@ -752,6 +773,8 @@ const backgroundRunningTurnDiagnostics = new Set<string>();
 const port = Number(process.env.PORT ?? 8787);
 const serverMonitorStartedAt = new Date().toISOString();
 const serverUrl = process.env.RUNNER_SERVER_URL ?? `http://127.0.0.1:${port}`;
+const collaborationService = new CollaborationService(sessionStore, serverUrl, (id, attachments) =>
+  saveUploadedAttachments(uploadDir, id, attachments, { preserveSource: true }).map(attachment => ({ ...attachment, type: attachment.mimeType })));
 const runnerPollMs = Number(process.env.RUNNER_LOG_POLL_MS ?? 250);
 const runnerWatchdogMs = Number(process.env.RUNNER_WATCHDOG_MS ?? 15_000);
 const runnerStaleMs = Number(process.env.RUNNER_STALE_MS ?? 120_000);
@@ -857,6 +880,110 @@ const eventRingCapacity = Math.max(1, Number.parseInt(process.env.EVENT_RING_CAP
 const eventRingLog = new EventRingLog(eventRingLogPath, eventRingCapacity);
 const workspaceManager = new WorkspaceManagerService(sessionStore, {
   schedule: schedulePendingTurnsForSession,
+  assessLoopTask: (workspaceId, prompt) => sessionSummarizer.assessLoopTask(workspaceId, prompt),
+  loadTaskAttachments: turnId => loadSavedAttachments(uploadDir, turnId),
+  prepareQueuedPromptFork: async input => {
+    const [session, workspace] = await Promise.all([
+      sessionStore.getSession(input.sessionId), sessionStore.getWorkspace(input.workspaceId)
+    ]);
+    if (!session || session.workspaceId !== input.workspaceId || !workspace) {
+      throw new Error("The source task or workspace is no longer available.");
+    }
+    const answer = await answerTransientSessionQuestion({
+      question: workspaceManagerQueuedPromptForkQuestion(input),
+      context: { session }, workspace, serverUrl,
+      model: MODEL_CATALOG.luna.id, reasoningEffort: "max"
+    });
+    await recordBackgroundModelUsage({
+      id: `background:queued_prompt_fork:${input.turnId}`,
+      task: "queued_prompt_fork_draft", source: "app_server", workspaceId: input.workspaceId,
+      sessionId: input.sessionId, accountId: session.accountId, model: answer.model, usage: answer.usage
+    });
+    return parseWorkspaceManagerQueuedPromptForkDraft(answer.answer, input.queuedPrompt);
+  },
+  saveStagedQueuedPromptAttachments: (key, attachments) => saveUploadedAttachments(uploadDir, key, attachments,
+    { preserveSource: true }),
+  cleanupStagedQueuedPromptAttachments: key => removeSavedAttachments(uploadDir, key),
+  createQueuedPromptFork: async input => {
+    const source = await sessionStore.getSession(input.parentSessionId);
+    if (!source || source.workspaceId !== input.workspaceId) throw new Error("The source task is no longer in this workspace.");
+    const attachmentKey = typeof input.turn.requestMetadata?.attachmentKey === "string"
+      ? input.turn.requestMetadata.attachmentKey : input.turn.id;
+    const attachments = loadSavedAttachments(uploadDir, attachmentKey).map(attachment => ({
+      id: attachment.id, name: attachment.name, type: attachment.mimeType, size: attachment.size, path: attachment.path
+    }));
+    const expectedAttachments = input.turn.requestMetadata?.attachments;
+    if (Array.isArray(expectedAttachments) && attachments.length !== expectedAttachments.length) {
+      throw new Error("The queued prompt's saved attachments are unavailable.");
+    }
+    const manager = await sessionStore.getWorkspaceManager(input.workspaceId);
+    const managerOwned = manager?.sessionId === input.managerSessionId &&
+      input.parentSessionId === input.managerSessionId;
+    const requestBody = {
+      parentSessionId: input.parentSessionId,
+      sourceSessionId: managerOwned ? input.managerSessionId : input.parentSessionId,
+      ...(managerOwned ? { managerRequestId: input.requestId } : { queueForkRequestId: input.requestId, contextFork: true }),
+      cwd: input.cwd, title: input.title, prompt: input.prompt,
+      startImmediately: true, attachments,
+      executionMode: input.turn.requestMetadata?.executionMode === "loop"
+        ? "loop" : normalizeExecutionMode(input.turn.requestMetadata?.executionMode),
+      approvalPolicy: normalizeApprovalPolicy(input.turn.requestMetadata?.approvalPolicy
+        ?? await sessionStore.resolveApprovalPolicy(input.parentSessionId))
+    } satisfies CreateSessionTaskRequest;
+    const expectedSessionId = `tx_${createHash("sha256").update(`${input.managerSessionId}:${input.requestId}`).digest("hex").slice(0, 32)}`;
+    const expectedTurnId = `manager_task_${expectedSessionId}`;
+    const verifyCreatedTask = async (sessionId: string, turnId: string) => {
+      const [createdSession, createdTurn] = await Promise.all([
+        sessionStore.getSession(sessionId), sessionStore.getSessionTurn(turnId)
+      ]);
+      if (!createdSession || createdSession.workspaceId !== input.workspaceId ||
+        createdSession.parentSessionId !== input.parentSessionId || !createdTurn || createdTurn.sessionId !== sessionId) {
+        return null;
+      }
+      return { sessionId, turnId };
+    };
+    let responseReceived = false;
+    let definitiveRejection = false;
+    try {
+      const response = await fetch(`${serverUrl.replace(/\/$/, "")}/api/session-tasks`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestBody), signal: AbortSignal.timeout(30_000)
+      });
+      responseReceived = true;
+      const result = readObject(await response.json().catch(() => null));
+      if (!response.ok) {
+        definitiveRejection = response.status >= 400 && response.status < 500 && response.status !== 409;
+        throw new Error(typeof result?.error === "string" ? result.error : `Threadex returned HTTP ${response.status}`);
+      }
+      const sessionId = typeof result?.sessionId === "string" ? result.sessionId : expectedSessionId;
+      const turnId = typeof result?.turnId === "string" ? result.turnId : expectedTurnId;
+      const verified = await verifyCreatedTask(sessionId, turnId);
+      if (!verified) throw new Error("The new task was accepted but its session and queued turn could not be verified.");
+      return verified;
+    } catch (error) {
+      const verified = await verifyCreatedTask(expectedSessionId, expectedTurnId).catch(() => null);
+      if (verified) return verified;
+      if (!responseReceived || !definitiveRejection) {
+        if (error && typeof error === "object") (error as Error & { retainQueueHold?: boolean }).retainQueueHold = true;
+      }
+      throw error;
+    }
+  },
+  clearQueuedPromptTimer: turnId => {
+    const timer = pendingTurnTimers.get(turnId);
+    if (timer) clearTimeout(timer);
+    pendingTurnTimers.delete(turnId);
+  },
+  settleQueuedPromptFork: async (sessionId, turnId, removed, attachmentKey) => {
+    const timer = pendingTurnTimers.get(turnId);
+    if (timer) clearTimeout(timer);
+    pendingTurnTimers.delete(turnId);
+    if (removed || attachmentKey) {
+      try { removeSavedAttachments(uploadDir, attachmentKey ?? turnId); }
+      catch (error) { console.warn(`Failed to remove attachments for forked prompt ${turnId}: ${errorMessage(error)}`); }
+    }
+    await schedulePendingTurnsForSession(sessionId);
+  },
   platform: async (workspaceId) => {
     const workspace = await sessionStore.getWorkspace(workspaceId);
     const approvals = await Promise.all([...pendingApprovals.values()].filter(item => item.decision === undefined).map(async item => {
@@ -905,6 +1032,15 @@ let shuttingDown = false;
 app.use("/api", createSecurity(resolve(dataDir, "security.json")));
 app.use("/api", createHtmlPreviewRouter());
 app.use(express.json({ limit: "32mb" }));
+app.use((error: unknown, _req: Request, res: Response, next: (error?: unknown) => void) => {
+  if (error && typeof error === "object" && "type" in error && error.type === "entity.too.large") {
+    res.status(413).json({ error: "The message and attachments exceed the 32 MB request limit. Remove or upload a large attachment and try again." });
+    return;
+  }
+  next(error);
+});
+// Keep old routes for runners that started before the Concurrent rename.
+app.use(["/api/concurrent/sessions", "/api/collaboration/sessions"], createCollaborationRouter(collaborationService));
 app.use("/api/workspace-manager", workspaceManager.router());
 app.use("/api/experimental/session-categories", createSessionCategoriesRouter(sessionStore, sessionCategories, categoryContextPools, categoryClassifier));
 app.use("/api/settings/auto-model", createAutoModelSettingsRouter(autoModelSettings));
@@ -1415,11 +1551,13 @@ async function getWorkspaceStatusMonitor(
     approvals.push(publicApprovalRecord(approval));
     approvalsBySessionId.set(approval.sessionId, approvals);
   }
-  const [workspaces, monitoredSessions, pendingSessions] = await Promise.all([
+  const [workspaces, monitoredSessions, pendingSessions, managers] = await Promise.all([
     sessionStore.listWorkspaces(),
     sessionStore.listWorkspaceMonitorSessions(),
-    Promise.all(pendingSessionIds.map((sessionId) => sessionStore.getSession(sessionId)))
+    Promise.all(pendingSessionIds.map((sessionId) => sessionStore.getSession(sessionId))),
+    sessionStore.listWorkspaceManagers()
   ]);
+  const managerSessionIds = new Set(managers.map((manager) => manager.sessionId));
   const pendingSessionById = new Map(
     pendingSessions.flatMap((session) => session ? [[session.id, session] as const] : [])
   );
@@ -1429,7 +1567,7 @@ async function getWorkspaceStatusMonitor(
     .map((workspace) => {
       const activeSessions = new Map<string, WorkspaceMonitorSession>();
       for (const session of monitoredSessions) {
-        if (session.workspaceId !== workspace.id) continue;
+        if (session.workspaceId !== workspace.id || managerSessionIds.has(session.sessionId)) continue;
         activeSessions.set(session.sessionId, {
           id: session.sessionId,
           name: session.sessionName,
@@ -1438,7 +1576,7 @@ async function getWorkspaceStatusMonitor(
       }
       for (const sessionId of pendingSessionIds) {
         const session = pendingSessionById.get(sessionId);
-        if (!session || session.workspaceId !== workspace.id || activeSessions.has(session.id)) continue;
+        if (!session || session.workspaceId !== workspace.id || managerSessionIds.has(session.id) || activeSessions.has(session.id)) continue;
         activeSessions.set(session.id, {
           id: session.id,
           name: session.title,
@@ -1922,6 +2060,8 @@ app.get("/api/profile-analytics", async (req, res) => {
         SELECT
           turn.id AS turn_id,
           turn.session_id,
+          (EXISTS (SELECT 1 FROM workspace_manager AS manager WHERE manager.session_id = turn.session_id)
+            OR EXISTS (SELECT 1 FROM workspace_manager_archive AS archive WHERE archive.session_id = turn.session_id)) AS is_manager_session,
           coalesce(turn.account_id, max(usage.account_id)) AS account_id,
           turn.created AS started_at,
           coalesce((
@@ -2020,7 +2160,7 @@ app.get("/api/profile-analytics", async (req, res) => {
         sql: `${turnUsageCte}, daily_model AS (
             SELECT
               CAST(started_at AS DATE) AS day,
-              model,
+              CASE WHEN is_manager_session THEN 'Manager · ' || model ELSE model END AS model,
               sum(tokens) AS tokens,
               sum(input_tokens) AS input_tokens,
               sum(cached_input_tokens) AS cached_input_tokens,
@@ -2028,7 +2168,7 @@ app.get("/api/profile-analytics", async (req, res) => {
             FROM filtered_usage
             WHERE CAST(started_at AS DATE) >= current_date - INTERVAL '9 days'
               AND model <> 'Unknown'
-            GROUP BY CAST(started_at AS DATE), model
+            GROUP BY CAST(started_at AS DATE), is_manager_session, model
             UNION ALL
             SELECT
               CAST(coalesce(usage.source_timestamp, usage.created) AS DATE) AS day,
@@ -3247,7 +3387,7 @@ async function getSessionSnapshot(session: SessionRecord, replayRunningTurns = f
   };
 }
 
-async function getWorkspaceSnapshot() {
+async function getWorkspaceSnapshot({ includeActiveSession = true }: { includeActiveSession?: boolean } = {}) {
   // Capture the cursor before reading the snapshot. Events committed while the
   // snapshot is being assembled will then be replayed instead of being skipped.
   const eventCursor = eventRingLog.latestPosition;
@@ -3305,7 +3445,7 @@ async function getWorkspaceSnapshot() {
       .filter((approval) => approval.decision === undefined)
       .map(publicApprovalRecord),
     activeSessionId,
-    activeSession: activeSession ? await getSessionSnapshot(activeSession) : null,
+    activeSession: includeActiveSession && activeSession ? await getSessionSnapshot(activeSession) : null,
     processMonitors,
     statusMonitor,
     waitEvents: waitEventRecords,
@@ -3650,9 +3790,15 @@ app.post("/api/sessions/:sessionId/todos/items", async (
       res.status(400).json({ error: "title is required." });
       return;
     }
+    if (Boolean(req.body.grillTurnId) !== Boolean(req.body.grillIssueId)) {
+      res.status(400).json({ error: "grillTurnId and grillIssueId must be supplied together." });
+      return;
+    }
     const todo = await sessionStore.upsertTodoItem({
       id: readString(req.body.id) ?? undefined,
       sessionId,
+      ...(req.body.grillTurnId && req.body.grillIssueId
+        ? { grillOrigin: { turnId: req.body.grillTurnId, issueId: req.body.grillIssueId } } : {}),
       parentId: req.body.parentId ?? null,
       title,
       details: req.body.details ?? "",
@@ -4055,6 +4201,8 @@ const turnGrillHandler = createTurnGrillHandler({
   sessionStore, serverUrl, recordUsage: recordBackgroundModelUsage
 });
 const loopingTurnsBySession = new Map<string, Set<string>>();
+let loopRecoveryTimer: ReturnType<typeof setInterval> | null = null;
+let loopRecoveryRunning = false;
 app.get("/api/loop-mode", async (_req, res) => {
   try { res.json({ enabled: await sessionStore.getGlobalLoopMode() }); }
   catch (error) { res.status(500).json({ error: errorMessage(error) }); }
@@ -4069,36 +4217,48 @@ app.put("/api/loop-mode", async (req, res) => {
   } catch (error) { res.status(500).json({ error: errorMessage(error) }); }
 });
 
-async function runLoopForCompletedTurn(sessionId: string, turnId: string): Promise<void> {
-  const [globalEnabled, promptEnabled, workTurn] = await Promise.all([
-    sessionStore.getGlobalLoopMode(), sessionStore.isTurnLoopModeEnabled(turnId), sessionStore.getLoopWorkTurn(turnId)
+async function runLoopForCompletedTurn(sessionId: string, turnId: string, nextWorkTurnId: string): Promise<void> {
+  const [globalEnabled, sessionEnabled, promptEnabled, workTurn] = await Promise.all([
+    sessionStore.getGlobalLoopMode(), sessionStore.getSessionLoopMode(sessionId),
+    sessionStore.isTurnLoopModeEnabled(turnId), sessionStore.getLoopWorkTurn(turnId)
   ]);
-  if (!globalEnabled && !promptEnabled) return;
+  if (!globalEnabled && !sessionEnabled && !promptEnabled) return;
   const turn = await sessionStore.getSessionTurn(turnId);
   if (!turn || turn.sessionId !== sessionId || turn.status !== "done" || turn.runnerExitCode !== 0) return;
+  // Also covers continuations queued before fork handoffs were excluded.
+  if (turn.requestMetadata?.contextFork === true) return;
   if (workTurn && loopStopReason(turn.agentResponse, workTurn.workCycle)) return;
-  const items = await sessionStore.listSessionTurnLiveItems(sessionId, turnId);
-  if (!shouldAutoGrillTurn(items, Boolean(workTurn))) return;
-  if (await sessionStore.getTurnGrill(sessionId, turnId)) return;
-
-  const reviewResponse = await fetch(`${serverUrl}/api/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/grill`, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "start", autoLoop: true })
-  });
-  if (!reviewResponse.ok) throw new Error(`Automatic Grill returned HTTP ${reviewResponse.status}: ${(await reviewResponse.text()).slice(0, 500)}`);
-  const accepted = await acceptLoopTodos(sessionStore, sessionId, turnId, (await reviewResponse.json()).grill as TurnGrill);
-  const review = accepted.review;
-  if (accepted.todoChanged) await publishTodoChanged(sessionId, await sessionStore.getSessionTodo(sessionId));
+  // A lost HTTP response must not create another work turn. A stopped or
+  // failed work turn remains owned by the ordinary turn retry/Stop workflow.
+  if (await sessionStore.getSessionTurn(nextWorkTurnId)) return;
+  let review = await sessionStore.getTurnGrill(sessionId, turnId);
+  if (review?.status === "running") {
+    const recovery = await fetch(`${serverUrl}/api/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/grill`);
+    if (!recovery.ok) throw new Error(`Automatic Grill recovery returned HTTP ${recovery.status}`);
+    review = (await recovery.json()).grill as TurnGrill | null;
+  }
+  if (review && (!review.automatic || (review.status !== "ready" && review.rounds.length > 0))) return;
+  if (review?.status !== "ready") {
+    const reviewResponse = await fetch(`${serverUrl}/api/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/grill`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "start", autoLoop: true, revision: review?.revision ?? 0 })
+    });
+    if (!reviewResponse.ok) throw new Error(`Automatic Grill returned HTTP ${reviewResponse.status}: ${(await reviewResponse.text()).slice(0, 500)}`);
+    review = (await reviewResponse.json()).grill as TurnGrill;
+  }
+  if (!review || review.status !== "ready") throw new Error("Automatic Grill did not finish a review.");
+  if (Object.keys(review.workTurns ?? {}).length) return;
   const issues = loopWorkIssues(review);
   if (!issues.length) {
     if (review.issues.length) await sessionStore.acknowledgeTurnGrill(sessionId, turnId, grillContentVersion(review));
     return;
   }
-  if (!promptEnabled && !await sessionStore.getGlobalLoopMode()) return;
+  if (!promptEnabled && !await sessionStore.getGlobalLoopMode() && !await sessionStore.getSessionLoopMode(sessionId)) return;
+  if (!await sessionStore.getLoopContinuation(turnId)) return;
   const session = await sessionStore.getSession(sessionId);
   if (!session) return;
   const preferences = await sessionStore.getSessionModelPreferences(sessionId);
   const autoModel = await sessionStore.getSessionAutoModel(sessionId);
-  const nextWorkTurnId = crypto.randomUUID();
   const workCycle = (workTurn?.workCycle ?? 0) + 1;
   await sessionStore.recordLoopWorkTurn(nextWorkTurnId, workTurn?.rootTurnId ?? turnId, workCycle);
   if (promptEnabled) await sessionStore.enableTurnLoopMode(nextWorkTurnId);
@@ -4107,7 +4267,7 @@ async function runLoopForCompletedTurn(sessionId: string, turnId: string): Promi
     body: JSON.stringify({
       sessionId, turnId: nextWorkTurnId, workspaceId: session.workspaceId, message: grillHandoff(issues, "", review.rounds),
       grillOrigin: { turnId, observedVersion: grillContentVersion(review) },
-      developerInstructions: loopWorkInstructions(workCycle),
+      developerInstructions: loopWorkInstructions(workCycle, turnId),
       model: preferences.selectedModel, modelReasoningEffort: preferences.selectedEffort,
       autoModel: autoModel.enabled,
       approvalPolicy: normalizeApprovalPolicy(await sessionStore.resolveApprovalPolicy(sessionId)),
@@ -4116,14 +4276,29 @@ async function runLoopForCompletedTurn(sessionId: string, turnId: string): Promi
   });
   if (!response.ok) throw new Error(`Automatic Start work returned HTTP ${response.status}`);
   await response.arrayBuffer();
+  // /api/chat streams errors with HTTP 200 too; only a persisted turn proves
+  // the handoff was accepted.
+  if (!await sessionStore.getSessionTurn(nextWorkTurnId)) throw new Error("Automatic Start work did not create a turn.");
 }
 
 function scheduleLoopForCompletedTurn(sessionId: string, turnId: string) {
+  if (shuttingDown) return;
   const active = loopingTurnsBySession.get(sessionId) ?? new Set<string>();
+  if (active.has(turnId)) return;
   active.add(turnId);
   loopingTurnsBySession.set(sessionId, active);
-  void runLoopForCompletedTurn(sessionId, turnId)
-    .catch((error) => console.warn(`Loop mode failed for ${turnId}: ${errorMessage(error)}`))
+  void (async () => {
+    const continuation = await sessionStore.getLoopContinuation(turnId);
+    if (!continuation) return;
+    await runLoopForCompletedTurn(sessionId, turnId, continuation.workTurnId);
+    await sessionStore.finishLoopContinuation(turnId);
+  })()
+    .catch(async (error) => {
+      console.warn(`Loop mode failed for ${turnId}: ${errorMessage(error)}`);
+      await sessionStore.deferLoopContinuation(turnId).catch((retryError) => {
+        console.warn(`Failed to defer Loop ${turnId}: ${errorMessage(retryError)}`);
+      });
+    })
     .finally(() => {
       active.delete(turnId);
       if (active.size) return;
@@ -4132,6 +4307,20 @@ function scheduleLoopForCompletedTurn(sessionId: string, turnId: string) {
         console.warn(`Failed to schedule pending turns after ${turnId}: ${errorMessage(error)}`);
       });
     });
+}
+
+async function recoverDueLoopContinuations() {
+  if (shuttingDown || loopRecoveryRunning) return;
+  loopRecoveryRunning = true;
+  try {
+    for (const { sessionId, turnId } of await sessionStore.listDueLoopContinuations()) {
+      scheduleLoopForCompletedTurn(sessionId, turnId);
+    }
+  } catch (error) {
+    console.warn(`Failed to recover Loop continuations: ${errorMessage(error)}`);
+  } finally {
+    loopRecoveryRunning = false;
+  }
 }
 app.get("/api/sessions/:sessionId/grills", async (req, res) => {
   try {
@@ -4579,6 +4768,10 @@ app.post("/api/runner/stop", async (req: Request<object, object, RunnerStopReque
         ? await sessionStore.getLatestRunningTurn(await resolveRequestedSessionId(requestedSessionId))
         : null;
 
+    const stoppedSessionId = turn?.sessionId ?? (requestedSessionId
+      ? await resolveRequestedSessionId(requestedSessionId) : null);
+    if (stoppedSessionId) await sessionStore.cancelLoopContinuations(stoppedSessionId);
+
     if (!turn) {
       res.status(404).json({ error: "Runner turn not found." });
       return;
@@ -4689,6 +4882,53 @@ app.post("/api/runner/stop", async (req: Request<object, object, RunnerStopReque
   } catch (error) {
     res.status(500).json({ error: errorMessage(error) });
   }
+});
+
+// Stable commands and durable receipts distinguish safe queue fallback from uncertain delivery.
+app.post(["/api/concurrent/steer", "/api/collaboration/steer"], async (req, res) => {
+  try {
+    const { sessionId, turnId, messageId, groupId, message } = req.body ?? {};
+    if (![sessionId, turnId, messageId, groupId, message].every(value => typeof value === "string" && value.length > 0)) {
+      res.status(400).json({ error: "Invalid collaboration steer." }); return;
+    }
+    const group = (await sessionStore.listCollaborationGroups(sessionId)).find(g => g.id === groupId);
+    const dispatch = group?.messages.find(m => m.id === messageId && m.targetTurnId === turnId && m.state === "steering");
+    const target = group?.members.find(m => m.sessionId === sessionId && m.localId === dispatch?.to);
+    if (!dispatch || !target || target.stopped) {
+      res.status(409).json({ error: "Collaboration dispatch is not active." }); return;
+    }
+    const expectedMessage = collaborationDeliveryText(group!, dispatch);
+    const previousMessage = `[Threadex Concurrent ${groupId}; message ${dispatch.id}; ${dispatch.from} → ${dispatch.to}]\n${dispatch.reason}\n\n${dispatch.text}`;
+    const legacyMessage = previousMessage.replace("[Threadex Concurrent ", "[Threadex collaboration ");
+    if (message !== expectedMessage && message !== previousMessage && message !== legacyMessage) { res.status(409).json({ error: "Concurrent dispatch payload changed." }); return; }
+    const commandId = `${messageId}_steer`;
+    const turn = await sessionStore.getSessionTurn(turnId);
+    if (!turn || turn.sessionId !== sessionId) { res.status(409).json({ error: "Invalid target turn." }); return; }
+    const receipt = await sessionStore.collaborationSteerReceipt(commandId, turnId, turn.runnerLogPath);
+    if (receipt === "delivered" || receipt === "not_sent" || receipt === "uncertain") {
+      res.json({ delivery: receipt }); return;
+    }
+    const resultPath = runnerControlResultPath(commandId);
+    if (existsSync(resultPath)) {
+      const result = JSON.parse(readFileSync(resultPath, "utf8")) as RunnerSteerResult;
+      res.json({ delivery: result.ok ? "delivered" : result.notSent ? "not_sent" : "uncertain" }); return;
+    }
+    if (turn.status !== "running" || !turn.runnerPid || !isProcessAlive(turn.runnerPid)) {
+      res.json({ delivery: receipt === "new" ? "not_sent" : "uncertain" }); return;
+    }
+    if (receipt === "new") await sessionStore.recordSessionTurnEvent({ id: `collaboration-dispatch:${commandId}`, sessionId, turnId,
+      eventName: "collaboration.steer_dispatch", payload: { commandId, runnerLogPath: turn.runnerLogPath } });
+    const command: RunnerSteerCommand = { id: commandId, message: expectedMessage, attachments: [], skills: [] };
+    mkdirSync(runnerControlDir, { recursive: true });
+    appendFileSync(runnerControlPath(turnId), `${JSON.stringify(command)}\n`, "utf8");
+    try {
+      const result = await waitForRunnerSteerResult(commandId, turnId, turn.runnerPid);
+      res.json({ delivery: result.ok ? "delivered" : result.notSent ? "not_sent" : "uncertain" });
+    } catch {
+      const finalReceipt = await sessionStore.collaborationSteerReceipt(commandId, turnId);
+      res.json({ delivery: finalReceipt === "delivered" ? "delivered" : finalReceipt === "not_sent" ? "not_sent" : "pending" });
+    }
+  } catch (error) { res.status(500).json({ error: errorMessage(error) }); }
 });
 
 app.post("/api/runner/steer", async (req: Request<object, object, RunnerSteerRequest>, res: Response) => {
@@ -4803,6 +5043,10 @@ app.post("/api/pending-turns", async (req: Request<object, object, PendingTurnCr
         res.status(409).json({ error: "turnId already belongs to another session." });
         return;
       }
+      if (existingTurn.lastEventName === "queue.fork_reserved") {
+        res.status(409).json({ error: "This queued prompt is held for Fork. Keep the local backup until Fork completes." });
+        return;
+      }
       res.json({
         ok: true,
         duplicate: true,
@@ -4815,7 +5059,8 @@ app.post("/api/pending-turns", async (req: Request<object, object, PendingTurnCr
     }
     await sessionStore.resolveApprovalPolicy(session.id, turnId,
       chatRequest.approvalPolicy === undefined ? undefined : normalizeApprovalPolicy(chatRequest.approvalPolicy));
-    const attachments = saveUploadedAttachments(uploadDir, turnId, chatRequest.attachments);
+    const attachments = saveUploadedAttachments(uploadDir, turnId, chatRequest.attachments,
+      { preserveSource: true });
     const messageForStorage = attachments.length > 0 ? formatStoredUserInput(message, attachments) : message;
     await recordSessionTurnWithLog({
       id: turnId,
@@ -4834,6 +5079,8 @@ app.post("/api/pending-turns", async (req: Request<object, object, PendingTurnCr
       pendingLoadBalance: chatRequest.loadBalanceInWorkspace === true,
       requestMetadata: buildPendingRequestMetadata(chatRequest, attachments)
     }, "pending.create");
+    try { removeStagedUploadedAttachmentSources(uploadDir, chatRequest.attachments); }
+    catch (error) { console.warn(`Failed to clean staged uploads for ${turnId}: ${errorMessage(error)}`); }
 
     const turn = await sessionStore.getSessionTurn(turnId);
     void schedulePendingTurnsForSession(session.id).catch((error) => {
@@ -4851,15 +5098,38 @@ app.post("/api/pending-turns", async (req: Request<object, object, PendingTurnCr
   }
 });
 
+app.post("/api/pending-turns/:turnId/edit", async (req: Request, res: Response) => {
+  const { sessionId, editToken, cancel } = req.body;
+  if (typeof sessionId !== "string" || !sessionId || typeof editToken !== "string" || !editToken) {
+    res.status(400).json({ error: "sessionId and editToken are required." });
+    return;
+  }
+  try {
+    const turnId = String(req.params.turnId);
+    if (cancel === true) {
+      await sessionStore.releasePendingSessionTurnEdit(turnId, sessionId, editToken);
+      void schedulePendingTurnsForSession(sessionId).catch(console.warn);
+      res.json({ ok: true });
+    } else {
+      const attachments = loadSavedAttachments(uploadDir, turnId);
+      const turn = await sessionStore.reservePendingSessionTurnForEdit(turnId, sessionId, editToken);
+      res.json({ ok: true, turn, message: typeof turn.requestMetadata?.message === "string" ? turn.requestMetadata.message : undefined,
+        attachments });
+    }
+  } catch (error) {
+    res.status(409).json({ error: errorMessage(error) });
+  }
+});
+
 app.patch("/api/pending-turns/:turnId", async (
   req: Request<{ turnId: string }, object, PendingTurnUpdateRequest>,
   res: Response
 ) => {
   const turnId = req.params.turnId.trim();
   const sessionId = req.body.sessionId?.trim();
-  const message = req.body.message?.trim();
+  const message = req.body.message;
 
-  if (!turnId || !sessionId || !message) {
+  if (!turnId || !sessionId || typeof message !== "string" || !message.trim()) {
     res.status(400).json({ error: "turnId, sessionId, and message are required." });
     return;
   }
@@ -4870,7 +5140,8 @@ app.patch("/api/pending-turns/:turnId", async (
       id: turnId,
       sessionId,
       userInput: attachments.length > 0 ? formatStoredUserInput(message, attachments) : message,
-      message
+      message,
+      editToken: req.body.editToken
     });
     await turnRingLog.appendUserPrompt({
       eventId: `prompt:${turnId}:pending.edit:${crypto.randomUUID()}`,
@@ -4880,6 +5151,7 @@ app.patch("/api/pending-turns/:turnId", async (
       userPrompt: message
     });
     res.json({ ok: true, turn });
+    void schedulePendingTurnsForSession(sessionId).catch(console.warn);
   } catch (error) {
     res.status(400).json({ error: errorMessage(error) });
   }
@@ -5001,7 +5273,7 @@ app.post("/api/pending-turns/:turnId/steer", async (
       throw new Error(steer?.error || "Steer delivery could not be confirmed.");
     }
     delivered = true;
-    if (!await sessionStore.deleteQueuedSessionTurn(turnId, sessionId, true)) {
+    if (!await sessionStore.deleteQueuedSessionTurn(turnId, sessionId, true, false, true)) {
       throw new Error("Steer was delivered, but the queued prompt could not be removed.");
     }
     const timer = pendingTurnTimers.get(turnId);
@@ -5142,6 +5414,13 @@ app.post("/api/session-tasks", async (req: Request<object, object, CreateSession
     if (req.body.managerRequestId !== undefined && (!managingWorkspace || !managerRequestId || managerRequestId.length > 100)) {
       res.status(400).json({ error: "A valid manager request ID requires a workspace manager source." }); return;
     }
+    const queueForkRequestId = typeof req.body.queueForkRequestId === "string" ? req.body.queueForkRequestId.trim() : "";
+    if (req.body.queueForkRequestId !== undefined &&
+      (!/^qfork_[a-f0-9]{48}$/.test(queueForkRequestId) || sourceSessionId !== parentSessionId ||
+        req.body.contextFork !== true || req.body.startImmediately !== true || managerRequestId)) {
+      res.status(400).json({ error: "A queued prompt fork requires its source session and a stable fork request ID." }); return;
+    }
+    const idempotentRequestId = managerRequestId || queueForkRequestId;
     if (managingWorkspace && parentSession.workspaceId !== managingWorkspace.workspaceId) {
       res.status(403).json({ error: "Choose a parent session in this manager's workspace." }); return;
     }
@@ -5195,21 +5474,21 @@ app.post("/api/session-tasks", async (req: Request<object, object, CreateSession
       return;
     }
 
-    const sessionId = managerRequestId
-      ? `tx_${createHash("sha256").update(`${managingWorkspace!.sessionId}:${managerRequestId}`).digest("hex").slice(0, 32)}`
+    const sessionId = idempotentRequestId
+      ? `tx_${createHash("sha256").update(`${managingWorkspace?.sessionId ?? sourceSessionId}:${idempotentRequestId}`).digest("hex").slice(0, 32)}`
       : createLocalSessionId();
     const startImmediately = req.body.startImmediately === true;
-    const turnId = startImmediately ? managerRequestId ? `manager_task_${sessionId}` : crypto.randomUUID() : null;
+    const turnId = startImmediately ? idempotentRequestId ? `manager_task_${sessionId}` : crypto.randomUUID() : null;
     const requestedTitle = req.body.title?.trim();
     const metadata = sessionStore.normalizeMetadata({
       title: requestedTitle,
       parentSessionId
     }, prompt);
-    const existingManagerTask = managerRequestId ? await sessionStore.getSession(sessionId) : null;
-    if (existingManagerTask && existingManagerTask.parentSessionId !== parentSessionId) {
-      res.status(409).json({ error: "This manager request already created a task with a different parent. Reuse its original parent when retrying.", sessionId }); return;
+    const existingIdempotentTask = idempotentRequestId ? await sessionStore.getSession(sessionId) : null;
+    if (existingIdempotentTask && existingIdempotentTask.parentSessionId !== parentSessionId) {
+      res.status(409).json({ error: "This fork request already created a task with a different parent. Reuse its original parent when retrying.", sessionId }); return;
     }
-    const childSession = existingManagerTask ?? await sessionStore.upsertSession({
+    const childSession = existingIdempotentTask ?? await sessionStore.upsertSession({
       id: sessionId,
       threadId: null,
       workspaceId: parentSession.workspaceId,
@@ -5220,15 +5499,15 @@ app.post("/api/session-tasks", async (req: Request<object, object, CreateSession
       titleSource: requestedTitle ? "user" : "initial",
       description: metadata.description,
       parentSessionId
-    }, { createOnly: Boolean(managerRequestId) });
-    if (managerRequestId && childSession.parentSessionId !== parentSessionId) {
-      res.status(409).json({ error: "This manager request already created a task with a different parent. Reuse its original parent when retrying.", sessionId }); return;
+    }, { createOnly: Boolean(idempotentRequestId), inheritParentLoopMode: req.body.contextFork === true });
+    if (idempotentRequestId && childSession.parentSessionId !== parentSessionId) {
+      res.status(409).json({ error: "This fork request already created a task with a different parent. Reuse its original parent when retrying.", sessionId }); return;
     }
     if (managingWorkspace) await sessionStore.setSessionTaskManager(childSession.id, managingWorkspace.sessionId);
     const managerPreferences = managingWorkspace ? await sessionStore.getWorkspaceModelPreferences(managingWorkspace.workspaceId) : null;
     const childModel = normalizeModel(req.body.model ?? managerPreferences?.selectedModel);
     const childModelReasoningEffort = normalizeReasoningEffort(req.body.modelReasoningEffort ?? managerPreferences?.selectedEffort);
-    if (childModel && !existingManagerTask) {
+    if (childModel && !existingIdempotentTask) {
       const parentPreferences = await sessionStore.getSessionModelPreferences(creationSource.id);
       const activeGearIndex = parentPreferences.activeGearIndex;
       const gearProfiles = parentPreferences.gearProfiles.map((profile, index) => index === activeGearIndex
@@ -5244,7 +5523,7 @@ app.post("/api/session-tasks", async (req: Request<object, object, CreateSession
     }
 
     await publishRingEvent({
-      eventId: managerRequestId ? `manager-task:${sessionId}` : crypto.randomUUID(),
+      eventId: idempotentRequestId ? `manager-task:${sessionId}` : crypto.randomUUID(),
       type: "session.task.created",
       workspaceId: childSession.workspaceId,
       sessionId: childSession.id,
@@ -5287,12 +5566,20 @@ app.post("/api/session-tasks", async (req: Request<object, object, CreateSession
     }
 
     if (startImmediately && turnId) {
-      if (managerRequestId) {
+      if (idempotentRequestId) {
         // A stable pending-turn ID makes manager retries safe, including a crash after session creation.
+        const assignment = req.body.model && isAutoModel(req.body.model)
+          ? await sessionStore.getSessionModelPreferences(childSession.id) : null;
         const response = await fetch(`${serverUrl.replace(/\/$/, "")}/api/pending-turns`, {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ sessionId: childSession.id, turnId, workspaceId: childSession.workspaceId,
-            message: taskPrompt, approvalPolicy: req.body.approvalPolicy, backgroundTask: true })
+            message: taskPrompt, approvalPolicy: req.body.approvalPolicy, backgroundTask: true,
+            executionMode: req.body.executionMode,
+            ...(assignment && isAutoModel(assignment.selectedModel) ? {
+              model: assignment.selectedModel, modelReasoningEffort: assignment.selectedEffort,
+              autoModel: false, workspaceManagerModelSelection: true
+            } : {}),
+            attachments: req.body.attachments })
         });
         if (!response.ok) throw new Error(`Unable to queue manager task: ${await response.text()}`);
       } else void runCreatedSessionTask({
@@ -5300,6 +5587,7 @@ app.post("/api/session-tasks", async (req: Request<object, object, CreateSession
         turnId,
         parentSession,
         prompt: taskPrompt,
+        attachments: req.body.attachments,
         model: req.body.model,
         modelReasoningEffort: req.body.modelReasoningEffort,
         approvalPolicy: req.body.approvalPolicy,
@@ -5331,6 +5619,7 @@ async function runCreatedSessionTask(input: {
   turnId: string;
   parentSession: SessionRecord;
   prompt: string;
+  attachments?: UploadedAttachment[];
   model?: string;
   modelReasoningEffort?: string;
   approvalPolicy?: ApprovalPolicy;
@@ -5346,6 +5635,7 @@ async function runCreatedSessionTask(input: {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         message: input.prompt,
+        attachments: input.attachments,
         sessionId: input.sessionId,
         turnId: input.turnId,
         workspaceId: input.parentSession.workspaceId,
@@ -5438,15 +5728,20 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
       : req.body;
     const chatRequest = await prepareAutoLoadBalancedChatRequest(requestForPreparation);
     const session = await getOrCreateSession(chatRequest, sessionMessage);
-    const workspaceManagerRole = await sessionStore.getSessionWorkspaceManager(session.id);
+    const workspaceManagerRole = await sessionStore.resolveSessionWorkspaceManager(session.id);
+    const mainWorkspaceManager = workspaceManagerRole?.sessionId === session.id;
+    const managerLoopAlert = Boolean(workspaceManagerRole &&
+      await sessionStore.isWorkspaceManagerLoopAlertTurn(session.id, retryTurn?.id ?? chatRequest.turnId?.trim() ?? ""));
     if (workspaceManagerRole) {
-      chatRequest.model = WORKSPACE_MANAGER_MODEL;
-      chatRequest.modelReasoningEffort = WORKSPACE_MANAGER_EFFORT;
+      if (mainWorkspaceManager) {
+        chatRequest.model = managerLoopAlert ? WORKSPACE_MANAGER_LOOP_ALERT_MODEL : WORKSPACE_MANAGER_MODEL;
+        chatRequest.modelReasoningEffort = managerLoopAlert ? WORKSPACE_MANAGER_LOOP_ALERT_EFFORT : WORKSPACE_MANAGER_EFFORT;
+        await sessionStore.setSessionModelPreferences(session.id, { selectedModel: WORKSPACE_MANAGER_MODEL, selectedEffort: WORKSPACE_MANAGER_EFFORT });
+      }
       chatRequest.autoModel = false;
       chatRequest.forcePlan = false;
       chatRequest.contextFork = false;
       chatRequest.executionMode = "default";
-      await sessionStore.setSessionModelPreferences(session.id, { selectedModel: WORKSPACE_MANAGER_MODEL, selectedEffort: WORKSPACE_MANAGER_EFFORT });
     }
     // A Todo worker keeps owning the same item for every later turn in its child
     // session. The browser follow-up request does not carry these internal fields,
@@ -5474,7 +5769,7 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
       return;
     }
 
-    const message = pendingTurn?.userInput ?? requestedMessage ?? sessionMessage;
+    let message = pendingTurn?.userInput ?? requestedMessage ?? sessionMessage;
     const requestedTurnId = pendingTurn?.id ?? chatRequest.turnId?.trim();
     const requestedTurn = requestedTurnId ? await sessionStore.getSessionTurn(requestedTurnId) : null;
 
@@ -5525,7 +5820,7 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
     const logPath = resolve(runnerLogDir, `${runnerAttemptId}.ndjson`);
     const pendingLogPath = resolve(pendingRunnerLogDir, `${runnerAttemptId}.ndjson`);
     const attachments = pendingTurn ? loadSavedAttachments(uploadDir, turnId) : saveUploadedAttachments(uploadDir, turnId, chatRequest.attachments);
-    const messageForStorage = attachments.length > 0 ? formatStoredUserInput(message, attachments) : message;
+    let messageForStorage = attachments.length > 0 ? formatStoredUserInput(message, attachments) : message;
     if (!pendingTurn) {
       const claim = await sessionStore.claimSessionTurn({
         id: turnId,
@@ -5666,6 +5961,12 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
         return;
       }
       claimedTurnId = turnId;
+      // Preparation can overlap an edit. Execute the row returned by the claim,
+      // never the prompt fetched before its hold was acquired/released.
+      message = claim.turn!.userInput;
+      messageForStorage = message;
+      chatRequest.message = typeof claim.turn!.requestMetadata?.message === "string"
+        ? claim.turn!.requestMetadata.message : message;
     }
     if (!retryPending && chatRequest.grillOrigin) {
       const grill = await sessionStore.acknowledgeTurnGrill(session.id, chatRequest.grillOrigin.turnId, chatRequest.grillOrigin.observedVersion, turnId);
@@ -5684,7 +5985,11 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
     const managerModelPreferences = managedTask ? await sessionStore.getSessionModelPreferences(session.id) : null;
     const selectedModel = chatRequest.model ?? managerModelPreferences?.selectedModel;
     const enableAutoModel = shouldEnableAutoModel(selectedModel, chatRequest.autoModel);
-    let autoModel = workspaceManagerRole
+    // Apply a queued Manager assignment only after this turn has claimed execution.
+    // An earlier Auto setting must not override it on pending/retry startup.
+    const managerAssignedModel = chatRequest.workspaceManagerModelSelection === true
+      && chatRequest.autoModel === false && isAutoModel(selectedModel);
+    let autoModel = workspaceManagerRole || managerAssignedModel
       ? await sessionStore.setSessionAutoModelEnabled(session.id, false)
       : retryPending && !enableAutoModel
       ? await sessionStore.getSessionAutoModel(session.id)
@@ -5722,6 +6027,11 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
     const modelReasoningEffort = autoModel.enabled
       ? normalizeReasoningEffort(autoModel.effort)
       : normalizeReasoningEffort(chatRequest.modelReasoningEffort ?? managerModelPreferences?.selectedEffort);
+    if (managerAssignedModel) {
+      await sessionStore.setSessionModelPreferences(session.id, {
+        selectedModel, selectedEffort: modelReasoningEffort
+      });
+    }
     const requestedSkills = resolveRequestedSkills(chatRequest.skills, session.workspaceId);
     await sessionStore.recordTokenUsage([{
       id: `agent:turn:${turnId}`,
@@ -5780,26 +6090,32 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
         recoveryEvents: recoveryEventInspection?.events ?? []
       });
     }
-    const startupSnapshot = session.threadId ? undefined : buildStartupSnapshot(session.cwd);
+    const startupSnapshot = session.threadId || workspaceManagerRole ? undefined : buildStartupSnapshot(session.cwd);
     // Composer Todo opts into the persistent lightweight harness. Explicit Plan mode remains separate.
     if (sessionCategories.read(session.workspaceId).enabled) {
       sessionCategories.sync(session.workspaceId, await sessionStore.listSessions(session.workspaceId));
       categoryClassifier.schedule(session.workspaceId);
     }
+    const collaboration = await collaborationService.runnerContext(session.id, turnId);
     const runnerDeveloperInstructions = [
       chatRequest.developerInstructions,
+      collaboration?.instructions,
       clientLayoutInstructions(chatRequest.clientLayout),
       sessionCategories.context(session.workspaceId, session.id),
       workspaceManagerRole ? await workspaceManager.context(session.workspaceId) : undefined
     ].filter(Boolean).join("\n\n") || undefined;
     const job: RunnerJob = {
+      ...(collaboration ? { collaboration } : {}),
       workspaceManager: Boolean(workspaceManagerRole),
+      managerDelegatedTask: Boolean(managedTask && !workspaceManagerRole),
+      managerLoopAlert,
       sessionId: session.id,
       turnId,
       message,
       threadId: session.threadId ?? undefined,
       model,
       modelReasoningEffort,
+      fastMode: !mainWorkspaceManager && chatRequest.fastMode === true,
       approvalPolicy: normalizeApprovalPolicy(chatRequest.approvalPolicy),
       autoModelEnabled: autoModel.enabled,
       autoModelRevision: autoModel.revision,
@@ -5949,6 +6265,8 @@ async function shutdown(signal: string) {
   console.log(`Received ${signal}; shutting down Threadex.`);
 
   clearInterval(watchdog);
+  if (loopRecoveryTimer) clearInterval(loopRecoveryTimer);
+  collaborationService.stop();
   webVsCodeWalkthroughService?.stop();
   webVsCodeWalkthroughService = null;
   stopCodexSessionTitlePollJob();
@@ -6029,7 +6347,9 @@ async function startApiServer() {
 
   apiServer = app.listen(port, () => {
     console.log(`Threadex API listening on http://localhost:${port}`);
+    void installKnownGitWorktreeReviewHooks().catch(error => console.warn(`Git worktree hook setup failed: ${errorMessage(error)}`));
     workspaceManager.start(() => eventRingLog.entries);
+    collaborationService.start();
     void sessionStore.listWorkspaceManagers().then(async managers => {
       for (const manager of managers) await publishRingEvent({ eventId: `platform:${serverMonitorStartedAt}:${manager.workspaceId}`,
         type: "platform.restarted", workspaceId: manager.workspaceId, sessionId: null, turnId: null,
@@ -6052,6 +6372,11 @@ async function startApiServer() {
     void recoverPendingTurns().catch((error) => {
       console.warn(`Failed to recover pending turns: ${errorMessage(error)}`);
     });
+    void sessionStore.recoverInterruptedLoopContinuations()
+      .then(recoverDueLoopContinuations)
+      .catch(error => console.warn(`Failed to recover interrupted Auto Grill: ${errorMessage(error)}`));
+    loopRecoveryTimer = setInterval(() => void recoverDueLoopContinuations(), 5_000);
+    loopRecoveryTimer.unref();
     void replayPendingRunnerLogs();
     void drainCodexHookQueue()
       .catch((error) => {
@@ -6721,7 +7046,8 @@ async function pendingResetAt(pending: PendingSessionTurnCandidate): Promise<num
     ? accounts.filter((account) => account.id !== pending.turn.accountId)
     : accounts;
   return pendingRetryAt({
-    alternateAccountAvailable: pendingUsesWorkspaceAccountPool(pending) && Boolean(
+    alternateAccountAvailable: (pendingUsesWorkspaceAccountPool(pending) ||
+      pending.session.accountId !== pending.turn.accountId) && Boolean(
       chooseLoadBalancedAccount(candidateAccounts, { hasSavedAuth: accountHasSavedAuth })
     ),
     resetTimes: accounts.flatMap((account) => accountQuotaResetTimes(account))
@@ -6729,11 +7055,15 @@ async function pendingResetAt(pending: PendingSessionTurnCandidate): Promise<num
 }
 
 async function pendingQuotaAccounts(pending: PendingSessionTurnCandidate): Promise<AccountRecord[]> {
-  return pendingUsesWorkspaceAccountPool(pending)
-    ? await sessionStore.listAccountsForWorkspace(pending.session.workspaceId)
-    : pending.account
-      ? [pending.account]
-      : [];
+  if (pendingUsesWorkspaceAccountPool(pending)) {
+    return sessionStore.listAccountsForWorkspace(pending.session.workspaceId);
+  }
+  const account = pending.session.accountId === pending.turn.accountId
+    ? pending.account
+    : pending.session.accountId
+      ? await sessionStore.getAccount(pending.session.accountId)
+      : null;
+  return account ? [account] : [];
 }
 
 async function runPendingTurnAutomatically(turnId: string) {
@@ -6746,6 +7076,8 @@ async function runPendingTurnAutomatically(turnId: string) {
   if (!pending) {
     return;
   }
+  if (pendingTurns.some(candidate => candidate.session.id === pending.session.id &&
+    candidate.turn.lastEventName === "queue.edit_reserved")) return;
   const firstPendingForSession = pendingTurns
     .filter((candidate) => candidate.session.id === pending.session.id)
     .filter((candidate) => pendingTurnReason(candidate.turn) !== "stopped")
@@ -7243,8 +7575,10 @@ function buildPendingRequestMetadata(request: ChatRequest, attachments: SavedAtt
     backgroundTask: request.backgroundTask,
     model: request.model,
     modelReasoningEffort: request.modelReasoningEffort,
+    fastMode: request.fastMode,
     approvalPolicy: request.approvalPolicy,
     autoModel: request.autoModel,
+    workspaceManagerModelSelection: request.workspaceManagerModelSelection,
     loadBalanceInWorkspace: request.loadBalanceInWorkspace,
     executionMode: request.executionMode,
     skills: request.skills,
@@ -7279,6 +7613,17 @@ async function appendSessionTurnPromptLog(
   });
 }
 
+async function installKnownGitWorktreeReviewHooks() {
+  const [sessions, workspaces] = await Promise.all([sessionStore.listSessions(), sessionStore.listWorkspaces()]);
+  for (const cwd of new Set([...sessions.map(session => session.cwd), ...workspaces.map(workspace => workspace.cwd)])) {
+    if (!cwd || !existsSync(cwd)) continue;
+    try { installGitWorktreeReviewHooks(cwd); }
+    catch (error) { console.warn(`Git worktree hook setup failed for ${cwd}: ${errorMessage(error)}`); }
+    // Do not starve API traffic while enrolling existing repositories.
+    await new Promise<void>(resolveNext => setImmediate(resolveNext));
+  }
+}
+
 async function spawnPromptRunner(job: RunnerJob): Promise<ChildProcess> {
   const ownership = runnerProcesses.begin(job.logPath);
   try {
@@ -7293,6 +7638,7 @@ async function spawnOwnedPromptRunner(
   job: RunnerJob,
   ownership: ReturnType<RunnerProcessRegistry["begin"]>
 ): Promise<ChildProcess> {
+  installGitWorktreeReviewHooks(job.cwd);
   mkdirSync(runnerJobDir, { recursive: true });
   mkdirSync(runnerLogDir, { recursive: true });
   mkdirSync(pendingRunnerLogDir, { recursive: true });
@@ -8045,7 +8391,7 @@ async function advanceLoadBalancedAccountForWorkspaceWithOptions(
 
 async function advanceAutoLoadBalanceAfterLimit(sessionId: string, persistedLoadBalance = false) {
   const session = await sessionStore.getSession(sessionId);
-  if (!session || (!persistedLoadBalance && !autoLoadBalanceWorkspaceIds.has(session.workspaceId))) {
+  if (!session || !persistedLoadBalance || !autoLoadBalanceWorkspaceIds.has(session.workspaceId)) {
     return;
   }
 
@@ -8055,20 +8401,25 @@ async function advanceAutoLoadBalanceAfterLimit(sessionId: string, persistedLoad
   }
 
   // A usage-limited follow-up should stay in the same Codex thread while the
-  // next available account handles the next turn. Manual account changes and
-  // explicit load-balance actions still clear the session below this path.
+  // next available account handles the next turn. The current workspace LB
+  // switch must still permit rotation when the runner's callback arrives.
   await rebindSessionAccount(sessionStore, session, account);
 }
 
 async function prepareAutoLoadBalancedChatRequest(request: ChatRequest): Promise<ChatRequest> {
   const workspace = await getRequestedOrActiveWorkspace(request.workspaceId);
-  if (request.loadBalanceInWorkspace === true) {
+  const loadBalanceInWorkspace = resolveChatLoadBalance({
+    requestedLoadBalance: request.loadBalanceInWorkspace,
+    retryPending: request.retryPending === true,
+    workspaceLoadBalanceEnabled: autoLoadBalanceWorkspaceIds.has(workspace.id)
+  });
+  if (loadBalanceInWorkspace) {
     if (!autoLoadBalanceWorkspaceIds.has(workspace.id)) {
       await sessionStore.setWorkspaceAutoLoadBalance(workspace.id, true);
     }
     autoLoadBalanceWorkspaceIds.add(workspace.id);
   }
-  return request;
+  return { ...request, loadBalanceInWorkspace };
 }
 
 async function getAccountResponseFields(workspaceId: string, knownActiveAccount?: AccountRecord | null) {
@@ -8735,7 +9086,7 @@ async function waitForRunnerSteerResult(commandId: string, turnId: string, runne
   while (Date.now() < deadline) {
     if (existsSync(resultPath)) {
       const result = JSON.parse(readFileSync(resultPath, "utf8")) as RunnerSteerResult;
-      rmSync(resultPath, { force: true });
+      if (!commandId.startsWith("collab_")) rmSync(resultPath, { force: true });
       return result;
     }
     if (!isProcessAlive(runnerPid)) {

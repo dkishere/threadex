@@ -12,6 +12,17 @@ directly.
 Use `RUNNER_SERVER_URL` when it is set, otherwise use
 `http://127.0.0.1:8787` for the local Threadex API.
 
+## Git Worktree Review
+
+Git worktree review is always on, with no Settings option. Threadex automatically
+installs repository-local hooks at server startup for known repositories and
+before each runner starts. Commit/push pauses when other worktrees contain
+unfinished work or their push status cannot be established from local refs.
+Review the report, handle related work within scope, or ask the user when intent
+is unclear. To leave work separate, explain why and retry only that command with
+the hook's `THREADEX_WORKTREE_REVIEW` token and `THREADEX_WORKTREE_REASON`.
+Never disable hooks or export an override to skip future reviews.
+
 ## Composer Suggestions
 
 - Saved keywords are scoped to a workspace and are shared by the Threadex UI
@@ -50,6 +61,21 @@ it at thread start, resume and turn start (including activity wakes and retries)
 Existing manager sessions receive current policy on their next turn; no new
 session, history migration or user reminder is needed.
 
+Future worker assignments follow workload before cost: Luna only for explicit
+mechanical work; routine small development/search uses the user's Terra category,
+currently assigned to Sol because the catalog aliases legacy Terra to Luna.
+Sol or higher handles substantive new capabilities, investigation/log analysis,
+medium planning/review/audit, large-data reasoning, performance and prompt work.
+Astra handles 3D, security and large plans/reviews/audits. Stalled follow-ups or
+user dissatisfaction escalate the next authorized attempt; repeated lack of
+progress escalates further. Quota percentages are not routing thresholds.
+Manager create/prompt/fork tools accept an explicit `model`; policy requires
+choosing it for each future dispatch and retaining it on idempotent retries.
+Follow-up/fork assignments are stored with the queued turn and take effect only
+when that turn starts. This does not change Jev settings, Manager reasoning
+effort, task boundaries, or existing running/pending turns, and is not permission
+to restart rate-limited work.
+
 For each message the manager first determines whether it asks for action; an
 attachment alone or an explicit read-only/no-task request does not start work.
 It confirms the project and clarifies ambiguity that would change routing or
@@ -65,7 +91,26 @@ route separately.
 
 If plausible readings would change the work's direction, ask the user to clarify
 before dispatching dependent work. Clear requests need no extra confirmation.
-Every worker brief preserves the user's original wording as the canonical request,
+For a running task, deliver relevant review findings, notifications and corrections
+with `workspace_steer_task`, targeting the inspected running `turnId`. Send only
+new actionable information and necessary source references, normally 1–3 short
+bullets. Do not repeat the original request or full brief, queue a second turn,
+or fork an ongoing-work update based on thread length. Quote new user corrections
+exactly and identify superseded assumptions. Skip already-known information and
+events needing no worker action. Verify steer acceptance; if rejected or delivery
+is uncertain, inspect current state before deciding what remains. Never silently
+fall back to queuing or blindly retry. Steer preserves the active model.
+
+All later manager prompts to an already-briefed session stay concise, including
+queued prompts, idle-session continuations, restarts, stronger-model interventions
+and fork requests. Send only new requirements, findings, corrections and necessary
+references. Do not repeat settled background, constraints, the original request or
+unchanged model rationale. Existing user or inherited context counts as briefing.
+A fork request briefly asks the parent to carry its existing canonical request into
+the child's first brief instead of repeating it to the parent.
+
+Only the first briefing in a destination session needs a self-contained brief that
+preserves the user's original wording as the canonical request,
 quotes confirmed clarifications, and labels the manager's interpretation of
 meaning/cause as possibly wrong. Workers must check the original intent and context
 before acting. A user correction must immediately reach the affected task with an
@@ -119,6 +164,14 @@ event queue. Only idle managers are woken; events are batched. Each turn receive
 fresh platform status. The manager decides whether to act, report to the user,
 or note an event silently. Stopping one manager turn does not change the durable
 automatic follow-up setting; use the explicit pause/resume control for that.
+With global Loop mode enabled, running ordinary tasks receive a read-only
+summariser health check every five minutes. A no-output or repeated-work finding
+becomes a `task.loop_stalled` manager event; the manager weighs the evidence and
+may leave the task running. Only the notification turn uses Astra/low, without
+changing the manager's normal Luna/max preference. The always-available
+`workspace_continue_stronger` tool stops the selected task's running/queued
+turns and continues the same task on the next supported model tier, with an
+idempotent `requestId`; inspect the returned turn before reporting it started.
 Manager-only tools enforce workspace scope. Historical events can be inspected
 through `GET /api/workspace-manager/events?workspaceId=...` and explicitly
 dismissed by ID with `POST /api/workspace-manager/events/dismiss` after checking

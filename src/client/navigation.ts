@@ -42,6 +42,11 @@ export function navigationUrl(target: NavigationTarget, href = window.location.h
   return `${url.pathname}${url.search}${url.hash}`;
 }
 
+export function workspaceManagerSessionUrl(manager: { workspaceId: string; sessionId: string }, view: "raw" | "manager", href: string) {
+  return navigationUrl({ workspaceId: manager.workspaceId, sessionId: manager.sessionId,
+    view: view === "manager" ? "workspace-chat" : null }, href);
+}
+
 function setQueryValue(url: URL, key: string, value: string | null) {
   if (value) {
     url.searchParams.set(key, value);

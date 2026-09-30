@@ -292,6 +292,10 @@ export async function submit(ctx, event, modeOverride?: string) {
         const turnSkills = selectedSkills.filter((skill) => message.includes(`$${skill.name}`));
         const forcePlan = composerTodoPlanModeEnabled;
         const submissionMode = modeOverride ?? composerMode;
+        if (ctx.concurrentSourceTurnId && submissionMode !== "steer") {
+            await ctx.startConcurrent(message, attachments, turnSkills);
+            return;
+        }
         if (executionMode === "loop" && !(currentSessionIsRunning && submissionMode === "steer")) {
             setComposerExecutionMode("default");
         }
@@ -326,11 +330,13 @@ export async function startChatTurn(ctx, message, turnAttachments, turnExecution
         setStatus(contextForkRequest ? "Preparing child task handoff" : "Connecting to Codex");
         const turnId = submissionId ?? crypto.randomUUID();
         const provisionalSessionId = sessionIdRef.current ?? `tx_${crypto.randomUUID()}`;
+        const submittedModelPreferences = currentModelPreferences();
         const submission = {
             id: turnId, turnId, sessionId: provisionalSessionId, workspaceId, kind: "prompt", message,
             attachments: turnAttachments,
             settings: { executionMode: turnExecutionMode, skills: turnSkills, contextFork: contextForkRequest,
-                forcePlan, grillOrigin, modelPreferences: currentModelPreferences(), approvalPolicy }
+                forcePlan, grillOrigin, modelPreferences: submittedModelPreferences, approvalPolicy,
+                fastMode: submittedModelPreferences.fastMode === true }
         };
         // Even restoring the selected session can make a network request.
         // Preserve the input before the first await, then rebind it if necessary.
@@ -422,6 +428,7 @@ export async function startChatTurn(ctx, message, turnAttachments, turnExecution
                     grillOrigin,
                     model: selectedModel === AUTO_MODEL_VALUE ? DEFAULT_MODEL : selectedModel,
                     modelReasoningEffort: selectedModel === AUTO_MODEL_VALUE ? "high" : selectedEffort,
+                    fastMode: modelPreferences.fastMode === true,
                     modelPreferences,
                     approvalPolicy,
                     autoModel: selectedModel === AUTO_MODEL_VALUE,
@@ -442,9 +449,11 @@ export async function startChatTurn(ctx, message, turnAttachments, turnExecution
                     resumeThreadId: currentSessionId ? resumeThreadId.trim() || undefined : undefined
                 })
             });
-            if (!response.ok || !response.body) {
-                throw new Error(`API returned ${response.status}`);
+            if (!response.ok) {
+                const payload = await response.json().catch(() => null);
+                throw new Error(payload?.error || `API returned ${response.status}`);
             }
+            if (!response.body) throw new Error("The chat response was empty.");
             noteBackendRequestSucceeded();
             scheduleLoadSessions();
             await readEventStream(response.body, (streamEvent) => handleStreamEvent(streamEvent, target));
@@ -601,18 +610,21 @@ export function enqueuePrompt(ctx, message, kind, mode, skills, promptAttachment
     const {
         activeWorkspaceIdRef, clearComposerInputDraft, clearComposerSessionLinks,
         isLikelyBackendDisconnect, noteBackendDisconnect, noteBackendRequestSucceeded,
-        refreshSelectedSessionSnapshot, sessionIdRef, setAttachments,
+        refreshSelectedSessionSnapshot, sessionIdRef, queueRetryRef, showQueuedPromptReceipt, setAttachments,
         setComposerResponseQuote, setResponseQuotePopover, setSelectedSkills,
         setSlashTrigger, setStatus
     } = ctx;
     const sessionId = sessionIdRef.current;
-    const id = crypto.randomUUID();
+    const requestKey = JSON.stringify({ sessionId, message, kind, mode, skills, promptAttachments, contextFork, forcePlan, requestSettings: ctx.requestSettings });
+    const id = queueRetryRef.current?.key === requestKey ? queueRetryRef.current.id : crypto.randomUUID();
     if (!sessionId || !preserveSubmission(ctx, {
         id, turnId: id, sessionId,
         workspaceId: activeWorkspaceIdRef.current, kind: "prompt", message,
         attachments: promptAttachments,
         settings: { queued: true, executionMode: mode, skills, contextFork, forcePlan, ...ctx.requestSettings }
     })) return false;
+
+    queueRetryRef.current = { key: requestKey, id };
 
     beginSubmission(id, sessionId);
     return (async () => {
@@ -638,6 +650,8 @@ export function enqueuePrompt(ctx, message, kind, mode, skills, promptAttachment
                 throw new Error(payload?.error || `API returned ${response.status}`);
             }
             noteBackendRequestSucceeded?.();
+            showQueuedPromptReceipt({ id, sessionId, content: message, attachments: promptAttachments, kind, contextFork });
+            if (queueRetryRef.current?.id === id) queueRetryRef.current = null;
             removePendingSubmission(id);
             if (clearComposer) {
                 clearComposerInputDraft();

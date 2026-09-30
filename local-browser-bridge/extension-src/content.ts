@@ -16,6 +16,7 @@ const contentGlobal = globalThis as typeof globalThis & {
 const contextKeyPrefix = "codex-browser-bridge:context:";
 const receiverAttribute = "data-local-browser-bridge-context-receiver";
 const injectionEvent = "local-browser-bridge:inject-context";
+const injectionResultEvent = "local-browser-bridge:inject-context-result";
 let active = true;
 let menuHost: HTMLElement | undefined;
 let highlightHost: HTMLElement | undefined;
@@ -24,11 +25,14 @@ const menuInteractionEvents = [
   "auxclick",
   "click",
   "dblclick",
+  "focusin",
+  "focusout",
   "keydown",
   "keypress",
   "keyup",
   "mousedown",
   "mouseup",
+  "pointerdown",
   "pointerup",
   "pointercancel",
   "touchstart",
@@ -55,7 +59,7 @@ function dispose(): void {
   if (contentGlobal.__localBrowserBridgeContent === controller) delete contentGlobal.__localBrowserBridgeContent;
 }
 
-function onExtensionMessage(message: unknown, _sender: chrome.runtime.MessageSender, sendResponse: (response?: unknown) => void): void {
+function onExtensionMessage(message: unknown, _sender: chrome.runtime.MessageSender, sendResponse: (response?: unknown) => void): boolean | void {
   const record = message && typeof message === "object" && !Array.isArray(message) ? message as Record<string, unknown> : null;
   if (record?.type === "browserContextReceiver") {
     sendResponse({ name: document.documentElement.getAttribute(receiverAttribute) });
@@ -68,8 +72,23 @@ function onExtensionMessage(message: unknown, _sender: chrome.runtime.MessageSen
     sendResponse({ ok: false });
     return;
   }
-  document.dispatchEvent(new CustomEvent(injectionEvent, { detail: JSON.stringify(context) }));
-  sendResponse({ ok: true });
+  const requestId = crypto.randomUUID();
+  const timeout = setTimeout(() => finish({ ok: false, error: "Threadex did not confirm the attachment. Check its tab before trying again." }), 60_000);
+  function onResult(event: Event): void {
+    if (!(event instanceof CustomEvent) || typeof event.detail !== "string") return;
+    try {
+      const result = JSON.parse(event.detail) as { requestId?: string; ok?: boolean; error?: string };
+      if (result.requestId === requestId) finish(result);
+    } catch { /* Ignore unrelated page events. */ }
+  }
+  function finish(result: { ok?: boolean; error?: string }): void {
+    clearTimeout(timeout);
+    document.removeEventListener(injectionResultEvent, onResult);
+    sendResponse({ ok: result.ok === true, error: result.error });
+  }
+  document.addEventListener(injectionResultEvent, onResult);
+  document.dispatchEvent(new CustomEvent(injectionEvent, { detail: JSON.stringify({ requestId, context }) }));
+  return true;
 }
 
 async function initialize(): Promise<void> {
@@ -135,7 +154,7 @@ function onKeyDown(event: KeyboardEvent): void {
 async function showContextMenu(x: number, y: number, element: Element, screenshot?: ContextScreenshot): Promise<void> {
   closeMenu();
   showElementHighlight(element);
-  const loading = createMenu(x, y);
+  const loading = createMenu(x, y, element);
   loading.shadowRoot?.append(createStatus("Loading page context…"));
   positionMenu(loading, x, y, element);
   try {
@@ -172,8 +191,8 @@ async function showContextMenu(x: number, y: number, element: Element, screensho
       const addLabel = `Add to ${config.receiver.name}`;
       actions.append(createButton(addLabel, async (button) => {
         setButtonState(button, "Adding…", true);
-        try { await send({ type: "submitPageContext", context: contextWithComment(), receiverTabId: config.receiver!.tabId }); setButtonState(button, "Added", true); setTimeout(closeMenu, 500); }
-        catch (error) { setButtonState(button, addLabel, false); showError(error); }
+        try { await send({ type: "submitPageContext", context: contextWithComment(), receiverTabId: config.receiver!.tabId }); setButtonState(button, "Added to Threadex", true); showMenuNotice("Page context attached in Threadex. You can keep browsing here."); }
+        catch (error) { setButtonState(button, addLabel, false); showMenuNotice(errorMessage(error), true); }
       }));
     }
     actions.append(createButton("Copy", async (button) => {
@@ -250,7 +269,7 @@ function cssPath(element: Element): string | null {
   return parts.join(" > ") || null;
 }
 
-function createMenu(x: number, y: number): HTMLElement {
+function createMenu(x: number, y: number, element: Element): HTMLElement {
   const host = document.createElement("div");
   host.dataset.localBrowserBridgeMenu = "1";
   Object.assign(host.style, { all: "initial", position: "fixed", zIndex: "2147483647", left: `${x}px`, top: `${y}px` });
@@ -259,7 +278,19 @@ function createMenu(x: number, y: number): HTMLElement {
   for (const eventName of menuInteractionEvents) {
     host.addEventListener(eventName, interceptMenuEvent);
   }
-  document.documentElement.append(host);
+  // Focus traps also inspect focusout on the page's previously focused control.
+  // Keep the retargeted shadow host inside the selected element's dialog so
+  // that transfer is allowed before the textarea can receive focusin.
+  const dialog = element.closest('dialog, [role="dialog"], [role="alertdialog"]');
+  if (dialog) {
+    // A top-layer popover retains DOM ancestry for the focus trap while escaping
+    // the dialog's transforms and clipping. Positioning stays viewport-relative.
+    host.popover = "manual";
+    dialog.append(host);
+    host.showPopover();
+  } else {
+    document.documentElement.append(host);
+  }
   menuHost = host;
   return host;
 }
@@ -353,6 +384,14 @@ function closeMenu(): void {
   removeEventListener("resize", updateElementHighlight);
 }
 function showError(error: unknown): void { window.alert(`Local Browser Bridge: ${errorMessage(error)}`); }
+function showMenuNotice(message: string, error = false): void {
+  const panel = menuHost?.shadowRoot?.querySelector(".panel");
+  if (!panel) return;
+  let notice = panel.querySelector<HTMLElement>(".notice");
+  if (!notice) { notice = document.createElement("p"); notice.className = "notice"; notice.setAttribute("role", "status"); panel.append(notice); }
+  notice.textContent = message;
+  notice.style.color = error ? "#f28b82" : "#81c995";
+}
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 
 async function copyText(value: string): Promise<void> {

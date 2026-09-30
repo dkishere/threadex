@@ -187,7 +187,7 @@
   }
 
   .responsive-layout .composer-gear-menu {
-    width: min(440px, calc(100vw - 24px));
+    width: min(420px, calc(100vw - 24px));
     max-height: min(360px, calc(var(--app-height, 100dvh) - var(--chat-header-height) - 24px));
     overflow-y: auto;
   }

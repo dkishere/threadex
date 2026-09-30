@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameS
 import { hostname } from "node:os";
 import { dirname, relative, resolve, sep } from "node:path";
 import { changedFilePaths } from "./changedFilePaths";
+import { originalGitHookPath } from "./gitWorktreeGuard";
 import { buildThreadexTurnReference, canonicalSessionId, parseCodexReference } from "../codexReference";
 
 // Git adapter: resolve event paths into a worktree, persist pending associations,
@@ -205,7 +206,7 @@ export function installGitProvenanceHooks(cwd: string, cli: string, tsx: string)
   repository(cwd);
   const quote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
   const hooks = ["prepare-commit-msg", "post-commit"] as const;
-  const targets = hooks.map(hook => ({ hook, path: resolve(cwd, git(cwd, ["rev-parse", "--git-path", `hooks/${hook}`]).trim()) }));
+  const targets = hooks.map(hook => ({ hook, path: originalGitHookPath(cwd, hook) }));
   for (const { path } of targets) {
     if (existsSync(path)) throw new Error(`Existing hook preserved: ${path}. Chain the Threadex CLI manually.`);
   }

@@ -6,9 +6,65 @@ import test from "node:test";
 import express from "express";
 import { SessionStore } from "./sessionStore";
 import { openPostgresSessionConnection, postgresSchemaFromStoreId } from "./sessionDb";
-import { WorkspaceManagerService, WORKSPACE_MANAGER_INSTRUCTIONS, workspaceManagerEvent, workspaceManagerContext } from "./workspaceManager";
+import { WorkspaceManagerService, WORKSPACE_MANAGER_INSTRUCTIONS, workspaceManagerEvent, workspaceManagerContext,
+  loopTaskHasNoOutput, loopTaskHealthPrompt, nextStrongerWorkspaceModel, parseLoopTaskHealthAssessment } from "./workspaceManager";
 import { WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS } from "./workspaceManagerRouting";
 import { isSilentManagerResponse, recentWorkspaceManagerMessages, recentWorkspaceManagerTurns, visibleWorkspaceManagerMessage, type WorkspaceManagerEvent } from "../workspaceManager";
+
+test("manager turn context bounds status and excludes dashboard history, metrics and approval payloads", () => {
+  const history = "HISTORY_PAYLOAD_".repeat(10_000);
+  const task = (index: number) => ({
+    sessionId: `task-${index}`, turnId: `turn-${index}`, title: `Task ${index}`, cwd: "/tmp/project",
+    description: history, parentSessionId: null, updated: "2026-09-28T12:00:00Z", status: "running",
+    pendingReason: null, latestRequest: history, latestResponse: history, requestPrompt: history,
+    runningModel: "gpt-6-sol", queuedTurns: 1, contextPercent: 75,
+    comments: [{ id: "comment", summary: history, detail: history, created: "now" }],
+    queuedPrompts: [{ id: "queued", prompt: history, created: "now" }],
+    tokenActivity: { minutes: [{ minute: "now", tokens: 999 }], lastIncreaseAt: "now" },
+    futureDashboardField: history
+  });
+  const snapshot = {
+    manager: { workspaceId: "a", sessionId: "manager-a", notificationsEnabled: true, created: "now", updated: "now" },
+    capturedAt: "2026-09-28T12:00:00Z", totalTasks: 100, runningTasks: 50, pendingTasks: 1, pendingEvents: 2,
+    globalLoopEnabled: true, tasks: Array.from({ length: 50 }, (_, i) => task(i)),
+    recentCompletedTasks: [task(0), ...Array.from({ length: 30 }, (_, i) => task(i + 50))]
+  };
+  const platform = {
+    workspaceId: "a", workspaceName: "Workspace A", projects: Array.from({ length: 30 }, (_, i) => `/tmp/project-${i}`),
+    processes: Array.from({ length: 25 }, (_, i) => ({ id: `process-${i}`, label: history, status: "running", error: history })),
+    approvals: Array.from({ length: 25 }, (_, i) => ({ approvalId: `approval-${i}`, sessionId: `task-${i}`,
+      turnId: `turn-${i}`, title: `Approval ${i}`, method: "commandExecution", params: { command: history } })),
+    futurePlatformField: history
+  };
+  const context = workspaceManagerContext(snapshot, platform);
+  const status = JSON.parse(context.slice(context.indexOf("\n\n") + 2));
+  assert.equal(status.managerSessionId, "manager-a");
+  assert.equal(status.capturedAt, snapshot.capturedAt);
+  assert.equal(status.globalLoopEnabled, true);
+  assert.equal(status.totalTasks, 100);
+  assert.equal(status.runningTasks, 50);
+  assert.equal(status.pendingTasks, 1);
+  assert.equal(status.pendingEvents, 2);
+  assert.equal(status.tasks.length, 40);
+  assert.equal(status.tasks[0].turnId, "turn-0");
+  assert.equal(status.tasks[0].runningModel, "gpt-6-sol");
+  assert.equal(status.tasks[0].queuedTurns, 1);
+  assert.equal(status.recentCompletedTasks.length, 20);
+  assert.ok(!status.recentCompletedTasks.some((item: { sessionId: string }) => item.sessionId === "task-0"));
+  assert.equal(status.projects.length, 20);
+  assert.equal(status.totalProjects, 30);
+  assert.equal(status.processes.length, 20);
+  assert.equal(status.totalProcesses, 25);
+  assert.equal(status.processes[0].label.length, 180);
+  assert.equal(status.approvals.length, 20);
+  assert.equal(status.totalApprovals, 25);
+  assert.equal(status.approvals[0].approvalId, "approval-0");
+  assert.doesNotMatch(context, /requestPrompt|latestRequest|latestResponse|comments|queuedPrompts|tokenActivity|contextPercent|futureDashboardField|futurePlatformField|"params"/);
+  assert.ok(!context.includes(WORKSPACE_MANAGER_INSTRUCTIONS));
+  assert.ok(context.length < 30_000, "large historical payloads must not expand turn context");
+  assert.equal(snapshot.tasks[0].requestPrompt, history, "full dashboard/history remains intact for on-demand inspection");
+  assert.equal(platform.approvals[0].params.command, history);
+});
 
 test("manager renders only the latest 50 turns including a live reply, without changing history", () => {
   const messages = Array.from({ length: 65 }, (_, index) => [
@@ -76,6 +132,116 @@ test("manager lifecycle events distinguish normal completion, explicit stop, une
   assert.equal(visibleWorkspaceManagerMessage({ role: "assistant", turnId: "manager_event", content: "[workspace-note] Fine", turnStatus: "done" }), false);
   assert.equal(visibleWorkspaceManagerMessage({ role: "assistant", turnId: "manager_event", content: "Needs attention", turnStatus: "done" }), true);
   assert.equal(visibleWorkspaceManagerMessage({ role: "assistant", turnId: "user-turn", content: "Streaming", turnStatus: "running" }), true);
+});
+
+test("Loop health checks run every five minutes only while globally enabled and queue a manager alert without stopping work", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "workspace-manager-loop-health-"));
+  const store = new SessionStore(resolve(root, "test.postgres"));
+  await store.ready();
+  let assessments = 0;
+  let assessmentText = JSON.stringify({ stalled: true, reason: "Repeated checks without a new result" });
+  const service = new WorkspaceManagerService(store, { schedule: async () => undefined,
+    platform: async () => ({}), post: async () => ({ ok: true }),
+    assessLoopTask: async (_workspaceId, prompt) => {
+      assessments += 1;
+      assert.match(prompt, /Repeated checks/);
+      return assessmentText;
+    } });
+  try {
+    await store.upsertWorkspace({ id: "a", name: "A", cwd: root, codexHome: root });
+    await store.upsertSession({ id: "task", workspaceId: "a", cwd: root, title: "Long task" });
+    await store.recordSessionTurn({ id: "work", sessionId: "task", userInput: "Repeated checks", agentResponse: "",
+      tokenIn: 0, tokenOut: 0, status: "running" });
+    await store.markSessionTurnRunning({ id: "work", runnerPid: process.pid, runnerLogPath: "/tmp/loop-health.ndjson" });
+    await store.recordSessionTurnEvent({ id: "progress", turnId: "work", sessionId: "task", eventName: "item",
+      payload: { id: "progress", itemType: "agent_message", eventType: "item.completed", text: "Checking again" } });
+    const due = new Date(Date.now() + 5 * 60_000 + 1000);
+    await service.sweepLoopTasks(due);
+    assert.equal(assessments, 0);
+    assert.equal((await store.listWorkspaceManagerEvents("a")).length, 0);
+    await store.setGlobalLoopMode(true);
+    await service.sweepLoopTasks(due);
+    assert.equal(assessments, 1);
+    const manager = await store.getWorkspaceManager("a");
+    assert.ok(manager);
+    await store.setSessionModelPreferences(manager!.sessionId, { selectedModel: "gpt-6-luna", selectedEffort: "max" });
+    const alerts = await store.listWorkspaceManagerEvents("a");
+    assert.equal(alerts.length, 1);
+    assert.equal(alerts[0].type, "task.loop_stalled");
+    assert.equal(alerts[0].turnId, "work");
+    assert.equal((await store.getSessionTurn("work"))?.status, "running");
+    await service.sweepLoopTasks(due);
+    assert.equal(assessments, 1, "same five-minute slot must not duplicate assessments");
+    const batch = await store.queueWorkspaceManagerEvents("a");
+    assert.ok(batch);
+    assert.equal(await store.isWorkspaceManagerLoopAlertTurn(manager!.sessionId, batch!.turnId), true);
+    assert.equal((await store.getSessionTurn(batch!.turnId))?.requestMetadata?.backgroundTask, true);
+    assert.equal((await store.getSessionModelPreferences(manager!.sessionId)).selectedModel, "gpt-6-luna");
+    assert.equal((await store.getSessionModelPreferences(manager!.sessionId)).selectedEffort, "max");
+    assessmentText = JSON.stringify({ stalled: false, reason: "No repeated commands" });
+    await service.sweepLoopTasks(new Date(due.getTime() + 5 * 60_000 + 1000));
+    assert.equal(assessments, 2);
+    assert.equal((await store.listWorkspaceManagerEvents("a")).length, 1,
+      "five minutes without recorded output still alerts even when repetition is not found");
+    await store.setGlobalLoopMode(false);
+    await service.sweepLoopTasks(new Date(due.getTime() + 10 * 60_000 + 1000));
+    assert.equal(assessments, 2);
+    assert.equal(parseLoopTaskHealthAssessment('```json\n{"stalled":false,"reason":"Working"}\n```')?.stalled, false);
+    assert.equal(parseLoopTaskHealthAssessment("not JSON"), null);
+    assert.equal(loopTaskHasNoOutput(new Date(due.getTime() - 60_000).toISOString(), due.toISOString()), false);
+    assert.equal(loopTaskHasNoOutput(null, due.toISOString()), true);
+    assert.match(loopTaskHealthPrompt((await store.getLoopHealthEvidence("work"))!, due.toISOString()), /Checking again/);
+  } finally { service.stop(); await store.close(); }
+});
+
+test("manager has a persistent stop-and-continue action that advances the model without Loop", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "workspace-manager-stronger-"));
+  const store = new SessionStore(resolve(root, "test.postgres"));
+  await store.ready();
+  const posts: Array<{ path: string; body: Record<string, unknown> }> = [];
+  const service = new WorkspaceManagerService(store, { schedule: async () => undefined, platform: async () => ({}),
+    post: async (path, body) => {
+      posts.push({ path, body });
+      if (path === "/api/runner/stop") await store.updateSessionTurn({ id: String(body.turnId),
+        agentResponse: "Stopped", tokenIn: 0, tokenOut: 0, status: "done", runnerExitCode: 143 });
+      if (path === "/api/pending-turns") await store.recordSessionTurn({ id: String(body.turnId),
+        sessionId: String(body.sessionId), userInput: String(body.message), agentResponse: "", tokenIn: 0, tokenOut: 0,
+        status: "todo", pendingReason: "queued", requestMetadata: { model: body.model } });
+      return { sessionId: body.sessionId, turnId: body.turnId };
+    } });
+  const app = express(); app.use(express.json()); app.use("/manager", service.router());
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise<void>(done => server.once("listening", done));
+  const address = server.address(); assert.ok(address && typeof address !== "string");
+  try {
+    await store.upsertWorkspace({ id: "a", name: "A", cwd: root, codexHome: root });
+    const manager = await store.ensureWorkspaceManager("a");
+    await store.upsertSession({ id: "task", workspaceId: "a", cwd: root, title: "Work" });
+    await store.recordSessionTurn({ id: "running", sessionId: "task", userInput: "Build", agentResponse: "",
+      tokenIn: 0, tokenOut: 0, status: "running", requestMetadata: { model: "gpt-6-luna" } });
+    await store.setSessionAutoModelEnabled("task", true);
+    const url = `http://127.0.0.1:${address.port}/manager/${manager.sessionId}/action`;
+    const body = { action: "continue_stronger", sessionId: "task", message: "Continue the same objective with more capacity",
+      requestId: "stronger-1" };
+    const send = () => fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const response = await send();
+    assert.equal(response.status, 200, await response.clone().text());
+    const result = await response.json();
+    assert.deepEqual(result.stoppedTurns, ["running"]);
+    assert.equal(result.strongerModel, "gpt-6.1-sol");
+    assert.equal(result.execution.state, "queued");
+    assert.deepEqual(posts.map(item => item.path), ["/api/runner/stop", "/api/pending-turns"]);
+    assert.equal(posts[1].body.model, "gpt-6.1-sol");
+    assert.equal(posts[1].body.autoModel, false);
+    assert.equal((await store.getSessionAutoModel("task")).enabled, false);
+    assert.equal((await store.getSessionModelPreferences("task")).selectedModel, "gpt-6.1-sol");
+    assert.equal((await send()).status, 200);
+    assert.equal(posts.length, 2, "retry must not stop its own newly queued continuation");
+    assert.equal(await store.getGlobalLoopMode(), false);
+    assert.equal(nextStrongerWorkspaceModel("gpt-6-sol"), "gpt-6-astra");
+    assert.equal(nextStrongerWorkspaceModel("gpt-6.1-sol"), "gpt-6-astra");
+    assert.equal(nextStrongerWorkspaceModel("gpt-6-astra"), null);
+  } finally { await new Promise<void>(done => server.close(() => done())); await store.close(); }
 });
 
 test("direct task prompts create one durable manager event; historical dismissals are audited and never delivered", async t => {
@@ -171,7 +337,7 @@ test("one manager per workspace, durable deduplicated delivery, pause, busy prot
     assert.equal(turn!.pendingReason, "queued");
     assert.equal((await store.workspaceManagerSnapshot("a")).pendingEvents, 0);
     const context = workspaceManagerContext(await store.workspaceManagerSnapshot("a"), { processes: [] });
-    assert.match(context, /ordinary session history is your memory/);
+    assert.ok(!context.includes(WORKSPACE_MANAGER_INSTRUCTIONS));
     assert.match(context, /tx_task_a/);
     assert.doesNotMatch(context, /tx_task_b/);
     await store.close();
@@ -237,6 +403,9 @@ test("manager actions stay within workspace, stop pending work first, and silent
     assert.equal((await post(`/${manager.sessionId}/action`, { action: "inspect", sessionId: manager.sessionId })).status, 200);
     await store.recordSessionTurn({ id: "running", sessionId: "tx_a", userInput: "Work", agentResponse: "", tokenIn: 0, tokenOut: 0, status: "running" });
     await store.recordSessionTurn({ id: "queued", sessionId: "tx_a", userInput: "Next", agentResponse: "", tokenIn: 0, tokenOut: 0, status: "todo", pendingReason: "queued" });
+    const runningInspection = await post(`/${manager.sessionId}/action`, { action: "inspect", sessionId: "tx_a", turnId: "running" });
+    assert.equal(runningInspection.status, 200);
+    assert.equal((await runningInspection.json()).runningEvidence.turnId, "running");
     assert.equal((await post(`/${manager.sessionId}/action`, { action: "stop", sessionId: "tx_a" })).status, 200);
     assert.deepEqual(posts.map(item => item.body.turnId), ["queued", "running"]);
     const create = { action: "create", title: "New task", message: "A self-contained brief", requestId: "create-1", cwd: root };
@@ -380,6 +549,13 @@ test("clearing a manager atomically replaces it, archives history and retains wo
     await store.upsertSession({ id: "owned-task", workspaceId: "a", cwd: root, title: "Owned",
       parentSessionId: old.sessionId });
     await store.setSessionTaskManager("owned-task", old.sessionId);
+    assert.deepEqual((await store.listSessions("a")).map(session => session.id), ["owned-task"]);
+    assert.equal((await store.listSessions()).some(session => session.id === old.sessionId || session.id === other.sessionId), false);
+    assert.deepEqual((await store.listSessionsPage("a")).sessions.map(session => session.id), ["owned-task"]);
+    assert.equal((await store.listSessionsPage("a", 0, 20, "coordination")).total, 0);
+    assert.deepEqual((await store.listSessionsByProjectPage("a")).sessions.map(session => session.id), ["owned-task"]);
+    assert.equal((await store.getSession(old.sessionId))?.id, old.sessionId);
+    assert.equal((await store.listSessionTurns(old.sessionId))[0]?.userInput, "Keep this");
     await store.resolveApprovalPolicy(old.sessionId, undefined, "on-request");
     await store.updateWorkspaceManager("a", { notificationsEnabled: false });
     await store.recordWorkspaceManagerEvent({ id: "pending-reset-event", workspaceId: "a",
@@ -411,6 +587,9 @@ test("clearing a manager atomically replaces it, archives history and retains wo
     assert.equal((await store.listSessionTurns(old.sessionId)).length, 2);
     assert.equal((await store.listSessionTurns(fresh.sessionId)).length, 0);
     assert.equal((await store.listSessionsPage("a")).sessions.some(session => session.id === old.sessionId), false);
+    assert.deepEqual((await store.listSessionsPage("a")).sessions.map(session => session.id), ["owned-task"]);
+    assert.equal((await store.listSessions("a")).some(session => session.id === fresh.sessionId), false);
+    assert.equal((await store.getSession(fresh.sessionId))?.id, fresh.sessionId);
     assert.equal((await store.workspaceManagerSnapshot("a")).tasks.some(task => task.sessionId === old.sessionId), false);
     assert.equal((await store.getSessionTaskManager("owned-task"))?.sessionId, fresh.sessionId);
     assert.equal((await store.getSession("owned-task"))?.parentSessionId, old.sessionId);
@@ -419,8 +598,8 @@ test("clearing a manager atomically replaces it, archives history and retains wo
     assert.equal((await store.getSessionModelPreferences(fresh.sessionId)).selectedEffort, "max");
     assert.equal((await store.getSessionAutoModel(fresh.sessionId)).enabled, false);
     const bootstrap = await service.context("a");
-    assert.ok(bootstrap.includes(WORKSPACE_MANAGER_INSTRUCTIONS));
-    assert.ok(bootstrap.includes(WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS));
+    assert.ok(!bootstrap.includes(WORKSPACE_MANAGER_INSTRUCTIONS));
+    assert.ok(!bootstrap.includes(WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS));
     assert.match(bootstrap, new RegExp(fresh.sessionId));
     assert.equal((await reset(old.sessionId)).status, 409, "a stale clear cannot create another manager");
     assert.equal((await store.listWorkspaceManagerArchives("a")).length, 1);

@@ -229,10 +229,8 @@ async function submitPageContext(input: unknown, sender: chrome.runtime.MessageS
   const target = await chrome.tabs.get(receiverTabId as number);
   const receiver = await injectionReceiverForTab(target);
   if (!receiver) throw new Error("The target agent tab is no longer registered.");
-  const injected = await chrome.tabs.sendMessage(receiver.tabId, { type: "injectBrowserContext", context }) as { ok?: boolean } | undefined;
-  if (injected?.ok !== true) throw new Error("The target agent tab rejected the page context.");
-  await chrome.windows.update(receiver.windowId, { focused: true });
-  await chrome.tabs.update(receiver.tabId, { active: true });
+  const injected = await chrome.tabs.sendMessage(receiver.tabId, { type: "injectBrowserContext", context }) as { ok?: boolean; error?: string } | undefined;
+  if (injected?.ok !== true) throw new Error(injected?.error || "Threadex did not attach the page context.");
   return { added: true, receiver: { tabId: receiver.tabId, name: receiver.name } };
 }
 async function enrichPageContext(input: unknown, sender: chrome.runtime.MessageSender): Promise<Record<string, unknown>> {

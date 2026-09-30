@@ -70,6 +70,7 @@ test("failed local write preserves direct and queued composer input", async t =>
   let cleared = false;
   let status = "";
   const ctx = {
+    queueRetryRef: { current: null },
     activeWorkspaceIdRef: { current: "workspace" }, sessionIdRef: { current: "session" },
     stickToMessageBottomRef: { current: false }, currentModelPreferences: () => ({}),
     clearComposerInputDraft: () => { cleared = true; },
@@ -90,6 +91,8 @@ test("ordinary queue writes once to the backend and does not create a frontend q
   let refreshed: [string, string] | undefined;
   let cleared = false;
   const ctx = {
+    queueRetryRef: { current: null },
+    showQueuedPromptReceipt() {},
     activeWorkspaceIdRef: { current: "workspace" },
     sessionIdRef: { current: "session" },
     requestSettings: { model: "model", approvalPolicy: "never", clientLayout: "desktop" },
