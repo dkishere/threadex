@@ -14,6 +14,12 @@ export function turnGrillUrl(sessionId: string, turnId: string) {
   return `/api/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/grill`;
 }
 
+export function shouldReloadTurnGrill(loaded: boolean, review: TurnGrill | null, revision: number) {
+  // Running reviews need a GET even without a new revision: after a server
+  // restart, that read recovers the persisted job whose worker was lost.
+  return !loaded || review?.status === "running" || revision > (review?.revision ?? 0);
+}
+
 export async function loadTurnGrill(url: string, options: { signal?: AbortSignal; fresh?: boolean } = {}) {
   return (await apiJson<{ grill: TurnGrill | null }>(url, options)).grill;
 }

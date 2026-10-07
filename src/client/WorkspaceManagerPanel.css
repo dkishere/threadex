@@ -17,9 +17,12 @@
 }
 .workspace-manager-dashboard p { color: #64748b; font-size: 12px; }
 .workspace-dashboard-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-.workspace-dashboard-summary, .workspace-task-card { min-width: 0; padding: 16px; border: 1px solid #dbe3ec; border-radius: 12px; background: white; box-shadow: 0 2px 8px rgb(15 23 42 / 4%); }
-.workspace-dashboard-summary { display: flex; justify-content: space-between; align-items: center; gap: 12px; color: #64748b; font-size: 12px; }
-.workspace-dashboard-summary strong { color: #0f172a; font-size: 20px; font-variant-numeric: tabular-nums; }
+.workspace-task-counts { display: inline-flex; align-items: center; flex: 0 0 auto; gap: 6px; }
+.workspace-task-count-badge { display: inline-flex; align-items: center; gap: 5px; min-height: 25px; padding: 0 7px; border: 1px solid #dbe3ec; border-radius: 999px; background: #f8fafc; color: #52637a; font-size: 12px; font-weight: 650; line-height: 1; white-space: nowrap; }
+.workspace-task-count-badge[data-kind="running"] { border-color: #bfdbfe; background: #eff6ff; color: #2563eb; }
+.workspace-task-count-badge svg { width: 13px; height: 13px; flex: 0 0 auto; }
+.workspace-task-count-badge > span { min-width: 1ch; text-align: center; font-variant-numeric: tabular-nums; }
+.workspace-task-card { min-width: 0; padding: 16px; border: 1px solid #dbe3ec; border-radius: 12px; background: white; box-shadow: 0 2px 8px rgb(15 23 42 / 4%); }
 .workspace-task-card { grid-column: span 2; padding: 12px; border-color: #dce4ef; border-radius: 12px; background: #fff; box-shadow: 0 2px 6px rgb(30 58 95 / 3%), inset 0 2px 0 #87a9e8; }
 .workspace-task-card:focus-within { border-color: #a5bfe8; }
 .workspace-task-heading { display: grid; grid-template-columns: 6px minmax(0, 1fr) auto; align-items: start; gap: 8px; }

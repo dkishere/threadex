@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { Router } from "express";
 import type { CollaborationGroup, CollaborationMember, CollaborationMessage, CollaborationView } from "../collaboration";
+import { isCollaborationMemberEnded } from "../collaboration";
 import type { SessionStore, SessionTurnRecord } from "./sessionStore";
 import type { UploadedAttachment } from "./attachmentUploads";
 import { MODEL_OPTIONS, DEFAULT_MODEL } from "../modelCatalog";
@@ -210,6 +211,8 @@ export class CollaborationService {
     const requestId = required(body.requestId, "requestId");
     const text = required(body.message, "message", 100_000);
     const reason = required(body.reason, "reason", 4000);
+    const view = await this.view(sessionId);
+    if (view && isCollaborationMemberEnded(view, to)) throw new Error("This Concurrent worker has ended and cannot accept new prompts.");
     const currentTurn = typeof body.turnId === "string" ? await this.store.getSessionTurn(body.turnId) : null;
     if (body.turnId && currentTurn?.sessionId !== sessionId) throw new Error("Source turn does not belong to the caller.");
     if (from.localId !== "main" && !currentTurn) throw new Error("Worker messages require their current turn ID.");
@@ -229,6 +232,13 @@ export class CollaborationService {
         ...(currentTurn ? { sourceTurnId: currentTurn.id } : {}),
         parentId: parent?.id ?? null, depth: (parent?.depth ?? 0) + 1 }));
     });
+  }
+
+  async assertAcceptsPrompt(sessionId: string) {
+    const view = await this.view(sessionId);
+    const member = view?.members.find(member => member.sessionId === sessionId);
+    if (view && member && isCollaborationMemberEnded(view, member.localId))
+      throw new Error("This Concurrent worker has ended and cannot accept new prompts.");
   }
 
   async control(sessionId: string, body: Record<string, unknown>) {
@@ -307,7 +317,7 @@ export class CollaborationService {
           : [
             `You ARE worker ${self.localId}, not main, the source session, or an observer. References to ${self.localId}/${self.localId.toUpperCase()} or session ${self.sessionId} mean YOU. Your native ephemeral thread is only the execution container for this stable Threadex identity.`,
             manager
-              ? `You retain the Manager role of source session ${manager.sessionId}. Use the workspace Manager tools to route and supervise YOUR assigned request; the Manager no-edit/no-shell rules still apply. Your local ID and session identify you, not another Manager already doing this work. A request addressed to you is entrusted to your delivery flow, not informational input owned by another task. Inspect suitable implementation tasks and dispatch through the Manager tools; do not route the request back to yourself or count its arrival here as a completed handoff. Report the actual downstream task/turn and its verified state.`
+              ? `You are the assigned worker in a Manager Concurrent fork of source session ${manager.sessionId}. Retain its workspace background, user decisions and coordination tools. Execute your own canonical request here under the current Manager Concurrent worker contract; the source supervisor's delegation-only/no-edit/no-shell rules are replaced for this worker. Use the available tools and the current sandbox/approval policy to perform the authorized task. Your local ID is not another Manager's delivery flow.`
               : "You are an ordinary task worker. Perform the assigned project work using this runner's tools and permissions.",
             "The canonical assigned request below is YOUR task to handle here according to your role, subject to later corrections and follow-ups addressed to you. Inherited source history supplies background, not the source agent's identity. Historical statements that this worker has received or is doing this work refer to you; they do not establish that someone else will do it.",
             `[Canonical assigned request]\n${self.task}\n[End canonical assigned request]`,

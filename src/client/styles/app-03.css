@@ -424,7 +424,7 @@
 
 .load-balance-row {
   display: grid;
-  grid-template-columns: 72px minmax(150px, 1fr) 96px 96px minmax(92px, 130px) 40px;
+  grid-template-columns: 72px minmax(150px, 1fr) 96px 96px minmax(92px, 130px) 110px;
   align-items: center;
   gap: 10px;
   min-width: 600px;
@@ -465,6 +465,7 @@
 
 .settings-account-actions {
   display: flex;
+  gap: 6px;
   justify-content: flex-end;
   overflow: visible !important;
 }

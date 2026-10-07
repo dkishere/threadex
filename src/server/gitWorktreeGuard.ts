@@ -66,6 +66,7 @@ export function installGitWorktreeReviewHooks(cwd: string): boolean {
   }
   const env = inspectionEnv(cwd);
   const cli = fileURLToPath(new URL("../../scripts/git-worktree-review.ts", import.meta.url));
+  const provenanceCli = fileURLToPath(new URL("../../scripts/git-provenance.ts", import.meta.url));
   const tsx = import.meta.resolve("tsx");
   const hooksDirectory = resolve(common, "threadex/worktree-review-hooks");
   const enrollmentPath = resolve(common, enrollmentName);
@@ -106,10 +107,14 @@ export function installGitWorktreeReviewHooks(cwd: string): boolean {
     // Unrelated hooks use a shell-only forwarder: don't start Node for every
     // index refresh/reference transaction, and preserve arbitrary stdin bytes.
     const fallback = enrollment.fallbackHooksPath ?? resolve(common, "hooks");
+    const provenance = ["prepare-commit-msg", "post-commit", "applypatch-msg", "post-applypatch"].includes(name);
     const forward = ["case \"$(pwd -P)\" in",
       ...Object.entries(enrollment.originalDirectories).map(([root, directory]) => `  ${quote(root)}) original=${quote(resolve(directory, name))} ;;`),
       `  *) original=${quote(`${fallback}/${name}`)} ;;`, "esac",
-      'if [ -x "$original" ]; then exec "$original" "$@"; fi', "exit 0"].join("\n");
+      provenance ? 'if [ -x "$original" ]; then "$original" "$@" || exit $?; fi'
+        : 'if [ -x "$original" ]; then exec "$original" "$@"; fi',
+      provenance ? `exec ${quote(process.execPath)} --import ${quote(tsx)} ${quote(provenanceCli)} ${quote(name)} "$@"`
+        : "exit 0"].join("\n");
     const command = name === "pre-commit" || name === "pre-push"
       ? `exec ${quote(process.execPath)} --import ${quote(tsx)} ${quote(cli)} ${quote(name)} "$@"`
       : forward;
@@ -210,10 +215,10 @@ export function worktreeReviewMessage(review: ReturnType<typeof inspectOtherWork
     ...review.concerns.flatMap(item => [`- ${JSON.stringify(item.path)} [${item.branch}]`, ...item.reasons.map(reason => `  ${reason}`)]),
     "Remote status uses local tracking refs; no fetch or worktree mutation was performed.",
     "",
-    "Choose how to proceed:",
+    "AGENT: decide and complete the next action:",
     "1. Handle related work together, within the user's authorization, then retry the original command.",
     `2. SKIP this review for your ${operation} retry: leave the listed worktrees unchanged and continue with your original command.`,
-    "The agent can choose to skip clearly separate work after explaining why. Ask the user only when ownership, scope, or permission is unclear.",
+    "For clearly separate work, the agent executing Git must explain the reason to the user, then run the retry below within the current task's permissions. Do not stop after reporting the hook pause or just tell the user to run it. Ask the user only when ownership, scope, or permission is unclear.",
     "",
     `HOW TO SKIP: put BOTH variable assignments below immediately before your ORIGINAL git ${operation} command:`,
     `THREADEX_WORKTREE_REVIEW=${review.token} THREADEX_WORKTREE_REASON='Replace with your reason for leaving this work separate' git ${operation} <original arguments>`,
@@ -271,10 +276,3 @@ export function runGitWorktreeReviewHook(hook: string, args: string[], input?: s
   }
   return 0;
 }
-
-export const GIT_WORKTREE_REVIEW_INSTRUCTIONS = [
-  "Threadex automatically installs Git pre-commit/pre-push hooks to review unfinished work in other worktrees of this repository.",
-  "When a hook pauses an operation, inspect its worktree/branch report. Decide whether the work belongs to the same authorized task and should be completed/committed/pushed together. If ownership, intent, or permission is unclear, ask the user. Never sweep unrelated work into a commit or push automatically.",
-  "You may SKIP the worktree review for clearly separate work after explaining why; user confirmation is needed only when ownership, scope, or permission is unclear. To skip, prepend BOTH THREADEX_WORKTREE_REVIEW=<exact token from this hook report> and THREADEX_WORKTREE_REASON='your reason for leaving the listed worktrees separate' to the ORIGINAL git commit/push command, preserving all of its options and arguments. Set these variables inline for that retry. This leaves the other worktrees untouched and still runs existing repository hooks. If blocked again, review the new report and use its new token; commit and push tokens differ. Do not export these variables, use --no-verify, remove/disable hooks, or change core.hooksPath to avoid the check.",
-  "Push status is based on locally known tracking refs; missing upstreams, detached unpublished commits, and inaccessible worktrees require review. The hooks do not fetch, merge, commit, or push other worktrees for you."
-].join("\n");

@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameS
 import { hostname } from "node:os";
 import { dirname, relative, resolve, sep } from "node:path";
 import { changedFilePaths } from "./changedFilePaths";
-import { originalGitHookPath } from "./gitWorktreeGuard";
+import { installGitWorktreeReviewHooks, originalGitHookPath } from "./gitWorktreeGuard";
 import { buildThreadexTurnReference, canonicalSessionId, parseCodexReference } from "../codexReference";
 
 // Git adapter: resolve event paths into a worktree, persist pending associations,
@@ -39,14 +39,50 @@ function repository(cwd: string) {
   return { root, pending };
 }
 
+const enrolledWorktrees = new Set<string>();
+
 export function recordGitProvenance(cwd: string, sessionId: string, turnId: string, paths: string[], eventId?: string, workspaceId = "default", turnNumber?: number) {
-  if (!paths.length) return;
-  let repo: ReturnType<typeof repository>;
-  try { repo = repository(cwd); } catch { return; }
-  const canonicalCwd = realpathSync(cwd);
-  const files = [...new Set(paths.map(path => relative(repo.root, resolve(canonicalCwd, path)).split(sep).join("/")))]
-    .filter(path => path && path !== ".." && !path.startsWith("../"));
-  if (!files.length) return;
+  const groups = new Map<string, { repo: ReturnType<typeof repository>; files: Set<string> }>();
+  const directories = new Map<string, ReturnType<typeof repository> | null>();
+  for (const path of paths) {
+    const absolute = resolve(cwd, path);
+    // Deleted files (and deleted parent directories) still belong to their
+    // nearest surviving ancestor's repo. Resolve directory symlinks, not the
+    // file itself: an edited symlink belongs to the repo containing the link.
+    let directory = dirname(absolute);
+    while (!existsSync(directory) && dirname(directory) !== directory) directory = dirname(directory);
+    if (!directories.has(directory)) {
+      try { directories.set(directory, repository(directory)); }
+      catch (error) {
+        if (!/not a git repository/.test(String((error as { stderr?: unknown }).stderr ?? ""))) throw error;
+        directories.set(directory, null);
+      }
+    }
+    const repo = directories.get(directory);
+    if (!repo) continue;
+    const canonicalPath = resolve(realpathSync(directory), relative(directory, absolute));
+    const file = relative(realpathSync(repo.root), canonicalPath).split(sep).join("/");
+    if (!file || file === ".." || file.startsWith("../")) continue;
+    const group = groups.get(repo.pending) ?? { repo, files: new Set<string>() };
+    group.files.add(file);
+    groups.set(repo.pending, group);
+  }
+  for (const { repo, files } of groups.values()) {
+    persistGitProvenance(repo, sessionId, turnId, [...files].sort(), eventId, workspaceId, turnNumber);
+  }
+  const setupErrors: unknown[] = [];
+  for (const { repo } of groups.values()) {
+    if (!enrolledWorktrees.has(repo.root)) {
+      try {
+        installGitWorktreeReviewHooks(repo.root);
+        enrolledWorktrees.add(repo.root);
+      } catch (error) { setupErrors.push(error); }
+    }
+  }
+  if (setupErrors.length) throw new AggregateError(setupErrors, "Git provenance recorded, but some worktree hooks could not be enrolled.");
+}
+
+function persistGitProvenance(repo: ReturnType<typeof repository>, sessionId: string, turnId: string, files: string[], eventId: string | undefined, workspaceId: string, turnNumber?: number) {
   const record: GitProvenance = { version: 1, host: hostname(), sessionId, turnId, workspaceId, files,
     ...(Number.isSafeInteger(turnNumber) && turnNumber! > 0 ? { turnNumber } : {}), ...(eventId ? { eventId } : {}) };
   mkdirSync(repo.pending, { recursive: true });
@@ -117,12 +153,31 @@ export async function resolvePendingTurnNumbers(cwd: string, lookup: (record: Gi
   }
 }
 
-export function prepareGitProvenance(cwd: string, messagePath: string) {
+export function prepareGitProvenance(cwd: string, messagePath: string, source?: string) {
   const { root, pending } = repository(cwd);
-  if (!existsSync(pending)) return;
   const staged = new Set(git(root, ["diff", "--cached", "--name-only", "--no-renames", "-z"]).split("\0").filter(Boolean));
-  if (!staged.size) return;
   const message = readFileSync(messagePath, "utf8");
+  const records: GitProvenance[] = [];
+  for (const name of existsSync(pending) ? readdirSync(pending).filter(name => name.endsWith(".json")) : []) {
+    const record: unknown = JSON.parse(readFileSync(resolve(pending, name), "utf8"));
+    if (!validRecord(record) || !record.files.some(path => staged.has(path))) continue;
+    if (record.turnNumber === undefined) throw new Error(`Missing turn number for ${record.sessionId}/${record.turnId}; resolve pending references before committing.`);
+    records.push(record);
+  }
+  if (source) records.push(...gitProvenanceSource(source));
+  if (!records.length) return;
+  writeFileSync(messagePath, appendGitProvenance(message, records));
+}
+
+// An explicit creator/rebuilder reference is separate from file-edit evidence.
+// Never infer it from author email, a branch name, fetch, or push activity.
+export function gitProvenanceSource(source: string): GitProvenance[] {
+  const reference = parseCodexReference(source);
+  if (!reference?.turnNumbers?.length) throw new Error("A numbered Threadex source reference is required.");
+  return parseGitProvenance(`${trailer}${reference.uri}`);
+}
+
+export function appendGitProvenance(message: string, records: GitProvenance[]) {
   const entries = new Map(message.split("\n").filter(isProvenanceTrailer).map(line => [line, line]));
   const groups = new Map<string, { workspaceId: string; sessionId: string; turns: Set<number> }>();
   const addNumber = (record: GitProvenance) => {
@@ -140,18 +195,7 @@ export function prepareGitProvenance(cwd: string, messagePath: string) {
       entries.delete(line);
     }
   }
-  for (const name of readdirSync(pending).filter(name => name.endsWith(".json"))) {
-    const record: unknown = JSON.parse(readFileSync(resolve(pending, name), "utf8"));
-    if (!validRecord(record)) continue;
-    const files = record.files.filter(path => staged.has(path));
-    if (!files.length) continue;
-    if (record.turnNumber === undefined) throw new Error(`Missing turn number for ${record.sessionId}/${record.turnId}; resolve pending references before committing.`);
-    if (record.turnNumber !== undefined) {
-      addNumber(record);
-      continue;
-    }
-
-  }
+  records.forEach(addNumber);
   for (const group of [...groups.values()].sort((a, b) => JSON.stringify([a.workspaceId, a.sessionId]).localeCompare(JSON.stringify([b.workspaceId, b.sessionId])))) {
     const line = `${trailer}${buildThreadexTurnReference(group.workspaceId, group.sessionId, [...group.turns])}`;
     entries.set(line, line);
@@ -162,8 +206,9 @@ export function prepareGitProvenance(cwd: string, messagePath: string) {
     const scissors = original.search(/^# -+ >8 -+.*$/m);
     const before = scissors < 0 ? original : original.slice(0, scissors).trimEnd();
     const after = scissors < 0 ? "" : `\n${original.slice(scissors)}\n`;
-    writeFileSync(messagePath, `${before}\n\n${[...entries.keys()].join("\n")}\n${after}`);
+    return `${before}\n\n${[...entries.keys()].join("\n")}\n${after}`;
   }
+  return message;
 }
 
 export function finishGitProvenance(cwd: string) {

@@ -13,6 +13,7 @@ import { PENDING_CODEX_SESSION_TITLE_PREFIX } from "./codexSessionTitles";
 import { stripTodoPlanOperationalSuffix } from "./todoInstructions";
 import { fileChangesFromTurnDiff, normalizeStructuredAgentComment } from "./codexEvents";
 import { changedFilePaths } from "./changedFilePaths";
+import { turnTokenUsageJoinSql } from "./turnTokenUsage";
 import { canonicalSessionId, isThreadexSessionId, sessionIdAliases } from "../codexReference";
 import { stripContextForkOperationalSuffix } from "../contextFork";
 import { managerActivityPrompt, WORKSPACE_MANAGER_MODEL, WORKSPACE_MANAGER_EFFORT,
@@ -512,6 +513,8 @@ export type SessionTurnRecord = {
   tokenIn: number;
   tokenOut: number;
   usageSample: SessionTurnTokenUsageSampleRecord | null;
+  /** Cached input accumulated over this turn, using the same samples as tokenIn. */
+  cachedInputTokens?: number;
   status: SessionTurnStatus;
   runnerPid: number | null;
   runnerStarted: string | null;
@@ -1017,6 +1020,7 @@ type RecordCodexCommandCallInput = {
 
 const sessionLiveItemOutputTailBytes = 64 * 1024;
 const latestUsageSampleJoinSql = `
+  ${turnTokenUsageJoinSql}
   LEFT JOIN token_usage AS latest_usage
     ON latest_usage.id = (
       SELECT id
@@ -1045,6 +1049,9 @@ const latestUsageSampleJoinSql = `
     )
 `;
 const latestUsageSampleSelectSql = `
+  turn_usage_totals.input_tokens AS turn_usage_input_tokens,
+  turn_usage_totals.cached_input_tokens AS turn_usage_cached_input_tokens,
+  turn_usage_totals.output_tokens AS turn_usage_output_tokens,
   COALESCE(
     (
       SELECT model
@@ -1197,6 +1204,9 @@ type SessionTurnRow = {
   requested_service_tier?: unknown;
   token_in?: unknown;
   token_out?: unknown;
+  turn_usage_input_tokens?: unknown;
+  turn_usage_cached_input_tokens?: unknown;
+  turn_usage_output_tokens?: unknown;
   status?: unknown;
   runner_pid?: unknown;
   runner_started?: unknown;
@@ -1949,7 +1959,11 @@ export class SessionStore {
             CAST(created AS VARCHAR) AS created,
             CAST(updated AS VARCHAR) AS updated,
             (SELECT count(*) FROM session_turn WHERE session_turn.session_id = sessions.id) AS turn_count,
-            COALESCE((SELECT CAST(sum(token_in + token_out) AS BIGINT) FROM session_turn WHERE session_turn.session_id = sessions.id), 0) AS token_count,
+            COALESCE((SELECT CAST(sum(
+              coalesce(turn_usage_totals.input_tokens, session_turn.token_in)
+              + coalesce(turn_usage_totals.output_tokens, session_turn.token_out)
+            ) AS BIGINT) FROM session_turn ${turnTokenUsageJoinSql}
+              WHERE session_turn.session_id = sessions.id), 0) AS token_count,
             CAST(COALESCE((
               SELECT json_agg(
                 json_build_object(
@@ -1964,9 +1978,10 @@ export class SessionStore {
               FROM (
                 SELECT
                   COALESCE(NULLIF(agent_usage.model, ''), 'Unknown') AS model,
-                  CAST(sum(session_turn.token_in + session_turn.token_out) AS BIGINT) AS token_count,
-                  CAST(sum(session_turn.token_in) AS BIGINT) AS input_token_count,
-                  CAST(sum(coalesce((
+                  CAST(sum(coalesce(turn_usage_totals.input_tokens, session_turn.token_in)
+                    + coalesce(turn_usage_totals.output_tokens, session_turn.token_out)) AS BIGINT) AS token_count,
+                  CAST(sum(coalesce(turn_usage_totals.input_tokens, session_turn.token_in)) AS BIGINT) AS input_token_count,
+                  CAST(sum(coalesce(turn_usage_totals.cached_input_tokens, (
                     SELECT coalesce(
                       max(cached_usage.cached_input_tokens) FILTER (WHERE cached_usage.source = 'app_server'),
                       max(cached_usage.cached_input_tokens) FILTER (WHERE cached_usage.source = 'codex_exec'),
@@ -1979,8 +1994,9 @@ export class SessionStore {
                     WHERE cached_usage.turn_id = session_turn.id
                       AND cached_usage.usage_type = 'agent'
                   ), 0)) AS BIGINT) AS cached_input_token_count,
-                  CAST(sum(session_turn.token_out) AS BIGINT) AS output_token_count
+                  CAST(sum(coalesce(turn_usage_totals.output_tokens, session_turn.token_out)) AS BIGINT) AS output_token_count
                 FROM session_turn
+                ${turnTokenUsageJoinSql}
                 LEFT JOIN token_usage AS agent_usage ON agent_usage.id = 'agent:turn:' || session_turn.id
                 WHERE session_turn.session_id = sessions.id
                 GROUP BY COALESCE(NULLIF(agent_usage.model, ''), 'Unknown')
@@ -4726,38 +4742,7 @@ export class SessionStore {
   }
 
   async getSessionTurn(turnId: string): Promise<SessionTurnRecord | null> {
-    return this.read(async (connection) => {
-      const result = await connection.run(
-        `
-          SELECT
-            id,
-            session_id,
-            EXISTS (SELECT 1 FROM turn_loop_mode WHERE turn_id = session_turn.id) AS loop_mode,
-            account_id,
-            user_input,
-            agent_response,
-            token_in,
-            token_out,
-            status,
-            runner_pid,
-            CAST(runner_started AS VARCHAR) AS runner_started,
-            CAST(runner_heartbeat AS VARCHAR) AS runner_heartbeat,
-            runner_log_path,
-            runner_exit_code,
-            last_event_name,
-            pending_reason,
-            pending_load_balance,
-            CAST(request_metadata AS VARCHAR) AS request_metadata,
-            CAST(created AS VARCHAR) AS created,
-            ${resultExecutionDurationSelectSql}
-          FROM session_turn AS session_turn
-          WHERE id = $turnId
-        `,
-        { turnId }
-      );
-      const rows = await result.getRowObjectsJS();
-      return rows.length > 0 ? toSessionTurnRecord(rows[0] as SessionTurnRow) : null;
-    });
+    return this.read((connection) => this.getSessionTurnWithConnection(connection, turnId));
   }
 
   async getLatestRunningTurn(sessionId: string): Promise<SessionTurnRecord | null> {
@@ -5137,8 +5122,9 @@ export class SessionStore {
     });
   }
 
-  /** Execution/action role, including Concurrent forks of the current Manager.
-   * Ordinary delegated tasks do not inherit this role through parentage. */
+  /** Manager context/action authority, including Concurrent forks of the current
+   * Manager. This does not make an assigned worker a read-only supervisor.
+   * Ordinary delegated tasks do not inherit this authority through parentage. */
   async resolveSessionWorkspaceManager(sessionId: string): Promise<WorkspaceManagerRecord | null> {
     const direct = await this.getSessionWorkspaceManager(sessionId);
     if (direct) return direct;
@@ -12395,8 +12381,9 @@ function toSessionTurnRecord(row: SessionTurnRow): SessionTurnRecord {
     ...(reasoningEffort ? { reasoningEffort } : {}),
     ...(row.requested_service_tier === "fast" || row.requested_service_tier === "default"
       ? { requestedServiceTier: row.requested_service_tier } : {}),
-    tokenIn: numberValue(row.token_in),
-    tokenOut: numberValue(row.token_out),
+    tokenIn: nullableNumber(row.turn_usage_input_tokens) ?? numberValue(row.token_in),
+    cachedInputTokens: nullableNumber(row.turn_usage_cached_input_tokens) ?? undefined,
+    tokenOut: nullableNumber(row.turn_usage_output_tokens) ?? numberValue(row.token_out),
     usageSample: toSessionTurnTokenUsageSampleRecord(row),
     status,
     runnerPid: status === "running" ? nullableNumber(row.runner_pid) : null,

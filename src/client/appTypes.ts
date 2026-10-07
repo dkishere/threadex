@@ -593,6 +593,8 @@ export type SessionTurnRecord = {
   }>;
   tokenIn: number;
   tokenOut: number;
+  /** Cached input accumulated over this turn, not just the latest request. */
+  cachedInputTokens?: number;
   usageSample?: {
     id: string;
     source: string;

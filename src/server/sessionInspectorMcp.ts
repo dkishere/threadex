@@ -56,6 +56,7 @@ const apiBaseUrl = process.env.SESSION_INSPECTOR_SERVER_URL?.replace(/\/$/, "") 
 const managerSessionId = process.env.THREADEX_SESSION_ID?.trim() || null;
 const collaborationId = process.env.THREADEX_CONCURRENT_ID?.trim() || process.env.THREADEX_COLLABORATION_ID?.trim() || null;
 const workspaceManager = process.env.THREADEX_WORKSPACE_MANAGER === "1";
+const managerConcurrent = workspaceManager && process.env.THREADEX_MANAGER_CONCURRENT === "1";
 const managerThreadId = process.env.THREADEX_THREAD_ID?.trim() || null;
 const managerTurnId = process.env.THREADEX_TURN_ID?.trim() || null;
 const autoModelEnabled = process.env.THREADEX_AUTO_MODEL === "1";
@@ -741,13 +742,17 @@ const collaborationTools: ToolSpec[] = [{
 }];
 
 function toolsForAgent() {
-  const base = baseToolsForAgent();
+  const base = [...baseToolsForAgent()];
+  if (managerConcurrent && !["side_chat", "turn_grill"].includes(todoAgentRole)) {
+    base.push(...WORKSPACE_MANAGER_TOOLS.filter(tool => todoAgentRole !== "planner" ||
+      ["workspace_status", "workspace_search_tasks", "workspace_inspect_task"].includes(tool.name)));
+  }
   return collaborationId && !["side_chat", "turn_grill", "planner"].includes(todoAgentRole)
     ? [...base, ...collaborationTools] : base;
 }
 
 function baseToolsForAgent() {
-  if (workspaceManager) return WORKSPACE_MANAGER_TOOLS;
+  if (workspaceManager && !managerConcurrent) return WORKSPACE_MANAGER_TOOLS;
   if (todoAgentRole === "turn_grill") return tools.filter((tool) => tool.name === "get_session");
   if (lightweightTodo) return tools.filter((tool) => !tool.name.startsWith("todo_"));
   if (continuityOnly) {

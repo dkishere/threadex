@@ -112,7 +112,7 @@
       "editor/context": [
         {
           "command": "threadexReview.addAnnotation",
-          "when": "resourceScheme == file && threadexReview.canAnnotate",
+          "when": "(resourceScheme == file || resourceScheme == threadex-review-baseline) && threadexReview.canAnnotate",
           "group": "navigation@19"
         },
         {
@@ -131,7 +131,7 @@
       "editor/title": [
         {
           "command": "threadexReview.addAnnotation",
-          "when": "resourceScheme == file && threadexReview.canAnnotate",
+          "when": "(resourceScheme == file || resourceScheme == threadex-review-baseline) && threadexReview.canAnnotate",
           "group": "navigation@19"
         },
         {

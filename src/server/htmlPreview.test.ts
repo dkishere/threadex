@@ -40,7 +40,7 @@ test("sandbox assets work through a tunnel without cookies using only a scoped p
     const preview = createHtmlPreviewUrl(join(dir, "report", "index.html"));
     const page = await fetch(base + preview, { headers });
     assert.equal(page.status, 200);
-    assert.match(page.headers.get("content-security-policy")!, /sandbox allow-scripts;/);
+    assert.match(page.headers.get("content-security-policy")!, /sandbox allow-scripts allow-downloads;/);
     assert.doesNotMatch(page.headers.get("content-security-policy")!, /allow-same-origin/);
     const image = new URL("images/hair.png", base + preview);
     assert.equal((await fetch(image, { headers })).status, 200);

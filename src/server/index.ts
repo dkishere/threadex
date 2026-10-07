@@ -1,4 +1,5 @@
 import { DEFAULT_MODEL, MODEL_CATALOG } from "../modelCatalog";
+import { createWebVsCodeAnnotationsRouter } from "./webVsCodeAnnotations";
 import { createHash } from "node:crypto";
 import { WorkspaceManagerService, parseWorkspaceManagerQueuedPromptForkDraft,
   workspaceManagerQueuedPromptForkQuestion } from "./workspaceManager";
@@ -112,6 +113,7 @@ import {
 } from "./todoInstructions";
 import { isTodoPlanAwaitingClarification } from "../todoPlan";
 import { decideSessionTaskCreation } from "./sessionTaskPolicy";
+import { queuedPromptForkRequestTarget, sessionTaskRequestSessionId } from "./queuedPromptForkRequest";
 import { rebindSessionAccount } from "./sessionAccountBinding";
 import {
   buildSessionRecoveryContext,
@@ -466,6 +468,7 @@ type ManagedSession = {
 type RunnerJob = {
   collaboration?: { groupId: string; fork: CollaborationFork | null; priorContext: string };
   workspaceManager?: boolean;
+  managerConcurrent?: boolean;
   managerDelegatedTask?: boolean;
   managerLoopAlert?: boolean;
   sessionId: string;
@@ -917,21 +920,18 @@ const workspaceManager = new WorkspaceManagerService(sessionStore, {
       throw new Error("The queued prompt's saved attachments are unavailable.");
     }
     const manager = await sessionStore.getWorkspaceManager(input.workspaceId);
-    const managerOwned = manager?.sessionId === input.managerSessionId &&
-      input.parentSessionId === input.managerSessionId;
+    const target = queuedPromptForkRequestTarget(input, manager?.sessionId ?? null);
     const requestBody = {
-      parentSessionId: input.parentSessionId,
-      sourceSessionId: managerOwned ? input.managerSessionId : input.parentSessionId,
-      ...(managerOwned ? { managerRequestId: input.requestId } : { queueForkRequestId: input.requestId, contextFork: true }),
-      cwd: input.cwd, title: input.title, prompt: input.prompt,
+      ...target.request,
+      title: input.title, prompt: input.prompt,
       startImmediately: true, attachments,
       executionMode: input.turn.requestMetadata?.executionMode === "loop"
         ? "loop" : normalizeExecutionMode(input.turn.requestMetadata?.executionMode),
       approvalPolicy: normalizeApprovalPolicy(input.turn.requestMetadata?.approvalPolicy
         ?? await sessionStore.resolveApprovalPolicy(input.parentSessionId))
     } satisfies CreateSessionTaskRequest;
-    const expectedSessionId = `tx_${createHash("sha256").update(`${input.managerSessionId}:${input.requestId}`).digest("hex").slice(0, 32)}`;
-    const expectedTurnId = `manager_task_${expectedSessionId}`;
+    const expectedSessionId = target.sessionId;
+    const expectedTurnId = target.turnId;
     const verifyCreatedTask = async (sessionId: string, turnId: string) => {
       const [createdSession, createdTurn] = await Promise.all([
         sessionStore.getSession(sessionId), sessionStore.getSessionTurn(turnId)
@@ -1046,6 +1046,7 @@ app.use("/api/experimental/session-categories", createSessionCategoriesRouter(se
 app.use("/api/settings/auto-model", createAutoModelSettingsRouter(autoModelSettings));
 app.use("/api/settings/global-instructions", createGlobalAgentInstructionsRouter(globalAgentInstructions));
 app.use("/api/quick-chat", createQuickChatRouter(resolve(dataDir, "quick-chat-sessions.json")));
+app.use("/api/sessions", createWebVsCodeAnnotationsRouter(dataDir, sessionStore));
 app.use(express.static(resolve(projectRoot, "dist"), { index: "index.html" }));
 
 app.get("/api/browser-context/value-mappings", async (req, res) => {
@@ -5035,6 +5036,7 @@ app.post("/api/pending-turns", async (req: Request<object, object, PendingTurnCr
   try {
     const chatRequest = await prepareAutoLoadBalancedChatRequest(req.body);
     const session = await getOrCreateSession(chatRequest, message);
+    await collaborationService.assertAcceptsPrompt(session.id);
     if (chatRequest.forcePlan === true) await enableOutcomeTracking(session.id);
     const turnId = chatRequest.turnId?.trim() || crypto.randomUUID();
     const existingTurn = await sessionStore.getSessionTurn(turnId);
@@ -5475,7 +5477,7 @@ app.post("/api/session-tasks", async (req: Request<object, object, CreateSession
     }
 
     const sessionId = idempotentRequestId
-      ? `tx_${createHash("sha256").update(`${managingWorkspace?.sessionId ?? sourceSessionId}:${idempotentRequestId}`).digest("hex").slice(0, 32)}`
+      ? sessionTaskRequestSessionId(managingWorkspace?.sessionId ?? sourceSessionId, idempotentRequestId)
       : createLocalSessionId();
     const startImmediately = req.body.startImmediately === true;
     const turnId = startImmediately ? idempotentRequestId ? `manager_task_${sessionId}` : crypto.randomUUID() : null;
@@ -5717,6 +5719,14 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
     return;
   }
 
+  if (!retryPending && req.body.sessionId) {
+    try { await collaborationService.assertAcceptsPrompt(req.body.sessionId); }
+    catch (error) {
+      res.status(409).json({ error: error instanceof Error ? error.message : String(error) });
+      return;
+    }
+  }
+
   prepareEventStream(res);
 
   let runner: ChildProcess | null = null;
@@ -5732,12 +5742,10 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
     const mainWorkspaceManager = workspaceManagerRole?.sessionId === session.id;
     const managerLoopAlert = Boolean(workspaceManagerRole &&
       await sessionStore.isWorkspaceManagerLoopAlertTurn(session.id, retryTurn?.id ?? chatRequest.turnId?.trim() ?? ""));
-    if (workspaceManagerRole) {
-      if (mainWorkspaceManager) {
-        chatRequest.model = managerLoopAlert ? WORKSPACE_MANAGER_LOOP_ALERT_MODEL : WORKSPACE_MANAGER_MODEL;
-        chatRequest.modelReasoningEffort = managerLoopAlert ? WORKSPACE_MANAGER_LOOP_ALERT_EFFORT : WORKSPACE_MANAGER_EFFORT;
-        await sessionStore.setSessionModelPreferences(session.id, { selectedModel: WORKSPACE_MANAGER_MODEL, selectedEffort: WORKSPACE_MANAGER_EFFORT });
-      }
+    if (mainWorkspaceManager) {
+      chatRequest.model = managerLoopAlert ? WORKSPACE_MANAGER_LOOP_ALERT_MODEL : WORKSPACE_MANAGER_MODEL;
+      chatRequest.modelReasoningEffort = managerLoopAlert ? WORKSPACE_MANAGER_LOOP_ALERT_EFFORT : WORKSPACE_MANAGER_EFFORT;
+      await sessionStore.setSessionModelPreferences(session.id, { selectedModel: WORKSPACE_MANAGER_MODEL, selectedEffort: WORKSPACE_MANAGER_EFFORT });
       chatRequest.autoModel = false;
       chatRequest.forcePlan = false;
       chatRequest.contextFork = false;
@@ -5989,7 +5997,7 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
     // An earlier Auto setting must not override it on pending/retry startup.
     const managerAssignedModel = chatRequest.workspaceManagerModelSelection === true
       && chatRequest.autoModel === false && isAutoModel(selectedModel);
-    let autoModel = workspaceManagerRole || managerAssignedModel
+    let autoModel = mainWorkspaceManager || managerAssignedModel
       ? await sessionStore.setSessionAutoModelEnabled(session.id, false)
       : retryPending && !enableAutoModel
       ? await sessionStore.getSessionAutoModel(session.id)
@@ -6106,7 +6114,8 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
     ].filter(Boolean).join("\n\n") || undefined;
     const job: RunnerJob = {
       ...(collaboration ? { collaboration } : {}),
-      workspaceManager: Boolean(workspaceManagerRole),
+      workspaceManager: mainWorkspaceManager,
+      managerConcurrent: Boolean(workspaceManagerRole && !mainWorkspaceManager),
       managerDelegatedTask: Boolean(managedTask && !workspaceManagerRole),
       managerLoopAlert,
       sessionId: session.id,
@@ -6120,7 +6129,7 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
       autoModelEnabled: autoModel.enabled,
       autoModelRevision: autoModel.revision,
       autoModelPromptFullVersion,
-      executionMode: workspaceManagerRole || chatRequest.contextFork === true ? "default" : normalizeExecutionMode(chatRequest.executionMode),
+      executionMode: mainWorkspaceManager || chatRequest.contextFork === true ? "default" : normalizeExecutionMode(chatRequest.executionMode),
       forcePlan: forcePlanForTurn,
       lightweightTodo,
       todoPlanClarificationPending,
@@ -6143,7 +6152,7 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
         chatRequest.taskChild === true && !session.threadId
           ? session.parentSessionId ?? undefined
           : undefined,
-      contextForkRequest: !workspaceManagerRole && chatRequest.contextFork === true,
+      contextForkRequest: !mainWorkspaceManager && chatRequest.contextFork === true,
       childExecutionMode: chatRequest.contextFork === true
         ? chatRequest.executionMode === "loop" ? "loop" : normalizeExecutionMode(chatRequest.executionMode)
         : undefined,

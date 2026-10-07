@@ -8,7 +8,7 @@ import { createServer } from "node:http";
 import { SessionStore } from "./sessionStore";
 import { createTurnGrillHandler } from "./turnGrillRoute";
 
-test("grill rejects older turns and persists the latest turn's questions and follow-ups", { timeout: 30_000 }, async () => {
+test("grill reviews an older turn and persists its questions and follow-ups under that turn", { timeout: 30_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "grill-route-"));
   const store = new SessionStore(join(root, "test.postgres"));
   const server = createServer();
@@ -21,11 +21,11 @@ test("grill rejects older turns and persists the latest turn's questions and fol
       await store.recordSessionTurn({ id, sessionId: "fixture", userInput: `Prompt ${id}`, agentResponse: `Reply ${id}`, tokenIn: 0, tokenOut: 0, status: "done" });
     }
     await store.recordSessionTurnEvent({
-      id: "large-unrelated-live-item", sessionId: "fixture", turnId: "a-middle", eventName: "item",
+      id: "large-unrelated-live-item", sessionId: "fixture", turnId: "m-newest", eventName: "item",
       payload: { id: "large-unrelated-live-item", itemType: "agent_message", eventType: "item.completed", text: "x".repeat(1_000_000) }
     });
     await store.recordSessionTurnEvent({
-      id: "target-file-change", sessionId: "fixture", turnId: "m-newest", eventName: "item",
+      id: "target-file-change", sessionId: "fixture", turnId: "a-middle", eventName: "item",
       payload: {
         id: "target-file-change", itemType: "file_change", eventType: "item.completed",
         changes: [{ path: "src/target.ts", kind: "update", diff: "@@ -1 +1 @@\n-old\n+new" }]
@@ -51,11 +51,11 @@ test("grill rejects older turns and persists the latest turn's questions and fol
         const payload = JSON.parse(prompt);
         lastPrompt = payload;
         assert.equal(session.id, "fixture");
-        assert.equal(payload.userInput, "Prompt m-newest");
-        assert.equal(payload.agentResponse, "Reply m-newest");
+        assert.equal(payload.userInput, "Prompt a-middle");
+        assert.equal(payload.agentResponse, "Reply a-middle");
         assert.deepEqual(payload.sessionContext, {
-          sessionUrl: "threadex://grill-test/fixture/m-newest", sessionId: "fixture", workspaceId: "grill-test",
-          turnId: "m-newest", currentTurnNumber: 3, totalTurns: 3
+          sessionUrl: "threadex://grill-test/fixture/a-middle", sessionId: "fixture", workspaceId: "grill-test",
+          turnId: "a-middle", currentTurnNumber: 2, totalTurns: 3
         });
         assert.equal(totalTurns, 3);
         if (extraQuestion) return { responseText: JSON.stringify([...payload.issues,
@@ -70,10 +70,7 @@ test("grill rejects older turns and persists the latest turn's questions and fol
     const address = server.address();
     assert.ok(address && typeof address === "object");
     const base = `http://127.0.0.1:${address.port}/api/sessions/fixture/turns`;
-    const older = await fetch(`${base}/a-middle/grill`, { method: "POST" });
-    assert.equal(older.status, 409);
-    assert.equal(calls, 0);
-    const response = await fetch(`${base}/m-newest/grill`, { method: "POST" });
+    const response = await fetch(`${base}/a-middle/grill`, { method: "POST" });
     const body = await response.json();
     assert.equal(response.status, 200, JSON.stringify(body));
     assert.equal(body.grill.issues[0].md, "**Evidence?**");
@@ -81,8 +78,8 @@ test("grill rejects older turns and persists the latest turn's questions and fol
     assert.deepEqual(recordedModels, ["gpt-6-luna"]);
     assert.equal(wholeSessionLiveItemReads, 0);
     assert.deepEqual(lastPrompt.fileChanges, [{ path: "src/target.ts", kind: "update", additions: 1, deletions: 1 }]);
-    assert.deepEqual((await (await fetch(`${base}/m-newest/grill`)).json()).grill, body.grill);
-    const post = (input: unknown) => fetch(`${base}/m-newest/grill`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) });
+    assert.deepEqual((await (await fetch(`${base}/a-middle/grill`)).json()).grill, body.grill);
+    const post = (input: unknown) => fetch(`${base}/a-middle/grill`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) });
     assert.equal((await post({ action: "save", revision: 0, issues: body.grill.issues })).status, 409);
     body.grill.issues[0].md = "Edited question";
     assert.equal((await post({ action: "followup", revision: body.grill.revision, issues: body.grill.issues })).status, 409);
@@ -95,8 +92,8 @@ test("grill rejects older turns and persists the latest turn's questions and fol
     assert.equal(updated.rounds.length, 2);
     assert.equal(updated.rounds[0].issues[0].md, "**Evidence?**");
     assert.equal(updated.rounds[1].prompt, "Check again");
-    assert.deepEqual(await store.getTurnGrill("fixture", "m-newest"), updated);
-    assert.deepEqual(await store.listGrilledTurnIds("fixture"), ["m-newest"]);
+    assert.deepEqual(await store.getTurnGrill("fixture", "a-middle"), updated);
+    assert.deepEqual(await store.listGrilledTurnIds("fixture"), ["a-middle"]);
     assert.deepEqual(await store.listGrilledTurnIds("unrelated"), []);
     const droppedResponse = await post({ action: "save", revision: updated.revision,
       issues: updated.issues.map((issue: any) => issue.id === "q1" ? { ...issue, dropped: true, selected: true } : issue) });
@@ -104,7 +101,7 @@ test("grill rejects older turns and persists the latest turn's questions and fol
     const dropped = (await droppedResponse.json()).grill;
     assert.equal(dropped.issues[0].dropped, true);
     assert.equal(dropped.issues[0].selected, false);
-    assert.deepEqual((await (await fetch(`${base}/m-newest/grill`)).json()).grill, dropped);
+    assert.deepEqual((await (await fetch(`${base}/a-middle/grill`)).json()).grill, dropped);
     assert.equal((await post({ action: "respond", revision: dropped.revision, issues: dropped.issues, issueId: "q1" })).status, 400);
     const answeredResponse = await post({ action: "respond", revision: dropped.revision, issues: dropped.issues });
     assert.equal(answeredResponse.status, 200);
@@ -119,8 +116,8 @@ test("grill rejects older turns and persists the latest turn's questions and fol
     assert.equal(restored.issues[0].dropped, false);
     assert.equal(restored.issues[0].selected, true);
     assert.equal(restored.issues[0].md, "Restored edited question");
-    assert.deepEqual((await (await fetch(`${base}/m-newest/grill`)).json()).grill, restored);
-    assert.deepEqual(await store.getTurnGrill("fixture", "m-newest"), restored);
+    assert.deepEqual((await (await fetch(`${base}/a-middle/grill`)).json()).grill, restored);
+    assert.deepEqual(await store.getTurnGrill("fixture", "a-middle"), restored);
     assert.equal(restored.issues[0].responseMd, updated.issues[0].responseMd);
     assert.ok(restored.rounds.some((round: any) => round.issues[0].dropped));
     const reviewedResponse = await post({ action: "followup", revision: restored.revision, issues: restored.issues, prompt: "Review the thread response" });
@@ -139,7 +136,7 @@ test("grill rejects older turns and persists the latest turn's questions and fol
     assert.ok(reviewed.issues.every((issue: any) => issue.status === "open"));
     const manual = await post({ action: "save", revision: reviewed.revision, issues: reviewed.issues.map((issue: any) => ({ ...issue, status: "resolved" })) });
     assert.equal(manual.status, 200);
-    assert.ok((await store.getTurnGrill("fixture", "m-newest"))!.issues.every((issue) => issue.status === "resolved"));
+    assert.ok((await store.getTurnGrill("fixture", "a-middle"))!.issues.every((issue) => issue.status === "resolved"));
     reviewed = (await manual.json()).grill;
     extraQuestion = true;
     const discovery = await post({ action: "followup", revision: reviewed.revision, issues: reviewed.issues });
@@ -151,9 +148,15 @@ test("grill rejects older turns and persists the latest turn's questions and fol
     assert.equal(discovered.issues[2].selected, true);
     assert.equal(discovered.issues[2].status, "open");
     assert.deepEqual(discovered.issues.slice(0, 2), reviewed.issues);
-    assert.deepEqual(await store.getTurnGrill("fixture", "m-newest"), discovered);
+    assert.deepEqual(await store.getTurnGrill("fixture", "a-middle"), discovered);
+    assert.equal(await store.getTurnGrill("fixture", "m-newest"), null);
+    const callsBeforeInvalidRequests = calls;
+    assert.equal((await post({ action: "start", revision: discovered.revision })).status, 409);
+    await store.recordSessionTurn({ id: "running", sessionId: "fixture", userInput: "In progress", agentResponse: "", tokenIn: 0, tokenOut: 0, status: "running" });
+    assert.equal((await fetch(`${base}/running/grill`, { method: "POST" })).status, 409);
+    assert.equal(calls, callsBeforeInvalidRequests);
     await store.upsertSession({ id: "other", workspaceId: "grill-test", cwd: root, title: "Other" });
-    const mismatch = `http://127.0.0.1:${address.port}/api/sessions/other/turns/m-newest/grill`;
+    const mismatch = `http://127.0.0.1:${address.port}/api/sessions/other/turns/a-middle/grill`;
     assert.equal((await fetch(mismatch)).status, 404);
     assert.equal((await fetch(mismatch, { method: "POST" })).status, 404);
   } finally {
@@ -189,7 +192,6 @@ test("automatic Loop review can Grill a completed turn after a newer turn exists
     const address = server.address();
     assert.ok(address && typeof address === "object");
     const url = `http://127.0.0.1:${address.port}/api/sessions/loop-session/turns/older/grill`;
-    assert.equal((await fetch(url, { method: "POST" })).status, 409);
     const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "start", autoLoop: true }) });
     assert.equal(response.status, 200);
     const review = (await response.json()).grill;

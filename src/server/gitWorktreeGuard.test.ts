@@ -32,7 +32,7 @@ function fixture(t: { after: (fn: () => void) => void }) {
     git(other, "push", "-qu", "origin", "other");
   };
   const run = (cwd: string, args: string[], extra: NodeJS.ProcessEnv = {}) => spawnSync("git", args, { cwd, env: { ...env, ...extra }, encoding: "utf8", timeout: 10_000 });
-  return { dir, main, other, remote, git, addOther, run };
+  return { dir, main, other, remote, env, git, addOther, run };
 }
 
 test("single worktree commits work; sibling changes block a real commit and a reviewed retry preserves them", t => {
@@ -54,6 +54,73 @@ test("single worktree commits work; sibling changes block a real commit and a re
   assert.equal(readFileSync(resolve(f.other, "untracked.txt"), "utf8"), "leave this alone\n");
   assert.match(f.git(f.other, "status", "--porcelain"), /untracked.txt/);
 });
+
+for (const operation of ["commit", "push"] as const) {
+  test(`${operation} hook tells the agent how to skip and its printed retry works`, t => {
+    const f = fixture(t); f.addOther();
+    f.git(f.main, "commit", "--allow-empty", "-qm", "Pending main push");
+    const hook = operation === "commit" ? "pre-commit" : "pre-push";
+    writeFileSync(resolve(f.main, ".git/hooks", hook), '#!/bin/sh\nprintf "%s\\n" "$0" > original-hook-ran.txt\n', { mode: 0o755 });
+    installGitWorktreeReviewHooks(f.main);
+    writeFileSync(resolve(f.other, "unfinished.txt"), "Another task's unfinished work\n");
+    const siblingHead = f.git(f.other, "rev-parse", "HEAD");
+    const siblingStatus = f.git(f.other, "status", "--porcelain");
+    const siblingRemote = f.git(f.remote, "rev-parse", "refs/heads/other");
+    const mainHead = f.git(f.main, "rev-parse", "HEAD");
+    const remoteHead = f.git(f.remote, "rev-parse", "refs/heads/main");
+    const args = operation === "commit"
+      ? ["-C", f.main, "commit", "--allow-empty", "-m", "Agent's reviewed retry"]
+      : ["-C", f.main, "push", "origin", "HEAD:refs/heads/main"];
+    const blocked = f.run(f.dir, args);
+    assert.notEqual(blocked.status, 0, blocked.stderr);
+    assert.match(blocked.stderr, /AGENT: decide and complete the next action:/);
+    assert.match(blocked.stderr, /agent executing Git must explain the reason to the user, then run the retry/);
+    assert.match(blocked.stderr, /Do not stop after reporting the hook pause or just tell the user to run it/);
+    assert.match(blocked.stderr, /Ask the user only when ownership, scope, or permission is unclear/);
+    assert.ok(blocked.stderr.includes(`HOW TO SKIP: put BOTH variable assignments below immediately before your ORIGINAL git ${operation} command:`));
+    assert.match(blocked.stderr, /Keep all original Git options \(including -C, if used\), message, remote and refspecs unchanged/);
+    assert.match(blocked.stderr, /Existing repository hooks still run; other worktrees are not committed, pushed or modified/);
+    assert.match(blocked.stderr, /If blocked again, review the new report and use its new token/);
+    assert.match(blocked.stderr, /Set the variables inline for the retry, not with export/);
+    assert.equal(f.git(f.main, "rev-parse", "HEAD"), mainHead);
+    assert.equal(f.git(f.remote, "rev-parse", "refs/heads/main"), remoteHead);
+    assert.equal(existsSync(resolve(f.main, "original-hook-ran.txt")), false);
+
+    const printedRetry = blocked.stderr.split("\n").find(line => line.startsWith("THREADEX_WORKTREE_REVIEW="));
+    assert.ok(printedRetry, blocked.stderr);
+    const token = /THREADEX_WORKTREE_REVIEW=([a-f0-9]{24}) /.exec(printedRetry)?.[1];
+    assert.ok(token, printedRetry);
+    const expectedToken = inspectOtherWorktrees(f.main, hook, operation === "push"
+      ? `HEAD ${mainHead} refs/heads/main ${remoteHead}\n` : "", operation === "push" ? "origin" : undefined).token;
+    assert.equal(token, expectedToken);
+    assert.ok(printedRetry.includes(" THREADEX_WORKTREE_REASON='Replace with your reason for leaving this work separate' "));
+    assert.ok(printedRetry.endsWith(` git ${operation} <original arguments>`));
+
+    // Follow the printed instructions: replace the reason and preserve the
+    // original command, including -C before the subcommand and quoted arguments.
+    const shellQuote = (value: string) => "'" + value.replace(/'/g, "'\\''") + "'";
+    const reason = "Other task's changes are still in progress";
+    const command = printedRetry
+      .replace("'Replace with your reason for leaving this work separate'", shellQuote(reason))
+      .replace(`git ${operation} <original arguments>`, ["git", ...args].map(shellQuote).join(" "));
+    const retried = spawnSync("sh", ["-c", command], { cwd: f.dir, env: f.env, encoding: "utf8", timeout: 10_000 });
+    assert.equal(retried.status, 0, retried.stderr);
+    assert.ok(retried.stderr.includes(`Threadex worktree review SKIPPED for this ${operation} retry.`));
+    assert.ok(retried.stderr.includes(`Reason: ${reason}`));
+    assert.equal(readFileSync(resolve(f.main, "original-hook-ran.txt"), "utf8"), resolve(f.main, ".git/hooks", hook) + "\n");
+    if (operation === "commit") {
+      assert.notEqual(f.git(f.main, "rev-parse", "HEAD"), mainHead);
+      assert.equal(f.git(f.main, "log", "-1", "--format=%s"), "Agent's reviewed retry");
+      assert.equal(f.git(f.remote, "rev-parse", "refs/heads/main"), remoteHead);
+    } else {
+      assert.equal(f.git(f.remote, "rev-parse", "refs/heads/main"), mainHead);
+    }
+    assert.equal(f.git(f.other, "rev-parse", "HEAD"), siblingHead);
+    assert.equal(f.git(f.other, "status", "--porcelain"), siblingStatus);
+    assert.equal(f.git(f.remote, "rev-parse", "refs/heads/other"), siblingRemote);
+    assert.equal(readFileSync(resolve(f.other, "unfinished.txt"), "utf8"), "Another task's unfinished work\n");
+  });
+}
 
 test("review tokens change with tracked, staged and untracked sibling changes and do not authorize another hook", t => {
   const f = fixture(t); f.addOther();

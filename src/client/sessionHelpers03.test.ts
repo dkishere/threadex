@@ -73,64 +73,67 @@ test("session snapshots restore persisted steer messages and their prompt count 
   assert.equal(messages.find((message: { role: string }) => message.role === "assistant")?.segments?.length, 1);
 });
 
-test("session snapshots carry per-turn run metadata onto the prompt", () => {
-  const messages = sessionTurnsToMessages({
-    createSystemMessage: (content: string) => ({ id: "system", role: "system", content }),
-    developerInstructionsIndicateForcePlan: () => false,
-    finalizePendingReasoningItems: (items: unknown[]) => items,
-    finalizePendingReasoningSegments: (segments: unknown[]) => segments,
-    isLiveItem: () => false,
-    isStreamItem: () => false,
-    mergeDeveloperInstructionRecords: (...groups: unknown[][]) => groups.flat(),
-    mergeSnapshotLiveItems: (snapshot: unknown[]) => snapshot,
-    mergeSnapshotSegmentsWithLocalSteers: () => [],
-    normalizeLiveItems: (items: unknown[]) => items,
-    normalizeStoredUserInput: (content: string) => ({ content, attachments: [] }),
-    streamItemsToSegments: () => [],
-    turnDurationMs: () => 3_750
-  }, [{
-    id: "turn-usage",
-    loopMode: true,
-    userInput: "Show the run details",
-    agentResponse: "Done",
-    model: "gpt-5.6-terra",
-    reasoningEffort: "xhigh",
-    tokenIn: 1_250,
-    usageSample: { cachedInputTokens: 900 },
-    tokenOut: 375,
-    autoModelProvider: "typesafe",
-    autoModelConfidence: 0.2,
-    status: "done",
-    created: "2026-08-25T10:00:00.000Z"
-  }], "Run metadata", [], undefined);
+for (const cachedInputTokens of [900, 0, undefined]) {
+  test(`session snapshots carry turn-level cached input (${cachedInputTokens}) onto the prompt`, () => {
+    const messages = sessionTurnsToMessages({
+      createSystemMessage: (content: string) => ({ id: "system", role: "system", content }),
+      developerInstructionsIndicateForcePlan: () => false,
+      finalizePendingReasoningItems: (items: unknown[]) => items,
+      finalizePendingReasoningSegments: (segments: unknown[]) => segments,
+      isLiveItem: () => false,
+      isStreamItem: () => false,
+      mergeDeveloperInstructionRecords: (...groups: unknown[][]) => groups.flat(),
+      mergeSnapshotLiveItems: (snapshot: unknown[]) => snapshot,
+      mergeSnapshotSegmentsWithLocalSteers: () => [],
+      normalizeLiveItems: (items: unknown[]) => items,
+      normalizeStoredUserInput: (content: string) => ({ content, attachments: [] }),
+      streamItemsToSegments: () => [],
+      turnDurationMs: () => 3_750
+    }, [{
+      id: "turn-usage",
+      loopMode: true,
+      userInput: "Show the run details",
+      agentResponse: "Done",
+      model: "gpt-5.6-terra",
+      reasoningEffort: "xhigh",
+      tokenIn: 1_250,
+      cachedInputTokens,
+      usageSample: { cachedInputTokens: 90 },
+      tokenOut: 375,
+      autoModelProvider: "typesafe",
+      autoModelConfidence: 0.2,
+      status: "done",
+      created: "2026-08-25T10:00:00.000Z"
+    }], "Run metadata", [], undefined);
 
-  const prompt = messages.find((message: { role: string }) => message.role === "user");
-  assert.deepEqual({
-    model: prompt?.model,
-    reasoningEffort: prompt?.reasoningEffort,
-    tokenIn: prompt?.tokenIn,
-    cachedInputTokens: prompt?.cachedInputTokens,
-    tokenOut: prompt?.tokenOut,
-    executionDurationMs: prompt?.executionDurationMs,
-    turnStatus: prompt?.turnStatus,
-    autoModel: prompt?.autoModel,
-    autoModelProvider: prompt?.autoModelProvider,
-    autoModelConfidence: prompt?.autoModelConfidence,
-    executionMode: prompt?.executionMode
-  }, {
-    model: "gpt-5.6-terra",
-    reasoningEffort: "xhigh",
-    tokenIn: 1_250,
-    cachedInputTokens: 900,
-    tokenOut: 375,
-    executionDurationMs: 3_750,
-    turnStatus: "done",
-    autoModel: true,
-    autoModelProvider: "typesafe",
-    autoModelConfidence: 0.2,
-    executionMode: "loop"
+    const prompt = messages.find((message: { role: string }) => message.role === "user");
+    assert.deepEqual({
+      model: prompt?.model,
+      reasoningEffort: prompt?.reasoningEffort,
+      tokenIn: prompt?.tokenIn,
+      cachedInputTokens: prompt?.cachedInputTokens,
+      tokenOut: prompt?.tokenOut,
+      executionDurationMs: prompt?.executionDurationMs,
+      turnStatus: prompt?.turnStatus,
+      autoModel: prompt?.autoModel,
+      autoModelProvider: prompt?.autoModelProvider,
+      autoModelConfidence: prompt?.autoModelConfidence,
+      executionMode: prompt?.executionMode
+    }, {
+      model: "gpt-5.6-terra",
+      reasoningEffort: "xhigh",
+      tokenIn: 1_250,
+      cachedInputTokens,
+      tokenOut: 375,
+      executionDurationMs: 3_750,
+      turnStatus: "done",
+      autoModel: true,
+      autoModelProvider: "typesafe",
+      autoModelConfidence: 0.2,
+      executionMode: "loop"
+    });
   });
-});
+}
 
 test("runner-reported duration takes priority over unreliable lifecycle timestamps", () => {
   assert.equal(turnDurationMs({}, {

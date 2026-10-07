@@ -336,19 +336,23 @@ class ThreadexReviewController {
   }
 
   canAnnotate() {
-    return Boolean(this.review?.capabilities?.annotate === true && this.review.sessionId && this.review.returnUrl)
+    return Boolean(this.review?.capabilities?.annotate === true && this.review.sessionId && process.env.THREADEX_REVIEW_REQUEST_DIR)
   }
 
   annotationRanges(document) {
-    if (!this.canAnnotate() || document.uri.scheme !== 'file' || !isInside(this.review.workspacePath, document.uri.fsPath)) return []
+    if (!this.canAnnotate() || !this.resolveExplainSource({ document })) return []
     const endLine = Math.max(0, document.lineCount - 1)
     return [new vscode.Range(0, 0, endLine, document.lineAt(endLine).text.length)]
   }
 
   async addAnnotation() {
     const editor = vscode.window.activeTextEditor
-    if (!editor || !this.canAnnotate() || editor.document.uri.scheme !== 'file' || !isInside(this.review.workspacePath, editor.document.uri.fsPath)) {
+    if (!this.canAnnotate()) {
       void vscode.window.showWarningMessage('Threadex: open this project from the source session before adding an annotation.')
+      return
+    }
+    if (!editor || !this.resolveExplainSource(editor)) {
+      void vscode.window.showWarningMessage('Threadex: select source code in the active project or this Threadex diff before adding an annotation.')
       return
     }
     const range = editor.selection.isEmpty
@@ -363,11 +367,12 @@ class ThreadexReviewController {
     await this.sendAnnotation(editor.document, range, reply.trim())
   }
 
-  async submitAnnotation(thread) {
+  async submitAnnotation(reply) {
+    const thread = reply?.thread ?? reply
     if (!thread?.uri || !thread.range) return this.addAnnotation()
     const document = await vscode.workspace.openTextDocument(thread.uri)
     const draft = [...(thread.comments ?? [])].reverse().find((comment) => comment?.body)
-    const body = typeof draft?.body === 'string' ? draft.body : draft?.body?.value
+    const body = typeof reply?.text === 'string' ? reply.text : typeof draft?.body === 'string' ? draft.body : draft?.body?.value
     if (!body?.trim()) {
       void vscode.window.showWarningMessage('Threadex: write a reply before sending the annotation.')
       return
@@ -379,8 +384,9 @@ class ThreadexReviewController {
 
   async sendAnnotation(document, range, reply) {
     if (!this.canAnnotate()) return
-    const relativePath = path.relative(this.review.workspacePath, document.uri.fsPath).split(path.sep).join('/')
-    if (!relativePath || relativePath.startsWith('../')) return
+    const source = this.resolveExplainSource({ document })
+    if (!source?.path) return
+    const relativePath = source.path
     const selectedText = document.getText(range).trim() || document.lineAt(range.start.line).text
     const payload = {
       version: 1,
@@ -402,11 +408,10 @@ class ThreadexReviewController {
         }
       }
     }
-    const target = new URL(this.review.returnUrl)
-    target.searchParams.set('sessionId', this.review.sessionId)
-    target.hash = `threadex-annotation=${Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')}`
-    await vscode.env.openExternal(vscode.Uri.parse(target.toString()))
-    vscode.window.setStatusBarMessage('Threadex: annotation returned to the source session.', 5_000)
+    const id = randomUUID()
+    const directory = path.resolve(process.env.THREADEX_REVIEW_REQUEST_DIR, '../annotations')
+    atomicWriteJson(path.join(directory, `${id}.json`), { ...payload, id, createdAt: new Date().toISOString() })
+    vscode.window.setStatusBarMessage('Threadex: comment saved. Return to the source session to see it in your draft.', 8_000)
   }
 
   resolveExplainSource(editor) {

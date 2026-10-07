@@ -5,7 +5,7 @@ import { GrillHistoryDialog } from "./GrillHistoryDialog";
 import { canFollowUpGrill, grillAwaitingAck, grillContentVersion, grillHandoff, mergeGrillEdits, type GrillIssue, type TurnGrill } from "../turnGrill";
 import { eventStore, useEventStore } from "./eventStore";
 import { ApiError } from "./apiClient";
-import { loadTurnGrill, turnGrillUrl, updateTurnGrill } from "./sessionApi";
+import { loadTurnGrill, shouldReloadTurnGrill, turnGrillUrl, updateTurnGrill } from "./sessionApi";
 import "./turnGrill.css";
 
 export function useGrilledTurns() {
@@ -20,8 +20,8 @@ export function useGrilledTurns() {
     pendingGrillSessions: new Set(grillSummaries.filter((item) => item.pending).map((item) => item.sessionId)) };
 }
 
-export function TurnGrillPanel({ sessionId, turnId, latest, mainBusy, onImplement, actionExtras, onGrilled, copyText }: {
-  sessionId: string; turnId: string; latest: boolean; mainBusy: boolean;
+export function TurnGrillPanel({ sessionId, turnId, mainBusy, onImplement, actionExtras, onGrilled, copyText }: {
+  sessionId: string; turnId: string; mainBusy: boolean;
   onImplement: (prompt: string, origin: { turnId: string; observedVersion: number }) => Promise<void>;
   actionExtras?: ReactNode;
   onGrilled?: (sessionId: string, turnId: string) => void;
@@ -136,7 +136,7 @@ export function TurnGrillPanel({ sessionId, turnId, latest, mainBusy, onImplemen
     let loaded = false;
     async function load() {
       const revision = eventStore.getState().grillSummaries.find((item) => item.sessionId === sessionId && item.turnId === turnId)?.revision ?? 0;
-      if (inFlight || (loaded && revision <= (reviewRef.current?.revision ?? 0))) return;
+      if (inFlight || !shouldReloadTurnGrill(loaded, reviewRef.current, revision)) return;
       inFlight = true;
       try {
         const latest = await loadTurnGrill(url, { signal: controller.signal });
@@ -231,7 +231,7 @@ export function TurnGrillPanel({ sessionId, turnId, latest, mainBusy, onImplemen
     className="message-action-icon" type="button" data-copy-state={copyState === "idle" ? undefined : copyState}
     title={copyState === "copied" ? "Agent response copied" : copyState === "error" ? "Could not copy agent response" : "Copy last agent response"}
     aria-label={copyState === "copied" ? "Agent response copied" : copyState === "error" ? "Could not copy agent response" : "Copy last agent response"}
-    onClick={(event) => void copyFinalResponse(event)}><Copy aria-hidden="true" /></button>{latest && !review && !started && <button
+    onClick={(event) => void copyFinalResponse(event)}><Copy aria-hidden="true" /></button>{!review && !started && <button
     className="message-action-icon" type="button" title="Grill with Luna Max; long turns use Sol Max" aria-label="Grill agent"
     disabled={locked || mainBusy} onClick={() => void act("start")}><Flame aria-hidden="true" /></button>}</div>;
   if (!review && !started) return <>{actions}{error && <p role="alert">{error}</p>}</>;

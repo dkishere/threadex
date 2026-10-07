@@ -104,9 +104,6 @@ export function createTurnGrillHandler({ sessionStore, serverUrl, recordUsage, r
         sessionStore.listSessionApprovalLiveItems(session.id),
         sessionStore.listSessionSteerMessages(session.id)
       ]);
-      if (action === "start" && req.body?.autoLoop !== true && sessionTurns.at(-1)?.id !== turn.id) {
-        res.status(409).json({ error: "Grill can only start on the latest turn. Fork this turn first." }); return;
-      }
       if (action === "start" && saved?.rounds.length) {
         res.status(409).json({ error: "This turn already has a Grill review. Follow up on its issues." }); return;
       }

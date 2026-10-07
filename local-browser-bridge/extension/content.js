@@ -13,6 +13,7 @@
     let menuHost;
     let highlightHost;
     let highlightedElement;
+    let selectionShield;
     const menuInteractionEvents = [
         "auxclick",
         "click",
@@ -53,6 +54,9 @@
         document.removeEventListener("contextmenu", onContextMenu, { capture: true });
         document.removeEventListener("pointerdown", onPointerDown, { capture: true });
         document.removeEventListener("keydown", onKeyDown, { capture: true });
+        document.removeEventListener("keyup", onSelectionKeyUp, { capture: true });
+        window.removeEventListener("blur", removeSelectionShield);
+        removeSelectionShield();
         closeMenu();
         if (contentGlobal.__localBrowserBridgeContent === controller)
             delete contentGlobal.__localBrowserBridgeContent;
@@ -97,6 +101,8 @@
             document.addEventListener("contextmenu", onContextMenu, { capture: true });
             document.addEventListener("pointerdown", onPointerDown, { capture: true });
             document.addEventListener("keydown", onKeyDown, { capture: true });
+            document.addEventListener("keyup", onSelectionKeyUp, { capture: true });
+            window.addEventListener("blur", removeSelectionShield);
         }
         catch {
             // Extension reloads and service-worker wakeups are retried by the next injection.
@@ -112,7 +118,8 @@
             return;
         event.preventDefault();
         event.stopImmediatePropagation();
-        const element = event.target instanceof Element ? event.target : document.documentElement;
+        const element = selectionShield ? selectionTarget(event.clientX, event.clientY) : event.target instanceof Element ? event.target : document.documentElement;
+        removeSelectionShield();
         void captureAndShowContextMenu(event.clientX, event.clientY, element);
     }
     async function captureAndShowContextMenu(x, y, element) {
@@ -128,6 +135,7 @@
             await showContextMenu(x, y, element.isConnected ? element : document.documentElement, screenshot);
     }
     function onPointerDown(event) {
+        if (event.button !== 2) removeSelectionShield();
         if (event.shiftKey && event.button === 2 && !menuHost?.contains(event.target)) {
             // Stop the host page from turning a Shift+right-click gesture into a text
             // selection or another page-owned pointer interaction before contextmenu.
@@ -145,11 +153,41 @@
         // stop their events before they bubble into the page UI.
     }
     function onKeyDown(event) {
+        if (event.key === "Shift" && !menuHost && !selectionShield) {
+            selectionShield = document.createElement("div");
+            selectionShield.setAttribute("data-local-browser-bridge-selection", "1");
+            selectionShield.style.cssText = "all:initial;position:fixed;inset:0;z-index:2147483647;background:transparent;pointer-events:auto";
+            document.documentElement.append(selectionShield);
+        }
         if (!menuHost || event.key !== "Escape")
             return;
         event.preventDefault();
         event.stopImmediatePropagation();
         closeMenu();
+    }
+    function removeSelectionShield() {
+        selectionShield?.remove();
+        selectionShield = undefined;
+    }
+    function onSelectionKeyUp(event) {
+        if (event.key === "Shift") removeSelectionShield();
+    }
+    function selectionTarget(x, y) {
+        if (selectionShield) selectionShield.style.pointerEvents = "none";
+        const hit = document.elementFromPoint(x, y) ?? document.documentElement;
+        const controls = [...document.querySelectorAll(":disabled,[aria-disabled='true']")];
+        const candidates = controls.filter((element) => {
+            const rect = element.getBoundingClientRect();
+            const style = getComputedStyle(element);
+            return hit.contains(element) && style.visibility !== "hidden" && style.display !== "none" &&
+                rect.width > 0 && rect.height > 0 && x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+        });
+        candidates.sort((a, b) => {
+            const left = a.getBoundingClientRect();
+            const right = b.getBoundingClientRect();
+            return left.width * left.height - right.width * right.height;
+        });
+        return hit.closest(":disabled,[aria-disabled='true']") ?? candidates[0] ?? hit;
     }
     async function showContextMenu(x, y, element, screenshot) {
         closeMenu();

@@ -1,0 +1,38 @@
+.forked-turns {
+  padding: 8px;
+  overflow: auto;
+  flex-shrink: 0;
+  max-height: 45%;
+}
+.forked-turns h3 {
+  margin: 0 0 8px;
+  font-size: 12px;
+}
+.forked-turn {
+  padding: 8px 0;
+  border-top: 1px solid currentColor;
+  font-size: 12px;
+}
+.forked-turn-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+.forked-turn-heading button {
+  background: none;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  padding: 0;
+  text-align: left;
+}
+.forked-turn summary {
+  cursor: pointer;
+  margin-top: 6px;
+}
+.forked-turn-prompt {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin-top: 6px;
+}

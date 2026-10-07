@@ -21,6 +21,7 @@ let active = true;
 let menuHost: HTMLElement | undefined;
 let highlightHost: HTMLElement | undefined;
 let highlightedElement: Element | undefined;
+let selectionShield: HTMLElement | undefined;
 const menuInteractionEvents = [
   "auxclick",
   "click",
@@ -55,6 +56,9 @@ function dispose(): void {
   document.removeEventListener("contextmenu", onContextMenu, { capture: true });
   document.removeEventListener("pointerdown", onPointerDown, { capture: true });
   document.removeEventListener("keydown", onKeyDown, { capture: true });
+  document.removeEventListener("keyup", onSelectionKeyUp, { capture: true });
+  window.removeEventListener("blur", removeSelectionShield);
+  removeSelectionShield();
   closeMenu();
   if (contentGlobal.__localBrowserBridgeContent === controller) delete contentGlobal.__localBrowserBridgeContent;
 }
@@ -98,6 +102,8 @@ async function initialize(): Promise<void> {
     document.addEventListener("contextmenu", onContextMenu, { capture: true });
     document.addEventListener("pointerdown", onPointerDown, { capture: true });
     document.addEventListener("keydown", onKeyDown, { capture: true });
+    document.addEventListener("keyup", onSelectionKeyUp, { capture: true });
+    window.addEventListener("blur", removeSelectionShield);
   } catch {
     // Extension reloads and service-worker wakeups are retried by the next injection.
   }
@@ -112,7 +118,8 @@ function onContextMenu(event: MouseEvent): void {
   if (!event.shiftKey) return;
   event.preventDefault();
   event.stopImmediatePropagation();
-  const element = event.target instanceof Element ? event.target : document.documentElement;
+  const element = selectionShield ? selectionTarget(event.clientX, event.clientY) : event.target instanceof Element ? event.target : document.documentElement;
+  removeSelectionShield();
   void captureAndShowContextMenu(event.clientX, event.clientY, element);
 }
 
@@ -128,6 +135,7 @@ async function captureAndShowContextMenu(x: number, y: number, element: Element)
 }
 
 function onPointerDown(event: PointerEvent): void {
+  if (event.button !== 2) removeSelectionShield();
   if (event.shiftKey && event.button === 2 && !menuHost?.contains(event.target as Node)) {
     // Stop the host page from turning a Shift+right-click gesture into a text
     // selection or another page-owned pointer interaction before contextmenu.
@@ -145,10 +153,45 @@ function onPointerDown(event: PointerEvent): void {
 }
 
 function onKeyDown(event: KeyboardEvent): void {
+  if (event.key === "Shift" && !menuHost && !selectionShield) {
+    selectionShield = document.createElement("div");
+    selectionShield.setAttribute("data-local-browser-bridge-selection", "1");
+    selectionShield.style.cssText = "all:initial;position:fixed;inset:0;z-index:2147483647;background:transparent;pointer-events:auto";
+    document.documentElement.append(selectionShield);
+  }
   if (!menuHost || event.key !== "Escape") return;
   event.preventDefault();
   event.stopImmediatePropagation();
   closeMenu();
+}
+
+function removeSelectionShield(): void {
+  selectionShield?.remove();
+  selectionShield = undefined;
+}
+
+function onSelectionKeyUp(event: KeyboardEvent): void {
+  if (event.key === "Shift") removeSelectionShield();
+}
+
+function selectionTarget(x: number, y: number): Element {
+  if (selectionShield) selectionShield.style.pointerEvents = "none";
+  const hit = document.elementFromPoint(x, y) ?? document.documentElement;
+  // Disabled controls often opt out of hit testing. Only consider controls
+  // beneath the hit's ancestry, so unrelated overlapping UI cannot win.
+  const controls = [...document.querySelectorAll(":disabled,[aria-disabled='true']")];
+  const candidates = controls.filter((element) => {
+    const rect = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    return hit.contains(element) && style.visibility !== "hidden" && style.display !== "none" &&
+      rect.width > 0 && rect.height > 0 && x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+  });
+  candidates.sort((a, b) => {
+    const left = a.getBoundingClientRect();
+    const right = b.getBoundingClientRect();
+    return left.width * left.height - right.width * right.height;
+  });
+  return hit.closest(":disabled,[aria-disabled='true']") ?? candidates[0] ?? hit;
 }
 
 async function showContextMenu(x: number, y: number, element: Element, screenshot?: ContextScreenshot): Promise<void> {

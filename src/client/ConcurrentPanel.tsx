@@ -2,6 +2,7 @@ import { GitPullRequestCreateArrow, X, ArrowUpRight, Pause, Play, Send, Users } 
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { CollaborationView } from "../collaboration";
+import { isCollaborationMemberEnded } from "../collaboration";
 import "./ConcurrentPanel.css";
 
 async function json<T>(path: string, body?: unknown): Promise<T> {
@@ -13,8 +14,10 @@ async function json<T>(path: string, body?: unknown): Promise<T> {
   return data as T;
 }
 
-export function ConcurrentPanel({ sessionId, sourceTurnId, refreshToken, onClose, onOpen }: {
-  sessionId: string; sourceTurnId: string | null; refreshToken?: number; onClose: () => void; onOpen: (id: string) => void;
+export function ConcurrentPanel({ sessionId, sourceTurnId, refreshToken, onGroupChange, onClose, onOpen }: {
+  sessionId: string; sourceTurnId: string | null; refreshToken?: number;
+  onGroupChange?: (state: { sessionId: string; group: CollaborationView | null }) => void;
+  onClose: () => void; onOpen: (id: string) => void;
 }) {
   const [anchor, setAnchor] = useState<Element | null>(null);
   const [open, setOpen] = useState(false);
@@ -27,6 +30,7 @@ export function ConcurrentPanel({ sessionId, sourceTurnId, refreshToken, onClose
   const trigger = useRef<HTMLButtonElement>(null);
   const request = useRef<{ fingerprint: string; id: string } | null>(null);
   const base = `/api/concurrent/sessions/${encodeURIComponent(sessionId)}`;
+  useEffect(() => { onGroupChange?.({ sessionId, group }); }, [sessionId, group, onGroupChange]);
   useEffect(() => { setAnchor(document.querySelector(".content-header-actions")); }, [sessionId]);
   useEffect(() => { if (sourceTurnId) setOpen(true); }, [sourceTurnId]);
   useEffect(() => {
@@ -60,6 +64,7 @@ export function ConcurrentPanel({ sessionId, sourceTurnId, refreshToken, onClose
     finally { setBusy(false); }
   };
   const submit = async () => {
+    if (!group || isCollaborationMemberEnded(group, target)) return;
     const fingerprint = JSON.stringify({ task, target });
     if (request.current?.fingerprint !== fingerprint) request.current = { fingerprint, id: crypto.randomUUID() };
     if (await action("send", { requestId: request.current.id, to: target, message: task, reason: "User follow-up from Concurrent panel" })) {
@@ -68,6 +73,7 @@ export function ConcurrentPanel({ sessionId, sourceTurnId, refreshToken, onClose
   };
   const main = !group || group.mainSessionId === sessionId;
   const workers = group?.members.filter(member => member.localId !== "main") ?? [];
+  const recipients = workers.filter(member => group && !isCollaborationMemberEnded(group, member.localId));
   const activeCount = workers.filter(member => ["running", "queued", "waiting"].includes(group?.activity[member.localId]?.status ?? "")).length;
   const uncertain = group?.messages.filter(message => message.state === "uncertain") ?? [];
   if (!anchor) return null;
@@ -91,7 +97,7 @@ export function ConcurrentPanel({ sessionId, sourceTurnId, refreshToken, onClose
           return <li key={member.localId}><div className="concurrent-member-heading">
             <button className="concurrent-member-link" onClick={() => onOpen(member.sessionId)}>{member.localId}<ArrowUpRight aria-hidden="true" /></button>
             <span className="concurrent-status" data-status={activity?.status}>{activity?.status ?? "creating"}</span>
-            {main && <button className="concurrent-icon-button concurrent-member-control" disabled={busy} onClick={() => void action("control", { localId: member.localId, stopped: !member.stopped })}
+            {main && !isCollaborationMemberEnded(group!, member.localId) && <button className="concurrent-icon-button concurrent-member-control" disabled={busy} onClick={() => void action("control", { localId: member.localId, stopped: !member.stopped })}
               title={member.stopped ? "Allow follow-ups" : "Stop worker"} aria-label={`${member.stopped ? "Allow follow-ups for" : "Stop"} ${member.localId}`}>{member.stopped ? <Play /> : <Pause />}</button>}
           </div><p className="concurrent-task" title={member.task}>{member.task}</p>
             {activity?.progress && <p className="concurrent-progress">{activity.progress.slice(-350)}</p>}
@@ -99,12 +105,12 @@ export function ConcurrentPanel({ sessionId, sourceTurnId, refreshToken, onClose
               .map(m => <small className="concurrent-wait" key={m.id}>Waiting for {m.to} · {m.reason}</small>)}
           </li>;
         })}</ul>}
-        {main && workers.some(member => !member.stopped) && <div className="concurrent-compose"><h3>Follow-up</h3>
+        {main && recipients.length > 0 && <div className="concurrent-compose"><h3>Follow-up</h3>
           <label><span>Send to</span><select aria-label="Concurrent recipient" value={target} onChange={event => setTarget(event.target.value)} disabled={busy}>
-            <option value="">Choose a worker</option>{workers.filter(member => !member.stopped).map(member => <option key={member.localId} value={member.localId}>{member.localId} · {member.task.slice(0, 45)}</option>)}
+            <option value="">Choose a worker</option>{recipients.map(member => <option key={member.localId} value={member.localId}>{member.localId} · {member.task.slice(0, 45)}</option>)}
           </select></label>
           <textarea aria-label="Concurrent task" value={task} onChange={event => setTask(event.target.value)} placeholder="Follow-up for a teammate…" rows={3} disabled={busy} />
-          <div className="concurrent-send-row"><small>Steer a running worker; queue for an idle worker.</small><button className="concurrent-send" disabled={busy || !task.trim() || !target} onClick={() => void submit()}><Send aria-hidden="true" />{busy ? "Sending…" : "Send"}</button></div>
+          <div className="concurrent-send-row"><small>Send a follow-up to an active worker.</small><button className="concurrent-send" disabled={busy || !task.trim() || !recipients.some(member => member.localId === target)} onClick={() => void submit()}><Send aria-hidden="true" />{busy ? "Sending…" : "Send"}</button></div>
         </div>}
         {group?.messages.filter(m => m.error && m.state !== "uncertain" && m.state !== "cancelled" && !m.completed).map(m => <p className="concurrent-notice" role="status" key={m.id}>{m.from} → {m.to}：{m.error}</p>)}
         {uncertain.map(m => <div key={m.id} className="concurrent-notice"><strong>Delivery needs review · {m.from} → {m.to}</strong><p>{m.text.slice(0, 200)}</p><p>Check the recipient's turn before confirming. The message will not be resent automatically.</p>

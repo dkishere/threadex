@@ -222,9 +222,7 @@ export function sessionTurnsToMessages(ctx, turns, title, existingMessages = [],
                 autoModelProvider: turn.autoModelProvider ?? existingUserMessage?.autoModelProvider,
                 autoModelConfidence: turn.autoModelConfidence ?? existingUserMessage?.autoModelConfidence,
                 tokenIn: Number.isFinite(turn.tokenIn) ? turn.tokenIn : existingUserMessage?.tokenIn,
-                cachedInputTokens: Number.isFinite(turn.usageSample?.cachedInputTokens)
-                    ? turn.usageSample.cachedInputTokens
-                    : existingUserMessage?.cachedInputTokens,
+                cachedInputTokens: Number.isFinite(turn.cachedInputTokens) ? turn.cachedInputTokens : undefined,
                 tokenOut: Number.isFinite(turn.tokenOut) ? turn.tokenOut : existingUserMessage?.tokenOut,
                 executionDurationMs: turnDurationMs(turn),
                 turnStatus: turn.status,

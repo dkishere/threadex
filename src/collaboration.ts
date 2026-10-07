@@ -68,3 +68,13 @@ export type CollaborationView = CollaborationGroup & {
   activity: Record<string, { status: string; turnId: string | null; progress: string }>;
   conflicts: Array<{ path: string; members: string[] }>;
 };
+
+export function isCollaborationMemberEnded(group: CollaborationView, localId: string): boolean {
+  const member = group.members.find(member => member.localId === localId);
+  if (!member || localId === "main") return false;
+  if (member.stopped) return true;
+  if (group.activity[localId]?.status !== "idle") return false;
+  return !group.messages.some(message => !message.completed && message.state !== "cancelled" &&
+    ((message.to === localId && ["pending", "steering", "uncertain"].includes(message.state)) ||
+      (message.from === localId && message.wait)));
+}

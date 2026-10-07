@@ -270,24 +270,45 @@ test("Grill rejects a turn from another session", async ({ request }) => {
   expect(response.status()).toBe(404);
 });
 
-test("only the latest completed turn offers a new Grill", async ({ page, request }) => {
+test("older completed turns offer Grill and keep the review under the selected turn", async ({ page, request }) => {
   const session = scenarioSessions.switchBeta;
   await selectSession(request, session.id);
-  await page.route(/\/api\/sessions\/(?:switch|[^/]+\/snapshot)$/, async (route) => {
+  const olderTurnId = `${session.id}-baseline`;
+  let saved: TurnGrill | null = null;
+  const reviewedTurnIds: string[] = [];
+  await page.route(/\/api\/(?:sessions\/(?:switch|[^/]+\/snapshot)|workspace\/snapshot|events\?[^/]+)$/, async (route) => {
     const response = await route.fetch();
     const data = await response.json();
-    if (data.session?.id === session.id && data.turns?.length) {
-      const previous = data.turns.at(-1);
-      data.turns.push({ ...previous, id: "grill-latest-fixture", status: "done", userInput: "Latest request", agentResponse: "Latest response" });
+    const snapshot = data.activeSession ?? data;
+    if (snapshot.session?.id === session.id && snapshot.turns?.length) {
+      const previous = snapshot.turns.at(-1);
+      snapshot.turns.push({ ...previous, id: "grill-latest-fixture", status: "done", userInput: "Latest request", agentResponse: "Latest response" });
     }
+    data.grillSummaries = saved ? [{ sessionId: session.id, turnId: olderTurnId, revision: saved.revision, pending: true }] : [];
     await route.fulfill({ response, json: data });
   });
-  await page.route("**/api/sessions/*/turns/*/grill", (route) => route.fulfill({ json: { grill: null } }));
-  await mockGrillSummaries(page, session.id, () => ({ revision: 1, status: "ready", updated: "", error: null, issues: [], rounds: [] }));
+  await page.route("**/api/sessions/*/turns/*/grill", (route) => {
+    const turnId = new URL(route.request().url()).pathname.split("/").at(-2)!;
+    if (route.request().method() === "GET") return route.fulfill({ json: { grill: turnId === olderTurnId ? saved : null } });
+    reviewedTurnIds.push(turnId);
+    const issues = [{ id: "q1", md: "Does this older turn cover its empty-input case?", responseMd: "", status: "open" as const, selected: true, dropped: false }];
+    saved = { revision: 1, status: "ready", updated: "", error: null, issues,
+      rounds: [{ id: "older-review", action: "start", prompt: "", created: "", issues }] };
+    return route.fulfill({ json: { grill: saved } });
+  });
   await page.goto(`/?workspaceId=default&sessionId=${session.id}`);
   await expect(page.getByRole("button", { name: "Fork from this message", exact: true })).toHaveCount(2);
-  await expect(page.getByRole("button", { name: "Grill agent", exact: true })).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "Grill agent", exact: true })).toHaveCount(2);
+  const olderTurn = page.locator(`.message[data-turn-id="${olderTurnId}"]`);
+  await olderTurn.getByRole("button", { name: "Grill agent", exact: true }).click();
+  await expect(olderTurn.getByRole("region", { name: "Grill review", exact: true })).toContainText("older turn");
+  expect(reviewedTurnIds).toEqual([olderTurnId]);
+  await expect(olderTurn.getByRole("button", { name: "Grill agent", exact: true })).toHaveCount(0);
   await expect(page.locator('[data-turn-id="grill-latest-fixture"]').getByRole("button", { name: "Grill agent", exact: true })).toBeVisible();
-  await expect(page.locator(`.prompt-turn-card[data-turn-id="${session.id}-baseline"]`).getByLabel("Grilled", { exact: true })).toBeVisible();
+  await expect(page.locator(`.prompt-turn-card[data-turn-id="${olderTurnId}"]`).getByLabel("Grill: Await ack", { exact: true })).toBeVisible();
   await expect(page.locator('.prompt-turn-card[data-turn-id="grill-latest-fixture"]').getByLabel("Grilled", { exact: true })).toHaveCount(0);
+  await page.reload();
+  await expect(olderTurn.getByRole("region", { name: "Grill review", exact: true })).toContainText("older turn");
+  await expect(page.getByRole("button", { name: "Grill agent", exact: true })).toHaveCount(1);
+  expect(reviewedTurnIds).toEqual([olderTurnId]);
 });

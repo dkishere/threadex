@@ -7,6 +7,7 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { CONTEXT_FORK_USER_SUFFIX } from "../contextFork";
+import { AUTO_MODEL_ORDER } from "../modelCatalog";
 import { WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS } from "./workspaceManagerRouting";
 import { WORKSPACE_MANAGER_INSTRUCTIONS, workspaceManagerContext } from "./workspaceManager";
 import { MANAGER_REPLY_LANGUAGE_INSTRUCTIONS } from "./replyLanguage";
@@ -28,7 +29,7 @@ test("prompt runner serializes burst callbacks so terminal updates are not stran
   const appServerExitMarkerPath = resolve(root, "app-server-exited");
   const turnParamsPath = resolve(root, "turn-params.json");
   const receivedEvents: string[] = [];
-  let appServerExitedBeforeTurnCompletedCallback = false;
+  let turnCompletedCallbackIndex = -1;
   let appServerExitedBeforeResult = false;
   let callbackQueue = Promise.resolve();
 
@@ -44,7 +45,7 @@ test("prompt runner serializes burst callbacks so terminal updates are not stran
     const current = callbackQueue.then(async () => {
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
       if (update.event === "codex" && update.data?.method === "turn/completed") {
-        appServerExitedBeforeTurnCompletedCallback = existsSync(appServerExitMarkerPath);
+        turnCompletedCallbackIndex = receivedEvents.length;
       }
       if (update.event === "result") {
         appServerExitedBeforeResult = existsSync(appServerExitMarkerPath);
@@ -121,7 +122,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.equal(entries.some((entry) => entry.event === "runner.callback_error"), false);
   assert.equal(existsSync(pendingLogPath), false);
   assert.ok(receivedEvents.includes("result"));
-  assert.equal(appServerExitedBeforeTurnCompletedCallback, true);
+  assert.ok(turnCompletedCallbackIndex >= 0);
+  assert.ok(turnCompletedCallbackIndex < receivedEvents.indexOf("result"));
   assert.equal(appServerExitedBeforeResult, true);
   assert.equal(receivedEvents.at(-1), "done");
 });
@@ -484,6 +486,7 @@ test("prompt runner enables current-session recovery for an ordinary resumed thr
   const jobPath = resolve(root, "job.json");
   const logPath = resolve(root, "runner.ndjson");
   const capturedArgsPath = resolve(root, "captured-args.json");
+  const capturedThreadPath = resolve(root, "captured-thread.json");
   const capturedTurnPath = resolve(root, "captured-turn.json");
 
   writeFileSync(fakeCodexPath, `#!/usr/bin/env node
@@ -494,7 +497,10 @@ const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
 createInterface({ input: process.stdin }).on("line", (line) => {
   const request = JSON.parse(line);
   if (request.method === "initialize") send({ id: request.id, result: {} });
-  if (request.method === "thread/resume") send({ id: request.id, result: { thread: { id: request.params.threadId } } });
+  if (request.method === "thread/resume") {
+    writeFileSync(process.env.CAPTURED_THREAD_PATH, JSON.stringify(request.params));
+    send({ id: request.id, result: { thread: { id: request.params.threadId } } });
+  }
   if (request.method === "thread/goal/clear") send({ id: request.id, result: {} });
   if (request.method === "turn/start") {
     writeFileSync(process.env.CAPTURED_TURN_PATH, JSON.stringify(request.params));
@@ -522,6 +528,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       ...process.env,
       CODEX_PATH: fakeCodexPath,
       CAPTURED_ARGS_PATH: capturedArgsPath,
+      CAPTURED_THREAD_PATH: capturedThreadPath,
       CAPTURED_TURN_PATH: capturedTurnPath,
       SESSION_INSPECTOR_MCP_MODE: "auto"
     },
@@ -536,11 +543,12 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   const args = JSON.parse(readFileSync(capturedArgsPath, "utf8")) as string[];
   assert.ok(args.some((arg) => arg.includes("mcp_servers.session_inspector.command")));
   assert.ok(args.includes('mcp_servers.session_inspector.env.THREADEX_CONTINUITY_ONLY="1"'));
+  const thread = JSON.parse(readFileSync(capturedThreadPath, "utf8"));
   const turn = JSON.parse(readFileSync(capturedTurnPath, "utf8"));
-  assert.match(turn.settings.developer_instructions, /call recover_current_session/i);
-  assert.match(turn.settings.developer_instructions, /complete user prompts and final assistant responses/i);
-  assert.doesNotMatch(turn.settings.developer_instructions, /For Todo MCP planning/);
-  assert.doesNotMatch(turn.settings.developer_instructions, /Use list_processes/);
+  assert.match(thread.developerInstructions, /call recover_current_session/i);
+  assert.match(thread.developerInstructions, /complete user prompts and final assistant responses/i);
+  assert.doesNotMatch(thread.developerInstructions, /For Todo MCP planning|Use list_processes/);
+  assert.doesNotMatch(turn.settings?.developer_instructions ?? "", /recover_current_session|THREADEX_WORKTREE_REVIEW/);
 });
 
 test("prompt runner treats force-plan requests as existing-plan follow-ups when todo items already exist", async () => {
@@ -1407,14 +1415,14 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.equal(turns[0].effort, "high");
   assert.equal(turns[0].input[0].text, "make the architecture decision");
   assert.match(turns[0].settings.developer_instructions, /\[AUTO MODEL\]/);
-  assert.match(turns[0].settings.developer_instructions, /Available upgrades are gpt-5\.6-luna/);
+  assert.ok(turns[0].settings.developer_instructions.includes(`Available upgrades are ${AUTO_MODEL_ORDER.join(", ")}`));
   assert.match(turns[0].settings.developer_instructions, /session_inspector\.upgrade_model/);
   assert.equal(turns[1].model, "gpt-5.6-sol");
   assert.equal(turns[1].effort, "xhigh");
   assert.equal(turns[1].input[0].text, "make the architecture decision");
   assert.match(turns[1].settings.developer_instructions, /AUTO MODEL CONTINUATION/);
   assert.match(turns[1].settings.developer_instructions, /Current setting: gpt-5\.6-sol \/ xhigh/);
-  assert.doesNotMatch(turns[1].settings.developer_instructions, /Available upgrades are gpt-5\.6-luna/);
+  assert.doesNotMatch(turns[1].settings.developer_instructions, /Available upgrades are/);
   assert.match(readFileSync(logPath, "utf8"), /auto_model\.phase_transition/);
 });
 
@@ -1608,7 +1616,13 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     } });
     send({ method: "thread/tokenUsage/updated", params: {
       threadId: "root-thread", turnId: "root-turn",
-      tokenUsage: { last: { inputTokens: 12, outputTokens: 4 } }
+      tokenUsage: { last: { inputTokens: 12, outputTokens: 4 }, total: { inputTokens: 1012, outputTokens: 104 } }
+    } });
+    // A second request and its duplicate notification must be counted once,
+    // without charging the inherited thread counter or the child thread.
+    for (let index = 0; index < 2; index++) send({ method: "thread/tokenUsage/updated", params: {
+      threadId: "root-thread", turnId: "root-turn",
+      tokenUsage: { last: { inputTokens: 20, outputTokens: 6 }, total: { inputTokens: 1032, outputTokens: 110 } }
     } });
     send({ method: "item/completed", params: {
       threadId: "root-thread",
@@ -1672,8 +1686,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     threadId: "root-thread",
     appTurnId: "root-turn",
     reply: "root final",
-    tokenIn: 12,
-    tokenOut: 4
+    tokenIn: 32,
+    tokenOut: 10
   });
   assert.equal(entries.some((entry) => entry.event === "error"), false);
 
@@ -2193,8 +2207,9 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   const thread = JSON.parse(readFileSync(capturedThreadPath, "utf8"));
   const turn = JSON.parse(readFileSync(capturedTurnPath, "utf8"));
   const config = thread.config.mcp_servers.session_inspector;
-  assert.match(turn.settings.developer_instructions, /Threadex automatically installs Git pre-commit\/pre-push hooks/);
-  assert.match(turn.settings.developer_instructions, /THREADEX_WORKTREE_REVIEW/);
+  const worktreeReviewGuidance = /THREADEX_WORKTREE_(?:REVIEW|REASON)|HOW TO SKIP|Threadex automatically installs Git pre-commit\/pre-push hooks/;
+  assert.doesNotMatch(turn.settings.developer_instructions, worktreeReviewGuidance);
+  assert.doesNotMatch(thread.developerInstructions, worktreeReviewGuidance);
   assert.equal(thread.developerInstructions.includes(MANAGER_REPLY_LANGUAGE_INSTRUCTIONS), workspaceManagerRole || managerDelegatedTask);
   if (managerDelegatedTask) assert.equal(thread.threadId, variant === "worker-resume" ? "thread-old" : undefined);
   if (workspaceManagerRole) {
@@ -2220,8 +2235,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     assert.equal(config.tools.workspace_fork_task.approval_mode, "approve");
     assert.equal(config.tools.workspace_stop_task.approval_mode, "approve");
     assert.equal(config.tools.workspace_continue_stronger.approval_mode, "approve");
-    assert.match(thread.developerInstructions, /dedicated manager/);
-    assert.match(thread.developerInstructions, /ordinary session history is your memory/);
+    assert.match(thread.developerInstructions, /workspace Manager/);
+    assert.match(thread.developerInstructions, /Use session history as memory/);
     assert.doesNotMatch(turn.settings.developer_instructions, /MUST use these tools instead of update_plan/);
     return;
   }

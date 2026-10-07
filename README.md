@@ -823,7 +823,11 @@ For Git projects, the runner synchronously writes an event-scoped record into
 the worktree's Git metadata (`threadex/provenance`) before queuing the DB callback,
 so a following commit in the same turn can find it. Server callbacks also record
 the same event idempotently for recovery. Non-Git projects still store the DB
-array. This does not stage files or create commits.
+array. Paths are grouped by their owning repository/worktree, even when the
+session CWD is a non-repository parent such as `/Volumes/dev`. Deleted paths use
+their nearest surviving directory; rename sources and destinations are both
+recorded. Each discovered worktree is enrolled in the hook dispatcher. This does
+not stage files or create commits.
 
 Threadex always installs a repository-local Git worktree review dispatcher for
 known session/workspace repositories at startup and before each runner starts.
@@ -839,7 +843,9 @@ together within the authorized scope, or asks the user if ownership or intent is
 unclear. To deliberately proceed separately, the agent explains its decision and
 retries that command with the reported `THREADEX_WORKTREE_REVIEW` snapshot token
 and a nonempty `THREADEX_WORKTREE_REASON`. Tokens differ for commit and push and
-change when the inspected state changes. This is a workflow check, not a security
+change when the inspected state changes. The hook's error message provides the
+agent's action and skip instructions; normal runner prompts do not include them.
+This is a workflow check, not a security
 boundary against deliberate Git hook bypasses.
 
 The dispatcher lives under the common Git directory's
@@ -847,22 +853,26 @@ The dispatcher lives under the common Git directory's
 directories. Repo-local `core.hooksPath` (and existing per-worktree overrides) is
 pointed at the dispatcher. Original hooks remain at their original paths and
 receive their original arguments, stdin and exit behavior, including Husky and
-provenance hooks. Other Git hooks are forwarded directly. The checks run without
+provenance hooks. `prepare-commit-msg` and `post-commit` then run Threadex's
+provenance CLI, even when no standalone provenance hook was installed.
+`applypatch-msg` and `post-applypatch` cover `git am`. A failing original hook
+retains its failure behavior. Other Git hooks are forwarded directly. The checks run without
 a live Threadex API; the local Threadex installation and Node executable must
 remain available. Non-Git directories are skipped; setup failures are reported.
 Tests in `src/server/gitWorktreeGuard.test.ts` exercise real commits and pushes
 against disposable local remotes.
 
-Enable commit annotation in each repository by running (from that repository):
+To enroll a repository immediately (without waiting for its next managed edit
+or runner start), run from that repository:
 
 ```sh
 node --import /absolute/path/to/threadex/node_modules/tsx/dist/loader.mjs /absolute/path/to/threadex/scripts/git-provenance.ts install
 ```
 
-The installer preserves existing hooks by refusing to overwrite them. If hooks
-already exist, chain the CLI's `prepare-commit-msg "$1"` and `post-commit`
-commands from those hooks. The generated hooks depend on this Threadex checkout
-and its Node installation. Git's configured hooks directory is respected.
+The installer idempotently updates the dispatcher, preserving original hooks
+at their existing paths and refusing to replace foreign dispatcher files. It
+also upgrades existing worktree-review-only installations. The generated hooks
+depend on this Threadex checkout and its Node installation.
 
 `prepare-commit-msg` adds one `Threadex-author:` trailer per contributing session,
 using the existing Threadex reference format, for example:
@@ -880,8 +890,8 @@ order (UUID breaks ties); later arrivals append, even for backdated imports.
 Deleted numbers are not reused. Numbers are stable references, not recalculated
 transcript positions. Existing database `local_` targets use `tx_` aliases.
 Before preparing the message, the hook resolves staged pending records that
-only contain UUIDs through the Threadex API (`RUNNER_SERVER_URL`, default
-`http://127.0.0.1:8787`). A failed lookup stops the commit with an error instead
+only contain UUIDs through the Threadex API (`RUNNER_SERVER_URL`, then
+`THREADEX_SERVER_URL`, then localhost at `PORT` or 8787). A failed lookup stops the commit with an error instead
 of silently omitting its author. Enrichment preserves consumed event tombstones.
 The client resolves all requested numbers and navigates to the first turn. This does
 not register an operating-system protocol handler for external applications.
@@ -892,6 +902,29 @@ The link and IDs are visible to anyone who can read Git history.
 `post-commit` consumes associations for paths committed by that task. Uncommitted
 paths from partial staging remain available for a later commit; an unrelated
 next commit gets no stale task link. Failed commits do not consume associations.
+
+Managed runners receive a per-turn command on start/resume/fork to create or
+rebuild commits through `git-provenance.ts run --source <numbered-URL> --
+<git-command> <args>`, using the target worktree as the command's working
+directory. It enrolls hooks before ordinary commit operations and passes an
+explicit creator/rebuilder reference only to that Git subprocess. Existing edit
+contributors and message trailers are retained and deduplicated. This creator
+reference records who assembled the commit, not line authorship.
+
+`run --source <URL> --rebuild-from <original-commit> -- commit-tree <args>`
+retains the original commit's source trailers and adds the rebuilding turn
+before Git creates/signs the object. It supports tree/parent arguments, message
+paragraphs/files/stdin and signing options; unknown options fail rather than
+falling back to an unattributed commit. It does not move refs or consume pending
+file associations, because the supplied tree need not match the index and the
+object may never reach a ref. Rebase uses the merge backend; apply-backend
+rebases and `am --no-verify` are rejected because they bypass message hooks.
+
+This is an explicit runner workflow, not interception of every Git binary call:
+raw `git commit-tree` still bypasses hooks and is prohibited by the injected
+instruction. Read-only Git operations, fetch, push and fast-forwards do not add
+creator attribution. Untouched Bot commits remain untouched. Installing/upgrading
+hooks does not rewrite existing history or backfill missing trailers.
 
 To query a commit, optionally filtered to a file (relative to the current directory):
 
@@ -1213,7 +1246,7 @@ For UI changes, run `npm run dev` and exercise:
 
 The composer Todo toggle now enables outcome tracking in the current session, including queued prompts. The main agent uses `outcome_plan_get` and `outcome_plan_set` to maintain a nested tree of concrete deliverables and acceptance conditions. It can revise, move, add or remove items but cannot write status. The toggle no longer starts the legacy grill/review workflow. Once a session has an outcome plan, later turns maintain it automatically; turning off the composer toggle only stops requesting activation for the next prompt.
 
-Grill starts from the flame icon on the latest completed agent turn. Its review panel contains a compact question list, a turn-level response, and one shared composer. Users can select, edit, drop or restore questions. Ask thread submits the selected questions together; Griller follow-up only becomes available after a saved thread response, enforced by both the UI and API. Both actions operate on the whole turn, and per-question inference requests are rejected. Start work sends selected responses and the optional composer instructions to the main thread while preserving its existing draft. Review history stays under the original turn and a flame tag marks reviewed turns in the left-hand list. Starting a new Grill on an older turn requires forking it first.
+Grill starts from the flame icon on any completed agent turn, including older turns without forking. Its review panel contains a compact question list, a turn-level response, and one shared composer. Users can select, edit, drop or restore questions. Ask thread submits the selected questions together; Griller follow-up only becomes available after a saved thread response, enforced by both the UI and API. Both actions operate on the whole turn, and per-question inference requests are rejected. Start work sends selected responses and the optional composer instructions to the main thread while preserving its existing draft. Review history stays under the original turn and a flame tag marks reviewed turns in the left-hand list.
 
 Grill state and question-history snapshots are persisted in `session_turn_grill`, with revision checks for concurrent edits. `GET /api/sessions/:sessionId/turns/:turnId/grill` loads the review; `POST` accepts `start`, `save`, `respond`, or `followup`, with `revision`, `issues`, and optional `prompt`. Each inference uses an isolated ephemeral Luna thread, reconstructing discussion from saved rounds (and earlier parent messages for responses), then cleans up its temporary home. This is context replay, not a native `thread/fork` or a permanent sidebar session. Interrupted requests retain their questions and follow-up for retry; abandoned running states recover after six minutes. Focused checks: `node --import tsx --test src/server/turnGrill*.test.ts` and `npm run test:e2e -- e2e/turn-grill.spec.ts`.
 

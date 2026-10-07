@@ -47,16 +47,24 @@ of that worker's DB history, with references to retrieve full details. It is not
 a native resume of the destroyed ephemeral thread. Missing native source history
 fails visibly instead of silently creating an unrelated context.
 
-Concurrent workers inherit the source role: a fork of the workspace Manager
-retains Manager instructions, workspace tools and the read-only/no-shell runtime.
-An ordinary session's worker remains an ordinary executor. Runner startup and
-the Manager action API resolve the role from persisted Concurrent membership and
-its current Manager source, including existing workers on later turns. Parentage
-alone does not grant Manager role to implementation tasks created by that worker.
-The worker retains its own session/local ID and assignment model/effort; its
-canonical request belongs to its own delivery flow. Manager workers handle it
-through Manager dispatch and supervision, not by treating themselves as another
-thread that already received the request.
+Manager Concurrent workers retain the source Manager's workspace background,
+confirmed decisions, attachments and coordination tools. They execute their own
+assigned request under a separate worker contract. `workspaceManager` identifies
+only the dedicated supervisor; `managerConcurrent` carries the worker's Manager
+context and tool access. Membership is resolved from the persisted group and its
+Manager source on initial and follow-up turns; parentage alone does not grant
+Manager authority to other tasks. Local/session identity and the canonical request
+remain the worker's own, not another thread's delivery flow.
+
+The runner installs the assigned-worker contract after inherited fork history via
+`thread/inject_items` and repeats it with current-turn context, so old supervisor
+developer messages do not remain the active role. Native history is retained.
+Worker fork/turn sandbox settings use the ordinary configured sandbox, and
+approval settings use the worker's saved policy. The supervisor-only read-only,
+shell-disable and automatic approval-denial branches do not apply. Explicit Plan
+mode and an explicitly configured read-only sandbox still do. No approval bypass
+or additional writable roots are added. Ordinary Concurrent and the dedicated
+Manager keep their existing execution paths.
 
 Manager Concurrent actions use the caller's active turn and session identity.
 Request IDs are scoped to that actor, default child hierarchy follows it, and
@@ -65,13 +73,16 @@ envelopes in the brief. Workspace boundaries, attachment verification and the
 canonical Manager's existing authority checks remain in place. Fork setup records
 the installed thread policy as a `developer_instructions` event for inspection.
 
-The C8 follow-up `manager_action_6ff27f9fe5eba8c610a6e96fbb6d9d8f` in
-`tx_collab_c89ec98761083046509d936a3c029f491fdd7d8e` exposed a role mismatch:
-worker identity was present, while inherited Manager instructions had no matching
-Manager tools/action access. The user's clarification requires preserving that
-Manager role. Removing the common skill's "Manager boundary" paragraph did not
-resolve the mismatch. The correction is validated statically and by typecheck;
-no automated test or live task replay was performed.
+In C8 (`tx_collab_c89ec98761083046509d936a3c029f491fdd7d8e`), follow-up
+`manager_action_67d77c3f3e09ac5f5bf4496176571262` reproduced the problem after a
+server restart. Its thread event contained the full supervisor prohibition on
+project work, and its turn context repeated that no-edit/no-shell rules applied.
+The native `thread/settings/updated` event reported `sandboxPolicy.type=readOnly`,
+`approvalPolicy=never`, and `approvalsReviewer=user`, despite the saved request's
+`granular` policy. The shared `workspaceManager` flag caused all these branches;
+adding Manager tools alone did not resolve it. The role split corrects both the
+instruction and permission paths. Static review, typecheck and diff checks do not
+establish a successful live replay; no automated tests or worker replay were run.
 
 ## Delivery and recovery
 

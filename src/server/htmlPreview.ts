@@ -53,7 +53,7 @@ export function createHtmlPreviewRouter() {
       && !(canInlineWorkspaceFile(filePath) && canInlineWorkspaceFile(realPath))) {
       res.status(403).send("Only images outside the preview directory are allowed."); return;
     }
-    res.setHeader("Content-Security-Policy", "sandbox allow-scripts; default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'");
+    res.setHeader("Content-Security-Policy", "sandbox allow-scripts allow-downloads; default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'");
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Referrer-Policy", "no-referrer");
     res.sendFile(realPath);

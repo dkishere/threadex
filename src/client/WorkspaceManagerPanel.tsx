@@ -55,6 +55,56 @@ export function WorkspaceManagerToggle({ active, busy, onToggle }: { active: boo
   </button>;
 }
 
+export function useWorkspaceManagerDashboard(workspaceId: string | undefined) {
+  const [state, setState] = useState<{ workspaceId: string; snapshot: WorkspaceManagerSnapshot | null; error: string } | null>(null);
+  useEffect(() => {
+    if (!workspaceId) return;
+    const controller = new AbortController();
+    let fetching = false;
+    const read = async () => {
+      if (fetching) return;
+      fetching = true;
+      try {
+        const snapshot = await apiJson<WorkspaceManagerSnapshot>(`/api/workspace-manager?workspaceId=${encodeURIComponent(workspaceId)}`, { signal: controller.signal });
+        if (!controller.signal.aborted) setState({ workspaceId, snapshot, error: "" });
+      } catch (cause) {
+        if (!controller.signal.aborted) setState(current => ({
+          workspaceId,
+          snapshot: current?.workspaceId === workspaceId ? current.snapshot : null,
+          error: cause instanceof Error ? cause.message : String(cause)
+        }));
+      } finally { fetching = false; }
+    };
+    setState(null);
+    void read();
+    const refresh = window.setInterval(() => void read(), 5000);
+    return () => { controller.abort(); window.clearInterval(refresh); };
+  }, [workspaceId]);
+  const updateSnapshot = useCallback((update: (current: WorkspaceManagerSnapshot | null) => WorkspaceManagerSnapshot | null) => {
+    setState(current => current && current.workspaceId === workspaceId ? { ...current, snapshot: update(current.snapshot) } : current);
+  }, [workspaceId]);
+  return {
+    snapshot: state?.workspaceId === workspaceId ? state?.snapshot ?? null : null,
+    error: state?.workspaceId === workspaceId ? state?.error ?? "" : "",
+    updateSnapshot
+  };
+}
+
+export function WorkspaceManagerTaskBadges({ snapshot }: {
+  snapshot: Pick<WorkspaceManagerSnapshot, "runningTasks" | "pendingTasks"> | null;
+}) {
+  const metrics = [
+    { kind: "running", label: "Running tasks", value: snapshot?.runningTasks, icon: Play },
+    { kind: "queued", label: "Queued tasks", value: snapshot?.pendingTasks, icon: ListOrdered }
+  ];
+  return <div className="workspace-task-counts" role="group" aria-label="Workspace task counts">
+    {metrics.map(({ kind, label, value, icon: Icon }) => <span className="workspace-task-count-badge" data-kind={kind} key={kind}
+      role="img" aria-label={`${label}: ${value ?? "unavailable"}`} title={`${label}: ${value ?? "unavailable"}`}>
+      <Icon aria-hidden="true" /><span>{value?.toLocaleString() ?? "—"}</span>
+    </span>)}
+  </div>;
+}
+
 export function workspaceTaskElapsed(started: string | null | undefined, now: number): string {
   if (!started) return "Unavailable";
   const start = Date.parse(started);
@@ -491,11 +541,11 @@ function WorkspaceTaskComments({ title, comments, activity }: {
   </>;
 }
 
-export function WorkspaceManagerDashboard({ hidden, workspaceId, onOpenTask }: {
-  hidden: boolean; workspaceId: string | undefined; onOpenTask: (sessionId: string) => void;
+export function WorkspaceManagerDashboard({ hidden, workspaceId, dashboard, onOpenTask }: {
+  hidden: boolean; workspaceId: string | undefined; dashboard: ReturnType<typeof useWorkspaceManagerDashboard>;
+  onOpenTask: (sessionId: string) => void;
 }) {
-  const [snapshot, setSnapshot] = useState<WorkspaceManagerSnapshot | null>(null);
-  const [error, setError] = useState("");
+  const { snapshot, error, updateSnapshot: setSnapshot } = dashboard;
   const [stopError, setStopError] = useState("");
   const [stoppingTaskIds, setStoppingTaskIds] = useState<Set<string>>(() => new Set());
   const [loopError, setLoopError] = useState("");
@@ -505,23 +555,8 @@ export function WorkspaceManagerDashboard({ hidden, workspaceId, onOpenTask }: {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     if (hidden || !workspaceId) return;
-    const controller = new AbortController();
-    let fetching = false;
-    const read = async () => {
-      if (fetching) return;
-      fetching = true;
-      try {
-        const next = await apiJson<WorkspaceManagerSnapshot>(`/api/workspace-manager?workspaceId=${encodeURIComponent(workspaceId)}`, { signal: controller.signal });
-        if (!controller.signal.aborted) { setSnapshot(next); setError(""); }
-      } catch (cause) {
-        if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : String(cause));
-      } finally { fetching = false; }
-    };
-    setSnapshot(null);
-    void read();
-    const refresh = window.setInterval(() => void read(), 5000);
     const clock = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => { controller.abort(); window.clearInterval(refresh); window.clearInterval(clock); };
+    return () => window.clearInterval(clock);
   }, [hidden, workspaceId]);
   const running = snapshot?.tasks.filter(task => task.status === "running") ?? [];
   const recentCompleted = snapshot?.recentCompletedTasks ?? [];
@@ -549,7 +584,7 @@ export function WorkspaceManagerDashboard({ hidden, workspaceId, onOpenTask }: {
         return next;
       });
     }
-  }, [snapshot?.manager?.sessionId, stoppingTaskIds]);
+  }, [setSnapshot, snapshot?.manager?.sessionId, stoppingTaskIds]);
   const toggleTaskLoopMode = useCallback(async (sessionId: string, enabled: boolean) => {
     if (!workspaceId || snapshot?.globalLoopEnabled || loopSavingTaskIds.has(sessionId)) return;
     setLoopSavingTaskIds(current => new Set(current).add(sessionId));
@@ -573,7 +608,7 @@ export function WorkspaceManagerDashboard({ hidden, workspaceId, onOpenTask }: {
         return next;
       });
     }
-  }, [loopSavingTaskIds, snapshot?.globalLoopEnabled, workspaceId]);
+  }, [loopSavingTaskIds, setSnapshot, snapshot?.globalLoopEnabled, workspaceId]);
   const forkQueuedPrompt = useCallback(async (sessionId: string, turnId: string) => {
     if (!workspaceId || forkingTurnIds.has(turnId)) return false;
     setForkingTurnIds(current => new Set(current).add(turnId));
@@ -598,14 +633,12 @@ export function WorkspaceManagerDashboard({ hidden, workspaceId, onOpenTask }: {
     } finally {
       setForkingTurnIds(current => { const next = new Set(current); next.delete(turnId); return next; });
     }
-  }, [forkingTurnIds, workspaceId]);
+  }, [forkingTurnIds, setSnapshot, workspaceId]);
   return <section className="workspace-manager-dashboard" id="session-panel-dashboard" aria-label="Workspace dashboard" hidden={hidden}>
     <div className="workspace-dashboard-content">
       <WorkspaceTokenChart activity={snapshot?.tokenActivity} />
       {error && <p role="alert">Could not refresh task status: {error}</p>}
       <div className="workspace-dashboard-grid">
-        <div className="workspace-dashboard-summary"><span>Running</span><strong>{snapshot?.runningTasks ?? "—"}</strong></div>
-        <div className="workspace-dashboard-summary"><span>Queued tasks</span><strong>{snapshot?.pendingTasks ?? "—"}</strong></div>
         {running.map(task => <RunningTaskCard key={task.sessionId} task={task} now={now} onOpenTask={onOpenTask}
           onStopTask={stopTask} stopping={stoppingTaskIds.has(task.sessionId)}
           globalLoopEnabled={snapshot?.globalLoopEnabled === true} onToggleLoopMode={toggleTaskLoopMode}
