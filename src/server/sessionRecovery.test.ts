@@ -85,6 +85,18 @@ test("recognizes only thread-resume failures as recoverable", () => {
   assert.equal(isRecoverableThreadResumeError("refresh token was revoked"), false);
 });
 
+test("first-provider recovery includes work completed ahead of a queued prompt and its user corrections", () => {
+  const recovery = buildSessionRecoveryContext({ session, currentTurnId: "queued", turns: [
+    turn({ id: "queued", userInput: "continue", status: "running" }),
+    turn({ id: "completed-later", userInput: "fix", agentResponse: "fixed", provider: "claude" }),
+    turn({ id: "future", userInput: "do not execute this yet", status: "todo", runnerExitCode: null })
+  ], steerMessagesByTurn: { "completed-later": [{ content: "Keep the existing API" }] } });
+  assert.match(recovery!.handoff, /agent=Claude Code/);
+  assert.match(recovery!.handoff, /Keep the existing API/);
+  assert.match(recovery!.handoff, /fixed/);
+  assert.doesNotMatch(recovery!.handoff, /do not execute this yet/);
+});
+
 test("forces one persisted handoff when the current native thread was created after an auth failure", () => {
   const turns = [
     turn({

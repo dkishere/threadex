@@ -253,6 +253,33 @@ Use `/api/experimental/session-categories`, never edit its backing files directl
   categories and five levels. Existing session lineage and the Sessions list are
   unchanged.
 
+## Agent Actor Library
+
+Reusable actors (Settings → Agent actors) are server-wide, shared across
+workspaces, and used by round tables and the Side chat room. Use
+`GET /api/settings/roundtable-actors` to read `{revision, actors}` and `PUT` to
+save that complete document using its observed revision. A stale revision returns
+409; reread and reconcile before retrying. Each actor has a unique `id`, `name`
+(1–80 characters), supported `model`, `effort` (`minimal`, `low`, `medium`, `high`,
+`xhigh`, `max`, or `ultra`), `rolePrompt` (up to 8000 characters), and
+boolean `isDefault`. Up to 100 presets and 8 defaults are allowed. Older actors
+without `effort` are read as `high`. The Settings page provides the same editor.
+Do not edit the backing file or browser storage.
+Actors may include `avatar`: a DiceBear `https://api.dicebear.com/10.x/` URL
+using bottts, lorelei, adventurer or pixel-art with a seed, or a PNG/JPEG/WebP
+base64 data URL up to 65536 characters. The UI resizes uploads to 128×128 WebP.
+Omitted avatars use a stable DiceBear image seeded by actor ID. Preset selection
+copies the avatar into the round snapshot. Draft actors retain `presetId` and
+follow that preset's saved avatar; submitted rounds retain their original image.
+Legacy drafts with no avatar bind only to a unique matching name/model/effort/role.
+The round table panel displays selected
+actors as an avatar grid; choose a preset and click Add. Add new actor opens the
+Settings actor editor in a modal; saving makes it available in the picker.
+New round tables copy default actors; gearbox actors fill any places needed to
+reach two. Existing drafts and rounds retain their snapshots. The round table
+picker can replace or add a saved actor without changing the library. All actors
+retain the built-in workspace isolation and discussion-only restrictions.
+
 ## Maintaining This Skill
 
 Keep future Threadex-client configuration contracts here when they affect how

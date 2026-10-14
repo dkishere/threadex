@@ -746,7 +746,7 @@ export async function switchSession(ctx, record, options = {}) {
             const response = await fetch("/api/sessions/switch", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ sessionId: record.id })
+                body: JSON.stringify({ sessionId: record.id, ...(options.workspaceManagerView ? { view: "workspace-chat" } : {}) })
             });
             if (!response.ok) {
                 throw new Error(`API returned ${response.status}`);

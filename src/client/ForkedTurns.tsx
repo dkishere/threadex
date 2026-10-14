@@ -1,15 +1,15 @@
 import type { CollaborationView } from "../collaboration";
 
-export function ForkedTurns({ sessionId, group, onOpen }: {
+export function ForkedTurns({ sessionId, sourceTurnId, group, onOpen }: {
   sessionId: string;
+  sourceTurnId: string;
   group: CollaborationView | null;
   onOpen: (sessionId: string) => void;
 }) {
   const workers = group?.members.filter(member => member.localId !== "main" &&
-    (group.mainSessionId === sessionId || member.sourceSessionId === sessionId)) ?? [];
+    member.sourceSessionId === sessionId && member.sourceTurnId === sourceTurnId) ?? [];
   if (!workers.length) return null;
-  return <section className="forked-turns" aria-label="Forked turns">
-    <h3>Forked turns <span>{workers.length}</span></h3>
+  return <section className="forked-turns" aria-label="Forked turns" data-source-turn-id={sourceTurnId}>
     {workers.map(member => {
       const prompt = group!.messages.find(message => message.to === member.localId && message.kind === "task")?.text ?? member.task;
       const status = group!.activity[member.localId]?.status ?? "creating";

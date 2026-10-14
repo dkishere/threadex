@@ -838,6 +838,8 @@
 .prompt-turn-details { display: grid; grid-column: 1 / -1; grid-row: 2; grid-template-columns: repeat(5, max-content) minmax(0, 1fr) max-content; align-items: center; gap: 9px; box-sizing: border-box; width: 100%; min-width: 0; padding-left: 20px; color: #475569; font-size: 10px; font-weight: 700; }
 .prompt-turn-stat { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
 .prompt-turn-stat svg { width: 11px; height: 11px; }
+.prompt-turn-model-flags { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; min-width: 0; }
+.prompt-turn-roundtable { color: #6d28d9; }
 .prompt-turn-copy { display: -webkit-box; align-self: center; overflow: hidden; font-size: 12px; line-height: 1.45; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
 .prompt-turn-copy > p { margin: 0; }
 .prompt-turn-summary { display: grid; align-content: start; gap: 3px; min-width: 0; }

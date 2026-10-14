@@ -1,14 +1,17 @@
 import type { RequestHandler } from "express";
 
 export function createWorkspaceSnapshotHandler({ readSnapshot, reconcileRunningTurns }: {
-  readSnapshot: (options: { includeActiveSession: boolean }) => Promise<unknown>;
+  readSnapshot: (options: { includeActiveSession: boolean; managerHistory: boolean }) => Promise<unknown>;
   reconcileRunningTurns: () => Promise<void>;
 }): RequestHandler {
   let reconciliationScheduled = false;
   return async (req, res) => {
     try {
       const started = performance.now();
-      const snapshot = await readSnapshot({ includeActiveSession: req.query.includeActiveSession !== "false" });
+      const snapshot = await readSnapshot({
+        includeActiveSession: req.query?.includeActiveSession !== "false",
+        managerHistory: req.query?.view === "workspace-chat"
+      });
       res.setHeader("Server-Timing", `snapshot;dur=${(performance.now() - started).toFixed(1)}`);
       res.once("finish", () => {
         if (reconciliationScheduled) return;

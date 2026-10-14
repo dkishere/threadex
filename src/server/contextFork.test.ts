@@ -10,9 +10,9 @@ import {
 test("context fork orchestration asks the parent to create one self-contained child task", () => {
   const prompt = buildContextForkOrchestrationPrefix();
   assert.match(prompt, /Handle the user's actual request in a new child session/);
-  assert.match(prompt, /full relevant context from this thread/);
+  assert.match(prompt, /precise references to necessary context/);
   assert.match(prompt, /language of the user's actual request, ignoring wrapper and operational instructions/);
-  assert.match(prompt, /mcp__session_inspector__create_task/);
+  assert.match(prompt, /session-inspector create_task/);
   assert.doesNotMatch(prompt, /mcp__session_inspectorcreate_task/);
   assert.match(prompt, /Omit model settings unless a different model or reasoning effort is clearly beneficial/);
   assert.match(prompt, /Do not use `spawn_agent`, `todo_create_task`, or any other mechanism/);
@@ -23,7 +23,7 @@ test("context fork orchestration asks the parent to create one self-contained ch
 });
 
 test("context fork user suffix makes the Threadex child contract explicit", () => {
-  assert.match(CONTEXT_FORK_USER_SUFFIX, /mcp__session_inspector__create_task/);
+  assert.match(CONTEXT_FORK_USER_SUFFIX, /session-inspector create_task/);
   assert.match(CONTEXT_FORK_USER_SUFFIX, /exactly once/);
   assert.match(CONTEXT_FORK_USER_SUFFIX, /Do not use `spawn_agent`, `todo_create_task`/);
   assert.match(CONTEXT_FORK_USER_SUFFIX, /ignoring wrapper and operational instructions/);

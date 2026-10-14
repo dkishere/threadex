@@ -6,8 +6,21 @@ export const MODEL_CATALOG = {
   astra: { id: "gpt-6-astra", label: "6 Astra", ultra: true, autoLowEffort: true, aliases: [] },
   gpt55: { id: "gpt-5.5", label: "5.5", ultra: false, autoLowEffort: false, aliases: [] },
   gpt54: { id: "gpt-5.4", label: "5.4", ultra: false, autoLowEffort: false, aliases: [] },
-  mini: { id: "gpt-5.4-mini", label: "5.4-mini", ultra: false, autoLowEffort: false, aliases: [] }
+  mini: { id: "gpt-5.4-mini", label: "5.4-mini", ultra: false, autoLowEffort: false, aliases: [] },
+  // Claude models run through the Claude Agent SDK instead of Codex (see server/claudeRunner.ts).
+  claudeOpus: { id: "claude-opus-5-5", label: "Claude Opus 5.5", ultra: false, autoLowEffort: false, aliases: ["opus"] },
+  claudeSonnet: { id: "claude-sonnet-5-5", label: "Claude Sonnet 5.5", ultra: false, autoLowEffort: false, aliases: ["sonnet"] },
+  claudeHaiku: { id: "claude-haiku-5-5", label: "Claude Haiku 5.5", ultra: false, autoLowEffort: false, aliases: ["haiku"] }
 } as const;
+
+export type ModelProvider = "codex" | "claude";
+/** Which agent backend runs a model. Claude model ids always start with "claude-". */
+export function modelProvider(value: string | null | undefined): ModelProvider {
+  return normalizeModelId(value?.trim() ?? "").startsWith("claude-") ? "claude" : "codex";
+}
+export function isClaudeModel(value: string | null | undefined): boolean {
+  return modelProvider(value) === "claude";
+}
 
 export const AUTO_MODEL_ORDER = [MODEL_CATALOG.luna.id, MODEL_CATALOG.sol.id, MODEL_CATALOG.astra.id] as const;
 /** Manager assignments use 6.1 Sol without changing Auto routing defaults. */
@@ -23,6 +36,26 @@ export function modelLabel(value: string): string {
 }
 export function supportsUltraEffort(value: string): boolean {
   return Object.values(MODEL_CATALOG).find(model => model.id === normalizeModelId(value))?.ultra ?? false;
+}
+export const CODEX_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"] as const;
+export const CODEX_ULTRA_EFFORTS = [...CODEX_EFFORTS, "max", "ultra"] as const;
+// https://platform.claude.com/docs/en/build-with-claude/effort
+// The catalog's Opus, Sonnet and Haiku 5.5 models support all five levels.
+export const CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
+export type ModelEffort = typeof CODEX_ULTRA_EFFORTS[number];
+
+export function modelEfforts(model: string): readonly ModelEffort[] {
+  if (isClaudeModel(model)) return CLAUDE_EFFORTS;
+  return supportsUltraEffort(model) ? CODEX_ULTRA_EFFORTS : CODEX_EFFORTS;
+}
+
+/** Preserve supported choices; adapt old settings and cross-provider model switches. */
+export function normalizeModelEffort(model: string, effort: string): ModelEffort {
+  const options = modelEfforts(model);
+  if (options.includes(effort as ModelEffort)) return effort as ModelEffort;
+  if (effort === "minimal" || effort === "none") return "low";
+  if (effort === "ultra" || effort === "max") return options[options.length - 1];
+  return "high";
 }
 export function supportsAutoLowEffort(value: string): boolean {
   return Object.values(MODEL_CATALOG).find(model => model.id === value)?.autoLowEffort ?? false;

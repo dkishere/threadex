@@ -2,21 +2,14 @@ import { createHash } from "node:crypto";
 import { AUTO_MODEL_ORDER } from "../modelCatalog";
 import type { CollaborationView } from "../collaboration";
 import { WORKSPACE_MANAGER_TOOLS, WORKSPACE_MANAGER_ACTIONS } from "./workspaceManagerTools";
-import { createInterface } from "node:readline";
 import { createTurnGrillHistoryReader } from "./turnGrillContext";
-import {
-  SessionStore,
-  type SessionInspectInput,
-  type SessionSearchInput,
-  type SessionVectorSearchInput
+import type {
+  SessionInspectInput,
+  SessionSearchInput,
+  SessionVectorSearchInput,
+  SessionTurnRecord
 } from "./sessionStore";
 
-type JsonRpcMessage = {
-  jsonrpc?: string;
-  id?: string | number | null;
-  method?: string;
-  params?: unknown;
-};
 
 type ToolSpec = {
   name: string;
@@ -52,7 +45,7 @@ type SessionPromptInput = {
   queueIfRunning?: boolean;
 };
 
-const apiBaseUrl = process.env.SESSION_INSPECTOR_SERVER_URL?.replace(/\/$/, "") || null;
+const apiBaseUrl = (process.env.RUNNER_SERVER_URL || process.env.SESSION_INSPECTOR_SERVER_URL)?.replace(/\/$/, "") || null;
 const managerSessionId = process.env.THREADEX_SESSION_ID?.trim() || null;
 const collaborationId = process.env.THREADEX_CONCURRENT_ID?.trim() || process.env.THREADEX_COLLABORATION_ID?.trim() || null;
 const workspaceManager = process.env.THREADEX_WORKSPACE_MANAGER === "1";
@@ -75,7 +68,6 @@ const grillHistoryRequest = todoAgentRole === "turn_grill" && managerSessionId
 const todoInitialGrillRequired = process.env.THREADEX_TODO_REQUIRE_INITIAL_GRILL === "1";
 const todoParentSessionId = process.env.THREADEX_TODO_PARENT_SESSION_ID?.trim() || null;
 const todoItemId = process.env.THREADEX_TODO_ITEM_ID?.trim() || null;
-let store: SessionStore | null = null;
 
 const todoPlanItemSchema: Record<string, unknown> = {
   type: "object",
@@ -130,7 +122,7 @@ const tools: ToolSpec[] = [
   {
     name: "get_session",
     description:
-      "Inspect a stored Codex session by local sessionId or Codex threadId. Supports turn/event pagination, text filtering, status filters, and optional live tool items.",
+      "Inspect a stored Codex session by local sessionId or Codex threadId. Full view includes round table context, actor settings/responses/errors and host synthesis under each turn's roundtable field. Supports pagination, text/status filters and optional live tool items.",
     inputSchema: {
       type: "object",
       properties: {
@@ -574,7 +566,7 @@ if (managerSessionId) {
     },
     {
       name: "todo_add_message",
-      description: "Add a short item-level status/progress message. In Todo MCP mode, call this whenever you send a user-facing commentary/status comment about plan execution, using the comment's short headline as the title. type defaults to update. Use challenge when work is not going smoothly; the result includes an incremental challengeId that must later be resolved.",
+      description: "Add a short item-level status/progress message. In Todo CLI mode, call this whenever you send a user-facing commentary/status comment about plan execution, using the comment's short headline as the title. type defaults to update. Use challenge when work is not going smoothly; the result includes an incremental challengeId that must later be resolved.",
       inputSchema: {
         type: "object",
         required: ["itemId", "title"],
@@ -741,7 +733,7 @@ const collaborationTools: ToolSpec[] = [{
       message: { type: "string", minLength: 1, maxLength: 100000 }, reason: { type: "string", minLength: 1, maxLength: 4000 }, wait: { type: "boolean" } } }
 }];
 
-function toolsForAgent() {
+export function toolsForAgent() {
   const base = [...baseToolsForAgent()];
   if (managerConcurrent && !["side_chat", "turn_grill"].includes(todoAgentRole)) {
     base.push(...WORKSPACE_MANAGER_TOOLS.filter(tool => todoAgentRole !== "planner" ||
@@ -787,84 +779,19 @@ function isToolExposed(name: string) {
   return toolsForAgent().some((tool) => tool.name === name);
 }
 
-const rl = createInterface({ input: process.stdin });
-let messageQueue = Promise.resolve();
 
-rl.on("line", (line) => {
-  messageQueue = messageQueue
-    .then(() => handleLine(line))
-    .catch((error) => {
-      process.stderr.write(`session-inspector MCP error: ${errorMessage(error)}\n`);
-    });
-});
-
-process.once("SIGINT", () => {
-  void closeAndExit(130);
-});
-process.once("SIGTERM", () => {
-  void closeAndExit(143);
-});
-
-async function handleLine(line: string) {
-  let message: JsonRpcMessage;
-  try {
-    message = JSON.parse(line) as JsonRpcMessage;
-  } catch {
-    writeResponse(null, null, { code: -32700, message: "Parse error" });
-    return;
-  }
-
-  if (message.id === undefined || message.id === null) {
-    return;
-  }
-
-  try {
-    if (message.method === "initialize") {
-      writeResponse(message.id, {
-        protocolVersion: "2024-11-05",
-        capabilities: { tools: {} },
-        serverInfo: { name: "session-inspector", version: "0.1.0" }
-      });
-      return;
-    }
-
-    if (message.method === "tools/list") {
-      writeResponse(message.id, { tools: toolsForAgent() });
-      return;
-    }
-
-    if (message.method === "tools/call") {
-      writeResponse(message.id, await callTool(message.params));
-      return;
-    }
-
-    if (message.method === "shutdown") {
-      writeResponse(message.id, {});
-      await closeAndExit(0);
-      return;
-    }
-
-    writeResponse(message.id, null, { code: -32601, message: `Method not found: ${message.method ?? ""}` });
-  } catch (error) {
-    writeResponse(message.id, toolError(error));
-  }
-}
-
-async function callTool(params: unknown) {
-  const record = readObject(params);
-  const name = readString(record?.name);
-  const args = readObject(record?.arguments) ?? {};
+export async function runCommand(name: string, args: Record<string, unknown>) {
 
   if (!name || !isToolExposed(name)) {
-    throw new Error(`Tool is not available to this ${todoAgentRole} agent: ${name ?? "unknown"}`);
+    throw new Error(`Command is not available to this ${todoAgentRole} agent: ${name ?? "unknown"}`);
   }
 
   if (name === "concurrent_status" || name === "concurrent_send") {
     if (!managerSessionId || !collaborationId) throw new Error("No active Concurrent group.");
     const path = `/api/concurrent/sessions/${encodeURIComponent(managerSessionId)}`;
-    if (name === "concurrent_send") return toolResult(await postJson(`${path}/send`, { ...args, turnId: managerTurnId }));
+    if (name === "concurrent_send") return (await postJson(`${path}/send`, { ...args, turnId: managerTurnId }));
     const { group } = await getJson(path) as { group: CollaborationView | null };
-    return toolResult(group ? { id: group.id, revision: group.revision, updated: group.updated, mainSessionId: group.mainSessionId,
+    return (group ? { id: group.id, revision: group.revision, updated: group.updated, mainSessionId: group.mainSessionId,
       members: group.members.map(member => ({ localId: member.localId, sessionId: member.sessionId, task: member.task.slice(0, 2000), ...group.activity[member.localId] })),
       conflicts: group.conflicts, error: group.error,
       pending: group.messages.filter(item => !item.completed && item.state !== "cancelled").slice(-50).map(item => ({ id: item.id, from: item.from, to: item.to, wait: item.wait, state: item.state, turnId: item.targetTurnId, error: item.error })),
@@ -874,24 +801,24 @@ async function callTool(params: unknown) {
 
   if (workspaceManager && WORKSPACE_MANAGER_ACTIONS[name]) {
     if (!managerSessionId) throw new Error("Workspace manager session is unavailable.");
-    return toolResult(await postJson(`/api/workspace-manager/${encodeURIComponent(managerSessionId)}/action`, {
+    return (await postJson(`/api/workspace-manager/${encodeURIComponent(managerSessionId)}/action`, {
       ...args, action: WORKSPACE_MANAGER_ACTIONS[name], managerTurnId
     }));
   }
 
   if (name === "outcome_plan_get" || name === "outcome_plan_set") {
     const path = `/api/sessions/${encodeURIComponent(managerSessionId!)}/outcome-plan`;
-    return toolResult(name === "outcome_plan_get" ? await getJson(path) : await postJson(path, args));
+    return (name === "outcome_plan_get" ? await getJson(path) : await postJson(path, args));
   }
 
   if (name === "get_session") {
     if (todoAgentRole === "turn_grill") {
       if (!grillHistoryRequest) throw new Error("Grill me target session is unavailable.");
       const result = readObject(await inspectSession(grillHistoryRequest(args)));
-      if (!result) return toolResult(null);
+      if (!result) return (null);
       const session = readObject(result.session);
       const turns = Array.isArray(result.turns) ? result.turns.map(readObject).filter((turn) => turn !== null) : [];
-      return toolResult({
+      return ({
         session: { id: session?.id, title: session?.title },
         turns: turns.map((turn) => ({
           id: turn.id, userInput: turn.userInput, agentResponse: turn.agentResponse,
@@ -903,14 +830,14 @@ async function callTool(params: unknown) {
         contextNote: "Bounded saved history, possibly truncated. Later turns may contain corrections; do not treat them as evidence available during the selected turn."
       });
     }
-    return toolResult(await inspectSession(args as SessionInspectInput));
+    return (await inspectSession(args as SessionInspectInput));
   }
 
   if (name === "recover_current_session") {
     if (!managerSessionId) {
       throw new Error("Current Threadex session id is unavailable.");
     }
-    return toolResult(await inspectSession({
+    return (await inspectSession({
       sessionId: managerSessionId,
       view: "turn_summary",
       status: "done",
@@ -923,37 +850,37 @@ async function callTool(params: unknown) {
   }
 
   if (name === "search_sessions") {
-    return toolResult(await searchSessions(args as SessionSearchInput));
+    return (await searchSessions(args as SessionSearchInput));
   }
 
   if (name === "ask_session") {
-    return toolResult(await askSession(args as SessionQuestionInput));
+    return (await askSession(args as SessionQuestionInput));
   }
 
   if (name === "prompt_session") {
-    return toolResult(await promptSession(args as SessionPromptInput));
+    return (await promptSession(args as SessionPromptInput));
   }
 
   if (name === "vector_status") {
-    return toolResult(await vectorStatus());
+    return (await vectorStatus());
   }
 
   if (name === "vector_search") {
-    return toolResult(await vectorSearch(args as SessionVectorSearchInput));
+    return (await vectorSearch(args as SessionVectorSearchInput));
   }
 
   if (name === "list_processes") {
-    return toolResult(await listProcesses());
+    return (await listProcesses());
   }
 
   if (name === "list_wait_events") {
-    return toolResult(await getJson("/api/wait-events"));
+    return (await getJson("/api/wait-events"));
   }
 
   if (name === "subscribe_wait_event") {
     const actionPayload = readObject(args.actionPayload);
     const inheritedApprovalPolicy = readString(actionPayload?.approvalPolicy) ?? managerApprovalPolicy;
-    return toolResult(await postJson("/api/wait-subscriptions", {
+    return (await postJson("/api/wait-subscriptions", {
       ...args,
       ...(readString(args.actionType) === "enqueue_prompt" && actionPayload
         ? {
@@ -967,12 +894,12 @@ async function callTool(params: unknown) {
   }
 
   if (name === "todo_list" || name === "todo_get_detail") {
-    return toolResult(await getJson(`/api/sessions/${encodeURIComponent(readSessionIdArg(args))}/todos`));
+    return (await getJson(`/api/sessions/${encodeURIComponent(readSessionIdArg(args))}/todos`));
   }
 
   if (name === "todo_add_item") {
     const sessionId = readSessionIdArg(args);
-    return toolResult(await postJson(`/api/sessions/${encodeURIComponent(sessionId)}/todos/items`, {
+    return (await postJson(`/api/sessions/${encodeURIComponent(sessionId)}/todos/items`, {
       grillTurnId: readString(args.grillTurnId) ?? undefined,
       grillIssueId: readString(args.grillIssueId) ?? undefined,
       id: readString(args.id) ?? undefined,
@@ -991,7 +918,7 @@ async function callTool(params: unknown) {
 
   if (name === "todo_set_plan") {
     if (todoAgentRole === "planner" && todoInitialGrillRequired) {
-      throw new Error("The Todo MCP toggle requires an initial grill-me round before plan creation. Call todo_request_clarification first and wait for the user's answers.");
+      throw new Error("The Todo CLI toggle requires an initial grill-me round before plan creation. Call todo_request_clarification first and wait for the user's answers.");
     }
     const sessionId = readSessionIdArg(args);
     const problem = validateTodoPlanString(args.problem, "problem", 12000, false);
@@ -1009,13 +936,13 @@ async function callTool(params: unknown) {
     await createTodoItemsRecursive(sessionId, null, verification, "verification");
     await postJson(`/api/sessions/${encodeURIComponent(sessionId)}/todos/control`, {
       paused: true,
-      pauseReason: "Initial Todo MCP plan created for review. Execution has not started.",
+      pauseReason: "Initial Todo CLI plan created for review. Execution has not started.",
       problem,
       objective,
       context: "",
       actor: "agent"
     });
-    return toolResult(await getJson(`/api/sessions/${encodeURIComponent(sessionId)}/todos`));
+    return (await getJson(`/api/sessions/${encodeURIComponent(sessionId)}/todos`));
   }
 
   if (name === "todo_request_clarification") {
@@ -1032,9 +959,9 @@ async function callTool(params: unknown) {
     if (readArray(current.items).length > 0) {
       throw new Error("Todo plan already exists for this session; clarify through the existing plan instead.");
     }
-    return toolResult(await postJson(`/api/sessions/${encodeURIComponent(sessionId)}/todos/control`, {
+    return (await postJson(`/api/sessions/${encodeURIComponent(sessionId)}/todos/control`, {
       paused: true,
-      pauseReason: "Todo MCP plan needs clarification before it can be created.",
+      pauseReason: "Todo CLI plan needs clarification before it can be created.",
       problem,
       objective,
       context: JSON.stringify({ clarificationQuestions: questions }),
@@ -1045,7 +972,7 @@ async function callTool(params: unknown) {
   if (name === "todo_update_item") {
     const sessionId = readSessionIdArg(args);
     const itemId = readRequiredString(args, "itemId");
-    return toolResult(await patchJson(`/api/sessions/${encodeURIComponent(sessionId)}/todos/items/${encodeURIComponent(itemId)}`, {
+    return (await patchJson(`/api/sessions/${encodeURIComponent(sessionId)}/todos/items/${encodeURIComponent(itemId)}`, {
       parentId: readString(args.parentId) ?? undefined,
       title: readString(args.title) ?? undefined,
       details: readString(args.details) ?? undefined,
@@ -1065,7 +992,7 @@ async function callTool(params: unknown) {
     const context = readRequiredString(args, "context");
     const itemId = readString(args.itemId);
     if (itemId) {
-      return toolResult(await patchJson(`/api/sessions/${encodeURIComponent(sessionId)}/todos/items/${encodeURIComponent(itemId)}`, {
+      return (await patchJson(`/api/sessions/${encodeURIComponent(sessionId)}/todos/items/${encodeURIComponent(itemId)}`, {
         context,
         actor: "agent",
         turnId: managerTurnId
@@ -1073,7 +1000,7 @@ async function callTool(params: unknown) {
     }
     const todo = await getJson(`/api/sessions/${encodeURIComponent(sessionId)}/todos`) as Record<string, unknown>;
     const control = readObject(todo.control) ?? {};
-    return toolResult(await postJson(`/api/sessions/${encodeURIComponent(sessionId)}/todos/control`, {
+    return (await postJson(`/api/sessions/${encodeURIComponent(sessionId)}/todos/control`, {
       paused: control.paused === true,
       pauseReason: readString(control.pauseReason) ?? null,
       context,
@@ -1083,7 +1010,7 @@ async function callTool(params: unknown) {
 
   if (name === "todo_add_comment") {
     const sessionId = readSessionIdArg(args);
-    return toolResult(await postJson(`/api/sessions/${encodeURIComponent(sessionId)}/todos/comments`, {
+    return (await postJson(`/api/sessions/${encodeURIComponent(sessionId)}/todos/comments`, {
       itemId: readString(args.itemId) ?? null,
       turnId: managerTurnId,
       type: readString(args.type) ?? "note",
@@ -1094,7 +1021,7 @@ async function callTool(params: unknown) {
 
   if (name === "todo_add_message") {
     const sessionId = readSessionIdArg(args);
-    return toolResult(await postJson(`/api/sessions/${encodeURIComponent(sessionId)}/todos/messages`, {
+    return (await postJson(`/api/sessions/${encodeURIComponent(sessionId)}/todos/messages`, {
       itemId: readRequiredString(args, "itemId"),
       turnId: managerTurnId,
       type: readString(args.type) ?? "update",
@@ -1110,7 +1037,7 @@ async function callTool(params: unknown) {
     if (!Number.isSafeInteger(challengeId) || challengeId <= 0) {
       throw new Error("challengeId must be a positive integer.");
     }
-    return toolResult(await postJson(
+    return (await postJson(
       `/api/sessions/${encodeURIComponent(sessionId)}/todos/challenges/${encodeURIComponent(String(challengeId))}/resolve`,
       { actor: "agent" }
     ));
@@ -1118,7 +1045,7 @@ async function callTool(params: unknown) {
 
   if (name === "todo_set_control") {
     const sessionId = readSessionIdArg(args);
-    return toolResult(await postJson(`/api/sessions/${encodeURIComponent(sessionId)}/todos/control`, {
+    return (await postJson(`/api/sessions/${encodeURIComponent(sessionId)}/todos/control`, {
       paused: args.paused === true,
       pauseReason: readString(args.pauseReason) ?? null,
       context: readString(args.context) ?? undefined,
@@ -1129,7 +1056,7 @@ async function callTool(params: unknown) {
   if (name === "todo_create_task") {
     const sessionId = readSessionIdArg(args);
     const startImmediately = readBoolean(args.startImmediately) === true;
-    return toolResult(await postJson("/api/session-tasks", {
+    return (await postJson("/api/session-tasks", {
       parentSessionId: sessionId,
       ...(managerSessionId ? { sourceSessionId: managerSessionId } : {}),
       todoItemId: readRequiredString(args, "itemId"),
@@ -1145,20 +1072,20 @@ async function callTool(params: unknown) {
   }
 
   if (name === "register_process_command") {
-    return toolResult(await monitorProcess({ ...args, registerOnly: true }));
+    return (await monitorProcess({ ...args, registerOnly: true }));
   }
 
   if (name === "run_process_command") {
-    return toolResult(await postJson(`/api/process-monitors/${encodeURIComponent(readRequiredString(args, "id"))}/run`, { parameterValues: args.parameterValues ?? {} }));
+    return (await postJson(`/api/process-monitors/${encodeURIComponent(readRequiredString(args, "id"))}/run`, { parameterValues: args.parameterValues ?? {} }));
   }
 
   if (name === "monitor_process") {
-    return toolResult(await monitorProcess(args));
+    return (await monitorProcess(args));
   }
 
   if (name === "adopt_process_monitor") {
     const id = readRequiredString(args, "id");
-    return toolResult(await postJson(`/api/process-monitors/${encodeURIComponent(id)}/adopt`, {
+    return (await postJson(`/api/process-monitors/${encodeURIComponent(id)}/adopt`, {
       ...args,
       id: undefined,
       ...(managerApprovalPolicy ? { approvalPolicy: managerApprovalPolicy } : {})
@@ -1166,18 +1093,18 @@ async function callTool(params: unknown) {
   }
 
   if (name === "restart_process_monitor") {
-    return toolResult(await postJson(
+    return (await postJson(
       `/api/process-monitors/${encodeURIComponent(readRequiredString(args, "id"))}/restart`,
       managerApprovalPolicy ? { approvalPolicy: managerApprovalPolicy } : {}
     ));
   }
 
   if (name === "stop_process_monitor") {
-    return toolResult(await postJson(`/api/process-monitors/${encodeURIComponent(readRequiredString(args, "id"))}/stop`, {}));
+    return (await postJson(`/api/process-monitors/${encodeURIComponent(readRequiredString(args, "id"))}/stop`, {}));
   }
 
   if (name === "remove_process_monitor") {
-    return toolResult(await deleteJson(`/api/process-monitors/${encodeURIComponent(readRequiredString(args, "id"))}`));
+    return (await deleteJson(`/api/process-monitors/${encodeURIComponent(readRequiredString(args, "id"))}`));
   }
 
   if (name === "create_task") {
@@ -1185,7 +1112,7 @@ async function callTool(params: unknown) {
       throw new Error("create_task requires a current Threadex session.");
     }
     const forkTurn = managerContextForkRequest && managerTurnId
-      ? await getStore().getSessionTurn(managerTurnId) : null;
+      ? await getJson(`/api/session-inspector/fork-source/${encodeURIComponent(managerSessionId)}/${encodeURIComponent(managerTurnId)}`) as Pick<SessionTurnRecord, "sessionId" | "requestMetadata"> : null;
     if (managerContextForkRequest && (!forkTurn || forkTurn.sessionId !== managerSessionId)) {
       throw new Error("Context fork source turn is unavailable.");
     }
@@ -1221,7 +1148,7 @@ async function callTool(params: unknown) {
     const attachmentForkRequestId = managerContextForkRequest && attachments.length > 0
       ? `qfork_${createHash("sha256").update(`${managerSessionId}:${managerTurnId}:attachments`).digest("hex").slice(0, 48)}`
       : null;
-    return toolResult(await postJson("/api/session-tasks", {
+    return (await postJson("/api/session-tasks", {
       parentSessionId: managerSessionId,
       sourceSessionId: managerSessionId,
       ...(managerContextForkRequest ? { contextFork: true } : {}),
@@ -1242,7 +1169,7 @@ async function callTool(params: unknown) {
     if (!autoModelEnabled || !managerSessionId) {
       throw new Error("upgrade_model is available only in an Auto session.");
     }
-    return toolResult(await postJson("/api/session-auto-model/upgrade", {
+    return (await postJson("/api/session-auto-model/upgrade", {
       sessionId: managerSessionId,
       model: readRequiredString(args, "model"),
       effort: readRequiredString(args, "effort"),
@@ -1250,21 +1177,15 @@ async function callTool(params: unknown) {
     }));
   }
 
-  throw new Error(`Unknown tool: ${name ?? ""}`);
+  throw new Error(`Unknown command: ${name ?? ""}`);
 }
 
 async function inspectSession(input: SessionInspectInput) {
-  if (apiBaseUrl) {
-    return postJson("/api/session-inspector/session", input);
-  }
-  return getStore().inspectSession(input);
+  return postJson("/api/session-inspector/session", input);
 }
 
 async function searchSessions(input: SessionSearchInput) {
-  if (apiBaseUrl) {
-    return postJson("/api/session-inspector/search", input);
-  }
-  return getStore().searchSessions(input);
+  return postJson("/api/session-inspector/search", input);
 }
 
 async function askSession(input: SessionQuestionInput) {
@@ -1330,17 +1251,11 @@ async function promptSession(input: SessionPromptInput) {
 }
 
 async function vectorStatus() {
-  if (apiBaseUrl) {
-    return getJson("/api/session-inspector/vector/status");
-  }
-  return getStore().getSessionVectorStatus();
+  return getJson("/api/session-inspector/vector/status");
 }
 
 async function vectorSearch(input: SessionVectorSearchInput) {
-  if (apiBaseUrl) {
-    return postJson("/api/session-inspector/vector/search", input);
-  }
-  return getStore().searchSessionVectors(input);
+  return postJson("/api/session-inspector/vector/search", input);
 }
 
 async function listProcesses() {
@@ -1608,11 +1523,6 @@ function parseSseEvents(text: string) {
   return events;
 }
 
-function getStore() {
-  store ??= new SessionStore();
-  return store;
-}
-
 async function getJson(path: string) {
   if (!apiBaseUrl) {
     throw new Error("SESSION_INSPECTOR_SERVER_URL is not configured.");
@@ -1665,39 +1575,6 @@ async function responseJsonOrThrow(response: Response) {
     throw new Error(message);
   }
   return parsed;
-}
-
-function toolResult(value: unknown) {
-  return {
-    content: [
-      {
-        type: "text",
-        text: JSON.stringify(value, null, 2)
-      }
-    ]
-  };
-}
-
-function toolError(error: unknown) {
-  return {
-    isError: true,
-    content: [
-      {
-        type: "text",
-        text: error instanceof Error ? error.message : String(error)
-      }
-    ]
-  };
-}
-
-function writeResponse(id: string | number | null, result: unknown, error?: { code: number; message: string }) {
-  process.stdout.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      id,
-      ...(error ? { error } : { result })
-    })}\n`
-  );
 }
 
 function readObject(value: unknown): Record<string, unknown> | null {
@@ -1774,10 +1651,4 @@ function parseJson(text: string): unknown {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
-}
-
-async function closeAndExit(code: number) {
-  rl.close();
-  await store?.close();
-  process.exit(code);
 }

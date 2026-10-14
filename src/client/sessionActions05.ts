@@ -1,4 +1,5 @@
 // @ts-nocheck
+import { normalizeModelEffort } from "../modelCatalog";
 export async function submitInlineUserPromptEdit(ctx, event, message) {
     const { inlinePromptEditor, resendUserPrompt, setInlinePromptEditor } = ctx;
         event.preventDefault();
@@ -424,10 +425,16 @@ export function seedReplayTargetFromMessage(ctx, target, message) {
             }
             const itemKey = liveItemKey(segment.item);
             target.liveItemEventRankById[itemKey] = Math.max(target.liveItemEventRankById[itemKey] ?? 0, itemEventRank(segment.item.eventType));
+            if (segment.item.itemType === "agent_message" && segment.item.comment) {
+                (target.commentaryItemKeys ??= new Set()).add(itemKey);
+            }
         }
         for (const item of message.liveItems ?? []) {
             const itemKey = liveItemKey(item);
             target.liveItemEventRankById[itemKey] = Math.max(target.liveItemEventRankById[itemKey] ?? 0, itemEventRank(item.eventType));
+            if (item.itemType === "agent_message" && item.comment) {
+                (target.commentaryItemKeys ??= new Set()).add(itemKey);
+            }
         }
         if (seededTextChars === 0 && message.content) {
             target.replayTextSkipChars = Math.max(target.replayTextSkipChars ?? 0, message.content.length);
@@ -708,7 +715,7 @@ export function updateGearProfile(ctx, index, update) {
             const requestedEffort = nextModel === AUTO_MODEL_VALUE ? "high" : update.effort ?? gear.effort;
             return {
                 model: nextModel,
-                effort: (requestedEffort === "max" || requestedEffort === "ultra") && !supportsUltraEffort(nextModel) ? "xhigh" : requestedEffort,
+                effort: normalizeModelEffort(nextModel, requestedEffort),
                 fastMode: update.fastMode ?? gear.fastMode ?? false
             };
         }));

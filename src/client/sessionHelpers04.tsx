@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { normalizeModelId, modelLabel, supportsUltraEffort as catalogSupportsUltraEffort, defaultGearProfiles } from "../modelCatalog";
+import { normalizeModelId, modelLabel, supportsUltraEffort as catalogSupportsUltraEffort, defaultGearProfiles, normalizeModelEffort } from "../modelCatalog";
 export function normalizeSessionModelPreferences(ctx, value) {
     const { MODEL_OPTIONS, isModelReasoningEffort, normalizeGearIndex, normalizeGearProfiles, normalizeStoredModel } = ctx;
     const fallbackModel = MODEL_OPTIONS[0];
@@ -205,7 +205,7 @@ export function normalizeEffortForModel(ctx, effort, model) {
     const { AUTO_MODEL_VALUE, supportsUltraEffort } = ctx;
     if (model === AUTO_MODEL_VALUE)
         return "high";
-    return (effort === "max" || effort === "ultra") && !supportsUltraEffort(model) ? "xhigh" : effort;
+    return normalizeModelEffort(model, effort);
 
 }
 

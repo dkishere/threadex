@@ -1,4 +1,7 @@
-import { DEFAULT_MODEL } from "../modelCatalog";
+import { DEFAULT_MODEL, isClaudeModel } from "../modelCatalog";
+import { runClaudeOneShot } from "./claudeOneShot";
+import { detectConversationLanguage } from "./conversationLanguage";
+import type { HelperModels } from "./helperModelSettings";
 import { applyOutcomeAssessment, buildOutcomeStatusPrompt, outcomeEvidenceHash, type OutcomeEvidence } from "./lightweightTodo";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -11,7 +14,7 @@ import {
 } from "./sessionStore";
 import { resolve } from "node:path";
 import { type AgentCliReasoningEffort } from "./agentCli";
-import { readAccountAuthIdentity, type AccountAuthIdentity } from "./accountAuth";
+import { accountAuthIdentityError, readAccountAuthIdentity, type AccountAuthIdentity } from "./accountAuth";
 import { writeCodexSessionTitle } from "./codexSessionTitles";
 import { IsolatedLunaRunner } from "./isolatedLunaRunner";
 import { normalizeModelTokenUsage, type ModelTokenUsage } from "./modelTokenUsage";
@@ -39,6 +42,13 @@ type SummarizerConfig = {
   mockResponse: string | null;
   promptDumpDir: string | null;
 };
+
+/** Prompts at least this long use the promoted summarizer model. */
+const SUMMARIZER_LONG_INPUT_CHAR_THRESHOLD = 100_000;
+
+type SummarizerModels = Pick<HelperModels, "summarizerModel" | "summarizerLongModel">;
+
+type ClaudeAccountScope = { workspaceId: string; sessionId?: string | null };
 
 class SummarizerPendingError extends Error {
   constructor(message: string, readonly workspaceId: string) {
@@ -267,8 +277,18 @@ export class SessionSummarizer {
     private readonly store: SessionStore,
     private readonly config: SummarizerConfig = defaultSummarizerConfig,
     private readonly onOutcomeStatusChanged?: (sessionId: string) => Promise<void>,
-    private readonly onSummaryUpdated?: (sessionId: string) => Promise<void>
+    private readonly onSummaryUpdated?: (sessionId: string) => Promise<void>,
+    private readonly helperModels?: () => SummarizerModels
   ) {}
+
+  private summarizerModels(): SummarizerModels {
+    return this.helperModels?.() ?? { summarizerModel: this.config.model, summarizerLongModel: this.config.model };
+  }
+
+  private summarizerModelFor(prompt: string) {
+    const models = this.summarizerModels();
+    return prompt.length >= SUMMARIZER_LONG_INPUT_CHAR_THRESHOLD ? models.summarizerLongModel : models.summarizerModel;
+  }
 
   start() {
     if (this.started || this.closed) {
@@ -456,7 +476,8 @@ export class SessionSummarizer {
     const outcomeWorkspace = await this.store.getWorkspace(session.workspaceId);
     await this.updateOutcomeStatus(context, turns, outcomeWorkspace?.codexHome ?? null);
 
-    if (!request.force && summaryState?.sourceHash === context.sourceHash && summaryState.summarizerModel === this.config.model) {
+    const summarizerModel = this.summarizerModels().summarizerModel;
+    if (!request.force && summaryState?.sourceHash === context.sourceHash && summaryState.summarizerModel === summarizerModel) {
       return;
     }
 
@@ -472,7 +493,7 @@ export class SessionSummarizer {
       sourceHash: context.sourceHash,
       sourceTurnCount: context.turnCount,
       sourceUpdated: context.sourceUpdated,
-      summarizerModel: this.config.model,
+      summarizerModel,
       title
     });
     await this.renameCodexTaskTitle(
@@ -564,10 +585,11 @@ export class SessionSummarizer {
     if (plan.sourceHash === hash) return;
     try {
       const prompt = buildOutcomeStatusPrompt(plan, bounded);
+      const model = this.summarizerModelFor(prompt);
       const result = this.config.provider === "mock"
         ? { responseText: this.config.mockResponse ?? "{\"updates\":[]}", usage: null, accountId: null }
-        : await this.runSummarizerLuna(prompt, codexHome);
-      await this.recordSummarizerUsage({ ...context, sourceHash: `outcomes:${hash}`, inputText: prompt }, result.usage, result.accountId);
+        : await this.runSummarizerLuna(prompt, codexHome, model, "summary", (await this.store.getSession(context.sessionId))?.accountId, context);
+      await this.recordSummarizerUsage({ ...context, sourceHash: `outcomes:${hash}`, inputText: prompt }, result.usage, result.accountId, model);
       const updated = applyOutcomeAssessment(plan, result.responseText, bounded);
       // Discard results if the agent revised the tree during inference.
       if (await this.store.saveOutcomePlan(context.sessionId, plan.revision, updated)) {
@@ -587,14 +609,15 @@ export class SessionSummarizer {
     workspaceCodexHome: string | null
   ): Promise<ParsedSummary> {
     const prompt = buildSummarizerPrompt(context);
-    this.dumpPrompt(context.sessionId, "summary", prompt, context);
+    const model = this.summarizerModelFor(prompt);
+    this.dumpPrompt(context.sessionId, "summary", prompt, context, model);
     if (this.config.provider === "mock") {
       return normalizeParsedSummary(parseSummaryResponse(this.config.mockResponse || prompt));
     }
 
     try {
-      const result = await this.runSummarizerLuna(prompt, workspaceCodexHome);
-      await this.recordSummarizerUsage(context, result.usage, result.accountId);
+      const result = await this.runSummarizerLuna(prompt, workspaceCodexHome, model, "summary", (await this.store.getSession(context.sessionId))?.accountId, context);
+      await this.recordSummarizerUsage(context, result.usage, result.accountId, model);
       return normalizeParsedSummary(parseSummaryResponse(result.responseText));
     } catch (error) {
       const message = errorMessage(error);
@@ -634,10 +657,10 @@ export class SessionSummarizer {
   async assessLoopTask(workspaceId: string, prompt: string): Promise<string> {
     const workspace = await this.store.getWorkspace(workspaceId);
     if (!workspace) throw new Error("Loop task workspace no longer exists");
-    const model = this.config.model;
+    const model = this.summarizerModelFor(prompt);
     const result = this.config.provider === "mock"
       ? { responseText: this.config.mockResponse ?? "{}", usage: null, accountId: null }
-      : await this.runSummarizerLuna(prompt, workspace.codexHome, model, "loop-health");
+      : await this.runSummarizerLuna(prompt, workspace.codexHome, model, "loop-health", undefined, { workspaceId });
     if (result.usage) {
       try {
         await this.store.recordTokenUsage([{
@@ -652,12 +675,13 @@ export class SessionSummarizer {
     return result.responseText;
   }
 
-  private async runSummarizerLuna(prompt: string, workspaceCodexHome: string | null, model?: string, lane = "summary") {
-    const key = JSON.stringify([workspaceCodexHome, lane]);
+  private async runSummarizerLuna(prompt: string, workspaceCodexHome: string | null, model?: string, lane = "summary", accountId?: string | null, claudeScope?: ClaudeAccountScope) {
+    if (model && isClaudeModel(model)) return this.runSummarizerClaude(prompt, model, claudeScope);
+    const key = JSON.stringify([workspaceCodexHome, lane, accountId ?? null]);
     const previous = this.lunaQueues.get(key) ?? Promise.resolve();
     const run = previous.then(() => {
       if (this.closed) throw new Error("Session summarizer is closed");
-      return this.runSummarizerLunaExclusive(prompt, workspaceCodexHome, model, lane);
+      return this.runSummarizerLunaExclusive(prompt, workspaceCodexHome, model, lane, accountId);
     });
     const tail = run.then(() => {}, () => {});
     this.lunaQueues.set(key, tail);
@@ -665,10 +689,35 @@ export class SessionSummarizer {
     return run;
   }
 
-  private async runSummarizerLunaExclusive(prompt: string, workspaceCodexHome: string | null, model?: string, lane = "summary") {
-    const key = JSON.stringify([workspaceCodexHome, lane]);
+  /** Claude helpers run on the session's Claude account, not the Codex account that owns the session. */
+  private async runSummarizerClaude(prompt: string, model: string, scope?: ClaudeAccountScope) {
+    if (this.closed) throw new Error("Session summarizer is closed");
+    const account = scope ? await this.store.resolveClaudeAccount(scope) : null;
+    const result = await runClaudeOneShot({
+      model,
+      prompt,
+      systemPrompt: SUMMARIZER_BASE_INSTRUCTIONS,
+      reasoningEffort: this.config.reasoningEffort,
+      timeoutMs: this.config.timeoutMs,
+      configDir: account?.configDir ?? null
+    });
+    return { responseText: result.responseText, usage: result.usage, accountId: null };
+  }
+
+  private async runSummarizerLunaExclusive(prompt: string, workspaceCodexHome: string | null, model?: string, lane = "summary", accountId?: string | null) {
+    const key = JSON.stringify([workspaceCodexHome, lane, accountId ?? null]);
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const authSnapshot = readSummarizerAuthSnapshot(workspaceCodexHome);
+      // Workspace homes are mutable: another session/account switch can replace
+      // auth.json while this session's background summary is queued.
+      const savedAuth = accountId ? await this.store.getAccountAuth(accountId) : null;
+      if (accountId && !savedAuth) throw new Error(`Summarizer account ${accountId} has no saved credentials. Sign in to that account again.`);
+      if (savedAuth && accountId) {
+        const account = await this.store.getAccount(accountId);
+        if (!account) throw new Error("Summarizer account no longer exists.");
+        const identityError = accountAuthIdentityError(savedAuth.authRaw, account);
+        if (identityError) throw new Error(`Summarizer account auth mismatch: ${identityError}.`);
+      }
+      const authSnapshot = readSummarizerAuthSnapshot(workspaceCodexHome, savedAuth?.authRaw);
       const accountIdBeforeRun = await this.resolveExecutionAccountId(authSnapshot);
       let entry = this.lunaRunners.get(key);
       if (entry && entry.authFingerprint !== authSnapshot.fingerprint) {
@@ -684,7 +733,8 @@ export class SessionSummarizer {
             model: this.config.model,
             reasoningEffort: this.config.reasoningEffort,
             timeoutMs: this.config.timeoutMs,
-            sourceHomeCandidates: summarizerAgentHomeCandidates(workspaceCodexHome),
+            sourceHomeCandidates: savedAuth ? [] : summarizerAgentHomeCandidates(workspaceCodexHome),
+            authRaw: savedAuth?.authRaw,
             allowMissingAuth: false,
             baseInstructions: SUMMARIZER_BASE_INSTRUCTIONS,
             freshThreadPerRun: true,
@@ -749,7 +799,7 @@ export class SessionSummarizer {
     return fingerprintMatches.length === 1 ? fingerprintMatches[0] : null;
   }
 
-  private dumpPrompt(sessionId: string, stage: "summary", prompt: string, context: SummaryContext) {
+  private dumpPrompt(sessionId: string, stage: "summary", prompt: string, context: SummaryContext, model: string) {
     if (!this.config.promptDumpDir) {
       return;
     }
@@ -761,7 +811,7 @@ export class SessionSummarizer {
       const header = [
         `Session ID: ${sessionId}`,
         `Stage: ${stage}`,
-        `Model: ${this.config.model}`,
+        `Model: ${model}`,
         `Turn count: ${context.turnCount}`,
         `Source updated: ${context.sourceUpdated}`,
         `Source hash: ${context.sourceHash}`,
@@ -776,7 +826,8 @@ export class SessionSummarizer {
   private async recordSummarizerUsage(
     context: SummaryContext,
     usage: ModelTokenUsage | null,
-    executionAccountId: string | null
+    executionAccountId: string | null,
+    model: string
   ) {
     if (!usage) {
       return;
@@ -789,7 +840,7 @@ export class SessionSummarizer {
         workspaceId: context.workspaceId,
         sessionId: context.sessionId,
         accountId: executionAccountId,
-        model: this.config.model,
+        model,
         inputTokens: usage.inputTokens,
         cachedInputTokens: usage.cachedInputTokens,
         outputTokens: usage.outputTokens,
@@ -845,15 +896,15 @@ export function summarizerExecutionAccountId(
   return matches.length === 1 ? matches[0].id : null;
 }
 
-function readSummarizerAuthSnapshot(workspaceCodexHome: string | null): SummarizerAuthSnapshot {
+function readSummarizerAuthSnapshot(workspaceCodexHome: string | null, savedAuthRaw?: string): SummarizerAuthSnapshot {
   const authPath = workspaceCodexHome ? resolve(workspaceCodexHome, "auth.json") : null;
-  if (!authPath || !existsSync(authPath)) {
+  if (!savedAuthRaw && (!authPath || !existsSync(authPath))) {
     return {
       fingerprint: "[missing-auth]",
       identity: { externalAccountId: null, externalUserId: null }
     };
   }
-  const authRaw = readFileSync(authPath, "utf8");
+  const authRaw = savedAuthRaw ?? readFileSync(authPath!, "utf8");
   return {
     fingerprint: hashText(authRaw),
     identity: readAccountAuthIdentity(authRaw)
@@ -900,7 +951,7 @@ export function buildSummaryContext(
     sourceHash: hashText(inputText),
     sourceUpdated,
     turnCount: selected.length,
-    titleLanguage: detectTitleLanguage(turnBlocks),
+    titleLanguage: detectConversationLanguage(turnBlocks.map((block) => block.inText)),
     fallbackText: fallbackTextFromTurns(selected),
     turnBlocks
   };
@@ -1044,21 +1095,6 @@ export function buildSummarizerPrompt(context: SummaryContext) {
   ].join("\n");
 }
 
-function detectTitleLanguage(turnBlocks: SummaryTurnBlock[]) {
-  const votes = new Map<string, number>();
-  for (const block of turnBlocks) {
-    const text = block.inText.trim();
-    if (!text || text.startsWith("Threadex commentary issue follow-up")) continue;
-    // Technical English names and brief acknowledgements are common in CJK
-    // conversations. They must not switch the language of the whole title.
-    const language = /[\p{Script=Hiragana}\p{Script=Katakana}]/u.test(text) ? "Japanese"
-      : /\p{Script=Hangul}/u.test(text) ? "Korean"
-      : /\p{Script=Han}/u.test(text) ? "Traditional Chinese/Cantonese"
-      : text.split(/\s+/u).length >= 5 ? "English" : null;
-    if (language) votes.set(language, (votes.get(language) ?? 0) + 1);
-  }
-  return [...votes].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "English";
-}
 
 export function summarizerAgentHomeCandidates(workspaceCodexHome: string | null = null) {
   return workspaceCodexHome ? [workspaceCodexHome] : [];

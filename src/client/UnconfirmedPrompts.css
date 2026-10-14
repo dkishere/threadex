@@ -1,0 +1,11 @@
+.unconfirmed-prompts {
+    border: 1px solid var(--border, #7776);
+    border-radius: 8px;
+    padding: 10px 12px;
+    max-height: 240px;
+    overflow: auto;
+    font-size: 13px;
+}
+.unconfirmed-prompts p { margin: 6px 0; }
+.unconfirmed-prompts > div + div { margin-top: 12px; }
+.unconfirmed-prompt-text { white-space: pre-wrap; overflow-wrap: anywhere; }

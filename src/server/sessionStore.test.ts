@@ -26,6 +26,18 @@ test("sidebar pages hide Concurrent workers but preserve ordinary child sessions
         stopped: false, observed: {}
       }))
     }, () => {});
+    // Incomplete legacy members must not turn the worker exclusion into a
+    // NOT IN (NULL), which would hide every unrelated sidebar session.
+    await store.changeCollaboration("sidebar-group", null, group => {
+      const worker = group.members[1];
+      group.members.push({ ...worker, localId: "missing-session", sessionId: null as unknown as string });
+      group.members.push({ ...worker, localId: "duplicate-worker", stopped: true });
+      group.messages.push({
+        id: "history", from: "main", to: "c3", text: "large discussion history ".repeat(10_000),
+        reason: "", kind: "followup", wait: false, completed: true, state: "delivered",
+        parentId: null, depth: 0, targetTurnId: null, error: null, created: new Date().toISOString()
+      });
+    });
     const page = await store.listSessionsPage("concurrent-sidebar", 0, 1);
     assert.equal(page.total, 2);
     assert.equal(page.hasMore, true);

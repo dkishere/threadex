@@ -1,4 +1,5 @@
 import { Cog, Zap } from "lucide-react";
+import { modelEfforts } from "../modelCatalog";
 import { useEffect, useRef, useState, type DragEvent, type MouseEvent, type ReactNode } from "react";
 import type { ModelReasoningEffort } from "./appTypes";
 import { COMPACT_FILE_DROP_QUERY } from "./globalFileDrop";
@@ -290,7 +291,7 @@ export function ComposerGearSelector({
                     onChange={(event) => onEffortChange(index, event.target.value as ModelReasoningEffort)}
                     aria-label={`Gear ${index + 1} effort`}
                   >
-                    {(isAuto || supportsUltraEffort(gear.model) ? ultraEffortOptions : effortOptions).map((effort) => (
+                    {(isAuto ? ultraEffortOptions : modelEfforts(gear.model)).map((effort) => (
                       <option value={effort} key={effort}>
                         {effortOptionLabel(effort)}{isAuto && effort === autoEffort ? " (current)" : ""}
                       </option>

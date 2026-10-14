@@ -302,7 +302,7 @@ export function streamItemFromThreadItem(
   return undefined;
 }
 
-function structureAgentComment(text: string): StructuredAgentComment | undefined {
+export function structureAgentComment(text: string): StructuredAgentComment | undefined {
   const detail = plainCommentaryDetail(text);
   if (!detail) return undefined;
   return {

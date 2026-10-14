@@ -1,9 +1,88 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { currentWorkspaceId, enqueuePrompt, loadSessions, selectedSessionReferences, startChatTurn, steerPrompt, submit } from "./sessionActions01";
+import { askAboutResponseQuote, captureResponseQuoteSelection, currentWorkspaceId, enqueuePrompt, loadSessions, refreshSelectedSessionSnapshot, selectedSessionReferences, startChatTurn, steerPrompt, submit } from "./sessionActions01";
+import { formatResponseAnnotationsPrompt, parseResponseAnnotations, type ResponseAnnotation } from "./responseAnnotations";
 import { mockSubmissionStorage } from "./pendingSubmissions.testSupport";
-import { acknowledgeSubmissionEvent, isSubmissionSending, readPendingSubmissions } from "./pendingSubmissions";
+import { acknowledgeSubmissionEvent, isSubmissionSending, readPendingSubmissions, savePendingSubmission } from "./pendingSubmissions";
 import { toSessionPageState } from "./sessionUtils";
+
+test("adding and submitting multiple quotes preserves each source and annotation", async t => {
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", { configurable: true, value: {
+    getSelection: () => ({ removeAllRanges() {} }), requestAnimationFrame() {}
+  } });
+  t.after(() => {
+    if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow);
+    else Reflect.deleteProperty(globalThis, "window");
+  });
+  let quotes: ResponseAnnotation[] | null = null;
+  const ctx = {
+    setComposerResponseQuote: (update: (current: ResponseAnnotation[] | null) => ResponseAnnotation[]) => { quotes = update(quotes); },
+    setResponseQuotePopover() {}, inputEditorRef: { current: null }
+  };
+  const first: ResponseAnnotation = { text: "First selection", annotation: "Explain this", source: { type: "response", sessionUrl: "threadex://threadex/session#1" } };
+  const second: ResponseAnnotation = { text: "Second selection", annotation: "Compare this", source: { type: "file", path: "example.ts", selection: { startLine: 1, startColumn: 1, endLine: 2, endColumn: 1 } } };
+  askAboutResponseQuote(ctx, first);
+  askAboutResponseQuote(ctx, second);
+  assert.deepEqual(quotes, [first, second]);
+  for (const input of ["Compare both selections", ""]) {
+    let sent = "";
+    await submit({
+      attachments: [], composerResponseQuote: quotes, composerSessionLinks: [], input,
+      replaceComposerLinkTokens: (value: string) => value,
+      formatResponseAnnotationsPrompt, selectedSkills: [], sessionIdRef: { current: "multi-quote-test" },
+      executionMode: "default", composerMode: "queue", currentSessionIsRunning: false,
+      startChatTurn: async (message: string) => { sent = message; },
+      setComposerExecutionMode() {}, setComposerForkNextPrompt() {}
+    }, undefined);
+    const parsed = parseResponseAnnotations(sent);
+    assert.deepEqual(parsed?.annotations, [first, second]);
+    assert.equal(parsed?.content, ["Explain this", "Compare this", input].filter(Boolean).join("\n\n"));
+  }
+});
+
+test("quote popover interactions preserve the annotation when selection collapses", t => {
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", { configurable: true, value: {
+    getSelection: () => ({ isCollapsed: true, rangeCount: 0 })
+  } });
+  t.after(() => {
+    if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow);
+    else Reflect.deleteProperty(globalThis, "window");
+  });
+  const updates: unknown[] = [];
+  const ctx = { setResponseQuotePopover: (value: unknown) => updates.push(value) };
+  captureResponseQuoteSelection(ctx, { target: { closest: (selector: string) => selector === ".response-quote-popover" ? {} : null } });
+  assert.deepEqual(updates, []);
+  captureResponseQuoteSelection(ctx, { target: { closest: () => null } });
+  assert.deepEqual(updates, [null]);
+});
+
+test("manager reconciliation pins the finished turn and rejects a late response after switching to raw view", async t => {
+  const viewKeyRef = { current: 1 };
+  const snapshots: unknown[] = [];
+  const urls: string[] = [];
+  let switchToRaw = false;
+  t.mock.method(globalThis, "fetch", async (url: string) => {
+    urls.push(url);
+    if (switchToRaw) viewKeyRef.current++;
+    return new Response(JSON.stringify({ session: { id: "manager" }, turns: [{ id: "older-running", status: "done" }] }));
+  });
+  const ctx = {
+    sessionIdRef: { current: "manager" }, viewKeyRef, workspaceManagerView: true,
+    pendingReconciliationTurnIdsRef: { current: new Set<string>() },
+    reconcilingTurnIdsRef: { current: new Set<string>() },
+    applySelectedSessionSnapshot: (snapshot: unknown) => snapshots.push(snapshot),
+    isLikelyBackendDisconnect: () => false, noteBackendDisconnect() {}, noteBackendRequestSucceeded() {}, setStatus() {}
+  };
+  await refreshSelectedSessionSnapshot(ctx, "manager", "older-running");
+  assert.equal(urls[0], "/api/sessions/manager/snapshot?view=workspace-chat&turnId=older-running");
+  assert.equal(snapshots.length, 1);
+  switchToRaw = true;
+  await refreshSelectedSessionSnapshot(ctx, "manager", "older-running");
+  assert.equal(snapshots.length, 1, "the same session in another view must not accept the old page");
+  assert.equal(ctx.reconcilingTurnIdsRef.current.size, 0);
+});
 
 test("direct submission is saved before composer clearing and survives a failed fetch", async t => {
   mockSubmissionStorage(t);
@@ -32,6 +111,60 @@ test("direct submission is saved before composer clearing and survives a failed 
   await startChatTurn(ctx, "Do not lose this", [], "default", [], false, false, true, undefined, "stable-turn");
   assert.equal(postedTurnId, "stable-turn");
   assert.equal(readPendingSubmissions()[0].turnId, postedTurnId);
+  assert.equal(readPendingSubmissions()[0].lastError, "Network disconnected");
+  assert.equal(isSubmissionSending("session"), false);
+});
+
+function recoveryContext() {
+  const noop = () => {};
+  return {
+    AUTO_MODEL_VALUE: "auto", activeWorkspaceIdRef: { current: "workspace" },
+    sessionIdRef: { current: "session" }, stickToMessageBottomRef: { current: false },
+    viewKeyRef: { current: "view" }, newSessionBaseSessionIdRef: { current: null },
+    streamTargetsRef: { current: {} }, selectedModel: "changed-model", resumeThreadId: "native-thread",
+    currentModelPreferences: () => ({ selectedModel: "changed-model", selectedEffort: "low" }),
+    setStatus: noop, setActiveTurnId: noop, markTurnRunning: noop, setMessages: noop,
+    registerStreamTarget: (turnId: string, assistantMessageId: string, sessionId: string) => ({ turnId, assistantMessageId, sessionId }),
+    unregisterStreamTarget: noop, noteBackendRequestSucceeded: noop, scheduleLoadSessions: noop,
+    handleStreamEvent: noop, isLikelyBackendDisconnect: () => false,
+    reconnectRunner: async () => false, patchAssistantMessage: noop, markTurnFinished: noop,
+    clearComposerInputDraft: () => { throw new Error("Retry must preserve current draft"); },
+    readEventStream: async (_body: unknown, onEvent: (event: unknown) => void) => onEvent({ type: "error", data: { message: "Account unavailable" } })
+  };
+}
+
+test("retry preserves original ID, prompt, attachments and model while persisting SSE failure across reload", async t => {
+  mockSubmissionStorage(t);
+  savePendingSubmission({ id: "original", turnId: "original", sessionId: "session", workspaceId: "workspace",
+    kind: "prompt", message: "俾個好D既outliner role prompt", createdAt: "2026-10-13T16:49:25Z",
+    attachments: [{ name: "context.txt" }], settings: { modelPreferences: { selectedModel: "gpt-6-astra", selectedEffort: "xhigh" }, approvalPolicy: "granular" } });
+  let body: Record<string, unknown> = {};
+  t.mock.method(globalThis, "fetch", async (_url: string, options?: RequestInit) => {
+    body = JSON.parse(String(options?.body));
+    return new Response("");
+  });
+  await startChatTurn(recoveryContext(), "different draft", [], "default", [], false, false, true, undefined, "original");
+  assert.equal(body.turnId, "original");
+  assert.equal(body.sessionId, "session");
+  assert.equal(body.message, "俾個好D既outliner role prompt");
+  assert.equal(body.model, "gpt-6-astra");
+  assert.equal(body.modelReasoningEffort, "xhigh");
+  assert.equal(body.approvalPolicy, "granular");
+  assert.deepEqual(body.attachments, [{ name: "context.txt" }]);
+  assert.equal(readPendingSubmissions()[0].createdAt, "2026-10-13T16:49:25Z");
+  assert.equal(readPendingSubmissions()[0].lastError, "Account unavailable");
+  assert.equal(isSubmissionSending("session"), false);
+  const ctx = recoveryContext();
+  ctx.sessionIdRef.current = "other-session";
+  await assert.rejects(startChatTurn(ctx, "", [], "default", [], false, false, false, undefined, "original"), /original session/);
+});
+
+test("a failure before fetch remains recoverable and releases sending state", async t => {
+  mockSubmissionStorage(t);
+  const ctx = recoveryContext();
+  ctx.registerStreamTarget = () => { throw new Error("View setup failed"); };
+  await startChatTurn(ctx, "keep this", [], "default", [], false, false, false);
+  assert.equal(readPendingSubmissions()[0].lastError, "View setup failed");
   assert.equal(isSubmissionSending("session"), false);
 });
 

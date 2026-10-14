@@ -34,16 +34,24 @@ export type IsolatedLunaRunnerOptions = {
   reasoningEffort: AgentCliReasoningEffort | "minimal";
   /** Omit for jobs that must be allowed to finish without a wall-clock limit. */
   timeoutMs?: number;
+  /** Inbound activity and process lifecycle; excludes outbound auth/configuration. */
+  onEvent?: (event: unknown) => void;
   sourceHomeCandidates: Array<string | null | undefined>;
+  authRaw?: string;
   baseInstructions: string;
   developerInstructions?: string | null;
   appServerConfigArgs?: string[];
   threadConfig?: Record<string, unknown>;
+  inspectorCli?: InspectorCliConfig;
   outputSchema?: Record<string, unknown>;
   allowMissingAuth?: boolean;
   /** Explicitly expose this project directory to an otherwise isolated read-only job. */
   workspaceCwd?: string | null;
   allowWorkspaceRead?: boolean;
+  /** Let the model write and run scripts in its own temp workspace; nothing else is writable. */
+  scratchWrite?: boolean;
+  /** With `scratchWrite`: let shell commands use the network. Codex cannot limit this to loopback. */
+  networkAccess?: boolean;
   freshThreadPerRun?: boolean;
   maxRunsPerProcess?: number;
   maxProcessAgeMs?: number;
@@ -66,6 +74,7 @@ export type IsolatedLunaRunOptions = {
  * it, but the model can be overridden per turn.
  */
 export class IsolatedLunaRunner {
+  private approveInspector: (command: unknown) => boolean = () => false;
   private child: ChildProcessWithoutNullStreams | null = null;
   private agentHome: ReturnType<typeof createEphemeralAgentHome> | null = null;
   private workspace: string | null = null;
@@ -83,6 +92,7 @@ export class IsolatedLunaRunner {
   private recycleAfterTurn = false;
   private runInProgress = false;
   private stopped = false;
+  private eventError: Error | null = null;
 
   constructor(private readonly options: IsolatedLunaRunnerOptions) {}
 
@@ -92,13 +102,29 @@ export class IsolatedLunaRunner {
     }
     this.runInProgress = true;
     try {
-      return await this.runExclusive(input, options);
+      try {
+        return await this.runExclusive(input, options);
+      } catch (error) {
+        // Discovery can retain rejected auth/routing state in a reused process.
+        // Rebuild isolated auth/routing state once, before inference.
+        if (!(error instanceof Error) || !/workspace routing discovery unauthorized \(401\)/i.test(error.message)) {
+          throw error;
+        }
+        this.disposeProcess();
+        try {
+          return await this.runExclusive(input, options);
+        } catch (retryError) {
+          this.disposeProcess();
+          throw retryError;
+        }
+      }
     } finally {
       this.runInProgress = false;
     }
   }
 
   private async runExclusive(input: string, options: IsolatedLunaRunOptions) {
+    this.approveInspector = this.options.inspectorCli ? inspectorApprovalGate(this.options.inspectorCli) : () => false;
     if (this.shouldRecycleProcess()) {
       this.disposeProcess();
     }
@@ -125,10 +151,13 @@ export class IsolatedLunaRunner {
         model,
         effort: options.reasoningEffort ?? this.options.reasoningEffort,
         summary: "none",
-        environments: [],
+        // An empty list removes the execution environment; scratch jobs keep the default local one for shell.
+        ...(this.options.scratchWrite || this.options.inspectorCli ? {} : { environments: [] }),
         ...(this.options.outputSchema ? { outputSchema: this.options.outputSchema } : {}),
-        sandboxPolicy: { type: "readOnly", networkAccess: false },
-        approvalPolicy: "never"
+        sandboxPolicy: this.options.scratchWrite && this.ephemeralWorkspace
+          ? { type: "workspaceWrite", writableRoots: [this.ephemeralWorkspace], networkAccess: this.options.networkAccess === true, excludeTmpdirEnvVar: true, excludeSlashTmp: true }
+          : { type: "readOnly", networkAccess: false },
+        approvalPolicy: this.options.inspectorCli ? "on-request" : "never"
       });
       turnStarted = true;
       return await withTimeout(completion, this.options.timeoutMs, `${this.options.name} turn timed out.`);
@@ -170,6 +199,7 @@ export class IsolatedLunaRunner {
     this.agentHome = createEphemeralAgentHome({
       prefix: `${safeTempPrefix(this.options.name)}-home-`,
       sourceHomeCandidates: this.options.sourceHomeCandidates,
+      authRaw: this.options.authRaw,
       allowMissingAuth: this.options.allowMissingAuth ?? Boolean(process.env.OPENAI_API_KEY?.trim()),
       copyConfig: false
     });
@@ -179,11 +209,16 @@ export class IsolatedLunaRunner {
       : this.ephemeralWorkspace;
     const child = spawn(
       agentCliExecutable(),
-      buildIsolatedLunaAppServerArgs(this.options.appServerConfigArgs, this.options.allowWorkspaceRead === true),
+      buildIsolatedLunaAppServerArgs([
+        ...(this.options.appServerConfigArgs ?? []),
+        ...(this.options.inspectorCli ? ["-c", 'approval_policy="on-request"', "-c", "features.shell_tool=true", "-c", "features.unified_exec=true"] : [])
+      ], this.options.allowWorkspaceRead === true, this.options.scratchWrite === true,
+        this.options.scratchWrite === true && this.options.networkAccess === true),
       {
         cwd: this.workspace,
         env: {
           ...process.env,
+          ...this.options.inspectorCli?.env,
           HOME: this.agentHome.home,
           AGENT_CLI_HOME: this.agentHome.home,
           CODEX_HOME: this.agentHome.home,
@@ -204,6 +239,7 @@ export class IsolatedLunaRunner {
     child.stderr.on("data", (chunk) => {
       if (this.child !== child) return;
       this.stderr = `${this.stderr}${String(chunk)}`.slice(-4_000);
+      this.emitEvent({ method: "process.stderr", text: String(chunk) });
     });
     child.on("error", (error) => {
       if (this.child === child) {
@@ -211,6 +247,7 @@ export class IsolatedLunaRunner {
       }
     });
     child.on("exit", (code, signal) => {
+      if (this.child === child) this.emitEvent({ method: "process.exited", code, signal });
       if (!this.stopped && this.child === child) {
         this.fail(new Error(
           `${this.options.name} app-server exited (${signal ?? code ?? "unknown"}).${this.stderr ? ` ${this.stderr.trim()}` : ""}`
@@ -218,6 +255,7 @@ export class IsolatedLunaRunner {
       }
     });
 
+    this.options.onEvent?.({ method: "process.started", pid: child.pid });
     await this.rpc("initialize", {
       clientInfo: { name: "threadex-isolated", title: "Threadex Isolated Agent", version: "0.1.0" },
       capabilities: { experimentalApi: true }
@@ -232,14 +270,14 @@ export class IsolatedLunaRunner {
       cwd: this.workspace,
       model,
       baseInstructions: this.options.baseInstructions,
-      developerInstructions: this.options.developerInstructions ?? null,
+      developerInstructions: [this.options.inspectorCli ? inspectorInstructions : undefined, this.options.developerInstructions].filter(Boolean).join("\n\n") || null,
       dynamicTools: [],
-      environments: [],
+      ...(this.options.scratchWrite || this.options.inspectorCli ? {} : { environments: [] }),
       selectedCapabilityRoots: [],
-      runtimeWorkspaceRoots: this.options.allowWorkspaceRead && this.workspace ? [this.workspace] : [],
+      runtimeWorkspaceRoots: (this.options.allowWorkspaceRead || this.options.scratchWrite) && this.workspace ? [this.workspace] : [],
       ephemeral: true,
-      sandbox: "read-only",
-      approvalPolicy: "never",
+      sandbox: this.options.scratchWrite ? "workspace-write" : "read-only",
+      approvalPolicy: this.options.inspectorCli ? "on-request" : "never",
       personality: "none",
       config: {
         features: { memories: false },
@@ -256,6 +294,7 @@ export class IsolatedLunaRunner {
   }
 
   private rpc(method: string, params: unknown = {}) {
+    if (this.eventError) return Promise.reject(this.eventError);
     if (!this.child) {
       return Promise.reject(new Error(`${this.options.name} app-server is not started.`));
     }
@@ -303,6 +342,12 @@ export class IsolatedLunaRunner {
       return;
     }
     if (id !== null && typeof message.method === "string") {
+      if (["item/commandExecution/requestApproval", "execCommandApproval"].includes(message.method) && this.options.inspectorCli) {
+        const approved = this.approveInspector(readObject(message.params)?.command);
+        this.send({ id, result: { decision: message.method === "execCommandApproval"
+          ? (approved ? "approved" : "denied") : (approved ? "accept" : "decline") } });
+        return;
+      }
       this.send({ id, error: { code: -32601, message: "Tools are disabled for isolated Luna runners." } });
       return;
     }
@@ -310,6 +355,7 @@ export class IsolatedLunaRunner {
     const params = readObject(message.params);
     const notificationThreadId = readString(params?.threadId) ?? readString(readObject(params?.thread)?.id);
     if (notificationThreadId && notificationThreadId !== this.activeTurn.threadId) return;
+    if (!this.emitEvent(message)) return;
 
     if (message.method === "item/completed") {
       const item = readObject(params?.item);
@@ -340,6 +386,14 @@ export class IsolatedLunaRunner {
         usage: readObject(params?.usage) ?? readObject(turn?.usage) ?? this.activeTurn.usage,
         authIdentity: this.currentAuthIdentity()
       });
+    }
+  }
+
+  private emitEvent(event: unknown) {
+    try { this.options.onEvent?.(event); return true; }
+    catch (error) {
+      this.eventError = error instanceof Error ? error : new Error(String(error));
+      this.fail(this.eventError); return false;
     }
   }
 
@@ -431,13 +485,14 @@ export class IsolatedLunaRunner {
   }
 }
 
-export function buildIsolatedLunaAppServerArgs(configArgs: string[] = [], allowWorkspaceRead = false) {
+export function buildIsolatedLunaAppServerArgs(configArgs: string[] = [], allowWorkspaceRead = false, scratchWrite = false, networkAccess = false) {
   return [
     "app-server",
     "-c", 'approval_policy="never"',
-    "-c", 'sandbox_mode="read-only"',
+    "-c", scratchWrite ? 'sandbox_mode="workspace-write"' : 'sandbox_mode="read-only"',
+    ...(networkAccess ? ["-c", "sandbox_workspace_write.network_access=true"] : []),
     "-c", "features.memories=false",
-    ...(allowWorkspaceRead ? [] : ["-c", "features.shell_tool=false", "-c", "features.unified_exec=false"]),
+    ...(allowWorkspaceRead || scratchWrite ? [] : ["-c", "features.shell_tool=false", "-c", "features.unified_exec=false"]),
     "-c", "features.apps=false",
     "-c", "features.multi_agent=false",
     "-c", "tools.web_search=false",
@@ -506,3 +561,4 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number | undefined, mess
     );
   });
 }
+import { inspectorApprovalGate, inspectorInstructions, type InspectorCliConfig } from "./sessionInspectorCommand";

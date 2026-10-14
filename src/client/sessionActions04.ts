@@ -522,10 +522,14 @@ export function applyStreamItem(ctx, target, item) {
         const isChildOrigin = Boolean(item.originThreadId && item.originThreadId !== threadIdRef.current);
         if (item.itemType === "agent_message" && item.comment) {
             target.textByItemId[itemKey] = item.text ?? item.comment.detail;
+            (target.commentaryItemKeys ??= new Set()).add(itemKey);
             upsertLiveItem(target, item);
             return;
         }
         if (item.itemType === "agent_message") {
+            if (target.commentaryItemKeys?.has(itemKey)) {
+                return;
+            }
             if (isChildOrigin) {
                 upsertLiveItem(target, item);
                 return;

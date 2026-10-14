@@ -1,4 +1,9 @@
-import { DEFAULT_MODEL, AUTO_MODEL_ORDER } from "../modelCatalog";
+import { DEFAULT_MODEL, AUTO_MODEL_ORDER, isClaudeModel } from "../modelCatalog";
+import { isClaudeThreadId } from "./claudeEvents";
+import { approvedInspectorCommand, inspectorInstructions } from "./sessionInspectorCommand";
+import { withProviderHandoff, type ProviderThreadScope } from "./sessionProviderThreads";
+import { prepareClaudeHome } from "./claudeHome";
+import { claudePermissions, providerSwitchNote, runClaudeTurn, type ClaudeInputPart } from "./claudeRunner";
 import type { CollaborationFork } from "../collaboration";
 import { WORKSPACE_MANAGER_TOOLS } from "./workspaceManagerTools";
 import { MANAGER_CONCURRENT_INSTRUCTIONS, WORKSPACE_MANAGER_INSTRUCTIONS } from "./workspaceManager";
@@ -72,6 +77,10 @@ import {
 } from "./sessionRecovery";
 
 type RunnerJob = {
+  claudeAccountId?: string | null;
+  claudeAccountLabel?: string | null;
+  claudeConfigDir?: string | null;
+  claudeAuthSourceDir?: string | null;
   collaboration?: { groupId: string; fork: CollaborationFork | null; priorContext: string };
   workspaceManager?: boolean;
   managerConcurrent?: boolean;
@@ -119,6 +128,8 @@ type RunnerJob = {
   globalAgentInstructions?: string;
   recoveryContext?: SessionRecoveryContext;
   forceRecoveryOnResume?: boolean;
+  providerThread?: ProviderThreadScope;
+  providerHandoff?: string;
 };
 
 type RequestedSkill = {
@@ -156,6 +167,9 @@ const THREADEX_DEVELOPER_INSTRUCTIONS = [
   "Context preservation: when conversation state is compacted or summarized, preserve every material correction, decision, root cause, completed action, changed file or identifier, verification result, unresolved blocker, and next concrete goal. A substantive final response remains important even when later turns change topic; never omit it solely because it is not recent.",
   "Search safety: never run recursive file or text searches from a filesystem root, workspace root, or broad parent directory. Resolve the owning project first and search only explicit source, test, configuration, or documentation paths. Never broadly search Threadex runtime data such as runner logs, pending or quarantined logs, Codex homes, account homes, build output, dependencies, or generated data."
 ].join(" ");
+
+// Claude tends to chain tool calls silently; ask for one short line per intent so the UI shows what it is doing.
+const CLAUDE_PROGRESS_INSTRUCTIONS = "Progress updates: before each group of tool calls that share one intent (for example reading related files, searching for a symbol, or running a test suite), write one short sentence in the user's language saying what you are about to do and why. Cover the whole group with that single sentence; do not comment on every individual call, and write a new one only when the intent changes.";
 
 type JsonRpcMessage = Record<string, unknown> & {
   id?: unknown;
@@ -250,10 +264,6 @@ if (job.workspaceManager) {
 }
 const logPath = resolve(job.logPath);
 const pendingLogPath = job.pendingLogPath ? resolve(job.pendingLogPath) : null;
-const serverDir = dirname(fileURLToPath(import.meta.url));
-const projectRoot = resolve(serverDir, "../..");
-const tsxPath = resolve(projectRoot, "node_modules/tsx/dist/cli.mjs");
-const sessionInspectorMcpPath = resolve(serverDir, "sessionInspectorMcp.ts");
 mkdirSync(dirname(logPath), { recursive: true });
 if (pendingLogPath) {
   mkdirSync(dirname(pendingLogPath), { recursive: true });
@@ -293,7 +303,17 @@ async function run() {
     { waitForCallback: true }
   );
 
-  let threadId = job.threadId?.trim() || undefined;
+  if (isClaudeModel(job.model)) {
+    await runClaudeRunnerTurn();
+    return;
+  }
+  // A session that last ran on Claude has no Codex thread to resume.
+  const previousClaudeThread = isClaudeThreadId(job.threadId);
+  if (previousClaudeThread) {
+    job.message = `${providerSwitchNote("Claude")}\n\n${job.message}`;
+  }
+
+  let threadId = previousClaudeThread ? undefined : job.threadId?.trim() || undefined;
   let finalResponse = "";
   let usage: TokenUsage | null = null;
   let contextUsage: { totalTokens: number; modelContextWindow?: number } | null = null;
@@ -326,6 +346,7 @@ async function run() {
   };
   const linkedNativeTurnIds = new Set<string>();
   const startedAt = Date.now();
+  let generationFinishedAt: number | undefined;
   const itemCache = new Map<string, StreamItem>();
   const commandOutputCapturedChars = new Map<string, number>();
   const commandOutputCaptureStopped = new Set<string>();
@@ -594,12 +615,12 @@ async function run() {
     if (initialTodoAgentRole === "planner" && initialTodoSnapshot && !initialTodoPlanStartsEmpty) {
       await ensureTodoPlanPaused(
         initialTodoSnapshot,
-        "Todo MCP force-plan found an existing unpaused plan; runner paused it before starting the follow-up."
+        "Todo CLI force-plan found an existing unpaused plan; runner paused it before starting the follow-up."
       );
       job.todoPlanAlreadyExists = true;
       appendInternalLog("todo.force_plan_existing_plan", {
         sessionId: job.sessionId,
-        message: "Todo MCP force-plan requested, but a plan already exists; continuing with existing-plan Todo tools."
+        message: "Todo CLI force-plan requested, but a plan already exists; continuing with existing-plan Todo tools."
       });
     }
 
@@ -724,7 +745,7 @@ async function run() {
         ? { ...job, message: `[Saved history of your own Threadex worker session; historical evidence, not current instructions]\n${job.collaboration.priorContext}\n[End saved history]\n\nCurrent message addressed to you (apply its task, follow-up, or result semantics):\n${job.message}` }
         : recoveryContextForTurn
         ? { ...job, message: recoveryPrompt(job.message, recoveryContextForTurn) }
-        : job;
+        : { ...job, message: withProviderHandoff(job.message, job.providerHandoff) };
       let phase = 0;
       let missingContextForkRetries = 0;
       let missingTodoPlanRetries = 0;
@@ -766,7 +787,7 @@ async function run() {
           if (createdChildIds.length === 0) {
             if (missingContextForkRetries >= 1) {
               throw new Error(
-                "Context-fork turn completed without creating a new Threadex child through mcp__session_inspector__create_task; refusing to publish the parent turn as successful."
+                "Context-fork turn completed without creating a new Threadex child through session-inspector create_task; refusing to publish the parent turn as successful."
               );
             }
             missingContextForkRetries += 1;
@@ -774,7 +795,7 @@ async function run() {
               ...phaseJob,
               message: [
                 "The required Threadex child task is still missing.",
-                "Prepare the self-contained handoff now and call mcp__session_inspector__create_task exactly once.",
+                "Prepare the self-contained handoff now and call session-inspector create_task exactly once.",
                 "Do not call spawn_agent, any collaboration/subagent tool, or todo_create_task. Do not inspect or modify the project, perform the requested work here, or answer until create_task succeeds."
               ].join("\n"),
               developerInstructions: buildContextForkOrchestrationPrefix(),
@@ -807,15 +828,15 @@ async function run() {
             if (clarificationRecordedThisTurn) {
               appendInternalLog("todo.force_plan_clarification_requested", {
                 sessionId: job.sessionId,
-                message: "Todo MCP planner requested clarification before creating the plan."
+                message: "Todo CLI planner requested clarification before creating the plan."
               });
               break;
             }
             if (missingTodoPlanRetries >= 1) {
               throw new Error(
                 job.todoPlanClarificationPending === true
-                  ? "Todo MCP planner completed the grill-me follow-up without calling todo_set_plan or recording new clarification successfully; refusing to publish the turn as successful."
-                  : "Todo MCP planner completed without recording the required initial grill-me clarification successfully; refusing to publish the turn as successful."
+                  ? "Todo CLI planner completed the grill-me follow-up without calling todo_set_plan or recording new clarification successfully; refusing to publish the turn as successful."
+                  : "Todo CLI planner completed without recording the required initial grill-me clarification successfully; refusing to publish the turn as successful."
               );
             }
             missingTodoPlanRetries += 1;
@@ -823,14 +844,14 @@ async function run() {
               ...phaseJob,
               message: job.todoPlanClarificationPending === true
                 ? [
-                    "The Todo MCP plan is still missing after the grill-me answers.",
-                    "Call mcp__session_inspector__todo_set_plan now, or record only genuinely unresolved material questions with mcp__session_inspector__todo_request_clarification.",
-                    "Do not repeat answered questions, use update_plan, perform task work, or answer until the MCP call succeeds."
+                    "The Todo CLI plan is still missing after the grill-me answers.",
+                    "Call session-inspector todo_set_plan now, or record only genuinely unresolved material questions with session-inspector todo_request_clarification.",
+                    "Do not repeat answered questions, use update_plan, perform task work, or answer until the CLI command succeeds."
                   ].join("\n")
                 : [
-                    "The required initial Todo MCP grill-me round is still missing for this turn.",
-                    "Call mcp__session_inspector__todo_request_clarification now with 1-5 focused questions and do not call todo_set_plan yet.",
-                    "Do not use update_plan, perform task work, or answer until the clarification MCP call succeeds."
+                    "The required initial Todo CLI grill-me round is still missing for this turn.",
+                    "Call session-inspector todo_request_clarification now with 1-5 focused questions and do not call todo_set_plan yet.",
+                    "Do not use update_plan, perform task work, or answer until the clarification CLI command succeeds."
                   ].join("\n"),
               developerInstructions: job.todoPlanClarificationPending === true
                 ? CONTINUE_TODO_PLAN_DEVELOPER_INSTRUCTIONS
@@ -846,7 +867,7 @@ async function run() {
           }
           await ensureTodoPlanPaused(
             todoSnapshot,
-            "Todo MCP force-plan created items without paused control; runner paused it before publishing."
+            "Todo CLI force-plan created items without paused control; runner paused it before publishing."
           );
         }
 
@@ -912,26 +933,12 @@ async function run() {
     // app-server alive during that drain makes the next user turn fail with
     // "already has an active writer" even though generation already finished.
     await appServer.stop();
-    await drainCommentaryHeadlineQueue();
-    await syncAccountSnapshotFromCodexHomeSafely();
 
+    generationFinishedAt = Date.now();
     const reply = finalResponse || "Turn completed without a final agent message.";
     const latestUsage = usage as TokenUsage | null;
-    const nativeTokenCounts = readNativeTokenCountSamples(threadId, startedAt - 5_000);
-    if (nativeTokenCounts.length > 0) {
-      await emitEvent(
-        "token_count",
-        {
-          sessionId: job.sessionId,
-          turnId: job.turnId,
-          threadId,
-          appTurnId,
-          samples: nativeTokenCounts
-        },
-        { waitForCallback: true }
-      );
-    }
-
+    // Releasing the writer completes the manager turn. Publish that boundary
+    // before optional bookkeeping so the next queued prompt can start.
     await emitEvent(
       "result",
       {
@@ -949,14 +956,13 @@ async function run() {
   } catch (error) {
     const message = errorMessage(error);
     const usageLimit = isUsageLimitError(message);
+    generationFinishedAt = Date.now();
     steeringFinished = true;
     const loginRequired = isAccountLoginRequiredMessage(message);
     // Error and rate-limit paths must release the thread writer before any
     // potentially delayed callback or account-sync cleanup for the same reason
     // as the successful path above.
     await appServer.stop();
-    await drainCommentaryHeadlineQueue();
-    await syncAccountSnapshotFromCodexHomeSafely();
 
     if (usageLimit || loginRequired) {
       await emitEvent(
@@ -988,9 +994,148 @@ async function run() {
     stopCompactionHeartbeat();
     await stopSteerControl?.();
     await appServer.stop();
+    // The turn is already terminal; failures in this background work must not
+    // emit a second terminal event or interfere with the next queued turn.
+    try {
+      await drainCommentaryHeadlineQueue();
+      await syncAccountSnapshotFromCodexHomeSafely();
+      const nativeTokenCounts = readNativeTokenCountSamples(threadId, startedAt - 5_000, generationFinishedAt);
+      if (nativeTokenCounts.length > 0) {
+        // Do not carry threadId: a later turn may already have rebound the
+        // session, and this late usage event must only update the old turn.
+        await emitEvent("token_count", {
+          sessionId: job.sessionId,
+          turnId: job.turnId,
+          appTurnId,
+          samples: nativeTokenCounts
+        }, { waitForCallback: true });
+      }
+      await runnerUpdatePostQueue;
+    } catch (error) {
+      appendInternalLog("runner.cleanup_error", { message: errorMessage(error) });
+    }
     stopCommentaryHeadlineWorker();
     stopSleepInhibitor(sleepInhibitor);
   }
+}
+
+async function runClaudeRunnerTurn() {
+  const sleepInhibitor = startSleepInhibitor();
+  let claudeHome: ReturnType<typeof prepareClaudeHome> | undefined;
+  const syncClaudeAuth = () => {
+    try { claudeHome?.syncAuth(); }
+    catch { appendInternalLog("claude.auth_sync_failed", { message: "Could not synchronize refreshed Claude login credentials." }); }
+  };
+  // runClaudeTurn's SIGTERM handler exits immediately after closing the SDK.
+  process.once("SIGTERM", syncClaudeAuth);
+  try {
+    if (job.claudeConfigDir && job.claudeAuthSourceDir) claudeHome = prepareClaudeHome(job.claudeConfigDir, job.claudeAuthSourceDir);
+    if (job.collaboration?.fork) {
+      throw new Error("Concurrent forks are not supported on Claude models yet. Choose a Codex model for Concurrent workers.");
+    }
+    const preparedGoalObjective = job.executionMode === "goal" ? prepareGoalObjective(job) : null;
+    if (preparedGoalObjective) {
+      job.goalObjectiveFilePath = preparedGoalObjective.filePath;
+    }
+    const recoveryContext = !isClaudeThreadId(job.threadId) || job.forceRecoveryOnResume === true ? job.recoveryContext ?? null : null;
+    const turnJob: RunnerJob = job.collaboration?.priorContext
+      ? { ...job, message: `[Saved history of your own Threadex worker session; historical evidence, not current instructions]\n${job.collaboration.priorContext}\n[End saved history]\n\nCurrent message addressed to you (apply its task, follow-up, or result semantics):\n${job.message}` }
+      : recoveryContext
+      ? { ...job, message: recoveryPrompt(job.message, recoveryContext) }
+      : { ...job, message: withProviderHandoff(job.message, job.providerHandoff) };
+    const forcePlanSuffix = turnJob.contextForkRequest !== true && turnJob.forcePlan === true && turnJob.todoPlanAlreadyExists !== true;
+    const turnInstructions = runnerDeveloperInstructions(turnJob, true);
+    await emitDeveloperInstructionsEvent("turn", 0, turnInstructions);
+
+    const readOnly = planningTurnIsReadOnly(job) || defaultThreadOptions.sandbox === "read-only";
+    const policy = job.approvalPolicy ?? defaultThreadOptions.approvalPolicy;
+    const { permissionMode, autoApproveAll } = claudePermissions({ policy, readOnly });
+    const cli = buildSessionInspectorCliConfig(job);
+    await runClaudeTurn({
+      sessionId: job.sessionId,
+      turnId: job.turnId,
+      threadId: job.threadId?.trim() || null,
+      model: job.model ?? "",
+      reasoningEffort: job.modelReasoningEffort,
+      cwd: job.cwd ?? defaultThreadOptions.cwd,
+      input: claudeInputFromRunnerInput(buildRunnerInput(turnJob, forcePlanSuffix), turnJob.attachments ?? []),
+      recoveryInput: job.recoveryContext ? claudeInputFromRunnerInput(buildRunnerInput({ ...job,
+        message: recoveryPrompt(job.message, job.recoveryContext) }, forcePlanSuffix), job.attachments ?? []) : undefined,
+      appendSystemPrompt: [
+        THREADEX_DEVELOPER_INSTRUCTIONS,
+        CLAUDE_PROGRESS_INSTRUCTIONS,
+        gitProvenanceDeveloperInstructions(job),
+        !job.contextForkRequest ? SESSION_RECOVERY_INSTRUCTIONS : undefined,
+        turnInstructions
+      ].filter(Boolean).join("\n\n"),
+      permissionMode,
+      autoApproveAll,
+      readOnly,
+      sandboxMode: defaultThreadOptions.sandbox,
+      protectedPaths: [job.claudeConfigDir, job.claudeAuthSourceDir].filter((path): path is string => Boolean(path)),
+      mcpServers: {},
+      allowedTools: [],
+      approvedInspectorCommands: cli.approvedCommands,
+      extraEnv: {
+        ...cli.env,
+        ...(job.claudeConfigDir ? { CLAUDE_CONFIG_DIR: job.claudeConfigDir } : {}),
+        ...(!job.claudeAccountId ? { THREADEX_CLAUDE_DEFAULT_AUTH: "1" } : {}),
+        THREADEX_MANAGED_RUNNER: "1",
+        THREADEX_SESSION_ID: job.sessionId,
+        THREADEX_TURN_ID: job.turnId,
+        THREADEX_SERVER_URL: job.serverUrl ?? ""
+      },
+      accountLabel: job.claudeAccountLabel ?? null,
+      reportAccountEvent: job.claudeAccountId && job.serverUrl
+        ? async (kind, info) => {
+          await postJson(`${job.serverUrl!.replace(/\/$/, "")}/api/claude-accounts/report`, { accountId: job.claudeAccountId, kind, info }, 5000);
+        }
+        : undefined,
+      emitEvent: async (event, data, options) => {
+        // Publish summaries before terminal events make the turn inactive.
+        if (["result", "error", "pending", "done"].includes(event)) {
+          await drainCommentaryHeadlineQueue();
+        }
+        const result = await emitEvent(event, data, options);
+        if (event === "item") queueCommentaryHeadline(data as StreamItem);
+        return result;
+      },
+      appendInternalLog,
+      requestApproval: (input) => requestApprovalDecision(input),
+      pendingSteerCommands: () => readSteerCommands().map((command) => ({
+        id: command.id,
+        message: command.message,
+        buildInput: () => claudeInputFromRunnerInput([
+          ...(command.developerInstructions ? [{ type: "text", text: `[Threadex developer note]\n${command.developerInstructions}` }] : []),
+          ...buildRunnerInput({ ...job, message: command.message, attachments: command.attachments ?? [], skills: command.skills ?? [] })
+        ], command.attachments ?? [])
+      })),
+      writeSteerResult
+    });
+  } finally {
+    process.removeListener("SIGTERM", syncClaudeAuth);
+    syncClaudeAuth();
+    await drainCommentaryHeadlineQueue();
+    stopSleepInhibitor(sleepInhibitor);
+    stopCommentaryHeadlineWorker();
+    await runnerUpdatePostQueue;
+  }
+}
+
+function claudeInputFromRunnerInput(input: Array<Record<string, unknown>>, attachments: SavedAttachment[]): ClaudeInputPart[] {
+  return input.flatMap((part): ClaudeInputPart[] => {
+    if (part.type === "text" && typeof part.text === "string") {
+      return [{ type: "text", text: part.text }];
+    }
+    if (part.type === "localImage" && typeof part.path === "string") {
+      const mimeType = attachments.find((attachment) => attachment.path === part.path)?.mimeType ?? "image/png";
+      return [{ type: "image", path: part.path, mimeType }];
+    }
+    if (part.type === "skill" && typeof part.name === "string" && typeof part.path === "string") {
+      return [{ type: "text", text: `Use the "${part.name}" skill for this request: read ${part.path} before starting and follow it.` }];
+    }
+    return [];
+  });
 }
 
 async function emitDeveloperInstructionsEvent(target: "thread" | "turn" | "steer", phase: number, developerInstructions: string | undefined) {
@@ -1187,6 +1332,7 @@ class AppServerClient {
       {
         env: {
           ...process.env,
+          ...buildSessionInspectorCliConfig(job).env,
           ...(job.codexHome ? { CODEX_HOME: job.codexHome } : {}),
           CODEX_WORKDIR: job.cwd ?? defaultThreadOptions.cwd,
           THREADEX_MANAGED_RUNNER: "1",
@@ -1344,7 +1490,9 @@ class AppServerClient {
           method: message.method,
           params: message.params ?? null
         };
-        const decision = planningTurnIsReadOnly(job)
+        const cliApproval = (message.method === "item/commandExecution/requestApproval" || message.method === "execCommandApproval") &&
+          approvedInspectorCommand(readObject(message.params)?.command, buildSessionInspectorCliConfig(job).approvedCommands);
+        const decision = cliApproval ? "accept" : planningTurnIsReadOnly(job)
           ? await denyPlannerApproval(approvalRequest)
           : await requestApprovalDecision(approvalRequest);
         this.send({ id, result: buildApprovalResponse(message.method, decision) });
@@ -1393,7 +1541,7 @@ async function denyPlannerApproval(input: {
       turnId: job.turnId,
       createdAt: new Date().toISOString(),
       decision: "decline",
-      reason: "Todo planner turns are read-only. Create the Todo MCP plan and execute it in a later turn."
+      reason: "Todo planner turns are read-only. Create the Todo CLI plan and execute it in a later turn."
     },
     { waitForCallback: true }
   );
@@ -1620,7 +1768,7 @@ function buildTurnStartParams(
 }
 
 function runnerApprovalSettings(job: RunnerJob) {
-  return resolveApprovalSettings(planningTurnIsReadOnly(job) ? "never" : job.approvalPolicy);
+  return resolveApprovalSettings(planningTurnIsReadOnly(job) ? "on-request" : job.approvalPolicy);
 }
 
 function startSteerControlLoop(
@@ -1702,7 +1850,7 @@ async function fetchSessionTodoSnapshot(): Promise<TodoSnapshot> {
   const url = new URL(`/api/sessions/${encodeURIComponent(job.sessionId)}/todos`, job.serverUrl.replace(/\/$/, ""));
   const response = await fetch(url, { signal: AbortSignal.timeout(2000) });
   if (!response.ok) {
-    throw new Error(`Unable to verify Todo MCP plan: HTTP ${response.status}.`);
+    throw new Error(`Unable to verify Todo CLI plan: HTTP ${response.status}.`);
   }
   const body = readObject(await response.json());
   const items = Array.isArray(body?.items)
@@ -1752,7 +1900,7 @@ async function ensureTodoPlanPaused(snapshot: TodoSnapshot, reason: string) {
     `${serverUrl}/api/sessions/${encodeURIComponent(job.sessionId)}/todos/control`,
     {
       paused: true,
-      pauseReason: "Initial Todo MCP plan created for review. Execution has not started.",
+      pauseReason: "Initial Todo CLI plan created for review. Execution has not started.",
       actor: "agent"
     },
     2000
@@ -1824,66 +1972,33 @@ function writeSteerResult(result: RunnerSteerResult) {
 }
 
 function buildThreadConfig(job: RunnerJob) {
-  const sessionInspectorConfig = buildSessionInspectorMcpServerConfig(job);
-  if (!sessionInspectorConfig) return {};
-
-  return { mcp_servers: { session_inspector: sessionInspectorConfig },
-    ...(job.workspaceManager ? { features: { shell_tool: false, unified_exec: false, apps: false, multi_agent: false } } : {}) };
+  return {
+    mcp_servers: { session_inspector: { command: process.execPath, args: [], enabled: false } },
+    ...(job.workspaceManager ? { features: { shell_tool: true, unified_exec: true, apps: false, multi_agent: false } } : {})
+  };
 }
 
 function buildPromptRunnerAppServerArgs(job: RunnerJob) {
   return [
-    ...buildAppServerArgs(planningTurnIsReadOnly(job) ? "never" : job.approvalPolicy),
-    ...(job.workspaceManager ? ["-c", 'sandbox_mode="read-only"', "-c", "features.shell_tool=false", "-c", "features.unified_exec=false", "-c", "features.apps=false", "-c", "features.multi_agent=false"] : []),
-    ...buildSessionInspectorMcpCliConfigArgs(job)
+    ...buildAppServerArgs(planningTurnIsReadOnly(job) ? "on-request" : job.approvalPolicy),
+    "-c", "mcp_servers.session_inspector.enabled=false",
+    "-c", `mcp_servers.session_inspector.command=${JSON.stringify(process.execPath)}`,
+    ...(job.workspaceManager ? ["-c", 'sandbox_mode="read-only"', "-c", "features.shell_tool=true", "-c", "features.unified_exec=true", "-c", "features.apps=false", "-c", "features.multi_agent=false"] : [])
   ];
 }
 
-function buildSessionInspectorMcpCliConfigArgs(job: RunnerJob) {
-  const config = buildSessionInspectorMcpServerConfig(job);
-  if (!config) return [];
-
-  const prefix = "mcp_servers.session_inspector";
-  const entries = [
-    `${prefix}.command=${tomlString(config.command)}`,
-    `${prefix}.args=${tomlStringArray(config.args)}`
-  ];
-  if (config.tools) {
-    for (const [toolName, toolConfig] of Object.entries(config.tools)) {
-      entries.push(`${prefix}.tools.${toolName}.approval_mode=${tomlString(toolConfig.approval_mode)}`);
-    }
-  }
-  for (const [name, value] of Object.entries(config.env)) {
-    entries.push(`${prefix}.env.${name}=${tomlString(value)}`);
-  }
-  return entries.flatMap((entry) => ["-c", entry]);
-}
-
-function buildSessionInspectorMcpServerConfig(job: RunnerJob) {
-  if (!threadexMcpEnabled(job)) {
-    return null;
-  }
-
-  const approvedTools = {
-    ...(job.workspaceManager || job.managerConcurrent ? Object.fromEntries(WORKSPACE_MANAGER_TOOLS.map(tool => [tool.name, { approval_mode: "approve" }])) : {}),
-    ...(job.lightweightTodo ? { outcome_plan_get: { approval_mode: "approve" }, outcome_plan_set: { approval_mode: "approve" } } : {}),
-    ...(job.autoModelEnabled ? { upgrade_model: { approval_mode: "approve" } } : {}),
-    ...(job.contextForkRequest ? { create_task: { approval_mode: "approve" } } : {}),
-    ...(todoPlanningRequested(job)
-      ? {
-          todo_set_plan: { approval_mode: "approve" },
-          todo_request_clarification: { approval_mode: "approve" }
-        }
-      : {})
-  };
-
+function buildSessionInspectorCliConfig(job: RunnerJob) {
   return {
-    command: process.execPath,
-    args: [tsxPath, sessionInspectorMcpPath],
-    ...(Object.keys(approvedTools).length > 0 ? { tools: approvedTools } : {}),
+    approvedCommands: [
+      "recover_current_session", "get_session", "search_sessions",
+      ...(job.workspaceManager || job.managerConcurrent ? WORKSPACE_MANAGER_TOOLS.map(tool => tool.name) : []),
+      ...(job.lightweightTodo ? ["outcome_plan_get", "outcome_plan_set"] : []),
+      ...(job.autoModelEnabled ? ["upgrade_model"] : []),
+      ...(job.contextForkRequest ? ["create_task"] : []),
+      ...(todoPlanningRequested(job) ? ["todo_set_plan", "todo_request_clarification"] : [])
+    ],
     env: {
-      TMPDIR: process.env.THREADEX_MCP_TMPDIR ?? (process.platform === "darwin" ? "/private/tmp" : tmpdir()),
-      SESSION_INSPECTOR_SERVER_URL: job.serverUrl ?? "",
+      RUNNER_SERVER_URL: job.serverUrl ?? "",
       THREADEX_SESSION_ID: job.sessionId,
       THREADEX_CONCURRENT_ID: job.collaboration?.groupId ?? "",
       THREADEX_WORKSPACE_MANAGER: job.workspaceManager || job.managerConcurrent ? "1" : "0",
@@ -1897,28 +2012,16 @@ function buildSessionInspectorMcpServerConfig(job: RunnerJob) {
       THREADEX_CHILD_EXECUTION_MODE: job.childExecutionMode ?? "default",
       THREADEX_CHILD_SKILLS: JSON.stringify(job.skills ?? []),
       THREADEX_CONTEXT_FORK_REQUEST: job.contextForkRequest ? "1" : "0",
-      THREADEX_CONTINUITY_ONLY: sessionInspectorContinuityOnly(job) ? "1" : "0",
+      THREADEX_CONTINUITY_ONLY: "0",
       THREADEX_LIGHTWEIGHT_TODO: job.lightweightTodo ? "1" : "0",
       THREADEX_TODO_AGENT_ROLE: todoAgentRole(job),
       THREADEX_TODO_REQUIRE_INITIAL_GRILL: job.forcePlan === true && job.todoPlanClarificationPending !== true ? "1" : "0",
       THREADEX_TODO_PARENT_SESSION_ID: job.todoParentSessionId ?? "",
       THREADEX_TODO_ITEM_ID: job.todoItemId ?? "",
-      SESSION_DB_BACKEND: "postgres",
-      SESSION_DATABASE_URL:
-        process.env.SESSION_DATABASE_URL ??
-        process.env.DATABASE_URL ??
-        "postgres://threadex:threadex@127.0.0.1:55432/threadex"
     }
   };
 }
 
-function tomlString(value: string) {
-  return JSON.stringify(value);
-}
-
-function tomlStringArray(values: string[]) {
-  return `[${values.map(tomlString).join(", ")}]`;
-}
 
 const SESSION_RECOVERY_INSTRUCTIONS = [
   "Threadex retains the complete user prompts and final assistant responses outside Codex's compacted context.",
@@ -1927,9 +2030,6 @@ const SESSION_RECOVERY_INSTRUCTIONS = [
 
 function sessionInspectorDeveloperInstructions(job: RunnerJob) {
   if (job.workspaceManager) return undefined; // Installed at thread scope above.
-  if (!sessionInspectorMcpEnabled(job)) {
-    return undefined;
-  }
 
   // Context forks have their own focused contract in contextFork.ts. Do not
   // dilute it with generic session, Todo, and process-monitoring guidance.
@@ -1937,9 +2037,6 @@ function sessionInspectorDeveloperInstructions(job: RunnerJob) {
     return undefined;
   }
 
-  if (sessionInspectorContinuityOnly(job)) {
-    return undefined;
-  }
 
   if (job.lightweightTodo) return LIGHTWEIGHT_TODO_INSTRUCTIONS;
 
@@ -1954,24 +2051,16 @@ function sessionInspectorDeveloperInstructions(job: RunnerJob) {
   }
 
   const todoInstructions = role === "worker"
-    ? "Todo worker: this session already owns one assigned Todo item. Treat every user follow-up here as continued work on that same item and reply/work in this same task thread. Ordinary worker turns cannot access task-creation tools: never create or delegate another task to continue, answer a question, revise work, or report progress. Use Todo MCP tools to update the assigned item, report progress, and mark it done/skipped/blocked. If genuinely independent work should be split out, add a nested Todo item for the parent session to delegate later. Only an explicit user context-fork action may create a child from this worker."
-    : "For Todo MCP planning, MUST use these tools instead of update_plan: todo_list/todo_get_detail/todo_add_item/todo_update_item/todo_set_context/todo_add_message/todo_resolve_challenge/todo_add_comment/todo_set_control/todo_create_task. For an initial plan, first establish a factual Problem and observable Objective; ask focused grill-me questions instead of guessing when either is unclear. Structure planned work as Solution items plus Verification items that prove the Objective, then pause unless the user explicitly asked to execute. Treat follow-ups as continued work in the current session and shared plan. Do not use todo_create_task for continuation, status reporting, simple revisions, or because a plan item exists; only create a child task when the user asks to delegate/background work or you deliberately split a genuinely independent item that needs its own worker. By default todo_create_task only creates and links a queued child task; on execute/continue, unpause and delegate items with todo_create_task using startImmediately=true only when a separate worker is warranted. Keep item status and short todo_add_message updates current.";
+    ? "Todo worker: this session already owns one assigned Todo item. Treat every user follow-up here as continued work on that same item and reply/work in this same task thread. Ordinary worker turns cannot access task-creation tools: never create or delegate another task to continue, answer a question, revise work, or report progress. Use Todo CLI tools to update the assigned item, report progress, and mark it done/skipped/blocked. If genuinely independent work should be split out, add a nested Todo item for the parent session to delegate later. Only an explicit user context-fork action may create a child from this worker."
+    : "For Todo CLI planning, MUST use these tools instead of update_plan: todo_list/todo_get_detail/todo_add_item/todo_update_item/todo_set_context/todo_add_message/todo_resolve_challenge/todo_add_comment/todo_set_control/todo_create_task. For an initial plan, first establish a factual Problem and observable Objective; ask focused grill-me questions instead of guessing when either is unclear. Structure planned work as Solution items plus Verification items that prove the Objective, then pause unless the user explicitly asked to execute. Treat follow-ups as continued work in the current session and shared plan. Do not use todo_create_task for continuation, status reporting, simple revisions, or because a plan item exists; only create a child task when the user asks to delegate/background work or you deliberately split a genuinely independent item that needs its own worker. By default todo_create_task only creates and links a queued child task; on execute/continue, unpause and delegate items with todo_create_task using startImmediately=true only when a separate worker is warranted. Keep item status and short todo_add_message updates current.";
 
+  if (!todoCommandsRequested(job)) return undefined;
   return [
-    "A local MCP server named session_inspector is available for stored-session inspection and Threadex actions.",
     ...(job.todoPlanAlreadyExists
-      ? ["A Todo MCP plan already exists for this session. Do not call todo_set_plan; inspect or update the existing plan with the standard Todo MCP tools and keep it paused unless the user explicitly asked to execute."]
+      ? ["A Todo CLI plan already exists for this session. Do not call todo_set_plan; inspect or update the existing plan and keep it paused unless the user explicitly asked to execute."]
       : []),
-    ...(job.contextForkRequest
-      ? ["For this context-fork request, call the create_task MCP tool from the session_inspector server exactly once after preparing a self-contained prompt from the current thread context. In Codex local tool naming, this tool is mcp__session_inspector__create_task; use the full name exactly as written, including both double-underscore separators. create_task creates and starts the child session with this session as its parent. You may choose its optional model and modelReasoningEffort when the delegated work benefits from a different setting; otherwise omit them to inherit the current task settings."]
-      : []),
-    "Use get_session with sessionId or threadId to inspect a specific session with pagination and filters.",
-    "Use search_sessions for global full-text search across stored sessions.",
-    "Use vector_status before vector_search; vector_search only covers precomputed session description embeddings in PostgreSQL.",
     todoInstructions,
-    "Initial Todo plans MUST use todo_set_plan exactly once; later changes MUST use todo_update_item or todo_add_item.",
-    TODO_LANGUAGE_RULE,
-    "Use list_processes for a compact view of monitored processes. A monitor label is display text only and never discovers a process. All newly registered monitors default to removeOnExit: true and are cleaned up after completion. Set removeOnExit: false explicitly only when persistent retention is required. Adoption preserves the existing cleanup setting unless explicitly changed. A PID-only monitor stores no executable/args and cannot restart. To attach an existing PID with restart control, supply the PID together with exactly one complete launch spec: exe plus args, dockerImage, or legacy command. Restart first signals only that attached PID, then launches and captures the supplied spec. Use stop_process_monitor to signal a live monitored PID while retaining its monitor. Built-in read-only monitors can still be restartable when they advertise restartable: true; restart_process_monitor then delegates to their supervisor. Interpreter executables such as node, sh, bash, and python must include the script or command args; never launch a bare interpreter. Use adopt_process_monitor to add a complete restart launch spec to an existing PID-only monitor without restarting it. For Docker monitors, dockerRunArgs are flags before the image while args are passed to the container command. Optional entryPoints are HTTP(S) web links; wakePrompt creates one backward-compatible subscription on exit; timeoutSeconds limits lifetime. Monitoring is server-side and does not consume turns. list_wait_events shows central durable events and per-session delivery state; subscribe_wait_event lets multiple sessions subscribe to the same retained event."
+    TODO_LANGUAGE_RULE
   ].join("\n");
 }
 
@@ -1989,7 +2078,7 @@ function planningTurnIsReadOnly(job: RunnerJob) {
     todoAgentRole(job) === "planner";
 }
 
-function todoMcpRequested(job: RunnerJob) {
+function todoCommandsRequested(job: RunnerJob) {
   return job.lightweightTodo === true || todoPlanningRequested(job) ||
     job.todoPlanAlreadyExists === true ||
     Boolean(job.todoParentSessionId && job.todoItemId) ||
@@ -2002,6 +2091,7 @@ function todoPlanningRequested(job: RunnerJob) {
 
 function runnerDeveloperInstructions(job: RunnerJob, includeStartupSnapshot = true) {
   const instructions = [
+    inspectorInstructions,
     job.globalAgentInstructions?.trim()
       ? `User's global agent instructions (apply across Threadex workspaces):\n${job.globalAgentInstructions}`
       : undefined,
@@ -2045,79 +2135,13 @@ function autoModelDeveloperInstructions(job: RunnerJob) {
   return [
     "Automatic model selection is enabled for this Threadex session. Threadex selects the initial model and effort for each turn using the user prompt and summarized context. Start work at the current setting.",
     "If the task is difficult or complex, or one or two attempts have not produced a good result, consider a higher reasoning effort or a stronger model.",
-    `Available upgrades are ${AUTO_MODEL_ORDER.join(", ")} with low, medium, high, xhigh, max, or ultra effort. Use the session_inspector.upgrade_model tool with model, effort, and a concise reason; direct jumps are allowed, but downgrades within a turn are not.`,
+    `Available upgrades are ${AUTO_MODEL_ORDER.join(", ")} with low, medium, high, xhigh, max, or ultra effort. Use the session-inspector upgrade_model tool with model, effort, and a concise reason; direct jumps are allowed, but downgrades within a turn are not.`,
     "Call upgrade_model only immediately before a substantive technical or business decision that benefits materially from the stronger setting.",
     "After upgrade_model succeeds, do not make the decision or continue implementation in this phase. End the phase immediately with a terse handoff; Threadex will automatically continue the same user request in the same thread at the upgraded setting.",
     "Do not upgrade for mechanical edits, straightforward verification, summarization, or merely because a task is long."
   ].join("\n");
 }
 
-function threadexMcpEnabled(job: RunnerJob) {
-  return job.autoModelEnabled === true ||
-    job.contextForkRequest === true ||
-    job.executionMode === "goal" ||
-    job.executionMode === "plan" ||
-    todoMcpRequested(job) ||
-    sessionInspectorMcpEnabled(job);
-}
-
-function sessionInspectorMcpEnabled(job: RunnerJob) {
-  if (job.collaboration) return true;
-  if (job.workspaceManager) return true;
-  if (job.contextParentSessionId || job.contextForkRequest) {
-    return true;
-  }
-
-  const legacy = process.env.ENABLE_SESSION_INSPECTOR_MCP;
-  if (legacy === "false" || legacy === "0") {
-    return false;
-  }
-  if (legacy === "true" || legacy === "1") {
-    return true;
-  }
-
-  const mode = (process.env.SESSION_INSPECTOR_MCP_MODE ?? "auto").toLowerCase();
-  if (mode === "off" || mode === "false" || mode === "0") {
-    return false;
-  }
-  if (mode === "always" || mode === "on" || mode === "true" || mode === "1") {
-    return true;
-  }
-
-  if (mode !== "auto") {
-    return false;
-  }
-
-  // A resumed native thread may already contain opaque compacted state. Keep
-  // the current-session recovery path available even when the new prompt does
-  // not explicitly mention history: terse follow-ups are exactly where a lost
-  // correction or decision is hardest for the model to notice.
-  return Boolean(job.threadId) || shouldEnableSessionInspectorForMessage(job.message) || todoMcpRequested(job);
-}
-
-function sessionInspectorContinuityOnly(job: RunnerJob) {
-  if (job.collaboration) return false;
-  if (job.workspaceManager) return false;
-  if (!job.threadId || job.contextParentSessionId || job.contextForkRequest) {
-    return false;
-  }
-  if (process.env.ENABLE_SESSION_INSPECTOR_MCP === "true" || process.env.ENABLE_SESSION_INSPECTOR_MCP === "1") {
-    return false;
-  }
-  const mode = (process.env.SESSION_INSPECTOR_MCP_MODE ?? "auto").toLowerCase();
-  if (mode !== "auto") {
-    return false;
-  }
-  return !job.autoModelEnabled &&
-    job.executionMode !== "goal" &&
-    job.executionMode !== "plan" &&
-    !todoMcpRequested(job) &&
-    !shouldEnableSessionInspectorForMessage(job.message);
-}
-
-function shouldEnableSessionInspectorForMessage(message: string) {
-  return /\bsession[ _-]?inspector\b|\b(?:inspect|search) (?:a |this |saved |past |previous )*(?:session|sessions|thread|threads|history|transcript|conversation)\b|\b(?:session|thread) (?:history|transcript|search)\b|\bprevious (?:session|conversation|transcript)\b|\b(?:monitor|restart|remove|list)\s+(?:a |the |this )?(?:process|processes|pid|command)\b|\bprocess\s+monitor(?:ing)?\b|(?:monitor|監控|監察|重啟|移除|查看|睇).{0,24}(?:process|pid|command|程序|進程)/i.test(message);
-}
 
 function shouldEnableTodoForMessage(message: string) {
   return /\btodo\b|\bto-do\b|\btask list\b|待辦|任務清單|工作清單|拆細|暫停|pause|hold|skip|blocked/i.test(message);
@@ -2128,6 +2152,9 @@ async function emitEvent(
   data: unknown,
   options: { waitForCallback?: boolean } = {}
 ): Promise<RunnerLogEntry> {
+  if (job.providerThread && (event === "session" || event === "result")) {
+    data = { ...readObject(data), providerThread: job.providerThread };
+  }
   const entry: RunnerLogEntry = {
     id: crypto.randomUUID(),
     ts: new Date().toISOString(),
@@ -2299,7 +2326,7 @@ function buildAutoModelPrefix(job: RunnerJob) {
   return [
     "[AUTO MODEL]",
     `Current setting: ${job.model ?? DEFAULT_MODEL} / ${job.modelReasoningEffort ?? "high"}.`,
-    "Upgrade with session_inspector.upgrade_model when needed; direct jumps are allowed and downgrades are not.",
+    "Upgrade with session-inspector upgrade_model when needed; direct jumps are allowed and downgrades are not.",
     "[END AUTO MODEL]"
   ].join("\n");
 }
@@ -2529,7 +2556,7 @@ function readUsage(value: unknown, previous: TokenUsage | null): TokenUsage | nu
   };
 }
 
-function readNativeTokenCountSamples(threadId: string | null | undefined, minTimestampMs: number): NativeTokenCountSample[] {
+function readNativeTokenCountSamples(threadId: string | null | undefined, minTimestampMs: number, maxTimestampMs = Infinity): NativeTokenCountSample[] {
   if (!threadId || !job.codexHome) {
     return [];
   }
@@ -2554,7 +2581,9 @@ function readNativeTokenCountSamples(threadId: string | null | undefined, minTim
     const timestamp = readString(event.timestamp);
     if (timestamp) {
       const timestampMs = Date.parse(timestamp);
-      if (Number.isFinite(timestampMs) && timestampMs < minTimestampMs) {
+      // The next prompt can already be appending to this native thread while
+      // the previous runner finishes its bookkeeping.
+      if (Number.isFinite(timestampMs) && (timestampMs < minTimestampMs || timestampMs > maxTimestampMs)) {
         continue;
       }
     }

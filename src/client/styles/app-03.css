@@ -275,7 +275,8 @@
 
 .account-login-tabs {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-auto-columns: 1fr;
+  grid-auto-flow: column;
   gap: 8px;
   padding: 0 16px;
 }
@@ -579,7 +580,7 @@
 
 .settings-page {
   position: fixed;
-  inset: 0 0 0 var(--sidebar-width);
+  inset: var(--workspace-header-height, 38px) 0 0 var(--sidebar-width);
   z-index: 30;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
@@ -637,6 +638,7 @@
 .settings-tabs button {
   display: flex;
   align-items: center;
+  justify-content: flex-start;
   gap: 9px;
   width: 100%;
   min-height: 38px;
@@ -647,6 +649,8 @@
   cursor: pointer;
   font-size: 13px;
   font-weight: 650;
+  text-align: left;
+  line-height: 1.3;
 }
 
 .settings-tabs button[data-active="true"] {
@@ -655,6 +659,7 @@
 }
 
 .settings-tabs svg {
+  flex: 0 0 16px;
   width: 16px;
   height: 16px;
 }
@@ -783,6 +788,32 @@
 .auto-model-settings-card .account-login-form > p {
   color: #64748b;
   font-size: 12px;
+}
+
+.helper-models-group {
+  display: grid;
+  gap: 6px;
+}
+
+.helper-models-group + .helper-models-group {
+  padding-top: 14px;
+  border-top: 1px solid #e2e8f0;
+}
+
+.helper-models-pair {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.helper-models-pair select {
+  min-width: 0;
+  min-height: 34px;
+  border: 1px solid #cbd5e1;
+  border-radius: 7px;
+  padding: 0 6px;
+  background: #ffffff;
+  color: #27272a;
+  font-size: 13px;
+  font-weight: 400;
 }
 
 .auto-model-settings-card .auto-model-routing-form {

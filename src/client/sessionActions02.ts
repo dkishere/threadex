@@ -1,12 +1,13 @@
 // @ts-nocheck
 import { reconcilePendingSubmissions } from "./pendingSubmissions";
+import { sessionSnapshotUrl } from "./workspaceManagerHistory";
 export async function restoreSelectedSessionForWorkspace(ctx, workspaceId) {
     const { sessionIdRef } = ctx;
         const selectedSessionId = sessionIdRef.current;
         if (!selectedSessionId) {
             return null;
         }
-        const snapshotResponse = await fetch(`/api/sessions/${encodeURIComponent(selectedSessionId)}/snapshot`, {
+        const snapshotResponse = await fetch(sessionSnapshotUrl(selectedSessionId, ctx.workspaceManagerView), {
             cache: "no-store"
         });
         if (!snapshotResponse.ok) {
@@ -19,7 +20,7 @@ export async function restoreSelectedSessionForWorkspace(ctx, workspaceId) {
         const switchResponse = await fetch("/api/sessions/switch", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ sessionId: snapshot.session.id })
+            body: JSON.stringify({ sessionId: snapshot.session.id, ...(ctx.workspaceManagerView ? { view: "workspace-chat" } : {}) })
         });
         if (!switchResponse.ok) {
             return snapshot;
@@ -36,9 +37,10 @@ export async function loadWorkspaceSnapshot(ctx, options = {}) {
         // Both kinds of request still become stale when the user changes views.
         const requestId = preserveSelectedSession ? navigationRequestIdRef.current : ++navigationRequestIdRef.current;
         const expectedViewKey = options.viewKey ?? viewKeyRef.current;
+        const managerView = options.workspaceManagerView === true || navigationTarget?.view === "workspace-chat";
         const snapshotUrl = options.includeActiveSession === false || preserveSelectedSession
             ? "/api/workspace/snapshot?includeActiveSession=false"
-            : "/api/workspace/snapshot";
+            : `/api/workspace/snapshot${managerView ? "?view=workspace-chat" : ""}`;
         const previousWorkspaceId = activeWorkspaceIdRef.current;
         const preservedWorkspaceId = preserveSelectedSession ? activeWorkspaceIdRef.current : null;
         try {
@@ -122,21 +124,21 @@ export async function loadWorkspaceSnapshot(ctx, options = {}) {
                     const switchResponse = await fetch("/api/sessions/switch", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ sessionId: navigationTarget.sessionId })
+                        body: JSON.stringify({ sessionId: navigationTarget.sessionId, ...(managerView ? { view: "workspace-chat" } : {}) })
                     });
                     if (switchResponse.ok) {
                         selectedSnapshot = await switchResponse.json();
                     }
                 }
                 else if (navigationTarget.sessionId) {
-                    const snapshotResponse = await fetch(`/api/sessions/${encodeURIComponent(navigationTarget.sessionId)}/snapshot`, { cache: "no-store" });
+                    const snapshotResponse = await fetch(sessionSnapshotUrl(navigationTarget.sessionId, managerView), { cache: "no-store" });
                     if (snapshotResponse.ok) {
                         const snapshot = (await snapshotResponse.json());
                         if (snapshot.session?.workspaceId === payload.activeWorkspace.id) {
                             const switchResponse = await fetch("/api/sessions/switch", {
                                 method: "POST",
                                 headers: { "Content-Type": "application/json" },
-                                body: JSON.stringify({ sessionId: snapshot.session.id })
+                                body: JSON.stringify({ sessionId: snapshot.session.id, ...(managerView ? { view: "workspace-chat" } : {}) })
                             });
                             if (switchResponse.ok) {
                                 selectedSnapshot = (await switchResponse.json());

@@ -1,6 +1,6 @@
 ---
 name: browser-bridge
-description: Control the trusted local Chrome browser through the authenticated Local Browser Bridge daemon without MCP. Not for mobile/tablet mode. Use when a task needs real Chrome tabs, windows, DOM inspection, JavaScript evaluation, clicks, typing, screenshots, CDP, cookies, downloads, or browser debugging.
+description: Control the trusted local Chrome browser through the authenticated Local Browser Bridge daemon without MCP, and locate the code behind pasted or attached `browser-bridge-context` JSON. Not for mobile/tablet mode. Use when a prompt contains a JSON object with `"kind":"browser-bridge-context"` or an `extension-context-key`, or when a task needs real Chrome tabs, windows, DOM inspection, JavaScript evaluation, clicks, typing, screenshots, CDP, cookies, downloads, or browser debugging.
 ---
 
 # Browser Bridge
@@ -50,10 +50,11 @@ Treat command output as JSON. Use `tabs` first when the tab id is unknown. Use
 matters. Keep screenshots under `/private/tmp` or the workspace and report the
 path.
 
-Codex runners must request this exact CLI command with
+Codex only: Codex runners must request this exact CLI command with
 `sandbox_permissions: "require_escalated"`. Its fixed `browser-bridge` prefix is
 pre-approved so only this purpose-built CLI bypasses the network sandbox; do
-not enable general sandbox network access.
+not enable general sandbox network access. Other agents, such as Claude Code,
+run the CLI directly.
 
 The CLI starts its loopback daemon automatically. If it says the extension is
 not connected, ask the user to enable/reload **Local Browser Bridge** from

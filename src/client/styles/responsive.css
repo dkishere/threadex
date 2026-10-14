@@ -46,7 +46,7 @@
   .responsive-layout .chat { height: calc(var(--app-height, 100dvh) - var(--workspace-header-height)); }
   .responsive-layout[data-left-open="true"] .sidebar { display: flex; width: min(320px, 90vw); height: calc(100dvh - var(--workspace-header-height)); z-index: 30; box-shadow: 8px 0 24px rgb(15 23 42 / 15%); }
   .responsive-layout .chat { margin-left: 0; }
-  .responsive-layout .settings-page { left: 0; }
+  .responsive-layout .settings-page { left: 0; top: var(--chat-header-height); }
 }
 
 @media (width < 1080px) {

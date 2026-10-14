@@ -1,4 +1,6 @@
 import type { GrillIssue, TurnGrill } from "../turnGrill";
+import type { RoundtableActor } from "../roundtable";
+import type { SideChatActor } from "../sideChatRoom";
 import { apiJson } from "./apiClient";
 
 export type SessionSideChat = {
@@ -8,6 +10,9 @@ export type SessionSideChat = {
   answer: string;
   model: string;
   created: string;
+  roundId?: string | null;
+  actor?: SideChatActor | null;
+  replyToId?: string | null;
 };
 
 export function turnGrillUrl(sessionId: string, turnId: string) {
@@ -40,6 +45,9 @@ export async function loadSideChats(sessionId: string, signal: AbortSignal) {
   )).sideChats;
 }
 
-export async function askSession(body: { sessionId: string; question: string; model: string; modelReasoningEffort: string }) {
+export async function askSession(body: {
+  sessionId: string; question: string; model: string; modelReasoningEffort: string;
+  actor?: RoundtableActor | null; roundId?: string; replyToId?: string; participants?: string[];
+}) {
   return (await apiJson<{ sideChat: SessionSideChat }>("/api/session-inspector/ask", { method: "POST", body })).sideChat;
 }

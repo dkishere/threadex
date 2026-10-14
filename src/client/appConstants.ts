@@ -1,4 +1,5 @@
 import { MAX_INLINE_ATTACHMENT_BYTES, MAX_PATH_ATTACHMENT_BYTES } from "../attachmentLimits";
+import { CODEX_EFFORTS, CODEX_ULTRA_EFFORTS } from "../modelCatalog";
 import type { ApprovalPolicy, ModelReasoningEffort } from "./appTypes";
 
 export const MESSAGE_BOTTOM_THRESHOLD = 80;
@@ -15,8 +16,8 @@ export const APPROVAL_POLICY_OPTIONS: Array<{ value: ApprovalPolicy; label: stri
   { value: "untrusted", label: "Custom (config.toml)" }
 ];
 export { MODEL_OPTIONS } from "../modelCatalog";
-export const EFFORT_OPTIONS: ModelReasoningEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
-export const ULTRA_EFFORT_OPTIONS: ModelReasoningEffort[] = [...EFFORT_OPTIONS, "max", "ultra"];
+export const EFFORT_OPTIONS: readonly ModelReasoningEffort[] = CODEX_EFFORTS;
+export const ULTRA_EFFORT_OPTIONS: readonly ModelReasoningEffort[] = CODEX_ULTRA_EFFORTS;
 export const MAX_ATTACHMENTS = Number.POSITIVE_INFINITY;
 export const MAX_ATTACHMENT_BYTES = MAX_INLINE_ATTACHMENT_BYTES;
 export { MAX_PATH_ATTACHMENT_BYTES };

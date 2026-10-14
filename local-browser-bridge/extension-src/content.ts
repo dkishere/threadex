@@ -300,16 +300,66 @@ function pageValuesForUrl(url: string, mappings: InjectedMapping[]): { values: R
   return Object.keys(values).length ? { values, matchedPrefixes } : null;
 }
 
+// Prefer rare class names: they are both stable selectors and useful code-search
+// terms. Utility classes such as `flex` are too common to qualify.
+const maxAnchorClassCount = 5;
+
 function cssPath(element: Element): string | null {
+  return semanticCssPath(element) ?? structuralCssPath(element);
+}
+
+function semanticCssPath(element: Element): string | null {
+  const parts: string[] = [];
+  for (let node: Element | null = element; node && parts.length < 8; node = node.parentElement) {
+    if (node.id) { parts.unshift(`#${CSS.escape(node.id)}`); break; }
+    const anchorClass = rarestClass(node);
+    let part = node.tagName.toLowerCase() + (anchorClass ? `.${CSS.escape(anchorClass)}` : "");
+    const siblings = node.parentElement ? [...node.parentElement.children].filter((sibling) => sibling.matches(part)) : [];
+    if (siblings.length > 1) part += `:nth-of-type(${nthOfType(node)})`;
+    parts.unshift(part);
+    if (anchorClass && matchesOnly(parts.join(" > "), element)) break;
+  }
+  const selector = parts.join(" > ");
+  return selector && matchesOnly(selector, element) ? selector : null;
+}
+
+function structuralCssPath(element: Element): string | null {
   const parts: string[] = [];
   for (let node: Element | null = element; node && parts.length < 8; node = node.parentElement) {
     if (node.id) { parts.unshift(`#${CSS.escape(node.id)}`); break; }
     let part = node.tagName.toLowerCase();
     const siblings = node.parentElement ? [...node.parentElement.children].filter((sibling) => sibling.tagName === node!.tagName) : [];
-    if (siblings.length > 1) part += `:nth-of-type(${siblings.indexOf(node) + 1})`;
+    if (siblings.length > 1) part += `:nth-of-type(${nthOfType(node)})`;
     parts.unshift(part);
   }
   return parts.join(" > ") || null;
+}
+
+function rarestClass(node: Element): string | null {
+  let best: { name: string; count: number } | null = null;
+  for (const name of node.classList) {
+    if (name.startsWith("local-browser-bridge")) continue;
+    const count = document.getElementsByClassName(name).length;
+    if (count <= maxAnchorClassCount && (!best || count < best.count)) best = { name, count };
+  }
+  return best?.name ?? null;
+}
+
+function nthOfType(node: Element): number {
+  let index = 1;
+  for (let sibling = node.previousElementSibling; sibling; sibling = sibling.previousElementSibling) {
+    if (sibling.tagName === node.tagName) index += 1;
+  }
+  return index;
+}
+
+function matchesOnly(selector: string, element: Element): boolean {
+  try {
+    const matches = document.querySelectorAll(selector);
+    return matches.length === 1 && matches[0] === element;
+  } catch {
+    return false;
+  }
 }
 
 function createMenu(x: number, y: number, element: Element): HTMLElement {

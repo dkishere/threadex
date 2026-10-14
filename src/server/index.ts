@@ -1,7 +1,11 @@
-import { DEFAULT_MODEL, MODEL_CATALOG } from "../modelCatalog";
+import { DEFAULT_MODEL, MODEL_OPTIONS, isClaudeModel, modelProvider, normalizeModelId } from "../modelCatalog";
+import { buildProviderHandoff, readProviderThreadScope, type ProviderThreadScope } from "./sessionProviderThreads";
+import { createClaudeAccountRouter } from "./claudeAccountRoutes";
+import { claudeQuotaRetryAt } from "./claudeAccounts";
+import { claudeAuthHome, workspaceClaudeHome } from "./claudeHome";
 import { createWebVsCodeAnnotationsRouter } from "./webVsCodeAnnotations";
 import { createHash } from "node:crypto";
-import { WorkspaceManagerService, parseWorkspaceManagerQueuedPromptForkDraft,
+import { WorkspaceManagerService, currentThreadModel, parseWorkspaceManagerQueuedPromptForkDraft,
   workspaceManagerQueuedPromptForkQuestion } from "./workspaceManager";
 import { isSilentManagerResponse, WORKSPACE_MANAGER_MODEL, WORKSPACE_MANAGER_EFFORT,
   WORKSPACE_MANAGER_LOOP_ALERT_MODEL, WORKSPACE_MANAGER_LOOP_ALERT_EFFORT } from "../workspaceManager";
@@ -13,10 +17,15 @@ import { USER_INPUT_METHOD, inputResponse } from "../userInputRequest";
 import { isAutoModel, isAutoEffort } from "../autoModelCatalog";
 import { buildAutoModelState, selectAutoModel, shouldEnableAutoModel } from "./autoModelSelector";
 import { AutoModelSettings, createAutoModelSettingsRouter } from "./autoModelSettings";
+import { HelperModelSettings, createHelperModelSettingsRouter } from "./helperModelSettings";
+import { RoundtableActorSettings, createRoundtableActorSettingsRouter } from "./roundtableActorSettings";
 import { GlobalAgentInstructions, createGlobalAgentInstructionsRouter } from "./globalAgentInstructions";
 import { RunnerProcessRegistry } from "./runnerProcessRegistry";
 import { clientLayoutInstructions } from "./clientLayoutInstructions";
 import { createTurnGrillHandler } from "./turnGrillRoute";
+import { createRoundtableRouter, RoundtableService, roundtableHostInstructions, roundtableHostPrompt } from "./roundtableService";
+import { parseRoundtableActor, roundtableResponse, type RoundtableActor } from "../roundtable";
+import { SIDE_CHAT_MAX_ACTORS, sideChatActorSnapshot } from "../sideChatRoom";
 import { createWorkspaceSnapshotHandler } from "./workspaceSnapshotRoute";
 import { loopWorkInstructions, loopWorkIssues, loopStopReason } from "./loopMode";
 import { grillContentVersion, grillHandoff, type TurnGrill } from "../turnGrill";
@@ -24,6 +33,7 @@ import { reviseOutcomePlan } from "./lightweightTodo";
 import express from "express";
 import { createSecurity } from "./security";
 import { createQuickChatRouter } from "./quickChatRoute";
+import { createAcpRouter } from "./acp";
 import { createHtmlPreviewRouter, createHtmlPreviewUrl } from "./htmlPreview";
 import type { Request, Response } from "express";
 import { buildCodexReference, canonicalSessionId, isThreadexSessionId } from "../codexReference.js";
@@ -156,6 +166,7 @@ import {
   subagentThreadBelongsToRoot
 } from "./subagentTranscript";
 import { RunnerUpdateQueue } from "./runnerUpdateQueue";
+import { RunnerStreamForwarder } from "./runnerStreamForwarder";
 import {
   RunnerLogReplay,
   shouldRefreshRunnerHeartbeat,
@@ -271,6 +282,7 @@ type WaitSubscriptionUpdateRequest = {
 
 type SwitchSessionRequest = {
   sessionId?: string;
+  view?: "workspace-chat";
 };
 
 type SummarizeSessionsRequest = {
@@ -466,6 +478,11 @@ type ManagedSession = {
 };
 
 type RunnerJob = {
+  /** Threadex Claude account for turns on Claude models (see claudeAccountRoutes.ts). */
+  claudeAccountId?: string | null;
+  claudeAccountLabel?: string | null;
+  claudeConfigDir?: string | null;
+  claudeAuthSourceDir?: string | null;
   collaboration?: { groupId: string; fork: CollaborationFork | null; priorContext: string };
   workspaceManager?: boolean;
   managerConcurrent?: boolean;
@@ -511,6 +528,8 @@ type RunnerJob = {
   globalAgentInstructions?: string;
   recoveryContext?: SessionRecoveryContext;
   forceRecoveryOnResume?: boolean;
+  providerThread?: ProviderThreadScope;
+  providerHandoff?: string;
 };
 
 type RunnerUpdateRequest = {
@@ -608,6 +627,14 @@ type SessionQuestionRequest = {
   turnLimit?: number;
   turnOffset?: number;
   maxTextChars?: number | null;
+  /** Side chat room: the answering actor (omit for the gearbox assistant). */
+  actor?: unknown;
+  /** Side chat room: groups the replies to one user message. */
+  roundId?: string;
+  /** Side chat room: the saved reply this actor is asked to respond to. */
+  replyToId?: string;
+  /** Side chat room: names of everyone currently in the room. */
+  participants?: unknown;
 };
 
 type ExperimentalSessionRoutingRequest = {
@@ -769,7 +796,7 @@ const sessionSummarizer = new SessionSummarizer(sessionStore, undefined, async (
     sessionCategories.sync(session.workspaceId, await sessionStore.listSessions(session.workspaceId));
     categoryClassifier.schedule(session.workspaceId);
   }
-});
+}, () => helperModelSettings.read());
 const pendingAccountLogins = new Map<string, PendingAccountLogin>();
 const runnerSwitchReplayAttempts = new Map<string, number>();
 const backgroundRunningTurnDiagnostics = new Set<string>();
@@ -791,7 +818,7 @@ const runnerStartupGraceMs = Number(
 );
 const accountQuotaRefreshIntervalMs = parseDurationMs(
   process.env.ACCOUNT_QUOTA_REFRESH_INTERVAL_MS,
-  5 * 60 * 1000,
+  30_000,
   "ACCOUNT_QUOTA_REFRESH_INTERVAL_MS"
 );
 const accountQuotaRefreshInitialDelayMs = parseDurationMs(
@@ -830,6 +857,7 @@ const categoryClassifier = new CategoryClassifier(sessionStore, sessionCategorie
   categoryContextPools.schedule(workspaceId);
 });
 const autoModelSettings = new AutoModelSettings(resolve(dataDir, "typesafe-api-key"));
+const helperModelSettings = new HelperModelSettings(resolve(dataDir, "helper-models.json"));
 const globalAgentInstructions = new GlobalAgentInstructions(resolve(dataDir, "global-agent-instructions.md"));
 const runnerPath = resolve(serverDir, "promptRunner.ts");
 const tsxPath = resolve(projectRoot, "node_modules/tsx/dist/cli.mjs");
@@ -892,15 +920,24 @@ const workspaceManager = new WorkspaceManagerService(sessionStore, {
     if (!session || session.workspaceId !== input.workspaceId || !workspace) {
       throw new Error("The source task or workspace is no longer available.");
     }
+    // Draft with the model and effort the source thread is using, not a fixed model.
+    const thread = currentThreadModel((await sessionStore.listSessionTurns(session.id)).filter(turn => turn.id !== input.turnId),
+      await sessionStore.getSessionModelPreferences(session.id));
+    const codexAccount = await sessionCodexAccount(session);
     const answer = await answerTransientSessionQuestion({
       question: workspaceManagerQueuedPromptForkQuestion(input),
       context: { session }, workspace, serverUrl,
-      model: MODEL_CATALOG.luna.id, reasoningEffort: "max"
+      model: MODEL_OPTIONS.includes(normalizeModelId(thread.model)) ? thread.model : DEFAULT_MODEL,
+      reasoningEffort: isSideChatReasoningEffort(thread.effort) ? thread.effort : "max",
+      resolveClaudeConfigDir: async () => (await sessionStore.resolveClaudeAccount({
+        workspaceId: session.workspaceId, sessionId: session.id
+      }))?.configDir ?? null,
+      authRaw: codexAccount.authRaw
     });
     await recordBackgroundModelUsage({
       id: `background:queued_prompt_fork:${input.turnId}`,
       task: "queued_prompt_fork_draft", source: "app_server", workspaceId: input.workspaceId,
-      sessionId: input.sessionId, accountId: session.accountId, model: answer.model, usage: answer.usage
+      sessionId: input.sessionId, accountId: isClaudeModel(answer.model) ? null : codexAccount.accountId, model: answer.model, usage: answer.usage
     });
     return parseWorkspaceManagerQueuedPromptForkDraft(answer.answer, input.queuedPrompt);
   },
@@ -1044,8 +1081,77 @@ app.use(["/api/concurrent/sessions", "/api/collaboration/sessions"], createColla
 app.use("/api/workspace-manager", workspaceManager.router());
 app.use("/api/experimental/session-categories", createSessionCategoriesRouter(sessionStore, sessionCategories, categoryContextPools, categoryClassifier));
 app.use("/api/settings/auto-model", createAutoModelSettingsRouter(autoModelSettings));
+app.use("/api/settings/helper-models", createHelperModelSettingsRouter(helperModelSettings));
+app.use("/api/settings/roundtable-actors", createRoundtableActorSettingsRouter(new RoundtableActorSettings(resolve(dataDir, "roundtable-actors.json"))));
 app.use("/api/settings/global-instructions", createGlobalAgentInstructionsRouter(globalAgentInstructions));
 app.use("/api/quick-chat", createQuickChatRouter(resolve(dataDir, "quick-chat-sessions.json")));
+const roundtableService = new RoundtableService({
+  logDir: resolve(dataDir, "roundtable-logs"),
+  store: sessionStore, summarizerModel: () => helperModelSettings.read().summarizerModel, serverUrl,
+  recordUsage: recordBackgroundModelUsage,
+  changed: async round => {
+    await publishRunnerUpdateEvent({ id: crypto.randomUUID(), sessionId: round.sessionId, turnId: round.turnId,
+      event: ["done", "error", "stopped"].includes(round.status) ? "result" : "roundtable.progress",
+      data: { reply: roundtableResponse(round), roundtableStatus: round.status, tokenIn: round.tokenIn, tokenOut: round.tokenOut } });
+  },
+  settled: sessionId => schedulePendingTurnsForSession(sessionId, { immediate: true })
+});
+app.use("/api/roundtable", createRoundtableRouter(roundtableService, sessionStore, async body => {
+  const session = await getOrCreateSession({
+    sessionId: typeof body.sessionId === "string" ? body.sessionId : undefined,
+    workspaceId: typeof body.workspaceId === "string" ? body.workspaceId : undefined,
+    newSessionProjectId: typeof body.newSessionProjectId === "string" ? body.newSessionProjectId : undefined,
+    baseSessionId: typeof body.baseSessionId === "string" ? body.baseSessionId : undefined,
+    backgroundTask: true
+  }, String(body.message));
+  await collaborationService.assertAcceptsPrompt(session.id);
+  await sessionStore.resolveApprovalPolicy(session.id, String(body.turnId),
+    body.approvalPolicy === undefined ? undefined : normalizeApprovalPolicy(body.approvalPolicy));
+  if (body.modelPreferences && typeof body.modelPreferences === "object") {
+    await sessionStore.setSessionModelPreferences(session.id, body.modelPreferences as SessionModelPreferencesInput);
+  }
+  return session;
+}));
+app.use(createClaudeAccountRouter({
+  store: sessionStore,
+  dataDir,
+  onAccountAvailable: () => {
+    void scheduleClaudePendingTurns().catch((error) => {
+      console.warn(`Failed to schedule Claude pending turns: ${errorMessage(error)}`);
+    });
+  }
+}));
+app.use("/api/acp", createAcpRouter({
+  create: async cwd => {
+    const session = await getOrCreateSession({ newSessionCwd: cwd, backgroundTask: true }, "Agent feedback");
+    return { id: session.id, cwd: session.cwd };
+  },
+  session: async id => {
+    const session = await getSessionForRequestedId(id);
+    return session ? { id: session.id, cwd: session.cwd } : null;
+  },
+  turn: id => sessionStore.getSessionTurn(id),
+  enqueue: async (sessionId, message, turnId) => {
+    const preferences = await sessionStore.getSessionModelPreferences(sessionId);
+    const response = await fetch(`${serverUrl.replace(/\/$/, "")}/api/pending-turns`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId, message, turnId, backgroundTask: true,
+        model: preferences.selectedModel, modelReasoningEffort: preferences.selectedEffort })
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "Could not queue agent feedback.");
+    if (payload.turn?.sessionId !== sessionId || payload.turn?.userInput !== message.trim()) {
+      throw new Error("Request ID was already used for different prompt content.");
+    }
+  },
+  cancel: async (sessionId, turnId) => {
+    const response = await fetch(`${serverUrl.replace(/\/$/, "")}/api/runner/stop`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId, turnId })
+    });
+    if (!response.ok) throw new Error("Could not cancel the ACP turn.");
+  }
+}));
 app.use("/api/sessions", createWebVsCodeAnnotationsRouter(dataDir, sessionStore));
 app.use(express.static(resolve(projectRoot, "dist"), { index: "index.html" }));
 
@@ -1904,7 +2010,11 @@ app.get("/api/sessions/:sessionId/snapshot", async (req: Request<{ sessionId: st
       res.status(404).json({ error: "Session not found." });
       return;
     }
-    res.json(await getSessionSnapshot(session));
+    res.json(await getSessionSnapshot(session, false, {
+      managerHistory: req.query.view === "workspace-chat",
+      beforeTurnId: typeof req.query.beforeTurnId === "string" ? req.query.beforeTurnId : undefined,
+      pinnedTurnId: typeof req.query.turnId === "string" ? req.query.turnId : undefined
+    }));
   } catch (error) {
     res.status(500).json({ error: errorMessage(error) });
   }
@@ -2707,7 +2817,7 @@ app.get("/api/workspaces/html/:workspaceId/:sessionId/:kind/*filePath", async (r
     const previewUrl = resolveWorkspaceFilePath(realpathSync(root), realPath)
       ? createHtmlPreviewUrl(realPath, realpathSync(root)) : createHtmlPreviewUrl(realPath);
     if (req.query.format === "json") {
-      res.json({ url: previewUrl });
+      res.json({ url: previewUrl, session: session ? { id: session.id, cwd: session.cwd } : null });
       return;
     }
     res.redirect(302, previewUrl);
@@ -3344,8 +3454,11 @@ app.post("/api/accounts/advance-load-balanced", async (
   }
 });
 
-async function getSessionSnapshot(session: SessionRecord, replayRunningTurns = false) {
-  let turns = await sessionStore.listSessionTurns(session.id);
+async function getSessionSnapshot(session: SessionRecord, replayRunningTurns = false,
+  options: { managerHistory?: boolean; beforeTurnId?: string; pinnedTurnId?: string } = {}) {
+  const page = options.managerHistory ? await sessionStore.listWorkspaceManagerTurnPage(session.id, options.beforeTurnId, options.pinnedTurnId) : null;
+  const turns = page?.turns ?? await sessionStore.listSessionTurns(session.id);
+  const turnIds = page ? turns.map(turn => turn.id) : undefined;
   if (replayRunningTurns) {
     const runningTurns = turns.filter((turn) => turn.status === "running");
     if (runningTurns.length > 0) {
@@ -3358,11 +3471,11 @@ async function getSessionSnapshot(session: SessionRecord, replayRunningTurns = f
     }
   }
   const [liveItemsByTurn, approvalLiveItemsByTurn, developerInstructionsByTurn, steerMessagesByTurn, autoModelProvidersByTurn, autoModel, modelPreferences] = await Promise.all([
-    sessionStore.listSessionLiveItems(session.id),
-    sessionStore.listSessionApprovalLiveItems(session.id),
-    sessionStore.listSessionDeveloperInstructions(session.id),
-    sessionStore.listSessionSteerMessages(session.id),
-    sessionStore.listSessionAutoModelProviders(session.id),
+    sessionStore.listSessionLiveItems(session.id, turnIds),
+    sessionStore.listSessionApprovalLiveItems(session.id, turnIds),
+    sessionStore.listSessionDeveloperInstructions(session.id, turnIds),
+    sessionStore.listSessionSteerMessages(session.id, turnIds),
+    sessionStore.listSessionAutoModelProviders(session.id, turnIds),
     sessionStore.getSessionAutoModel(session.id),
     sessionStore.getWorkspaceModelPreferences(session.workspaceId)
   ]);
@@ -3373,6 +3486,7 @@ async function getSessionSnapshot(session: SessionRecord, replayRunningTurns = f
     autoModel,
     modelPreferences,
     todo,
+    ...(page ? { managerHistory: page.managerHistory } : {}),
     turns: turns.map((turn) => ({
       ...turn,
       liveItems: mergeLiveItemsById([
@@ -3388,7 +3502,7 @@ async function getSessionSnapshot(session: SessionRecord, replayRunningTurns = f
   };
 }
 
-async function getWorkspaceSnapshot({ includeActiveSession = true }: { includeActiveSession?: boolean } = {}) {
+async function getWorkspaceSnapshot({ includeActiveSession = true, managerHistory = false }: { includeActiveSession?: boolean; managerHistory?: boolean } = {}) {
   // Capture the cursor before reading the snapshot. Events committed while the
   // snapshot is being assembled will then be replayed instead of being skipped.
   const eventCursor = eventRingLog.latestPosition;
@@ -3446,7 +3560,7 @@ async function getWorkspaceSnapshot({ includeActiveSession = true }: { includeAc
       .filter((approval) => approval.decision === undefined)
       .map(publicApprovalRecord),
     activeSessionId,
-    activeSession: includeActiveSession && activeSession ? await getSessionSnapshot(activeSession) : null,
+    activeSession: includeActiveSession && activeSession ? await getSessionSnapshot(activeSession, false, { managerHistory }) : null,
     processMonitors,
     statusMonitor,
     waitEvents: waitEventRecords,
@@ -3687,7 +3801,7 @@ app.post("/api/sessions/switch", async (req: Request<object, object, SwitchSessi
     if (previousActiveSessionId && previousActiveSessionId !== session.id) {
       sessionSummarizer.noteSessionActivity(previousActiveSessionId);
     }
-    const snapshot = await getSessionSnapshot(session, true);
+    const snapshot = await getSessionSnapshot(session, true, { managerHistory: req.body.view === "workspace-chat" });
     await publishRingEvent({
       eventId: crypto.randomUUID(),
       type: "session.switched",
@@ -4066,6 +4180,22 @@ app.get("/api/sessions/:sessionId/side-chats", async (req, res) => {
   }
 });
 
+app.get("/api/session-inspector/fork-source/:sessionId/:turnId", async (req, res) => {
+  try {
+    const turn = await sessionStore.getSessionTurn(req.params.turnId);
+    if (!turn || turn.sessionId !== req.params.sessionId) {
+      res.status(404).json({ error: "Context fork source turn is unavailable." });
+      return;
+    }
+    res.json({ sessionId: turn.sessionId, requestMetadata: {
+      message: turn.requestMetadata?.message,
+      attachments: turn.requestMetadata?.attachments
+    } });
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
 app.get("/api/session-inspector/session", async (req, res) => {
   try {
     const result = await sessionStore.inspectSession(sessionInspectInputFromQuery(req.query));
@@ -4199,7 +4329,7 @@ app.post("/api/session-inspector/search", async (
 });
 
 const turnGrillHandler = createTurnGrillHandler({
-  sessionStore, serverUrl, recordUsage: recordBackgroundModelUsage
+  sessionStore, serverUrl, recordUsage: recordBackgroundModelUsage, helperModels: () => helperModelSettings.read()
 });
 const loopingTurnsBySession = new Map<string, Set<string>>();
 let loopRecoveryTimer: ReturnType<typeof setInterval> | null = null;
@@ -4366,6 +4496,25 @@ app.post("/api/session-inspector/ask", async (
     const requestedEffort = requestedEffortValue && isSideChatReasoningEffort(requestedEffortValue)
       ? requestedEffortValue
       : undefined;
+    let actor: RoundtableActor | null = null;
+    if (req.body.actor !== undefined && req.body.actor !== null) {
+      try { actor = parseRoundtableActor(req.body.actor); } catch (actorError) {
+        res.status(400).json({ error: errorMessage(actorError) });
+        return;
+      }
+    }
+    const roundId = typeof req.body.roundId === "string" && req.body.roundId ? req.body.roundId : null;
+    if (roundId && !/^[a-zA-Z0-9_-]{1,80}$/.test(roundId)) {
+      res.status(400).json({ error: "Invalid side-chat roundId." });
+      return;
+    }
+    const participants = req.body.participants ?? [];
+    if (!Array.isArray(participants) || participants.length > SIDE_CHAT_MAX_ACTORS
+      || participants.some((name) => typeof name !== "string" || !name.trim() || name.length > 80)) {
+      res.status(400).json({ error: `participants must list up to ${SIDE_CHAT_MAX_ACTORS} actor names.` });
+      return;
+    }
+    const replyToId = typeof req.body.replyToId === "string" && req.body.replyToId ? req.body.replyToId : null;
 
     const context = await sessionStore.inspectSession({
       sessionId: req.body.sessionId,
@@ -4389,13 +4538,26 @@ app.post("/api/session-inspector/ask", async (
       res.status(404).json({ error: "Session workspace not found." });
       return;
     }
+    const history = (await sessionStore.listSessionSideChats(context.session.id))?.sideChats ?? [];
+    const replyTo = replyToId ? history.find((entry) => entry.id === replyToId) ?? null : null;
+    if (replyToId && !replyTo) {
+      res.status(404).json({ error: "The side-chat message to reply to was not found." });
+      return;
+    }
+    const messageId = `side_chat_${crypto.randomUUID()}`;
+    const codexAccount = await sessionCodexAccount(context.session);
     const answer = await answerSessionQuestion({
       question,
       context: { session: context.session },
       workspace,
       serverUrl,
       model: requestedModel,
-      reasoningEffort: requestedEffort
+      reasoningEffort: requestedEffort,
+      resolveClaudeConfigDir: async () => (await sessionStore.resolveClaudeAccount({
+        workspaceId: context.session.workspaceId, sessionId: context.session.id
+      }))?.configDir ?? null,
+      authRaw: codexAccount.authRaw,
+      room: { actor, participants: participants as string[], history, replyTo, messageId }
     });
     const sourceSessionId = req.body.sourceSessionId?.trim()
       ? await resolveRequestedSessionId(req.body.sourceSessionId.trim())
@@ -4403,6 +4565,10 @@ app.post("/api/session-inspector/ask", async (
     const sourceThreadId = req.body.sourceThreadId?.trim() || null;
     const sourceTurnId = req.body.sourceTurnId?.trim() || null;
     const sideChat = await sessionStore.recordSessionSideChat({
+      id: messageId,
+      roundId,
+      actor: actor ? sideChatActorSnapshot(actor) : null,
+      replyToId,
       sessionId: context.session.id,
       workspaceId: context.session.workspaceId,
       sourceSessionId,
@@ -4421,7 +4587,8 @@ app.post("/api/session-inspector/ask", async (
       source: "app_server",
       workspaceId: context.session.workspaceId,
       sessionId: context.session.id,
-      accountId: context.session.accountId,
+      // Claude usage is not attributable to a Codex account.
+      accountId: isClaudeModel(answer.model) ? null : codexAccount.accountId,
       model: answer.model,
       usage: answer.usage
     });
@@ -4776,6 +4943,16 @@ app.post("/api/runner/stop", async (req: Request<object, object, RunnerStopReque
     if (!turn) {
       res.status(404).json({ error: "Runner turn not found." });
       return;
+    }
+
+    if (turn.requestMetadata?.roundtable === true) {
+      const round = await sessionStore.getRoundtableRound(turn.id);
+      if (round && round.status !== "host" && round.status !== "done") {
+        await roundtableService.stop(turn.id);
+        await schedulePendingTurnsForSession(turn.sessionId);
+        res.json({ ok: true, sessionId: turn.sessionId, turnId: turn.id });
+        return;
+      }
     }
 
     if (turn.status !== "running") {
@@ -5733,9 +5910,18 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
   let claimedTurnId: string | null = null;
   try {
     const sessionMessage = requestedMessage || "Retry pending turn";
-    const requestForPreparation = retryPending && retryTurn?.requestMetadata
+    let requestForPreparation = retryPending && retryTurn?.requestMetadata
       ? { ...retryTurn.requestMetadata, ...req.body } as ChatRequest
       : req.body;
+    let roundtableSynthesisPrompt: string | undefined;
+    if (retryTurn?.requestMetadata?.roundtable === true) {
+      const round = await sessionStore.getRoundtableRound(retryTurn.id);
+      if (!round || round.status !== "host") throw new Error("Round table actors are not ready for the host response.");
+      roundtableSynthesisPrompt = roundtableHostPrompt(round);
+      requestForPreparation = { ...requestForPreparation, model: round.hostModel, modelReasoningEffort: round.hostEffort,
+        autoModel: false, executionMode: "default", forcePlan: false, skills: [],
+        developerInstructions: roundtableHostInstructions(round) };
+    }
     const chatRequest = await prepareAutoLoadBalancedChatRequest(requestForPreparation);
     const session = await getOrCreateSession(chatRequest, sessionMessage);
     const workspaceManagerRole = await sessionStore.resolveSessionWorkspaceManager(session.id);
@@ -6061,6 +6247,7 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
       ? buildSessionRecoveryContext({
           session: recoverySession,
           turns: recoveryTurns,
+          steerMessagesByTurn: await sessionStore.listSessionSteerMessages(session.id),
           currentTurnId: turnId,
           sourceThreadId: session.threadId ?? null,
           reason: session.accountChanged ? "account_changed" : "thread_unavailable"
@@ -6120,7 +6307,7 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
       managerLoopAlert,
       sessionId: session.id,
       turnId,
-      message,
+      message: roundtableSynthesisPrompt ?? message,
       threadId: session.threadId ?? undefined,
       model,
       modelReasoningEffort,
@@ -6276,6 +6463,7 @@ async function shutdown(signal: string) {
   clearInterval(watchdog);
   if (loopRecoveryTimer) clearInterval(loopRecoveryTimer);
   collaborationService.stop();
+  roundtableService.stopAll();
   webVsCodeWalkthroughService?.stop();
   webVsCodeWalkthroughService = null;
   stopCodexSessionTitlePollJob();
@@ -6932,6 +7120,9 @@ async function schedulePendingTurnsForAccount(accountId: string, options: { imme
 }
 
 function pendingUsesWorkspaceAccountPool(pending: PendingSessionTurnCandidate) {
+  if (isClaudeModel(pending.turn.model)) {
+    return false;
+  }
   if (pendingTurnReason(pending.turn) === "auth") {
     return false;
   }
@@ -7049,6 +7240,13 @@ async function schedulePendingTurn(
 }
 
 async function pendingResetAt(pending: PendingSessionTurnCandidate): Promise<number | null> {
+  if (isClaudeModel(pending.turn.model)) {
+    const claudeAccount = await sessionStore.resolveClaudeAccount({
+      workspaceId: pending.session.workspaceId,
+      sessionId: pending.session.id
+    });
+    return claudeQuotaRetryAt(claudeAccount?.quotaSnapshot ?? null);
+  }
   const accounts = await pendingQuotaAccounts(pending);
   const pendingReason = pendingTurnReason(pending.turn);
   const candidateAccounts = pendingReason === "rate_limit"
@@ -7064,6 +7262,9 @@ async function pendingResetAt(pending: PendingSessionTurnCandidate): Promise<num
 }
 
 async function pendingQuotaAccounts(pending: PendingSessionTurnCandidate): Promise<AccountRecord[]> {
+  if (isClaudeModel(pending.turn.model)) {
+    return [];
+  }
   if (pendingUsesWorkspaceAccountPool(pending)) {
     return sessionStore.listAccountsForWorkspace(pending.session.workspaceId);
   }
@@ -7073,6 +7274,18 @@ async function pendingQuotaAccounts(pending: PendingSessionTurnCandidate): Promi
       ? await sessionStore.getAccount(pending.session.accountId)
       : null;
   return account ? [account] : [];
+}
+
+async function scheduleClaudePendingTurns() {
+  const pendingTurns = (await sessionStore.listPendingSessionTurns())
+    .filter((pending) => isClaudeModel(pending.turn.model) && pendingTurnReason(pending.turn) === "rate_limit");
+  for (const pending of pendingTurns) {
+    await schedulePendingTurn(pending);
+  }
+}
+
+function runnerErrorResponse(message: string) {
+  return /^Claude\b/.test(message) ? message : `Codex error: ${message}`;
 }
 
 async function runPendingTurnAutomatically(turnId: string) {
@@ -7108,6 +7321,10 @@ async function runPendingTurnAutomatically(turnId: string) {
   const pendingReason = pendingTurnReason(pending.turn);
   if (pendingReason === "stopped" || await managerActivityPaused(pending)) {
     return;
+  }
+  if (pending.turn.requestMetadata?.roundtable === true) {
+    const round = await sessionStore.getRoundtableRound(turnId);
+    if (round?.status !== "host") { roundtableService.resume(turnId); return; }
   }
   if (pendingReason === "rate_limit") {
     const resetAt = await pendingResetAt(pending);
@@ -7658,10 +7875,46 @@ async function spawnOwnedPromptRunner(
   mkdirSync(job.codexHome, { recursive: true, mode: 0o700 });
   rmSync(job.controlPath, { force: true });
 
+  const claudeAccount = isClaudeModel(job.model)
+    ? await sessionStore.resolveClaudeAccount({ workspaceId: job.workspaceId, sessionId: job.sessionId })
+    : null;
+  if (claudeAccount) {
+    void sessionStore.touchClaudeAccount(claudeAccount.id).catch(() => undefined);
+  }
+  const codexHome = await prepareRunnerCodexHome(job);
+  const claudeAuthSourceDir = claudeAccount?.configDir ?? claudeAuthHome();
+  const claudeConfigDir = isClaudeModel(job.model) ? workspaceClaudeHome(dataDir, job.workspaceId, claudeAuthSourceDir) : null;
+  // Concurrent workers use intentionally ephemeral forks, not resumable bindings.
+  if (!job.collaboration?.fork) {
+    const provider = modelProvider(job.model);
+    const scope: ProviderThreadScope = {
+      provider, cwd: resolve(job.cwd),
+      nativeHome: resolve(provider === "codex" ? codexHome
+        : claudeConfigDir!),
+      accountId: provider === "codex" ? job.accountId ?? null : claudeAccount?.id ?? null
+    };
+    const thread = await sessionStore.getSessionProviderThread({ ...scope, sessionId: job.sessionId, legacyThreadId: job.threadId,
+      allowLegacy: provider !== "claude" });
+    job.providerThread = scope;
+    job.threadId = thread?.threadId ?? null;
+    job.providerHandoff = thread ? buildProviderHandoff({ thread,
+      turns: await sessionStore.listSessionTurns(job.sessionId), currentTurnId: job.turnId,
+      steerMessagesByTurn: await sessionStore.listSessionSteerMessages(job.sessionId) }) : undefined;
+    if (!thread && provider === "claude" && !job.recoveryContext) {
+      const session = await sessionStore.getSession(job.sessionId);
+      if (session) job.recoveryContext = buildSessionRecoveryContext({ session,
+        turns: await sessionStore.listSessionTurns(job.sessionId), currentTurnId: job.turnId,
+        steerMessagesByTurn: await sessionStore.listSessionSteerMessages(job.sessionId) }) ?? undefined;
+    }
+  }
   const runnerJob = {
     ...job,
     turnNumber: (await sessionStore.getSessionTurnReferences({ sessionId: job.sessionId })).find(turn => turn.turnId === job.turnId)?.turnNumber,
-    codexHome: await prepareRunnerCodexHome(job)
+    codexHome,
+    ...(claudeConfigDir ? { claudeConfigDir, claudeAuthSourceDir } : {}),
+    ...(claudeAccount
+      ? { claudeAccountId: claudeAccount.id, claudeAccountLabel: claudeAccount.email ? `${claudeAccount.name} (${claudeAccount.email})` : claudeAccount.name }
+      : {})
   };
   const fileName = runnerFileName(job.turnId);
   const jobPath = resolve(runnerJobDir, `${fileName}.json`);
@@ -9165,7 +9418,7 @@ async function appendRunnerResponseToTurnLog(
     status = "todo";
   } else if (update.event === "error") {
     source = "runner.error";
-    agentResponse = `Codex error: ${objectString(update.data, "message") ?? "Unknown error"}`;
+    agentResponse = runnerErrorResponse(objectString(update.data, "message") ?? "Unknown error");
     status = isAccountLoginRequiredMessage(objectString(update.data, "message")) ? "todo" : "done";
   }
 
@@ -9202,6 +9455,14 @@ async function applyRunnerUpdate(
   await persistRunnerUsageSamples(update);
 
   const runnerThreadId = objectString(update.data, "threadId") ?? objectString(update.data, "thread_id");
+  const providerThread = readProviderThreadScope(readObject(update.data)?.providerThread);
+  if (runnerThreadId && providerThread && (update.event === "session" || update.event === "result")) {
+    await sessionStore.recordSessionProviderThread({ ...providerThread, sessionId: update.sessionId,
+      turnId: update.turnId, threadId: runnerThreadId, completed: update.event === "result", logPath: update.logPath });
+  } else if (runnerThreadId && (update.event === "session" || update.event === "result")) {
+    await sessionStore.recordSessionNativeThread({ sessionId: update.sessionId, turnId: update.turnId,
+      threadId: runnerThreadId, logPath: update.logPath });
+  }
   if (runnerThreadId) {
     await sessionStore.upsertSession({
       id: update.sessionId,
@@ -9312,7 +9573,9 @@ async function applyRunnerUpdate(
       sessionStore.getSessionTurn(update.turnId),
       sessionStore.getSession(update.sessionId)
     ]);
-    const pendingLoadBalance = pendingLoadBalanceForUpdate({
+    // Claude limits wait for the Claude account to reset; they never rotate Codex accounts.
+    const claudeTurn = isClaudeModel(currentTurn?.model);
+    const pendingLoadBalance = claudeTurn ? false : pendingLoadBalanceForUpdate({
       pendingReason,
       persistedLoadBalance: currentTurn?.pendingLoadBalance ?? null,
       workspaceLoadBalanceEnabled: autoLoadBalanceWorkspaceIds.has(session?.workspaceId ?? "")
@@ -9333,7 +9596,7 @@ async function applyRunnerUpdate(
       return false;
     }
     if (pendingReason === "rate_limit") {
-      void advanceAutoLoadBalanceAfterLimit(update.sessionId, pendingLoadBalance)
+      void (claudeTurn ? Promise.resolve() : advanceAutoLoadBalanceAfterLimit(update.sessionId, pendingLoadBalance))
         .catch((error) => {
           console.warn(`Failed to auto advance after usage limit for ${update.sessionId}: ${errorMessage(error)}`);
         })
@@ -9359,7 +9622,7 @@ async function applyRunnerUpdate(
       id: update.turnId,
       agentResponse: loginRequired
         ? "Account authentication failed. The original prompt is saved and will be retried after login or an account switch."
-        : `Codex error: ${message}`,
+        : runnerErrorResponse(message),
       tokenIn: 0,
       tokenOut: 0,
       status: loginRequired ? "todo" : "done",
@@ -10093,15 +10356,12 @@ async function streamRunnerLog(
     childExitCode = code;
   });
 
-  while (!closed && !completed) {
-    const entries = readNewRunnerEntries(logPath, offset, buffer, jsonlIndex);
-    offset = entries.offset;
-    buffer = entries.buffer;
-    jsonlIndex = entries.jsonlIndex;
-
-    for (const entry of entries.items) {
-      await applyRunnerLogEntry(entry, logPath, "live");
-      emitRunnerEntry(res, entry);
+  const forwarder = new RunnerStreamForwarder<IndexedRunnerLogEntry>({
+    apply: (entry) => applyRunnerLogEntry(entry, logPath, "live"),
+    itemKey: runnerItemEntryKey,
+    isTerminal: isRunnerTerminalEntry,
+    emit: (entry) => {
+      if (!closed) emitRunnerEntry(res, entry);
       if (entry.event === "done") {
         sawDone = true;
       }
@@ -10109,6 +10369,27 @@ async function streamRunnerLog(
         completed = true;
       }
     }
+  });
+  let replayingBacklog = true;
+
+  while (!closed && !completed) {
+    const entries = readNewRunnerEntries(logPath, offset, buffer, jsonlIndex);
+    offset = entries.offset;
+    buffer = entries.buffer;
+    jsonlIndex = entries.jsonlIndex;
+    const items = entries.items;
+    // The log is read in chunks; coalesce the whole existing backlog at once.
+    while (replayingBacklog) {
+      const more = readNewRunnerEntries(logPath, offset, buffer, jsonlIndex);
+      offset = more.offset;
+      buffer = more.buffer;
+      jsonlIndex = more.jsonlIndex;
+      if (more.items.length === 0) break;
+      items.push(...more.items);
+    }
+    replayingBacklog = false;
+
+    await forwarder.forward(items);
 
     if (completed || closed) {
       if (completed && !sawDone && !closed) {
@@ -10125,16 +10406,8 @@ async function streamRunnerLog(
       offset = finalEntries.offset;
       buffer = finalEntries.buffer;
       jsonlIndex = finalEntries.jsonlIndex;
-      for (const entry of finalEntries.items) {
-        await applyRunnerLogEntry(entry, logPath, "live");
-        emitRunnerEntry(res, entry);
-        if (entry.event === "done") {
-          sawDone = true;
-        }
-        if (isRunnerTerminalEntry(entry)) {
-          completed = true;
-        }
-      }
+      await forwarder.forward(finalEntries.items);
+      await forwarder.flush();
 
       if (!completed) {
         emit(res, "error", {
@@ -10151,6 +10424,13 @@ async function streamRunnerLog(
 
     await sleep(runnerPollMs);
   }
+}
+
+function runnerItemEntryKey(entry: IndexedRunnerLogEntry) {
+  if (entry.event !== "item") return null;
+  const item = readObject(entry.data);
+  const id = readString(item?.id);
+  return id ? JSON.stringify([readString(item?.originThreadId) ?? "", id]) : null;
 }
 
 function emitRunnerEntry(res: Response, entry: IndexedRunnerLogEntry) {
@@ -10446,6 +10726,10 @@ async function diagnoseRunningTurn(turn: SessionTurnRecord, source: string, now 
 }
 
 async function diagnoseRunningTurnOnce(turn: SessionTurnRecord, source: string, now: number) {
+  if (turn.requestMetadata?.roundtable === true) {
+    const round = await sessionStore.getRoundtableRound(turn.id);
+    if (round && round.status !== "host" && round.status !== "done") return roundtableService.recover(round);
+  }
   const replayedTerminal = await replayRunnerLogForTurn(turn);
   if (replayedTerminal) {
     return true;
@@ -11185,6 +11469,17 @@ function errorMessage(error: unknown) {
 function normalizeUploadedAttachmentMimeType(value: string) {
   const mimeType = value.trim().toLowerCase().split(";", 1)[0] ?? "";
   return /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/.test(mimeType) ? mimeType : "application/octet-stream";
+}
+
+/**
+ * The Threadex-managed Codex login for helper agents on a session: the session's account,
+ * else the workspace's active account. Like round tables, never rely on the workspace
+ * home's auth.json, whose token can be stale and fail with 401.
+ */
+async function sessionCodexAccount(session: { workspaceId: string; accountId: string | null }) {
+  const accountId = session.accountId ?? (await sessionStore.getActiveAccount(session.workspaceId))?.id ?? null;
+  const auth = accountId ? await sessionStore.getAccountAuth(accountId) : null;
+  return { accountId, authRaw: auth?.authRaw ?? null };
 }
 
 function isLoopbackClient(req: Request) {

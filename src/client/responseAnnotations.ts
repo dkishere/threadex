@@ -29,6 +29,7 @@ export type ResponseAnnotation = {
 
 export type ParsedResponseAnnotations = {
   annotations: ResponseAnnotation[];
+  request: string;
   content: string;
 };
 
@@ -119,6 +120,7 @@ export function parseResponseAnnotations(value: string): ParsedResponseAnnotatio
 
   return {
     annotations,
+    request,
     content: [...comments, request].filter(Boolean).join("\n\n")
   };
 }

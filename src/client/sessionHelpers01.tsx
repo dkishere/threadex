@@ -31,6 +31,29 @@ export function steerSegmentFromMessage(ctx, message) {
 
 export function mergeSnapshotSegmentsWithLocalSteers(ctx, snapshotSegments, existingSegments = [], preservedSteers = []) {
     const { appendSteerSegment, compareSteerMessages, isDisplayableMessageSegment, normalizeMessageSegments, steerSegmentFromMessage } = ctx;
+    // Snapshot refreshes can race commentary classification. Reconcile the
+    // text/card identity before merging, in either direction, so an older
+    // snapshot cannot resurrect text already replaced by a commentary card.
+    const commentaryBySource = new Map();
+    for (const segment of [...existingSegments, ...snapshotSegments]) {
+        if (segment.type === "live" && segment.item.itemType === "agent_message" && segment.item.comment) {
+            commentaryBySource.set(`agent:${segment.id.slice("live:".length)}`, segment);
+        }
+    }
+    const reconcileCommentary = (segments) => {
+        const seen = new Set();
+        return segments.flatMap((segment) => {
+            const source = segment.type === "text" ? segment.sourceId ?? segment.id
+                : segment.type === "live" ? `agent:${segment.id.slice("live:".length)}` : null;
+            const comment = commentaryBySource.get(source);
+            if (!comment) return [segment];
+            if (seen.has(source)) return [];
+            seen.add(source);
+            return [comment];
+        });
+    };
+    snapshotSegments = reconcileCommentary(snapshotSegments);
+    existingSegments = reconcileCommentary(existingSegments);
     const displayExisting = existingSegments.filter(isDisplayableMessageSegment);
     if (displayExisting.length === 0) {
         return [...preservedSteers]
@@ -149,6 +172,22 @@ export function upsertLiveSegment(ctx, segments, item) {
     if (!isDisplayableLiveItem(displayItem)) {
         return existingIndex === -1 ? segments : segments.filter((segment) => segment.id !== segmentId);
     }
+    // Claude only classifies text as commentary after it has streamed as plain
+    // text; the structured comment replaces that text in place.
+    const streamedTextId = displayItem.itemType === "agent_message" && displayItem.comment ? `agent:${liveItemKey(displayItem)}` : null;
+    if (existingIndex === -1 && streamedTextId && segments.some((segment) => segment.type === "text" && (segment.sourceId ?? segment.id) === streamedTextId)) {
+        let replaced = false;
+        return segments.flatMap((segment) => {
+            if (segment.type !== "text" || (segment.sourceId ?? segment.id) !== streamedTextId) {
+                return [segment];
+            }
+            if (replaced) {
+                return [];
+            }
+            replaced = true;
+            return [{ id: segmentId, type: "live", item: displayItem }];
+        });
+    }
     if (existingIndex === -1) {
         return [
             ...segments,
@@ -195,8 +234,14 @@ export function applyLiveItemToMessage(ctx, message, item) {
     }
     const normalizedLiveItems = normalizeLiveItems(nextItems);
     const segments = normalizeMessageSegments(upsertLiveSegment(message.segments ?? [], displayItem));
+    // Drop streamed text that a commentary item replaced from the reply text too.
+    const keptSegmentIds = new Set(segments.map((segment) => segment.id));
+    const content = (message.segments ?? [])
+        .filter((segment) => segment.type === "text" && !keptSegmentIds.has(segment.id))
+        .reduce((text, segment) => text.replace(segment.text, () => ""), message.content ?? "");
     return {
         ...message,
+        content,
         liveItems: normalizedLiveItems,
         segments,
         pending: terminal ? false : isDisplayable ? true : message.pending

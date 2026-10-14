@@ -190,3 +190,7 @@
 .workspace-task-activity-comment .workspace-task-activity[data-kind="thinking"] { color: #9270d1; }
 .workspace-task-activity-comment .workspace-task-activity[data-kind="command"],
 .workspace-task-activity-comment .workspace-task-activity[data-kind="tool"] { color: #b57920; }
+.workspace-manager-history { display: grid; justify-items: center; gap: 8px; padding: 12px 0; }
+.workspace-manager-history button { display: inline-flex; align-items: center; gap: 6px; }
+.workspace-manager-history svg { width: 14px; height: 14px; }
+.workspace-manager-history p { margin: 0; color: #b42318; font-size: 13px; }

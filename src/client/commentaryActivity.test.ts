@@ -130,7 +130,7 @@ test("keeps action groups before the first comment at top level", () => {
   assert.equal(entries[1]?.kind, "comment_activity");
 });
 
-test("promotes a comment type to edit when its activities contain edits", () => {
+test("preserves inferred comment types when activities contain edits", () => {
   const entries = attachCommentaryActivities([
     comment("editing"),
     editGroup("edit", ["src/client/App.tsx"])
@@ -138,10 +138,12 @@ test("promotes a comment type to edit when its activities contain edits", () => 
   const entry = entries[0];
   assert.equal(entry?.kind, "comment_activity");
   if (entry?.kind !== "comment_activity") return;
-  assert.equal(commentaryTypeForActivities(entry.item.comment!.extracts[0].type, entry.activities), "edit");
+  for (const type of ["action", "answer", "verification", "solution", "wait", "edit"] as const) {
+    assert.equal(commentaryTypeForActivities(type, entry.activities), type);
+  }
 });
 
-test("promotes a comment type to edit for edit and in-place sed commands", () => {
+test("preserves inferred action type for edit and in-place sed commands", () => {
   for (const command of [
     "edit src/client/App.tsx",
     "sed -i '' 's/old/new/' src/client/App.tsx",
@@ -152,7 +154,7 @@ test("promotes a comment type to edit for edit and in-place sed commands", () =>
     const entry = entries[0];
     assert.equal(entry?.kind, "comment_activity");
     if (entry?.kind !== "comment_activity") continue;
-    assert.equal(commentaryTypeForActivities(entry.item.comment!.extracts[0].type, entry.activities), "edit");
+    assert.equal(commentaryTypeForActivities(entry.item.comment!.extracts[0].type, entry.activities), "action");
   }
 });
 
@@ -170,7 +172,7 @@ test("preserves the generated comment type for unrelated and read-only sed comma
   }
 });
 
-test("corrects a generated edit type for read-only sed commands", () => {
+test("preserves a generated edit type for read-only sed commands", () => {
   for (const command of [
     "sed -n '1,20p' src/client/App.tsx",
     "sed -e 's/old/new/p' -n src/client/App.tsx",
@@ -180,7 +182,7 @@ test("corrects a generated edit type for read-only sed commands", () => {
     const entry = entries[0];
     assert.equal(entry?.kind, "comment_activity");
     if (entry?.kind !== "comment_activity") continue;
-    assert.equal(commentaryTypeForActivities("edit", entry.activities), "action");
+    assert.equal(commentaryTypeForActivities("edit", entry.activities), "edit");
   }
 });
 
@@ -197,7 +199,7 @@ test("keeps a generated edit type for in-place sed commands", () => {
   }
 });
 
-test("corrects a generated edit type when mixed command activity has no edit evidence", () => {
+test("preserves a generated edit type when mixed command activity has no edit evidence", () => {
   const entries = attachCommentaryActivities([
     comment("mixed"),
     commandGroup("sed", 1, "sed -n '1,20p' src/client/App.tsx"),
@@ -206,7 +208,7 @@ test("corrects a generated edit type when mixed command activity has no edit evi
   const entry = entries[0];
   assert.equal(entry?.kind, "comment_activity");
   if (entry?.kind !== "comment_activity") return;
-  assert.equal(commentaryTypeForActivities("edit", entry.activities), "action");
+  assert.equal(commentaryTypeForActivities("edit", entry.activities), "edit");
 });
 
 test("turn issue tracker accumulates delta comments and their later solutions", () => {
@@ -226,6 +228,6 @@ test("turn issue tracker accumulates delta comments and their later solutions", 
   });
 });
 
-test("preserves a generated edit type until activity provides stronger evidence", () => {
+test("preserves a generated edit type without activities", () => {
   assert.equal(commentaryTypeForActivities("edit", []), "edit");
 });

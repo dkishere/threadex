@@ -90,7 +90,7 @@ test("force-plan instructions keep wrapper language separate and require a concr
   assert.match(FORCE_TODO_PLAN_DEVELOPER_INSTRUCTIONS, /MUST conduct exactly one focused grill-me round/);
   assert.match(FORCE_TODO_PLAN_DEVELOPER_INSTRUCTIONS, /even when the request initially appears clear/);
   assert.match(FORCE_TODO_PLAN_DEVELOPER_INSTRUCTIONS, /end the turn without calling todo_set_plan/);
-  assert.match(FORCE_TODO_PLAN_DEVELOPER_INSTRUCTIONS, /Do not inspect files, search the workspace, browse, run commands/);
+  assert.match(FORCE_TODO_PLAN_DEVELOPER_INSTRUCTIONS, /Do not inspect files, search the workspace, browse, run other commands/);
   assert.match(FORCE_TODO_PLAN_DEVELOPER_INSTRUCTIONS, /another capable agent could execute the plan without inferring missing work/);
   assert.match(FORCE_TODO_PLAN_DEVELOPER_INSTRUCTIONS, /read-only both before and after plan creation/);
   assert.match(FORCE_TODO_PLAN_DEVELOPER_INSTRUCTIONS, /chronological, not a final-state check/);
@@ -99,7 +99,7 @@ test("force-plan instructions keep wrapper language separate and require a concr
   assert.match(CONTINUE_TODO_PLAN_USER_SUFFIX, /use the user's answers/);
   assert.match(CONTINUE_TODO_PLAN_USER_SUFFIX, /Do not repeat questions/);
   assert.match(CONTINUE_TODO_PLAN_DEVELOPER_INSTRUCTIONS, /first task-related tool action MUST be one successful/);
-  assert.match(CONTINUE_TODO_PLAN_DEVELOPER_INSTRUCTIONS, /mcp__session_inspector__todo_set_plan/);
+  assert.match(CONTINUE_TODO_PLAN_DEVELOPER_INSTRUCTIONS, /session-inspector todo_set_plan/);
 
   assert.match(TODO_PLAN_MODE_DEVELOPER_INSTRUCTIONS, /If either is materially unclear/);
   assert.doesNotMatch(TODO_PLAN_MODE_DEVELOPER_INSTRUCTIONS, /MUST conduct exactly one focused grill-me round/);
@@ -116,7 +116,7 @@ test("todo clarification state remains recognizable until plan items exist", () 
   }), false);
   assert.equal(isTodoPlanAwaitingClarification({
     items: [],
-    control: { pauseReason: "Initial Todo MCP plan created for review. Execution has not started." }
+    control: { pauseReason: "Initial Todo CLI plan created for review. Execution has not started." }
   }), false);
 });
 

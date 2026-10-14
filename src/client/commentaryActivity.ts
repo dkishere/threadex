@@ -81,58 +81,9 @@ export function commentaryActivityCounts(activities: TimelineActivity[]) {
 
 export function commentaryTypeForActivities(
   type: StructuredCommentType,
-  activities: TimelineActivity[]
+  _activities: TimelineActivity[]
 ): StructuredCommentType {
-  if (activities.some((activity) => activityIndicatesEdit(activity))) return "edit";
-  if (type === "edit" && activities.length > 0) return "action";
   return type;
-}
-
-function activityIndicatesEdit(activity: TimelineActivity) {
-  return activity.groupType === "edit" || activity.item.itemType === "file_change" || (
-    activity.item.itemType === "command_execution" &&
-    commandIndicatesEdit(activity.item.command)
-  );
-}
-
-function commandIndicatesEdit(command: string) {
-  return shellCommandSources(command).some((source) => source
-    .split(/&&|\|\||[;|\n]/)
-    .some((segment) => shellSegmentIndicatesEdit(segment)));
-}
-
-function shellCommandSources(command: string) {
-  const sources = [command];
-  for (const match of command.matchAll(/(?:^|\s)-(?:l)?c\s+(?:"([^"]*)"|'([^']*)')/gi)) {
-    const shellPayload = match[1] ?? match[2];
-    if (shellPayload) sources.push(shellPayload);
-  }
-  return sources;
-}
-
-function shellSegmentIndicatesEdit(segment: string) {
-  const words = segment.trim().replace(/^[({]+/, "").split(/\s+/).filter(Boolean);
-  let index = 0;
-  while (index < words.length) {
-    const word = words[index]?.replace(/^["']+|["']+$/g, "") ?? "";
-    const commandName = word.split("/").at(-1)?.toLowerCase() ?? "";
-    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) {
-      index += 1;
-      continue;
-    }
-    if (commandName === "env" || commandName === "sudo" || commandName === "command" || commandName === "exec" || commandName === "nohup") {
-      index += 1;
-      while (words[index]?.startsWith("-")) index += 1;
-      continue;
-    }
-    if (commandName === "edit") return true;
-    if (commandName !== "sed") return false;
-    return words.slice(index + 1).some((argument) => {
-      const value = argument.replace(/^["']+|["']+$/g, "");
-      return /^--in-place(?:=|$)/.test(value) || /^-[^-]*i/.test(value);
-    });
-  }
-  return false;
 }
 
 function isStructuredCommentEntry(entry: TimelineEntry): entry is TimelineItemEntry & TWithComment {

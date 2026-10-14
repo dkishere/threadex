@@ -4,6 +4,34 @@ import { AUTO_MODEL_ORDER, MODEL_OPTIONS, defaultGearProfiles, normalizeModelId,
 import { AUTO_MODEL_CHOICES } from "./autoModelCatalog";
 import { MODEL_OPTIONS as composerModels } from "./client/appConstants";
 import { modelOptionLabel, normalizeStoredModel } from "./client/sessionHelpers04";
+import { modelEfforts, normalizeModelEffort } from "./modelCatalog";
+import { roundtableEfforts, parseRoundtableActors, newRoundtableActor } from "./roundtable";
+import { normalizeEffortForModel } from "./client/sessionHelpers04";
+import { updateGearProfile } from "./client/sessionActions05";
+
+test("Claude gears and actors share provider effort choices and model-switch normalization", () => {
+  for (const model of ["opus", "sonnet", "haiku", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]) {
+    assert.deepEqual(modelEfforts(model), ["low", "medium", "high", "xhigh", "max"]);
+    assert.equal(roundtableEfforts(model), modelEfforts(model));
+    assert.equal(normalizeModelEffort(model, "minimal"), "low");
+    assert.equal(normalizeModelEffort(model, "ultra"), "max");
+    assert.equal(normalizeEffortForModel({ AUTO_MODEL_VALUE: "auto" }, "max", model), "max");
+    let gears = [{ model: "gpt-6-luna", effort: "ultra" }];
+    updateGearProfile({ AUTO_MODEL_VALUE: "auto", modelPreferencesEditRevisionRef: { current: 0 },
+      setGearProfiles: (update: (current: typeof gears) => typeof gears) => { gears = update(gears); }
+    }, 0, { model });
+    assert.equal(gears[0].effort, "max");
+    const actors = [newRoundtableActor({ model, effort: "max" }), newRoundtableActor({ model, effort: "minimal" })];
+    actors[0].name = "First";
+    actors[1].name = "Second";
+    assert.equal(parseRoundtableActors(actors)[0].effort, "max");
+    assert.equal(actors[1].effort, "low");
+    assert.throws(() => parseRoundtableActors([{ ...actors[0], effort: "minimal" }, actors[1]]));
+  }
+  assert.deepEqual(modelEfforts("gpt-5.4"), ["minimal", "low", "medium", "high", "xhigh"]);
+  assert.ok(modelEfforts("gpt-6-luna").includes("ultra"));
+  assert.equal(normalizeModelEffort("gpt-5.4", "max"), "xhigh");
+});
 
 test("composer, persisted gears and Auto share the catalog", () => {
   assert.equal(composerModels, MODEL_OPTIONS);

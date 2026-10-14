@@ -71,6 +71,61 @@ test("Ask history loads on first open, stays loaded across tabs, and appends the
   expect(inspectorReads).toBe(0);
 });
 
+test("Side chat room: added actors replace the default, all answer, @mentions narrow, and replies name another actor", async ({ page, request }) => {
+  const session = scenarioSessions.switchBeta;
+  await selectSession(request, session.id);
+  await page.addInitScript(() => localStorage.removeItem(`threadex.sideChatActors:${new URLSearchParams(location.search).get("sessionId")}`));
+  await page.route("**/api/settings/roundtable-actors", route => route.fulfill({ json: { revision: 1, actors: [
+    { id: "critic", name: "Critic", model: "gpt-5.5", effort: "high", rolePrompt: "Challenge it", isDefault: false },
+    { id: "builder", name: "Builder", model: "gpt-5.5", effort: "low", rolePrompt: "", isDefault: false }
+  ] } }));
+  await page.route("**/api/sessions/*/side-chats", route => route.fulfill({ json: { sideChats: [] } }));
+  const asks: { question: string; actor?: { name: string }; roundId?: string; replyToId?: string; participants?: string[] }[] = [];
+  await page.route("**/api/session-inspector/ask", route => {
+    const body = route.request().postDataJSON();
+    asks.push(body);
+    const { actor } = body;
+    return route.fulfill({ json: { sideChat: { id: `answer-${asks.length}`, sessionId: session.id, question: body.question, roundId: body.roundId,
+      replyToId: body.replyToId ?? null, actor: actor ? { id: actor.id, name: actor.name, model: actor.model, effort: actor.effort } : null,
+      answer: `${actor?.name ?? "Default"} answer ${asks.length}`, model: actor?.model ?? "fixture", created: new Date().toISOString() } } });
+  });
+  await page.goto(`/?workspaceId=default&sessionId=${session.id}`);
+  await page.getByRole("tab", { name: "Side chat", exact: true }).click();
+  const panel = page.getByRole("complementary", { name: "Read-only side chat" });
+  await expect(panel.getByRole("complementary", { name: "Side chat model gears" })).toBeVisible();
+  await panel.getByRole("combobox", { name: "Add actor" }).selectOption("critic");
+  await panel.getByRole("combobox", { name: "Add actor" }).selectOption("builder");
+  await expect(panel.getByRole("complementary", { name: "Side chat model gears" })).toHaveCount(0);
+  const composerBox = await panel.locator(".side-chat-composer").boundingBox();
+  const toolbarBox = await panel.locator(".side-chat-composer .composer-bar").boundingBox();
+  expect(Math.abs(toolbarBox!.x - composerBox!.x), "without the gearbox the toolbar fills the composer width").toBeLessThan(1);
+
+  await panel.getByRole("textbox").fill("Ship it?");
+  await panel.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(panel).toContainText("Critic answer");
+  await expect(panel).toContainText("Builder answer");
+  expect(asks.map(ask => ask.actor?.name).sort()).toEqual(["Builder", "Critic"]);
+  expect(new Set(asks.map(ask => ask.roundId)).size).toBe(1);
+  expect(asks[0].participants).toEqual(["Critic", "Builder"]);
+
+  const composer = panel.getByRole("textbox");
+  await composer.pressSequentially("Only you @Bu");
+  const mentions = panel.getByRole("listbox", { name: "Mention an actor" });
+  await expect(mentions.getByRole("option")).toHaveCount(1);
+  await expect(mentions).toContainText("@Builder");
+  await composer.press("Enter");
+  await expect(composer).toContainText("@Builder");
+  await composer.press("Enter");
+  await expect(panel).toContainText("Builder answer 3");
+  expect(asks).toHaveLength(3);
+  expect(asks[2].actor?.name).toBe("Builder");
+
+  await panel.getByRole("combobox", { name: "Ask another actor to reply to Builder" }).last().selectOption({ label: "Critic" });
+  await expect(panel).toContainText("Critic answer 4");
+  expect(asks[3]).toMatchObject({ actor: { name: "Critic" }, replyToId: "answer-3" });
+  await expect(panel).toContainText("↩ Builder");
+});
+
 test("side-chat history endpoint returns only history and distinguishes missing sessions", async ({ request }) => {
   const response = await request.get(`${apiBaseUrl}/api/sessions/${scenarioSessions.switchAlpha.id}/side-chats`);
   expect(response.status()).toBe(200);

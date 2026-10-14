@@ -1,6 +1,6 @@
 // @ts-nocheck
 export function selectSlashSuggestion(ctx, suggestion) {
-    const { capitalize, executionMode, input, inputEditorRef, setComposerExecutionMode, setComposerInput, setSelectedSkills, setSlashTrigger, setStatus, slashTrigger } = ctx;
+    const { capitalize, executionMode, input, inputEditorRef, setComposerExecutionMode, setComposerInput, setSelectedSkills, setSlashTrigger, setStatus, slashTrigger, toggleTodoPlanMode } = ctx;
         if (!slashTrigger)
             return;
         const before = input.slice(0, slashTrigger.start);
@@ -14,6 +14,9 @@ export function selectSlashSuggestion(ctx, suggestion) {
             const enabled = executionMode !== suggestion.mode;
             setComposerExecutionMode(enabled ? suggestion.mode : "default");
             setStatus(`${capitalize(suggestion.mode)} mode ${enabled ? "on" : "off"}`);
+        }
+        else if (suggestion.kind === "todo") {
+            toggleTodoPlanMode();
         }
         else if (suggestion.kind === "skill") {
             setSelectedSkills((current) => current.some((skill) => skill.name === suggestion.name && skill.path === suggestion.path)

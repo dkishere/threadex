@@ -16,7 +16,7 @@ const CONTEXT_FORK_PROMPT = [
   "   - Do not repeat environment details or instructions supplied by AGENTS.md, skills, or Threadex injection (workspace layout, shell, sandbox/approval rules, tool usage, or generic development commands). Include only task-specific exceptions or essential facts the child cannot obtain there, such as an external artifact path or an active process identifier.",
   "   - Resolve ambiguous references with precise source locations. Do not assume the child inherits the parent conversation or require it to reconstruct the task from unrelated history.",
   "",
-  "2. Call `mcp__session_inspector__create_task` exactly once with that prompt and an optional concise title.",
+  "2. Call `session-inspector create_task` exactly once with that prompt and an optional concise title.",
   "   - Omit model settings unless a different model or reasoning effort is clearly beneficial.",
   "",
   "3. Do not perform the requested work in this parent session.",

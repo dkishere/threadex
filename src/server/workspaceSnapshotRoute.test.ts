@@ -16,6 +16,22 @@ function response() {
   });
 }
 
+test("manager entry opts into paged snapshots; ordinary and raw entry keep full snapshots", async () => {
+  const options: unknown[] = [];
+  const handler = createWorkspaceSnapshotHandler({
+    readSnapshot: async input => { options.push(input); return {}; },
+    reconcileRunningTurns: async () => {}
+  });
+  for (const query of [{ view: "workspace-chat" }, {}, { includeActiveSession: "false", view: "workspace-chat" }]) {
+    await handler({ query } as Request, response() as unknown as Response, () => {});
+  }
+  assert.deepEqual(options, [
+    { includeActiveSession: true, managerHistory: true },
+    { includeActiveSession: true, managerHistory: false },
+    { includeActiveSession: false, managerHistory: true }
+  ]);
+});
+
 test("snapshot responses finish before slow recovery, and overlapping requests share recovery", async () => {
   let recoveries = 0;
   let release!: () => void;

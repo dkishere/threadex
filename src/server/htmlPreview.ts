@@ -1,8 +1,9 @@
 import { randomBytes } from "node:crypto";
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, relative, sep } from "node:path";
 import express, { type Request } from "express";
 import { canInlineWorkspaceFile, resolveWorkspaceFilePath } from "./workspaceFiles";
+import { addBddFeedback } from "./bddFeedback";
 
 const grants = new Map<string, { root: string; pageRoot: string; expires: number }>();
 const prefix = "/workspaces/html-content/";
@@ -56,6 +57,10 @@ export function createHtmlPreviewRouter() {
     res.setHeader("Content-Security-Policy", "sandbox allow-scripts allow-downloads; default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'");
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Referrer-Policy", "no-referrer");
+    if (/\.html?$/i.test(realPath)) {
+      res.type("html").send(addBddFeedback(readFileSync(realPath, "utf8")));
+      return;
+    }
     res.sendFile(realPath);
   });
   return router;

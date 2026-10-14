@@ -1,0 +1,106 @@
+
+/* Claude accounts (ClaudeAccountsSection.tsx) */
+.claude-accounts-section {
+  display: grid;
+  max-height: min(420px, 50vh);
+  overflow-y: auto;
+  border-top: 1px solid #cbd5e1;
+  background: #ffffff;
+}
+
+.claude-accounts-header {
+  display: grid;
+  gap: 2px;
+  padding: 10px 13px;
+  border-left: 3px solid #c2410c;
+  border-bottom: 1px solid #e2e8f0;
+  background: #fff7ed;
+}
+
+.claude-accounts-header strong {
+  color: #334155;
+  font-size: 12px;
+}
+
+.claude-accounts-header small {
+  color: #64748b;
+  font-size: 10px;
+}
+
+.claude-account-actions > button:not(.ghost-icon) {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 25px;
+  padding: 0 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #334155;
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.claude-account-actions > button:not(.ghost-icon):hover {
+  background: #f8fafc;
+}
+
+.claude-account-actions button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.claude-accounts-list {
+  display: grid;
+}
+
+.claude-account-card[data-selected="true"] {
+  border-left-color: #c2410c;
+}
+
+.claude-account-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 0 13px 9px;
+}
+
+.claude-account-actions .ghost-icon svg {
+  width: 13px;
+  height: 13px;
+}
+
+.claude-account-error {
+  display: block;
+  margin: -3px 13px 9px;
+}
+
+/* Settings › Accounts */
+.claude-account-no-lb {
+  color: #a1a1aa;
+  cursor: help;
+}
+
+.claude-login-panel code,
+.claude-login-panel pre {
+  margin: 0;
+  padding: 6px 8px;
+  overflow-x: auto;
+  border-radius: 6px;
+  background: #dbeafe;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.claude-login-panel .device-code-row input {
+  min-height: 30px;
+}
+
+.claude-login-error {
+  margin: 0;
+  color: #b91c1c;
+  font-size: 12px;
+}

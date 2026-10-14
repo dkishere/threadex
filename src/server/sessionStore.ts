@@ -1,10 +1,15 @@
-import { DEFAULT_MODEL, defaultGearProfiles } from "../modelCatalog";
+import { DEFAULT_MODEL, defaultGearProfiles, type ModelProvider } from "../modelCatalog";
 import type { LightweightTodo } from "../lightweightTodo";
+import { parseRoundtableSynthesis, roundtableResponse, roundtableRunning, roundtableSynthesisMarkdown, type RoundtableRound } from "../roundtable";
+import { parseSideChatActorJson, type SideChatActor } from "../sideChatRoom";
 import type { CollaborationFork, CollaborationGroup } from "../collaboration";
 import type { ProcessCommandParameter, ProcessCommandValues } from "../processCommandParameters";
 import { AUTO_MODEL_CHOICES, AUTO_EFFORT_CHOICES, isAutoModel, isAutoEffort, normalizeAutoModel } from "../autoModelCatalog";
 import { acknowledgeGrill, grillAwaitingAck, type GrillSummary, type TurnGrill } from "../turnGrill";
 import { openPostgresSessionConnection, postgresSchemaFromStoreId, type SessionDbConnection, type SessionDbValue } from "./sessionDb";
+import * as claudeAccountStore from "./claudeAccountStore";
+import { backfillProviderTurnHistory, ensureProviderThreadSchema, getProviderThread, recordProviderThread, threadProvider } from "./sessionProviderThreads";
+import type { ClaudeAccountRecord, ClaudeAccountStatusUpdate, ClaudeQuotaSnapshot } from "./claudeAccountStore";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, statSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
@@ -16,7 +21,7 @@ import { changedFilePaths } from "./changedFilePaths";
 import { turnTokenUsageJoinSql } from "./turnTokenUsage";
 import { canonicalSessionId, isThreadexSessionId, sessionIdAliases } from "../codexReference";
 import { stripContextForkOperationalSuffix } from "../contextFork";
-import { managerActivityPrompt, WORKSPACE_MANAGER_MODEL, WORKSPACE_MANAGER_EFFORT,
+import { managerActivityPrompt, WORKSPACE_MANAGER_MODEL, WORKSPACE_MANAGER_EFFORT, WORKSPACE_MANAGER_VISIBLE_TURNS,
   type WorkspaceManagerRecord, type WorkspaceManagerEvent, type WorkspaceManagerSnapshot,
   type WorkspaceManagerTask, type WorkspaceManagerTaskComment, type WorkspaceManagerLineCounts } from "../workspaceManager";
 
@@ -25,13 +30,14 @@ export type KeywordWeights = Record<string, number>;
 // Concurrent workers are accessed through their main session's Concurrent panel.
 // Parent links alone also describe ordinary forks and must not hide those sessions.
 function concurrentWorkerSessionPredicate(sessionAlias: string) {
-  return `EXISTS (
-  SELECT 1 FROM collaboration_group AS concurrent_group
-  WHERE concurrent_group.state->'members' @> jsonb_build_array(jsonb_build_object('sessionId', ${sessionAlias}.id))
-    AND EXISTS (
-      SELECT 1 FROM jsonb_array_elements(concurrent_group.state->'members') AS member
-      WHERE member->>'sessionId' = ${sessionAlias}.id AND member->>'localId' <> 'main'
-    )
+  // Build the worker IDs once per query. A correlated JSON containment check
+  // decompresses every group's growing transcript for every sidebar session.
+  // Exclude null IDs so NOT IN also keeps unrelated sessions visible.
+  return `${sessionAlias}.id IN (
+  SELECT member->>'sessionId'
+  FROM collaboration_group AS concurrent_group,
+    jsonb_array_elements(concurrent_group.state->'members') AS member
+  WHERE member->>'localId' <> 'main' AND member->>'sessionId' IS NOT NULL
 )`;
 }
 const concurrentWorkerSessionSql = concurrentWorkerSessionPredicate("sessions");
@@ -45,7 +51,9 @@ const emptyNativeSessionAliasSql = `(
   AND NOT EXISTS (SELECT 1 FROM session_turn WHERE session_id = sessions.id)
   AND EXISTS (
     SELECT 1 FROM sessions AS owner
-    WHERE owner.thread_id = sessions.thread_id
+    WHERE (owner.thread_id = sessions.thread_id OR EXISTS (
+      SELECT 1 FROM session_provider_thread pt WHERE pt.session_id = owner.id AND pt.thread_id = sessions.thread_id
+    ))
       AND owner.workspace_id = sessions.workspace_id
       AND owner.id <> sessions.id
       AND EXISTS (SELECT 1 FROM session_turn WHERE session_id = owner.id)
@@ -63,6 +71,33 @@ function workspacePendingTaskSql(alias: string) {
       AND ${alias}.agent_response ~ '${legacyWatchdogStoppedResponseSql}')`;
 }
 export type SessionTitleSource = "initial" | "summarizer" | "user";
+
+// Display activity includes background discussion and Concurrent work; it does
+// not grant a runner writer or change the ordinary turn queue's ownership.
+const activeSessionDisplaySql = `WITH RECURSIVE direct_activity AS (
+  SELECT session_id FROM session_turn WHERE status = 'running'
+  UNION SELECT session_id FROM session_turn_grill WHERE document::jsonb->>'status' = 'running'
+  UNION SELECT session_id FROM session_roundtable_round
+    WHERE document::jsonb->>'status' IN ('queued', 'context', 'actors', 'host')
+), concurrent_members AS (
+  SELECT g.state->>'mainSessionId' AS main_session_id, member->>'sessionId' AS session_id,
+    member->>'localId' AS local_id, g.state AS group_state
+  FROM collaboration_group g, jsonb_array_elements(g.state->'members') member
+  WHERE COALESCE((member->>'stopped')::boolean, false) = false
+), active_sessions(session_id) AS (
+  SELECT session_id FROM direct_activity
+  UNION SELECT m.session_id FROM concurrent_members m
+    WHERE EXISTS (SELECT 1 FROM session_turn t WHERE t.session_id = m.session_id
+      AND t.status = 'todo' AND t.pending_reason IS DISTINCT FROM 'stopped')
+    OR EXISTS (SELECT 1 FROM jsonb_array_elements(m.group_state->'messages') message
+      WHERE COALESCE((message->>'completed')::boolean, false) = false
+        AND message->>'state' <> 'cancelled'
+        AND ((message->>'to' = m.local_id AND message->>'state' IN ('pending', 'steering', 'uncertain'))
+          OR (message->>'from' = m.local_id AND (message->>'wait')::boolean = true)))
+  UNION SELECT m.main_session_id FROM concurrent_members m
+    JOIN active_sessions a ON a.session_id = m.session_id
+)
+SELECT DISTINCT session_id FROM active_sessions`;
 
 export type ComposerSuggestionKeywordRecord = {
   workspaceId: string;
@@ -500,6 +535,9 @@ export type SessionTitleSyncResult = SessionTitleSyncInput & {
 export type SessionTurnRecord = {
   id: string;
   sessionId: string;
+  nativeThreadId?: string | null;
+  provider?: ModelProvider | null;
+  nativeUpdatedAt?: string | null;
   loopMode?: boolean;
   accountId: string | null;
   userInput: string;
@@ -585,6 +623,9 @@ export type SessionSideChatRecord = {
   contextTurnCount: number;
   contextFilter: string | null;
   mode: string;
+  roundId: string | null;
+  actor: SideChatActor | null;
+  replyToId: string | null;
   created: string;
 };
 
@@ -648,6 +689,7 @@ type SessionInspectTurnRecord = SessionTurnRecord & {
   userInputOmittedChars?: number;
   agentResponseOmittedChars?: number;
   liveItems?: unknown[];
+  roundtable?: RoundtableRound;
   developerInstructions?: SessionDeveloperInstructionsRecord[];
 };
 
@@ -878,6 +920,9 @@ type RecordSessionSideChatInput = {
   contextTurnCount?: number;
   contextFilter?: string | null;
   mode?: string;
+  roundId?: string | null;
+  actor?: SideChatActor | null;
+  replyToId?: string | null;
 };
 
 type SessionTurnAccountInput = {
@@ -1195,6 +1240,9 @@ type AccountRow = {
 type SessionTurnRow = {
   id?: unknown;
   session_id?: unknown;
+  native_thread_id?: unknown;
+  provider?: unknown;
+  native_updated_at?: unknown;
   loop_mode?: unknown;
   account_id?: unknown;
   user_input?: unknown;
@@ -1256,6 +1304,9 @@ type SessionSideChatRow = {
   context_turn_count?: unknown;
   context_filter?: unknown;
   mode?: unknown;
+  round_id?: unknown;
+  actor_json?: unknown;
+  reply_to_id?: unknown;
   created?: unknown;
 };
 
@@ -2147,22 +2198,10 @@ export class SessionStore {
 
   async listActiveSessionExecutionStatuses(workspaceId?: string | null): Promise<Record<string, ActiveSessionExecutionStatus>> {
     return this.read(async (connection) => {
-      const result = workspaceId
-        ? await connection.run(
-            `
-              SELECT DISTINCT session_turn.session_id
-              FROM session_turn
-              INNER JOIN sessions ON sessions.id = session_turn.session_id
-              WHERE sessions.workspace_id = $workspaceId
-                AND session_turn.status = 'running'
-            `,
-            { workspaceId }
-          )
-        : await connection.run(`
-            SELECT DISTINCT session_id
-            FROM session_turn
-            WHERE status = 'running'
-          `);
+      const result = await connection.run(`SELECT activity.session_id
+        FROM (${activeSessionDisplaySql}) activity JOIN sessions ON sessions.id = activity.session_id
+        ${workspaceId ? "WHERE sessions.workspace_id = $workspaceId" : ""}`,
+      workspaceId ? { workspaceId } : {});
       const rows = await result.getRowObjectsJS();
       return Object.fromEntries(
         rows.flatMap((row) => {
@@ -2184,11 +2223,7 @@ export class SessionStore {
           sessions.id AS session_id,
           sessions.title AS session_name
         FROM sessions
-        INNER JOIN (
-          SELECT DISTINCT session_id
-          FROM session_turn
-          WHERE status = 'running'
-        ) AS running_turn ON running_turn.session_id = sessions.id
+        INNER JOIN (${activeSessionDisplaySql}) AS running_turn ON running_turn.session_id = sessions.id
         ORDER BY sessions.updated DESC, sessions.id ASC
       `);
       return (await result.getRowObjectsJS()).flatMap((row) => {
@@ -2524,6 +2559,86 @@ export class SessionStore {
       const row = (await result.getRowObjectsJS())[0];
       return row ? JSON.parse(String(row.document)) as TurnGrill : null;
     });
+  }
+
+  async listRoundtableRounds(sessionId: string): Promise<RoundtableRound[]> {
+    return this.read(async connection => {
+      const rows = await (await connection.run(`SELECT r.document FROM session_roundtable_round r
+        JOIN session_turn t ON t.id = r.turn_id WHERE r.session_id = $sessionId ORDER BY t.created, t.id`, { sessionId })).getRowObjectsJS();
+      return rows.map(row => JSON.parse(String(row.document)) as RoundtableRound);
+    });
+  }
+
+  async getRoundtableRound(turnId: string): Promise<RoundtableRound | null> {
+    return this.read(async connection => {
+      const rows = await (await connection.run("SELECT document FROM session_roundtable_round WHERE turn_id = $turnId", { turnId })).getRowObjectsJS();
+      return rows[0] ? JSON.parse(String(rows[0].document)) as RoundtableRound : null;
+    });
+  }
+
+  async createRoundtableRound(round: RoundtableRound): Promise<RoundtableRound> {
+    return this.transaction(async connection => {
+      await this.assertSessionExistsWithConnection(connection, round.sessionId);
+      const inserted = await this.insertSessionTurnWithConnection(connection, {
+        id: round.turnId, sessionId: round.sessionId, userInput: round.prompt, agentResponse: roundtableResponse(round),
+        tokenIn: 0, tokenOut: 0, status: "todo", pendingReason: "queued", requestMetadata: { roundtable: true }
+      }, true);
+      if (!inserted) {
+        const rows = await (await connection.run("SELECT document FROM session_roundtable_round WHERE turn_id = $turnId", { turnId: round.turnId })).getRowObjectsJS();
+        const existing = rows[0] ? JSON.parse(String(rows[0].document)) as RoundtableRound : null;
+        if (!existing || existing.sessionId !== round.sessionId || existing.prompt !== round.prompt
+          || JSON.stringify(existing.answers.map(a => a.actor)) !== JSON.stringify(round.answers.map(a => a.actor))) {
+          throw new Error("This round table request ID already belongs to another prompt or configuration.");
+        }
+        return existing;
+      }
+      await connection.run(`INSERT INTO session_roundtable_round (turn_id, session_id, revision, document)
+        VALUES ($turnId, $sessionId, $revision, $document)`, {
+        turnId: round.turnId, sessionId: round.sessionId, revision: round.revision, document: JSON.stringify(round)
+      });
+      await this.syncSessionUpdatedWithLastTurn(connection, round.sessionId);
+      await this.refreshSessionTurnFtsIndex(connection);
+      return round;
+    });
+  }
+
+  async saveRoundtableRound(round: RoundtableRound, expectedRevision: number): Promise<void> {
+    await this.transaction(async connection => {
+      const result = await connection.run(`UPDATE session_roundtable_round SET revision = $revision, document = $document
+        WHERE turn_id = $turnId AND session_id = $sessionId AND revision = $expectedRevision`, {
+        turnId: round.turnId, sessionId: round.sessionId, revision: round.revision, expectedRevision, document: JSON.stringify(round)
+      });
+      if (!result.rowCount) throw new Error("Round table changed. Reload before retrying.");
+      const status = round.status === "queued" || round.status === "host" ? "todo" : roundtableRunning(round) ? "running" : "done";
+      await connection.run(`UPDATE session_turn SET agent_response = $response, status = $status,
+        pending_reason = $pendingReason, token_in = $tokenIn, token_out = $tokenOut, last_event_name = $event
+        WHERE id = $turnId AND session_id = $sessionId`, {
+        turnId: round.turnId, sessionId: round.sessionId, response: roundtableResponse(round), status,
+        pendingReason: status === "todo" ? "queued" : null, tokenIn: round.tokenIn, tokenOut: round.tokenOut,
+        event: status === "done" ? "result" : "roundtable.progress"
+      });
+      if (status === "done") await this.refreshSessionTurnFtsIndex(connection);
+    });
+  }
+
+  /** Every terminal host-turn write settles its round, whether or not a client is watching. */
+  private async settleRoundtableHostWithConnection(connection: SessionDbConnection, input: UpdateSessionTurnInput): Promise<void> {
+    const stopped = (input.status === "todo" && input.pendingReason === "stopped") || (input.status === "done" && input.runnerExitCode === 143);
+    if (input.status !== "done" && !stopped) return;
+    const rows = await (await connection.run("SELECT document FROM session_roundtable_round WHERE turn_id = $turnId", { turnId: input.id })).getRowObjectsJS();
+    const round = rows[0] ? JSON.parse(String(rows[0].document)) as RoundtableRound : null;
+    if (round?.status !== "host") return;
+    const failed = !stopped && Boolean(input.runnerExitCode);
+    const synthesis = stopped || failed ? null : parseRoundtableSynthesis(input.agentResponse, round.answers.map(answer => answer.actor.name));
+    // Unparseable host output is kept verbatim so nothing is lost.
+    const summary = stopped || failed ? "" : synthesis ? roundtableSynthesisMarkdown(synthesis, round.answers.length) : input.agentResponse;
+    const next: RoundtableRound = { ...round, revision: round.revision + 1, status: stopped ? "stopped" : failed ? "error" : "done",
+      summary, synthesis,
+      error: stopped ? "Host stopped. Retry to summarise the saved actor answers."
+        : failed ? "Host response failed. Retry to summarise the saved actor answers." : null };
+    await connection.run("UPDATE session_roundtable_round SET revision = $revision, document = $document WHERE turn_id = $turnId AND revision = $expectedRevision",
+      { turnId: input.id, revision: next.revision, expectedRevision: round.revision, document: JSON.stringify(next) });
+    if (synthesis) await connection.run("UPDATE session_turn SET agent_response = $summary WHERE id = $turnId", { turnId: input.id, summary });
   }
 
   async listGrilledTurnIds(sessionId: string): Promise<string[]> {
@@ -4073,7 +4188,59 @@ export class SessionStore {
     return this.read(async (connection) => this.getSessionByThreadIdWithConnection(connection, threadId, workspaceId));
   }
 
-  async listSessionTurns(sessionId: string): Promise<SessionTurnRecord[]> {
+  async getSessionProviderThread(input: Parameters<typeof getProviderThread>[1]) {
+    return this.transaction(connection => getProviderThread(connection, input));
+  }
+
+  async recordSessionProviderThread(input: Parameters<typeof recordProviderThread>[1]) {
+    return this.write(connection => recordProviderThread(connection, input));
+  }
+
+  async recordSessionNativeThread(input: { sessionId: string; turnId: string; threadId: string; logPath?: string }) {
+    return this.write(async connection => {
+      await connection.run(`UPDATE session_turn SET native_thread_id = $threadId, provider = $provider, native_updated_at = now()
+        WHERE id = $turnId AND session_id = $sessionId AND status = 'running'
+          ${input.logPath ? "AND runner_log_path = $logPath" : ""}`,
+      { ...input, provider: threadProvider(input.threadId) });
+    });
+  }
+
+  async listWorkspaceManagerTurnPage(sessionId: string, beforeTurnId?: string, pinnedTurnId?: string) {
+    const rows = await this.read(async connection => {
+      const result = await connection.run(`
+        WITH history_page AS (
+          SELECT id, created FROM session_turn
+          WHERE session_id = $sessionId
+            AND (NOT starts_with(id, 'manager_') OR (status = 'done'
+              AND NOT starts_with(regexp_replace(agent_response, '^[[:space:]]+', ''), '[workspace-note]')))
+            ${beforeTurnId ? `AND (created, id) < (
+              SELECT created, id FROM session_turn WHERE session_id = $sessionId AND id = $beforeTurnId
+            )` : ""}
+          ORDER BY created DESC, id DESC LIMIT $limit
+        )
+        SELECT id, created, TRUE AS in_page FROM history_page
+        ${beforeTurnId ? "" : `UNION ALL
+          SELECT id, created, FALSE AS in_page FROM session_turn
+          WHERE session_id = $sessionId AND (status = 'running' ${pinnedTurnId ? "OR id = $pinnedTurnId" : ""})
+        `}
+        ORDER BY created DESC, id DESC
+      `, { sessionId, limit: WORKSPACE_MANAGER_VISIBLE_TURNS + 1,
+        ...(beforeTurnId ? { beforeTurnId } : {}), ...(!beforeTurnId && pinnedTurnId ? { pinnedTurnId } : {}) });
+      return result.getRowObjectsJS();
+    });
+    const page = rows.filter(row => row.in_page).slice(0, WORKSPACE_MANAGER_VISIBLE_TURNS);
+    const ids = [...new Set([...page, ...rows.filter(row => !row.in_page)].map(row => stringValue(row.id)))];
+    return {
+      turns: await this.listSessionTurns(sessionId, ids),
+      managerHistory: {
+        beforeTurnId: page.length ? stringValue(page.at(-1)!.id) : null,
+        hasMore: rows.filter(row => row.in_page).length > WORKSPACE_MANAGER_VISIBLE_TURNS,
+        requestedBeforeTurnId: beforeTurnId ?? null
+      }
+    };
+  }
+
+  async listSessionTurns(sessionId: string, turnIds?: string[]): Promise<SessionTurnRecord[]> {
     return this.read(async (connection) => {
       const result = await connection.run(
         `
@@ -4101,14 +4268,16 @@ export class SessionStore {
             session_turn.pending_load_balance,
             CAST(session_turn.request_metadata AS VARCHAR) AS request_metadata,
             CAST(session_turn.created AS VARCHAR) AS created,
+            session_turn.native_thread_id, session_turn.provider, CAST(session_turn.native_updated_at AS VARCHAR) AS native_updated_at,
             ${resultExecutionDurationSelectSql},
             ${latestUsageSampleSelectSql}
           FROM session_turn
           ${latestUsageSampleJoinSql}
           WHERE session_turn.session_id = $sessionId
+            ${turnIds ? "AND session_turn.id = ANY($turnIds::VARCHAR[])" : ""}
           ORDER BY session_turn.created ASC, session_turn.id ASC
         `,
-        { sessionId }
+        { sessionId, ...(turnIds ? { turnIds } : {}) }
       );
       return (await result.getRowObjectsJS()).map(toSessionTurnRecord);
     });
@@ -4184,6 +4353,7 @@ export class SessionStore {
             session_turn.pending_load_balance,
             CAST(session_turn.request_metadata AS VARCHAR) AS request_metadata,
             CAST(session_turn.created AS VARCHAR) AS created,
+            session_turn.native_thread_id, session_turn.provider, CAST(session_turn.native_updated_at AS VARCHAR) AS native_updated_at,
             ${resultExecutionDurationSelectSql},
             ${latestUsageSampleSelectSql}
           FROM session_turn
@@ -4199,6 +4369,38 @@ export class SessionStore {
         .map((turn) => truncateSessionTurnRecord(turn, maxTextChars));
 
       const view = normalizeSessionInspectView(input.view);
+      const roundtables = new Map<string, RoundtableRound>();
+      if (view === "full" && turns.length) {
+        const ids = turns.map((_, index) => `$rt${index}`).join(", ");
+        const parameters = Object.fromEntries(turns.map((turn, index) => [`rt${index}`, turn.id]));
+        const rows = await (await connection.run(
+          `SELECT document FROM session_roundtable_round WHERE session_id = $sessionId AND turn_id IN (${ids})`,
+          { sessionId: session.id, ...parameters }
+        )).getRowObjectsJS();
+        const clip = (text: string) => maxTextChars === null ? text : truncateText(text, maxTextChars).text;
+        for (const row of rows) {
+          const round = JSON.parse(String(row.document)) as RoundtableRound;
+          const host = turns.find(turn => turn.id === round.turnId)!;
+          // Inspection is read-only; reconcile the host handoff without needing a UI poll.
+          if (round.status === "host" && host.status === "done") {
+            round.status = host.runnerExitCode ? "error" : "done";
+            round.summary = host.agentResponse;
+            if (host.runnerExitCode) round.error = "Host response failed.";
+          }
+          // Actors can inspect their host session; peers' answers stay sealed until every actor finishes.
+          const sealed = ["queued", "context", "actors"].includes(round.status);
+          roundtables.set(round.turnId, { ...round, prompt: clip(round.prompt),
+            ...(round.continuation ? { continuation: { ...round.continuation, topic: clip(round.continuation.topic) } } : {}),
+            context: round.context === null ? null : clip(round.context), summary: clip(round.summary),
+            error: round.error === null ? null : clip(round.error),
+            answers: round.answers.map(answer => ({ ...answer, text: sealed ? "" : clip(answer.text),
+              attempts: sealed ? answer.attempts?.map(attempt => ({ ...attempt, logPath: "", error: undefined })) : answer.attempts,
+              error: answer.error === null ? null : clip(answer.error),
+              actor: { ...answer.actor, systemPrompt: clip(answer.actor.systemPrompt),
+                avatar: answer.actor.avatar?.startsWith("data:") ? undefined : answer.actor.avatar }
+            })) });
+        }
+      }
       const needsFileChanges = view === "file_changes" || view === "turn_summary";
       const liveItemsByTurn =
         input.includeLiveItems === true || needsFileChanges
@@ -4276,6 +4478,7 @@ export class SessionStore {
         session,
         turns: turns.map((turn) => ({
           ...turn,
+          ...(roundtables.has(turn.id) ? { roundtable: roundtables.get(turn.id)! } : {}),
           ...(input.includeLiveItems === true
             ? {
                 liveItems: [
@@ -4560,8 +4763,8 @@ export class SessionStore {
     });
   }
 
-  async listSessionLiveItems(sessionId: string): Promise<Record<string, unknown[]>> {
-    return this.read(async (connection) => this.listSessionLiveItemsWithConnection(connection, sessionId));
+  async listSessionLiveItems(sessionId: string, turnIds?: string[]): Promise<Record<string, unknown[]>> {
+    return this.read(async (connection) => this.listSessionLiveItemsWithConnection(connection, sessionId, turnIds));
   }
 
   async listSessionTurnLiveItems(sessionId: string, turnId: string): Promise<unknown[]> {
@@ -4570,20 +4773,20 @@ export class SessionStore {
     ));
   }
 
-  async listSessionApprovalLiveItems(sessionId: string): Promise<Record<string, unknown[]>> {
-    return this.read(async (connection) => this.listSessionApprovalLiveItemsWithConnection(connection, sessionId));
+  async listSessionApprovalLiveItems(sessionId: string, turnIds?: string[]): Promise<Record<string, unknown[]>> {
+    return this.read(async (connection) => this.listSessionApprovalLiveItemsWithConnection(connection, sessionId, turnIds));
   }
 
-  async listSessionDeveloperInstructions(sessionId: string): Promise<Record<string, SessionDeveloperInstructionsRecord[]>> {
-    return this.read(async (connection) => this.listSessionDeveloperInstructionsWithConnection(connection, sessionId));
+  async listSessionDeveloperInstructions(sessionId: string, turnIds?: string[]): Promise<Record<string, SessionDeveloperInstructionsRecord[]>> {
+    return this.read(async (connection) => this.listSessionDeveloperInstructionsWithConnection(connection, sessionId, turnIds));
   }
 
-  async listSessionSteerMessages(sessionId: string): Promise<Record<string, SessionSteerMessageRecord[]>> {
-    return this.read(async (connection) => this.listSessionSteerMessagesWithConnection(connection, sessionId));
+  async listSessionSteerMessages(sessionId: string, turnIds?: string[]): Promise<Record<string, SessionSteerMessageRecord[]>> {
+    return this.read(async (connection) => this.listSessionSteerMessagesWithConnection(connection, sessionId, turnIds));
   }
 
-  async listSessionAutoModelProviders(sessionId: string): Promise<Record<string, { provider: SessionAutoModelProvider; confidence?: number }>> {
-    return this.read(async (connection) => this.listSessionAutoModelProvidersWithConnection(connection, sessionId));
+  async listSessionAutoModelProviders(sessionId: string, turnIds?: string[]): Promise<Record<string, { provider: SessionAutoModelProvider; confidence?: number }>> {
+    return this.read(async (connection) => this.listSessionAutoModelProvidersWithConnection(connection, sessionId, turnIds));
   }
 
   async getNextTodoTurn(sessionId: string): Promise<SessionTurnRecord | null> {
@@ -6264,6 +6467,59 @@ export class SessionStore {
     });
   }
 
+  // Claude accounts (see claudeAccountStore.ts); separate from Codex accounts by design.
+  async listClaudeAccounts(): Promise<ClaudeAccountRecord[]> {
+    return this.read((connection) => claudeAccountStore.listClaudeAccounts(connection));
+  }
+
+  async getClaudeAccount(id: string): Promise<ClaudeAccountRecord | null> {
+    return this.read((connection) => claudeAccountStore.getClaudeAccount(connection, id));
+  }
+
+  async createClaudeAccount(input: { id: string; name: string; configDir: string }): Promise<ClaudeAccountRecord> {
+    return this.write((connection) => claudeAccountStore.createClaudeAccount(connection, input));
+  }
+
+  async renameClaudeAccount(id: string, name: string): Promise<ClaudeAccountRecord | null> {
+    return this.write((connection) => claudeAccountStore.renameClaudeAccount(connection, id, name));
+  }
+
+  async updateClaudeAccountStatus(id: string, update: ClaudeAccountStatusUpdate): Promise<ClaudeAccountRecord | null> {
+    return this.write((connection) => claudeAccountStore.updateClaudeAccountStatus(connection, id, update));
+  }
+
+  async mergeClaudeAccountQuota(id: string, patch: ClaudeQuotaSnapshot, quotaError: string | null = null): Promise<ClaudeAccountRecord | null> {
+    return this.write((connection) => claudeAccountStore.mergeClaudeAccountQuota(connection, id, patch, quotaError));
+  }
+
+  async touchClaudeAccount(id: string): Promise<void> {
+    await this.write((connection) => claudeAccountStore.touchClaudeAccount(connection, id));
+  }
+
+  async deleteClaudeAccount(id: string): Promise<boolean> {
+    return this.write((connection) => claudeAccountStore.deleteClaudeAccount(connection, id));
+  }
+
+  async getWorkspaceClaudeAccountId(workspaceId: string): Promise<string | null> {
+    return this.read((connection) => claudeAccountStore.getWorkspaceClaudeAccountId(connection, workspaceId));
+  }
+
+  async setWorkspaceClaudeAccount(workspaceId: string, accountId: string | null): Promise<void> {
+    await this.write((connection) => claudeAccountStore.setWorkspaceClaudeAccount(connection, workspaceId, accountId));
+  }
+
+  async getSessionClaudeAccountId(sessionId: string): Promise<string | null> {
+    return this.read((connection) => claudeAccountStore.getSessionClaudeAccountId(connection, sessionId));
+  }
+
+  async setSessionClaudeAccount(sessionId: string, accountId: string | null): Promise<void> {
+    await this.write((connection) => claudeAccountStore.setSessionClaudeAccount(connection, sessionId, accountId));
+  }
+
+  async resolveClaudeAccount(input: { workspaceId: string; sessionId?: string | null }): Promise<ClaudeAccountRecord | null> {
+    return this.read((connection) => claudeAccountStore.resolveClaudeAccount(connection, input));
+  }
+
   async switchAccount(id: string | null, workspaceId?: string): Promise<AccountRecord | null> {
     return this.write(async (connection) => {
       const targetWorkspaceId = workspaceId ?? await this.getActiveWorkspaceIdWithConnection(connection);
@@ -6450,10 +6706,11 @@ export class SessionStore {
   async listSessionSideChats(sessionId: string) {
     return this.read(async (connection) => {
       if (!await this.getSessionWithConnection(connection, sessionId)) return null;
+      // The chat shows, and actors read, the latest messages in chronological order.
       const page = await this.listSessionSideChatsWithConnection(connection, {
-        sessionId, limit: 100, offset: 0, order: "ASC"
+        sessionId, limit: 100, offset: 0, order: "DESC"
       });
-      return { sideChats: page.records, sideChatPage: { limit: 100, offset: 0, total: page.total, hasMore: page.total > page.records.length } };
+      return { sideChats: page.records.reverse(), sideChatPage: { limit: 100, offset: 0, total: page.total, hasMore: page.total > page.records.length } };
     });
   }
 
@@ -6475,6 +6732,9 @@ export class SessionStore {
             context_turn_count,
             context_filter,
             mode,
+            round_id,
+            actor_json,
+            reply_to_id,
             created
           )
           VALUES (
@@ -6490,6 +6750,9 @@ export class SessionStore {
             $contextTurnCount,
             $contextFilter,
             $mode,
+            $roundId,
+            $actorJson,
+            $replyToId,
             now()
           )
         `,
@@ -6505,7 +6768,10 @@ export class SessionStore {
           model: input.model,
           contextTurnCount: input.contextTurnCount ?? 0,
           contextFilter: input.contextFilter ?? null,
-          mode: input.mode ?? "forked_ephemeral"
+          mode: input.mode ?? "forked_ephemeral",
+          roundId: input.roundId ?? null,
+          actorJson: input.actor ? JSON.stringify(input.actor) : null,
+          replyToId: input.replyToId ?? null
         }
       );
       const result = await connection.run(
@@ -6523,6 +6789,9 @@ export class SessionStore {
             context_turn_count,
             context_filter,
             mode,
+            round_id,
+            actor_json,
+            reply_to_id,
             CAST(created AS VARCHAR) AS created
           FROM session_side_chat
           WHERE id = $id
@@ -7046,6 +7315,7 @@ export class SessionStore {
             await connection.run("UPDATE session_turn_grill SET revision = $revision, document = $document WHERE session_id = $sessionId AND turn_id = $turnId", { sessionId: turn.sessionId, turnId: String(row.turn_id), revision: next.revision, document: JSON.stringify(next) });
           }
         }
+        if (turn.requestMetadata?.roundtable === true) await this.settleRoundtableHostWithConnection(connection, input);
         await this.syncSessionUpdatedWithLastTurn(connection, turn.sessionId);
         await connection.run(
           `
@@ -7330,6 +7600,7 @@ export class SessionStore {
   async reservePendingSessionTurnForEdit(id: string, sessionId: string, token: string): Promise<SessionTurnRecord> {
     return this.write(async (connection) => {
       const turn = await this.getSessionTurnWithConnection(connection, id);
+      if (turn?.requestMetadata?.roundtable === true) throw new Error("Round table prompts are frozen after sending. Stop this round and send a new prompt.");
       if (!turn || turn.sessionId !== sessionId || turn.status !== "todo" ||
         turn.lastEventName === "queue.steer_reserved" || turn.lastEventName === "queue.fork_reserved") {
         throw new Error("This prompt is no longer available for editing.");
@@ -7366,6 +7637,7 @@ export class SessionStore {
   async updatePendingSessionTurn(input: UpdatePendingSessionTurnInput): Promise<SessionTurnRecord> {
     return this.transaction(async (connection) => {
       const existing = await this.getSessionTurnWithConnection(connection, input.id);
+      if (existing?.requestMetadata?.roundtable === true) throw new Error("Round table prompts are frozen after sending. Stop this round and send a new prompt.");
       if (!existing || existing.sessionId !== input.sessionId) {
         throw new Error(`Pending turn not found: ${input.id}`);
       }
@@ -7448,6 +7720,7 @@ export class SessionStore {
 
   async reserveQueuedSessionTurnForSteer(id: string, sessionId: string, runningTurnId: string): Promise<SessionTurnRecord | null> {
     return this.write(async (connection) => {
+      if ((await this.getSessionTurnWithConnection(connection, id))?.requestMetadata?.roundtable === true) return null;
       const result = await connection.run(
         `UPDATE session_turn AS pending_turn
          SET last_event_name = 'queue.steer_reserved'
@@ -7946,6 +8219,7 @@ export class SessionStore {
           runner_exit_code,
           last_event_name,
           pending_reason,
+          CAST(request_metadata AS VARCHAR) AS request_metadata,
           CAST(created AS VARCHAR) AS created
         FROM session_turn
         WHERE status = 'running'
@@ -8386,6 +8660,7 @@ export class SessionStore {
         updated TIMESTAMPTZ NOT NULL DEFAULT current_timestamp
       )
     `);
+    await ensureProviderThreadSchema(connection);
     await connection.run(`
       CREATE TABLE IF NOT EXISTS workspaces (
         id VARCHAR PRIMARY KEY,
@@ -8473,6 +8748,7 @@ export class SessionStore {
         updated TIMESTAMPTZ NOT NULL DEFAULT current_timestamp
       )
     `);
+    await claudeAccountStore.ensureClaudeAccountSchema(connection);
     await connection.run(`
       CREATE TABLE IF NOT EXISTS active_session (
         key VARCHAR PRIMARY KEY,
@@ -8678,6 +8954,9 @@ export class SessionStore {
         created TIMESTAMPTZ NOT NULL DEFAULT current_timestamp
       )
     `);
+    await connection.run("ALTER TABLE session_side_chat ADD COLUMN IF NOT EXISTS round_id VARCHAR");
+    await connection.run("ALTER TABLE session_side_chat ADD COLUMN IF NOT EXISTS actor_json VARCHAR");
+    await connection.run("ALTER TABLE session_side_chat ADD COLUMN IF NOT EXISTS reply_to_id VARCHAR");
     await connection.run(`
       CREATE INDEX IF NOT EXISTS session_side_chat_session_idx
       ON session_side_chat (session_id, created)
@@ -8723,6 +9002,10 @@ export class SessionStore {
       session_id VARCHAR NOT NULL, turn_id VARCHAR NOT NULL, revision BIGINT NOT NULL,
       document VARCHAR NOT NULL, PRIMARY KEY (session_id, turn_id)
     )`);
+    await connection.run(`CREATE TABLE IF NOT EXISTS session_roundtable_round (
+      turn_id VARCHAR PRIMARY KEY, session_id VARCHAR NOT NULL, revision BIGINT NOT NULL, document VARCHAR NOT NULL
+    )`);
+    await connection.run("CREATE INDEX IF NOT EXISTS session_roundtable_session_idx ON session_roundtable_round(session_id)");
     await connection.run(`CREATE TABLE IF NOT EXISTS session_outcome_plan (
       session_id VARCHAR PRIMARY KEY,
       revision BIGINT NOT NULL,
@@ -8839,6 +9122,9 @@ export class SessionStore {
     // open() upgrades both fresh and existing stores before ready()/enqueue()
     // release readers or writers. PostgreSQL supplies [] for pre-existing rows.
     await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS changed_files TEXT[] NOT NULL DEFAULT '{}'::TEXT[]");
+    await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS native_thread_id VARCHAR");
+    await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS provider VARCHAR");
+    await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS native_updated_at TIMESTAMPTZ");
     await connection.run(`CREATE TABLE IF NOT EXISTS session_turn_reference (
       session_id VARCHAR NOT NULL, turn_id VARCHAR NOT NULL, turn_number BIGINT NOT NULL CHECK (turn_number > 0),
       PRIMARY KEY (session_id, turn_id), UNIQUE (session_id, turn_number)
@@ -8910,6 +9196,7 @@ export class SessionStore {
     await connection.run("CREATE INDEX IF NOT EXISTS session_turn_event_session_name_created_idx ON session_turn_event(session_id, event_name, created ASC, id ASC)");
     await connection.run("CREATE INDEX IF NOT EXISTS session_turn_event_session_turn_created_idx ON session_turn_event(session_id, turn_id, created ASC, id ASC)");
     await connection.run("CREATE INDEX IF NOT EXISTS session_turn_event_turn_name_created_idx ON session_turn_event(turn_id, event_name, created ASC, id ASC)");
+    await backfillProviderTurnHistory(connection);
     await connection.run(`
       CREATE TABLE IF NOT EXISTS session_live_item (
         turn_id VARCHAR NOT NULL,
@@ -9638,9 +9925,12 @@ export class SessionStore {
           CAST(created AS VARCHAR) AS created,
           CAST(updated AS VARCHAR) AS updated
         FROM sessions
-        WHERE thread_id = $threadId
+        WHERE (thread_id = $threadId OR EXISTS (
+          SELECT 1 FROM session_provider_thread pt WHERE pt.session_id = sessions.id AND pt.thread_id = $threadId
+        ))
           ${workspacePredicate}
-        ORDER BY EXISTS (SELECT 1 FROM session_turn WHERE session_id = sessions.id) DESC,
+        ORDER BY EXISTS (SELECT 1 FROM session_provider_thread pt WHERE pt.session_id = sessions.id AND pt.thread_id = $threadId) DESC,
+          EXISTS (SELECT 1 FROM session_turn WHERE session_id = sessions.id) DESC,
           updated DESC, created DESC, id DESC
         LIMIT 1
       `,
@@ -9766,6 +10056,7 @@ export class SessionStore {
           session_turn.pending_load_balance,
           CAST(session_turn.request_metadata AS VARCHAR) AS request_metadata,
           CAST(session_turn.created AS VARCHAR) AS created,
+          session_turn.native_thread_id, session_turn.provider, CAST(session_turn.native_updated_at AS VARCHAR) AS native_updated_at,
           ${resultExecutionDurationSelectSql},
           ${latestUsageSampleSelectSql}
         FROM session_turn
@@ -9804,6 +10095,7 @@ export class SessionStore {
           session_turn.pending_load_balance,
           CAST(session_turn.request_metadata AS VARCHAR) AS request_metadata,
           CAST(session_turn.created AS VARCHAR) AS created,
+          session_turn.native_thread_id, session_turn.provider, CAST(session_turn.native_updated_at AS VARCHAR) AS native_updated_at,
           ${resultExecutionDurationSelectSql},
           ${latestUsageSampleSelectSql}
         FROM session_turn
@@ -9859,9 +10151,12 @@ export class SessionStore {
           CAST(created AS VARCHAR) AS created,
           CAST(updated AS VARCHAR) AS updated
         FROM sessions
-        WHERE thread_id = $threadId
+        WHERE (thread_id = $threadId OR EXISTS (
+          SELECT 1 FROM session_provider_thread pt WHERE pt.session_id = sessions.id AND pt.thread_id = $threadId
+        ))
           ${workspacePredicate}
-        ORDER BY updated DESC, created DESC
+        ORDER BY EXISTS (SELECT 1 FROM session_provider_thread pt WHERE pt.session_id = sessions.id AND pt.thread_id = $threadId) DESC,
+          updated DESC, created DESC
         LIMIT 1
       `,
       workspaceId ? { threadId, workspaceId } : { threadId }
@@ -9966,6 +10261,9 @@ export class SessionStore {
           context_turn_count,
           context_filter,
           mode,
+          round_id,
+          actor_json,
+          reply_to_id,
           CAST(created AS VARCHAR) AS created
         FROM session_side_chat
         WHERE session_id = $sessionId
@@ -9987,11 +10285,11 @@ export class SessionStore {
   private async listSessionLiveItemsWithConnection(
     connection: SessionDbConnection,
     sessionId: string,
-    turnId?: string,
+    turnId?: string | string[],
     fileChangesOnly = false
   ): Promise<Record<string, unknown[]>> {
-    const turnFilter = turnId ? "AND turn_id = $turnId" : "";
-    const queryParams = turnId ? { sessionId, turnId } : { sessionId };
+    const turnFilter = Array.isArray(turnId) ? "AND turn_id = ANY($turnIds::VARCHAR[])" : turnId ? "AND turn_id = $turnId" : "";
+    const queryParams = { sessionId, ...(Array.isArray(turnId) ? { turnIds: turnId } : turnId ? { turnId } : {}) };
     const result = await connection.run(
       `
         SELECT
@@ -10083,7 +10381,7 @@ export class SessionStore {
   private async listLatestTurnDiffsWithConnection(
     connection: SessionDbConnection,
     sessionId: string,
-    turnId?: string,
+    turnId?: string | string[],
     before?: { created: string; id: string },
     authoritativeTurnIds: string[] = []
   ): Promise<Record<string, unknown>[]> {
@@ -10096,7 +10394,7 @@ export class SessionStore {
       WITH event_turns AS (
         SELECT DISTINCT turn_id FROM session_turn_event
         WHERE session_id = $sessionId AND event_name = 'codex'
-          ${turnId ? "AND turn_id = $turnId" : ""}
+          ${Array.isArray(turnId) ? "AND turn_id = ANY($turnIds::VARCHAR[])" : turnId ? "AND turn_id = $turnId" : ""}
           ${authoritativeTurnIds.length ? "AND turn_id <> ALL($authoritativeTurnIds::VARCHAR[])" : ""}
       ), latest_diffs AS MATERIALIZED (
         SELECT diff_event.* FROM event_turns
@@ -10114,7 +10412,7 @@ export class SessionStore {
       FROM latest_diffs
     `, {
       sessionId,
-      ...(turnId ? { turnId } : {}),
+      ...(Array.isArray(turnId) ? { turnIds: turnId } : turnId ? { turnId } : {}),
       ...(authoritativeTurnIds.length ? { authoritativeTurnIds } : {}),
       ...(before ? { beforeCreated: before.created, beforeId: before.id } : {})
     });
@@ -10132,7 +10430,8 @@ export class SessionStore {
 
   private async listSessionApprovalLiveItemsWithConnection(
     connection: SessionDbConnection,
-    sessionId: string
+    sessionId: string,
+    turnIds?: string[]
   ): Promise<Record<string, unknown[]>> {
     const result = await connection.run(
       `
@@ -10147,6 +10446,7 @@ export class SessionStore {
           FROM session_turn_event
           WHERE session_id = $sessionId
             AND event_name IN ('approval.requested', 'approval.resolved')
+            ${turnIds ? "AND turn_id = ANY($turnIds::VARCHAR[])" : ""}
         ),
         ranked AS (
           SELECT
@@ -10166,6 +10466,7 @@ export class SessionStore {
           FROM session_turn_event
           WHERE session_id = $sessionId
             AND event_name = 'approval.decision'
+            ${turnIds ? "AND turn_id = ANY($turnIds::VARCHAR[])" : ""}
           GROUP BY turn_id, json_extract_string(payload, '$.approvalId')
         )
         SELECT
@@ -10182,7 +10483,7 @@ export class SessionStore {
         WHERE ranked.row_number = 1
         ORDER BY ranked.created ASC, ranked.event_id ASC
       `,
-      { sessionId }
+      { sessionId, ...(turnIds ? { turnIds } : {}) }
     );
 
     const itemsByTurn: Record<string, unknown[]> = {};
@@ -10200,7 +10501,8 @@ export class SessionStore {
 
   private async listSessionDeveloperInstructionsWithConnection(
     connection: SessionDbConnection,
-    sessionId: string
+    sessionId: string,
+    turnIds?: string[]
   ): Promise<Record<string, SessionDeveloperInstructionsRecord[]>> {
     const result = await connection.run(
       `
@@ -10211,9 +10513,10 @@ export class SessionStore {
         FROM session_turn_event
         WHERE session_id = $sessionId
           AND event_name = 'developer_instructions'
+          ${turnIds ? "AND turn_id = ANY($turnIds::VARCHAR[])" : ""}
         ORDER BY created ASC, id ASC
       `,
-      { sessionId }
+      { sessionId, ...(turnIds ? { turnIds } : {}) }
     );
 
     const recordsByTurn: Record<string, SessionDeveloperInstructionsRecord[]> = {};
@@ -10242,7 +10545,8 @@ export class SessionStore {
 
   private async listSessionAutoModelProvidersWithConnection(
     connection: SessionDbConnection,
-    sessionId: string
+    sessionId: string,
+    turnIds?: string[]
   ): Promise<Record<string, { provider: SessionAutoModelProvider; confidence?: number }>> {
     const result = await connection.run(
       `
@@ -10250,9 +10554,10 @@ export class SessionStore {
         FROM session_turn_event
         WHERE session_id = $sessionId
           AND event_name = 'auto_model.selected'
+          ${turnIds ? "AND turn_id = ANY($turnIds::VARCHAR[])" : ""}
         ORDER BY created ASC, id ASC
       `,
-      { sessionId }
+      { sessionId, ...(turnIds ? { turnIds } : {}) }
     );
     const providers: Record<string, { provider: SessionAutoModelProvider; confidence?: number }> = {};
     for (const row of await result.getRowObjectsJS()) {
@@ -10269,7 +10574,8 @@ export class SessionStore {
 
   private async listSessionSteerMessagesWithConnection(
     connection: SessionDbConnection,
-    sessionId: string
+    sessionId: string,
+    turnIds?: string[]
   ): Promise<Record<string, SessionSteerMessageRecord[]>> {
     const result = await connection.run(
       `
@@ -10282,9 +10588,10 @@ export class SessionStore {
         FROM session_turn_event
         WHERE session_id = $sessionId
           AND event_name IN ('steer', 'steer.accepted')
+          ${turnIds ? "AND turn_id = ANY($turnIds::VARCHAR[])" : ""}
         ORDER BY created ASC, id ASC
       `,
-      { sessionId }
+      { sessionId, ...(turnIds ? { turnIds } : {}) }
     );
 
     const recordsByTurn = new Map<string, Map<string, { steer: SessionSteerMessageRecord; isDurableSteer: boolean }>>();
@@ -12374,6 +12681,9 @@ function toSessionTurnRecord(row: SessionTurnRow): SessionTurnRecord {
     id: stringValue(row.id),
     sessionId: stringValue(row.session_id),
     loopMode: row.loop_mode === true,
+    nativeThreadId: nullableString(row.native_thread_id),
+    provider: row.provider === "claude" || row.provider === "codex" ? row.provider : null,
+    nativeUpdatedAt: nullableString(row.native_updated_at),
     accountId: nullableString(row.account_id),
     userInput: stringValue(row.user_input),
     agentResponse: stringValue(row.agent_response),
@@ -12461,6 +12771,9 @@ function toSessionSideChatRecord(row: SessionSideChatRow): SessionSideChatRecord
     contextTurnCount: numberValue(row.context_turn_count),
     contextFilter: nullableString(row.context_filter),
     mode: stringValue(row.mode, "forked_ephemeral"),
+    roundId: nullableString(row.round_id),
+    actor: parseSideChatActorJson(row.actor_json),
+    replyToId: nullableString(row.reply_to_id),
     created: stringValue(row.created)
   };
 }

@@ -1,5 +1,8 @@
 import type { RequestHandler } from "express";
+import { isClaudeModel } from "../modelCatalog";
 import { buildTurnGrillMidTurnInputs, buildTurnGrillPrompt, buildTurnGrillSessionContext, grillTurn, isLongTurnGrill, turnGrillModel } from "./turnGrill";
+import type { HelperModels } from "./helperModelSettings";
+import { detectConversationLanguage } from "./conversationLanguage";
 import { normalizeModelTokenUsage, type ModelTokenUsage } from "./modelTokenUsage";
 import { summarizeSessionFileChanges, type SessionStore } from "./sessionStore";
 import { acknowledgeGrill, grillContentVersion, canFollowUpGrill, parseGrillIssues, type TurnGrill } from "../turnGrill";
@@ -9,11 +12,12 @@ type GrillUsage = {
   sessionId: string; accountId: string | null; model: string; usage: ModelTokenUsage | null;
 };
 
-export function createTurnGrillHandler({ sessionStore, serverUrl, recordUsage, runGrill = grillTurn }: {
+export function createTurnGrillHandler({ sessionStore, serverUrl, recordUsage, runGrill = grillTurn, helperModels }: {
   sessionStore: SessionStore;
   serverUrl: string;
   recordUsage: (usage: GrillUsage) => Promise<void>;
   runGrill?: typeof grillTurn;
+  helperModels?: () => HelperModels;
 }): RequestHandler<{ sessionId: string; turnId: string }> {
   const activeTurnGrills = new Set<string>();
   return async (req, res) => {
@@ -116,7 +120,9 @@ export function createTurnGrillHandler({ sessionStore, serverUrl, recordUsage, r
         sessionContext: buildTurnGrillSessionContext(session, turn.id, sessionTurns),
         action, issues: requestedIssues, reservedIssueIds: issues.map((issue) => issue.id), rounds: (saved?.rounds ?? []).map((round) => ({ ...round,
         issues: round.issues.filter((issue) => requestedIssues.some((current) => current.id === issue.id)) })), followup, longTurn,
-        autoLoop: req.body?.autoLoop === true || saved?.automatic === true
+        autoLoop: req.body?.autoLoop === true || saved?.automatic === true,
+        // A short target prompt such as "go" says little about the user's language.
+        responseLanguage: detectConversationLanguage([...sessionTurns.map((sessionTurn) => sessionTurn.userInput), followup])
       });
       let acknowledged = saved;
       if (saved && req.body.observedVersion !== undefined) {
@@ -129,11 +135,16 @@ export function createTurnGrillHandler({ sessionStore, serverUrl, recordUsage, r
         res.status(409).json({ error: "Grill changed. Reload before retrying." }); return;
       }
       running = next;
-      const result = await runGrill(workspace.codexHome, prompt, session, serverUrl, sessionTurns.length, turn.id, longTurn);
+      const model = turnGrillModel(longTurn, helperModels?.());
+      const claudeConfigDir = isClaudeModel(model)
+        ? (await sessionStore.resolveClaudeAccount({ workspaceId: session.workspaceId, sessionId: session.id }))?.configDir ?? null
+        : null;
+      const result = await runGrill(workspace.codexHome, prompt, session, serverUrl, sessionTurns.length, turn.id, longTurn, { model, claudeConfigDir });
       await recordUsage({
         id: `background:turn_grill:${crypto.randomUUID()}`,
         task: "session_question", source: "app_server", workspaceId: workspace.id,
-        sessionId: session.id, accountId: session.accountId, model: turnGrillModel(longTurn),
+        // Claude usage is not attributable to a Codex account.
+        sessionId: session.id, accountId: isClaudeModel(model) ? null : session.accountId, model,
         usage: normalizeModelTokenUsage(result.usage)
       });
       const returned = parseGrillIssues(JSON.parse(result.responseText.trim()));

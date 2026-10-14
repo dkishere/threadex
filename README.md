@@ -147,7 +147,7 @@ Useful scripts:
 | `npm run codex:stop-sync-hook` | Runs the Codex `Stop` hook helper; normally invoked by `.codex/hooks.json` |
 | `npm run embed:session-descriptions` | Embeds stale/missing `sessions.description` rows |
 | `npm run summarize:workspace-sessions` | Forces session title regeneration for the active workspace |
-| `npm run mcp:session-inspector` | Starts the session inspector/manager MCP server |
+| `npm run session-inspector -- help` | Lists the role-scoped session inspector CLI commands |
 
 ## Environment
 
@@ -189,7 +189,8 @@ RUNNER_COMMAND_OUTPUT_HARD_LIMIT_CHARS=16777216
 SESSION_COMMENTARY_HEADLINE_REASONING_EFFORT=none
 SESSION_COMMENTARY_HEADLINE_TIMEOUT_MS=12000
 SESSION_QUESTION_MODEL=luna
-SESSION_QUESTION_TIMEOUT_MS=90000
+# Optional override; defaults to 600000 for chat investigations, 90000 for fork drafting.
+SESSION_QUESTION_TIMEOUT_MS=600000
 SESSION_QUESTION_AGENT_HOME=~/.codex
   SESSION_ROUTER_MODEL=gpt-6-luna
 SESSION_ROUTER_TIMEOUT_MS=90000
@@ -204,7 +205,6 @@ TURN_RING_MAX_BYTES=104857600
 THREADEX_INHIBIT_SLEEP=true
 APPROVAL_WAIT_MS=600000
 RUNNER_APPROVAL_WAIT_MS=600000
-SESSION_INSPECTOR_MCP_MODE=auto
 ```
 
 `CODEX_WORKDIR` controls the cwd sent to Codex for new threads. The default is
@@ -266,23 +266,91 @@ On macOS, each active prompt runner starts a `caffeinate` process to prevent
 display, idle, disk, and system sleep until that runner exits. Set
 `THREADEX_INHIBIT_SLEEP=0` to disable this behavior.
 
-`SESSION_INSPECTOR_MCP_MODE` defaults to `auto`. The
-`skills/session-inspector` skill documents the HTTP API and MCP tools. In
-`auto`, MCP is attached to every resumed native thread so
-`recover_current_session` can restore saved user/final-assistant turns omitted
-by opaque Codex compaction. Ordinary resumed turns get a continuity-only tool
-set (`recover_current_session`, `get_session`, and `search_sessions`) rather
-than mutation, Todo, or process controls. MCP is also attached to new threads
-whose prompts explicitly inspect/search stored session history or monitor a process. Use
-`off` to disable it or `always` to expose it on every runner turn. The older
-`ENABLE_SESSION_INSPECTOR_MCP=true/false` still works as an override.
+Session Inspector uses Skill + CLI. Runners supply an absolute invocation of
+`scripts/session-inspector.mjs` together with the active API URL, session, role
+and approval policy. Run `npm run session-inspector -- help` in this repository,
+or `help <command>` for the command's generated JSON schema. Commands accept
+one JSON object (or `--stdin` / `--file PATH`), return JSON on stdout and exit
+nonzero with a JSON error on stderr. Short aliases include `search`, `get`,
+`recover`, `ask` and `prompt`.
+
+The CLI uses the HTTP API exclusively; it never opens the session database.
+There is no session-inspector stdio MCP process or eager tool-schema injection.
+Legacy MCP mode environment variables no longer select the transport.
+Role-scoped commands and control semantics are unchanged. Restricted runners
+approve only exact CLI invocations for their allowed commands; unrelated
+command escalation stays denied. Large file/stdin payloads use normal approval.
+See [the skill](skills/session-inspector/SKILL.md) for workflows.
+
 `ask_session` is a read-only side chat persisted outside `session_turn`. Each
 target session gets an in-memory ephemeral app-server thread with a selectable
-model and only the read-only `get_session`/`search_sessions` inspector tools;
-the thread uses the target workspace account without creating a Codex rollout.
-`prompt_session` is the MCP path for adding a real prompt to a target session;
+model, the read-only `get_session`/`search_sessions` inspector tools, and the
+session's Threadex-managed account login, without creating a Codex rollout.
+Side chat may also investigate without changing anything: read the session's
+project by absolute path, run read-only git commands, query local databases,
+search the web, and run throwaway scripts in a private scratch working
+directory, the only writable place. Claude side chats get loopback only;
+Codex cannot limit network to loopback, so Codex side chats get full network
+access. Read-only git and database use is enforced by instructions, not by the
+sandbox. One-off drafting jobs stay transcript-only.
+
+The Side chat tab is a read-only chat room. With no actors it answers with the
+gearbox model, as before. Add agent actors from the Agent actors library to
+replace that default: every actor answers each message in parallel, or only the
+actors you @mention (the composer suggests names after `@`). Each actor reply
+has a **Reply with…** menu that asks another actor to respond to it. Every actor
+keeps its own isolated thread and, on its next turn, reads the room messages it
+has not seen yet. The per-session roster is stored in the browser. The ask
+endpoint accepts optional `actor`, `participants`, `roundId`, and `replyToId`
+fields, and saved side chats return `roundId`, `actor`, and `replyToId`.
+`prompt_session` is the CLI command for adding a real prompt to a target session;
 it starts or queues the normal runner, so it becomes part of that session's log
 and future context.
+
+BDD review feedback can also enter the original session through the minimal
+ACP v1 adapter. Use **Review HTML with agent feedback** beside a workspace HTML
+link, enable agent feedback in the preview header, then use **Send to agent** on
+a saved BDD comment. The parent binds the sandboxed preview to that link's
+session; comments retain their exact wording, scenario, element context,
+revision and replacement history. Saving a comment remains local. Sending it
+creates a normal queued turn, which starts when the session can run. The demo
+shows a durable receipt separately from completion; read the answer in Threadex.
+Disconnecting the preview leaves accepted work intact. Retrying the same comment
+uses its original request ID, avoiding duplicate turns. Threadex adds the feedback
+controls when serving the maintained web-bdd v1 review shell; the artifact on
+disk and external framework sources are untouched. This adapter observes the
+shell's validated contract and comment cards, so older exports using that shell
+can receive feedback controls without rebuilding. Unsupported shells keep the
+ordinary preview behavior.
+
+`npm run acp` exposes newline-delimited JSON-RPC over stdio for external ACP
+clients. Set `RUNNER_SERVER_URL` to the Threadex server URL (otherwise it uses
+`PORT`, default 8787). Supported methods are `initialize`, `session/new`,
+`session/resume`, `session/prompt`, `session/update` and `session/cancel`.
+Create/resume require the absolute session cwd and `mcpServers: []`; new-session
+directories must already be registered in the active workspace. The adapter
+uses the session's existing tools, model preferences and approval policy. It
+accepts text only and does not implement session listing/history replay,
+client filesystem/terminal tools or custom MCP servers. Cancellation only
+targets prompts owned by that ACP connection, including its queued feedback.
+
+The browser uses a documented **custom transport**, not the draft ACP HTTP
+transport: POST one JSON-RPC message to `/api/acp` with a stable random
+`X-Threadex-ACP-Connection` header (16–100 alphanumeric, underscore or hyphen
+characters); read newline-delimited JSON-RPC notifications and the final
+response. Initialize once, then create or resume a session before prompting.
+`session/prompt` remains open until that turn completes. A
+`session/update` user-message notification carries a receipt at
+`update._meta["threadex/receipt"]`; this confirms persistence, not completion.
+For retries across connections, supply a stable string of at most 200 characters
+in prompt `_meta["threadex/requestId"]`. Reusing it with different prompt
+content is rejected. Browser requests retain the existing Threadex login and
+origin checks. Preview content keeps its existing `connect-src 'none'` sandbox;
+the explicitly enabled parent relays ACP messages through `postMessage` on the
+`threadex-acp-v1` channel. Offline demos still support local comments and export.
+
+Focused integration verification:
+`WEB_BDD_BUILDER=/path/to/web-bdd/scripts/build-demo.mjs node --import tsx --test src/client/acpPreviewBridge.test.ts`.
 
 `SESSION_SUMMARIZER_MODEL` controls the small model used for automatic session
 title generation. The summarizer runs as soon as that session has no running
@@ -339,6 +407,7 @@ Main browser API:
 | `GET/POST /api/session-inspector/session` | Inspect one session by `sessionId` or `threadId` with pagination and filters |
 | `GET/POST /api/session-inspector/search` | Global full-text/recent search across stored sessions |
 | `POST /api/session-inspector/ask` | Read-only side-chat turn on an isolated ephemeral app-server thread; supports `model`/`modelReasoningEffort` and persists answers outside `session_turn` |
+| `POST /api/acp` | Minimal ACP JSON-RPC adapter using the documented browser NDJSON transport |
 | `GET /api/session-inspector/vector/status` | Check optional vector-search readiness |
 | `POST /api/session-inspector/vector/search` | Search precomputed `session_description_embedding` rows with a supplied embedding |
 | `GET /api/session-auto-model/:sessionId` | Read the per-session Auto model state |
@@ -461,9 +530,8 @@ processes launched by Threadex are stopped as their own process groups.
 - `sessionId`
 - `resumeThreadId`
 - `contextFork` (asks the current parent agent to prepare a same-language, self-contained handoff and call
-  the `create_task` MCP tool from the `session_inspector` server, exposed in local Codex tool naming as
-  `mcp__session_inspector__create_task`; the child is created and tracked by Threadex)
-- `forcePlan` (the composer Todo MCP toggle; the initial turn records and asks one focused grill-me round,
+  `session-inspector create_task`; the child is created and tracked by Threadex)
+- `forcePlan` (the composer Todo toggle; the initial turn records and asks one focused grill-me round,
   then answer turns remain in planner mode until `todo_set_plan` creates the paused plan)
 - `retryPending`
 - `turnId`
@@ -1009,8 +1077,7 @@ When a turn starts:
    a `session_turn` with `status = 'running'`.
 2. The server writes `data/runner-jobs/<turn-id>.json`.
 3. The server spawns `src/server/promptRunner.ts` detached from the request.
-4. If `SESSION_INSPECTOR_MCP_MODE` enables it, the runner starts with the
-   read-only `session_inspector` MCP server.
+4. The runner supplies the Session Inspector CLI invocation and its scoped environment.
 5. The runner writes `data/runner-logs/<turn-id>.ndjson`.
 6. The server tails that log as SSE.
 7. The runner posts each log entry back to `/api/runner/update`.
@@ -1091,8 +1158,9 @@ All token and quota usage is recorded in `token_usage`: normal Codex turns use
 `usage_type = 'background'`, and quota-ratio observations use `usage_type =
 'account'`. Profile analytics shows each background task as its own model trend.
 The startup migration idempotently backfills legacy usage tables. Account quota
-snapshots refresh only on the background interval, so a completed turn never
-starts another app-server just to read rate limits. Tune this with `ACCOUNT_QUOTA_REFRESH_INTERVAL_MS` and
+snapshots refresh on a background interval, defaulting to 30 seconds with the
+first refresh 10 seconds after startup, so a completed turn never starts another
+app-server just to read rate limits. Tune this with `ACCOUNT_QUOTA_REFRESH_INTERVAL_MS` and
 `ACCOUNT_QUOTA_REFRESH_INITIAL_DELAY_MS`; set the interval to `0` to disable it.
 
 ## Attachments
@@ -1253,3 +1321,17 @@ Grill state and question-history snapshots are persisted in `session_turn_grill`
 After a completed turn and once the session queue drains, the session summariser assesses status from bounded conversation and tool-result evidence. Status is pending, active, unverified, done or blocked; a completion claim without acceptance evidence remains unverified. Parent completion requires completed children and its own acceptance. Updates are revision-checked, persisted and published to the live panel. Failed or malformed assessments retain the last status. The current implementation does not update status during a running turn.
 
 Plan edits preserve stable IDs. Changes to an item's content/acceptance or descendants invalidate its previous assessment; moving an unchanged item retains it. Legacy Todo plans and explicit planning mode remain available separately.
+
+### Round table discussions
+
+Enable **Round table** in the composer to discuss a prompt with independent actors. Its settings appear beside Concurrent in the top right. A new configuration starts with two actors using the first two model gears, random names and empty custom system prompts. Add up to eight actors and choose Codex or Claude models and a perspective for each. The mode stays enabled for following prompts until toggled off, including when the first prompt creates a new host session.
+
+The configured session summariser prepares focused background from the host's completed conversation: only what the current prompt needs, with relevant Threadex turn links and other URLs listed verbatim. Every follow-up round, whether started with a new composer prompt or Next round, supplies each actor with the previous round's complete raw actor responses, names, statuses and errors directly. These responses bypass summarisation, and the previous host synthesis is omitted from both this payload and the context summariser's input. Each actor receives the same frozen context and the current prompt. Actors can read host history with Session Inspector, search the web, and write and run verification scripts in their own temporary scratch directory; they cannot implement project changes. Current-round peer answers are hidden from Session Inspector until the actor stage ends. Actor names must be unique. Once every actor finishes, their answers return to the original host agent as a durable queued turn. The host only synthesises: it returns issues, each with distinct positions and the actors who hold them. The transcript shows this as a card that highlights consensus (every actor on one position), disagreements (conflicting positions), and other points with actors who did not state a position explicitly identified. Supporting actors appear with names and avatars; original answers can be expanded. Source links remain clickable. The host turn stores a readable Markdown form for history, search and copy. Unparseable output or invalid attribution is kept verbatim instead of silently dropping positions. Further composer prompts queue behind the current round.
+
+Progress cards show context preparation, individual actors and the host response. Actor answers and state are saved in `session_roundtable_round`; the prompt and final host response are ordinary turns in the same session. Stop cancels actor inference, and **Retry unfinished work** retains completed answers. Interrupted actor work requires an explicit retry after server restart. Host inference uses the existing runner and its normal retry lifecycle. Settings changes apply to subsequent prompts; submitted round table prompts are frozen. This first version accepts text and quoted context, not attachments or skills.
+
+Each context/actor inference attempt now has a durable JSONL activity journal under `SESSION_DATA_DIR/roundtable-logs` (default `data/roundtable-logs`), separate from disposable provider homes. Actor cards link to each attempt and show its status, event count and last activity time. Start, provider activity (including tool calls/results and usage), completion, errors, cancellation and restart interruption are retained; retries append a new attempt instead of replacing history. Payload previews are bounded and credential fields are redacted; reasoning records keep activity counts rather than reasoning text. Inspector results include attempt metadata; peer log paths remain sealed while actors run. There is no fixed roundtable inference timeout. Old runs without journals cannot be reconstructed, and a silent provider alone does not prove a stall.
+
+Settings → **Agent actors** manages a reusable server-wide actor library, shared by round tables and Side chat: name, model, effort, role prompt, default flag, and avatar. Effort choices follow the composer gearbox: max and ultra are offered only for models that support them. Upload a PNG/JPEG/WebP image (resized to 128×128), or choose and shuffle a DiceBear avatar. New round tables copy default actors, filling any places needed to reach two from gearbox models. Round table settings shows selected actors in an avatar grid. Choose a preset from the dropdown and click Add; Add new actor opens the Settings editor in a popup. Avatars also appear beside actor progress and results. Library edits do not change existing drafts or submitted rounds. The library API is `GET/PUT /api/settings/roundtable-actors`, with revision checking to reject stale saves.
+
+Focused checks: `node --import tsx --test src/server/roundtableService.test.ts src/server/roundtableActorSettings.test.ts src/server/claudeOneShot.test.ts` and `npm run test:e2e -- e2e/roundtable.spec.ts`. Model responses in these checks are controlled fixtures, not live provider calls.

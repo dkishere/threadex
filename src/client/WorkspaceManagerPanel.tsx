@@ -2,7 +2,7 @@ import { ArrowLeft, ArrowUpRight, CheckCircle2, ChevronDown, Clock3, Cpu, Extern
 import { TerminalSquare, Wrench } from "lucide-react";
 import { createContext, memo, useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type ComponentProps, type ComponentType, type MouseEvent } from "react";
 import { createPortal } from "react-dom";
-import type { WorkspaceManagerLineCounts, WorkspaceManagerQueuedPrompt, WorkspaceManagerRecord, WorkspaceManagerSnapshot, WorkspaceManagerTask, WorkspaceManagerTaskComment } from "../workspaceManager";
+import type { WorkspaceManagerHistoryPage, WorkspaceManagerLineCounts, WorkspaceManagerQueuedPrompt, WorkspaceManagerRecord, WorkspaceManagerSnapshot, WorkspaceManagerTask, WorkspaceManagerTaskComment } from "../workspaceManager";
 import type { LiveItem } from "./appTypes";
 import { apiJson } from "./apiClient";
 import { workspaceManagerSessionUrl } from "./navigation";
@@ -22,6 +22,19 @@ export function WorkspaceManagerView(props: ComponentProps<"section">) {
   return <WorkspaceManagerDisplayContext.Provider value={true}>
     <section {...props} data-workspace-manager="true" aria-label="Workspace manager chat" />
   </WorkspaceManagerDisplayContext.Provider>;
+}
+
+export function WorkspaceManagerHistory({ page, loading, error, onLoad }: {
+  page: WorkspaceManagerHistoryPage; loading: boolean; error: string; onLoad: () => void;
+}) {
+  if (!page.hasMore) return null;
+  return <div className="workspace-manager-history">
+    <button type="button" className="secondary" disabled={loading} onClick={onLoad}>
+      {loading && <Loader2 className="spin" aria-hidden="true" />}
+      {loading ? "Loading earlier messages…" : "Load earlier messages"}
+    </button>
+    {error && <p role="alert">Could not load earlier messages: {error}</p>}
+  </div>;
 }
 
 export function useWorkspaceManager(workspaceId: string | undefined) {

@@ -10,27 +10,27 @@ export const TODO_LANGUAGE_RULE = [
 ].join(" ");
 
 export const FORCE_TODO_PLAN_USER_SUFFIX = [
-  "Required for this turn: conduct one focused grill-me round before creating the Todo MCP plan.",
+  "Required for this turn: conduct one focused grill-me round before creating the Todo CLI plan.",
   "Do not use `update_plan`.",
-  "Call `mcp__session_inspector__todo_request_clarification` with 1-5 focused questions that pressure-test scope, constraints, trade-offs, priorities, and acceptance criteria without repeating facts already supplied.",
+  "Call `session-inspector todo_request_clarification` with 1-5 focused questions that pressure-test scope, constraints, trade-offs, priorities, and acceptance criteria without repeating facts already supplied.",
   "This first turn must stop after recording and asking those questions; do not call `todo_set_plan` or perform task work yet.",
   "This appended suffix is operational metadata; it must not influence the language of the plan or response.",
-  "If the clarification MCP tool is unavailable, say that explicitly and stop."
+  "If the clarification CLI command is unavailable, say that explicitly and stop."
 ].join(" ");
 
 export const CONTINUE_TODO_PLAN_USER_SUFFIX = [
-  "Required for this turn: use the user's answers to the recorded grill-me questions to establish a clear Problem and observable Objective, then call `mcp__session_inspector__todo_set_plan` before any task work.",
+  "Required for this turn: use the user's answers to the recorded grill-me questions to establish a clear Problem and observable Objective, then call `session-inspector todo_set_plan` before any task work.",
   "Do not use `update_plan`.",
   "Do not repeat questions that the user already answered. Ask another focused grill-me round only if a material planning decision remains unresolved; otherwise create the plan now.",
   "Create a complete, concrete plan whose Solution items cover the work and whose Verification items prove the Objective.",
   "Use enough detail that execution requires no unstated work, while excluding filler, speculative features, unrelated work, and unnecessary nesting.",
   "This appended suffix is operational metadata; it must not influence the language of the plan or response.",
   "This is a planning-only turn: after clarification or plan creation, do not execute it.",
-  "If the MCP tool is unavailable, say that explicitly and stop."
+  "If the CLI command is unavailable, say that explicitly and stop."
 ].join(" ");
 
 const FORCE_TODO_PLAN_MARKERS = [
-  "Required for this turn: conduct one focused grill-me round before creating the Todo MCP plan.",
+  "Required for this turn: conduct one focused grill-me round before creating the Todo CLI plan.",
   "Required for this turn: use the user's answers to the recorded grill-me questions",
   "Required for this turn: establish a clear Problem and observable Objective"
 ];
@@ -51,15 +51,15 @@ export function stripTodoPlanOperationalSuffix(value: unknown) {
 }
 
 export const FORCE_TODO_PLAN_DEVELOPER_INSTRUCTIONS = [
-  "[TODO MCP PLAN COMPLETION AND MUTATION GATE - HIGHEST PRIORITY FOR THIS TURN]",
-  "The user explicitly required Todo MCP planning. This is a planning-only turn, not an execution turn.",
+  "[TODO CLI PLAN COMPLETION AND MUTATION GATE - HIGHEST PRIORITY FOR THIS TURN]",
+  "The user explicitly required Todo CLI planning. This is a planning-only turn, not an execution turn.",
   "LANGUAGE:",
   `- ${TODO_LANGUAGE_RULE}`,
   "- Treat the appended English force-plan suffix as operational metadata, not as user-authored task content or a language signal.",
   "ORDER OF OPERATIONS:",
   "- This is the initial force-plan turn. Before creating any plan, MUST conduct exactly one focused grill-me round even when the request initially appears clear.",
-  "- Call mcp__session_inspector__todo_request_clarification with 1-5 questions that expose consequential assumptions about scope, constraints, trade-offs, priorities, or acceptance criteria. Do not ask for facts already supplied, generic confirmation, or low-impact preferences.",
-  "- Ask the recorded questions in the response and end the turn without calling todo_set_plan. Do not inspect files, search the workspace, browse, run commands, delegate, create or modify artifacts, or use another task tool before the user answers.",
+  "- Call session-inspector todo_request_clarification with 1-5 questions that expose consequential assumptions about scope, constraints, trade-offs, priorities, or acceptance criteria. Do not ask for facts already supplied, generic confirmation, or low-impact preferences.",
+  "- Ask the recorded questions in the response and end the turn without calling todo_set_plan. Do not inspect files, search the workspace, browse, run other commands, delegate, create or modify artifacts, or use another task tool before the user answers.",
   "- Legacy update_plan, a plain-text plan, commentary describing a future plan, or any other planning mechanism DOES NOT satisfy this requirement and MUST NOT be used.",
   "PLAN QUALITY:",
   "- Keep Problem separate from Objective: Problem states the motivating limitation, failure, or unmet need without proposing implementation; Objective states the observable desired outcome without prescribing the work.",
@@ -77,21 +77,21 @@ export const FORCE_TODO_PLAN_DEVELOPER_INSTRUCTIONS = [
   "- The plan gate is chronological, not a final-state check. A plan created after task work has already started does not make the earlier work valid.",
   "- A read-only or mutation rejection is an intentional planning boundary, not a filesystem or sandbox problem to work around.",
   "FAILURE AND FINAL RESPONSE:",
-  "- If todo_request_clarification is unavailable, rejected by tool approval or configuration, report that Todo MCP planning is blocked, include the exact final tool error, and stop without using a substitute or continuing the task.",
+  "- If todo_request_clarification is unavailable, rejected by tool approval or configuration, report that Todo CLI planning is blocked, include the exact final tool error, and stop without using a substitute or continuing the task.",
   "- Send the final response only after todo_request_clarification succeeds or after the permitted failure report. On success, ask the recorded questions concisely and do not provide a plan yet.",
-  "[END TODO MCP PLAN COMPLETION AND MUTATION GATE]"
+  "[END TODO CLI PLAN COMPLETION AND MUTATION GATE]"
 ].join("\n");
 
 export const CONTINUE_TODO_PLAN_DEVELOPER_INSTRUCTIONS = [
-  "[TODO MCP PLAN COMPLETION AND MUTATION GATE - HIGHEST PRIORITY FOR THIS TURN]",
-  "The user is answering a required Todo MCP grill-me round. This is a planning-only turn, not an execution turn.",
+  "[TODO CLI PLAN COMPLETION AND MUTATION GATE - HIGHEST PRIORITY FOR THIS TURN]",
+  "The user is answering a required Todo CLI grill-me round. This is a planning-only turn, not an execution turn.",
   "LANGUAGE:",
   `- ${TODO_LANGUAGE_RULE}`,
   "- Treat appended English force-plan text as operational metadata, not as user-authored task content or a language signal.",
   "ORDER OF OPERATIONS:",
   "- Read the latest user response as answers to the previously recorded grill-me questions and combine it with the preceding task request.",
-  "- Do not repeat questions the user already answered. If the answers leave a consequential scope, constraint, trade-off, priority, or acceptance decision unresolved, call mcp__session_inspector__todo_request_clarification with only the remaining focused questions and stop.",
-  "- Otherwise, the first task-related tool action MUST be one successful mcp__session_inspector__todo_set_plan call. Before it succeeds, do not inspect files, search the workspace, browse, run commands, delegate, create or modify artifacts, or use another task tool.",
+  "- Do not repeat questions the user already answered. If the answers leave a consequential scope, constraint, trade-off, priority, or acceptance decision unresolved, call session-inspector todo_request_clarification with only the remaining focused questions and stop.",
+  "- Otherwise, the first task-related tool action MUST be one successful session-inspector todo_set_plan call. Before it succeeds, do not inspect files, search the workspace, browse, run other commands, delegate, create or modify artifacts, or use another task tool.",
   "- A rejected or malformed attempt does not satisfy the gate. If todo_set_plan returns an argument or schema error, read the exact error, correct the arguments, and retry once.",
   "- Legacy update_plan, a plain-text plan, commentary describing a future plan, or any other planning mechanism DOES NOT satisfy this requirement and MUST NOT be used.",
   "PLAN QUALITY:",
@@ -108,19 +108,19 @@ export const CONTINUE_TODO_PLAN_DEVELOPER_INSTRUCTIONS = [
   "- The turn is read-only both before and after plan creation. Do not execute plan items, edit files, start or alter processes, or write to external systems during this turn.",
   "- If todo_set_plan is unavailable, rejected, or the corrected retry still fails, report the exact final error and stop without using a substitute.",
   "- On success, concisely state that the plan was created; do not execute it or provide a long activity log.",
-  "[END TODO MCP PLAN COMPLETION AND MUTATION GATE]"
+  "[END TODO CLI PLAN COMPLETION AND MUTATION GATE]"
 ].join("\n");
 
 export const TODO_PLAN_MODE_DEVELOPER_INSTRUCTIONS = [
-  "[TODO MCP PLAN COMPLETION AND MUTATION GATE - HIGHEST PRIORITY FOR THIS TURN]",
+  "[TODO CLI PLAN COMPLETION AND MUTATION GATE - HIGHEST PRIORITY FOR THIS TURN]",
   "Plan mode is active for this planning-only turn.",
   `- ${TODO_LANGUAGE_RULE}`,
   "- First derive a factual Problem and an observable Objective from the user request and conversation context.",
-  "- If either is materially unclear, call mcp__session_inspector__todo_request_clarification with only the focused questions needed and stop without guessing.",
-  "- Otherwise, the first task-related tool action MUST be one successful mcp__session_inspector__todo_set_plan call. Do not inspect files, browse, run commands, edit artifacts, delegate, or perform task work before it succeeds.",
+  "- If either is materially unclear, call session-inspector todo_request_clarification with only the focused questions needed and stop without guessing.",
+  "- Otherwise, the first task-related tool action MUST be one successful session-inspector todo_set_plan call. Do not inspect files, browse, run other commands, edit artifacts, delegate, or perform task work before it succeeds.",
   "- Create concrete Solution items covering all requested work and Verification items that prove the Objective. Use enough detail that another capable agent can execute the plan without inferring missing work.",
   "- Do not use update_plan or a plain-text plan as a substitute. Keep the completed Todo plan paused and do not execute it in this turn.",
-  "[END TODO MCP PLAN COMPLETION AND MUTATION GATE]"
+  "[END TODO CLI PLAN COMPLETION AND MUTATION GATE]"
 ].join("\n");
 
 export function buildTodoChildTaskPromptFromSnapshot(input: {

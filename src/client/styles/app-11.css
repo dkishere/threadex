@@ -311,6 +311,11 @@
   background: #f8fafc;
 }
 
+/* Agent actors replace the gearbox, so the toolbar takes the full width. */
+.side-chat-composer[data-gearless="true"] > .composer-layout .composer-bar {
+  margin-left: -12px;
+}
+
 @media (max-width: 1440px) {
   .todo-view-tabs {
     display: flex;
@@ -518,12 +523,147 @@
   bottom: 0;
   left: calc(var(--sidebar-width) + ((100vw - var(--sidebar-width)) / 2));
   display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
   border-left: 1px solid #d4d4d8;
   background: #ffffff;
+}
+
+.side-chat-roster {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 18px;
+  border-bottom: 1px solid #e4e4e7;
+}
+
+.side-chat-roster-actor {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+  padding: 3px 6px 3px 3px;
+  border: 1px solid #e4e4e7;
+  border-radius: 999px;
+  color: #27272a;
+  font-size: 12px;
+}
+
+.side-chat-roster-actor > span:not(.actor-avatar) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.side-chat-roster-actor button,
+.side-chat-roster-manage {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: #71717a;
+  cursor: pointer;
+}
+
+.side-chat-roster-actor button svg { width: 12px; height: 12px; }
+.side-chat-roster-manage svg { width: 16px; height: 16px; }
+.side-chat-roster-actor button:hover,
+.side-chat-roster-manage:hover { background: #f4f4f5; color: #27272a; }
+
+.side-chat-roster .actor-avatar,
+.side-chat-bubble > header .actor-avatar,
+.side-chat-mentions .actor-avatar {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  font-size: 9px;
+}
+
+.side-chat-default-avatar svg { width: 14px; height: 14px; }
+
+.side-chat-roster-add,
+.side-chat-reply-select {
+  max-width: 160px;
+  padding: 3px 6px;
+  border: 1px dashed #d4d4d8;
+  border-radius: 999px;
+  background: #ffffff;
+  color: #52525b;
+  font-size: 12px;
+}
+
+.side-chat-bubble {
+  margin: 12px 0 4px;
+}
+
+.side-chat-bubble > header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+
+.side-chat-speaker {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  font-size: 12px;
+}
+
+.side-chat-speaker small {
+  color: #71717a;
+  font-size: 11px;
+}
+
+.side-chat-reply-target {
+  color: #6366f1 !important;
+}
+
+.side-chat-bubble > .side-chat-answer {
+  margin-left: 30px;
+}
+
+.side-chat-bubble > footer {
+  margin: 2px 0 0 30px;
+}
+
+.side-chat-bubble .side-chat-thinking {
+  justify-content: flex-start;
+  min-height: 32px;
+  margin-left: 30px;
+}
+
+.side-chat-bubble .side-chat-error {
+  margin-left: 30px;
+}
+
+.side-chat-error button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  padding: 2px 8px;
+  border: 1px solid #fecaca;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #b91c1c;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.side-chat-error button + button { margin-left: 0; }
+.side-chat-error button svg { width: 12px; height: 12px; }
+
+.side-chat-mentions button {
+  grid-template-columns: auto minmax(0, 1fr) auto;
 }
 
 .side-chat-messages {

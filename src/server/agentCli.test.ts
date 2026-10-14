@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
@@ -58,6 +58,17 @@ test("ephemeral agent homes can copy auth without user config", () => {
   } finally {
     isolated.cleanup();
     rmSync(source, { recursive: true, force: true });
+  }
+});
+
+test("explicit auth creates an isolated home without a workspace auth file", () => {
+  const authRaw = JSON.stringify({ tokens: { account_id: "session-account" } });
+  const isolated = createEphemeralAgentHome({ prefix: "agent-cli-pinned-", sourceHomeCandidates: [], copyConfig: false, authRaw });
+  try {
+    assert.equal(readFileSync(resolve(isolated.home, "auth.json"), "utf8"), authRaw);
+    assert.equal(existsSync(resolve(isolated.home, "config.toml")), false);
+  } finally {
+    isolated.cleanup();
   }
 });
 

@@ -28,13 +28,14 @@
     "migrate:duckdb-to-postgres": "node --import tsx scripts/migrate-duckdb-to-postgres.mjs",
     "codex:stop-sync-hook": "node scripts/codex-stop-sync.mjs",
     "summarize:workspace-sessions": "node node_modules/tsx/dist/cli.mjs scripts/resummarize-workspace-sessions.ts",
-    "mcp:session-inspector": "node node_modules/tsx/dist/cli.mjs src/server/sessionInspectorMcp.ts",
+    "session-inspector": "node scripts/session-inspector.mjs",
+    "acp": "node scripts/acp.mjs",
     "preview": "node node_modules/vite/bin/vite.js preview --host 0.0.0.0 --port 4173",
     "start": "node node_modules/tsx/dist/cli.mjs src/server/index.ts",
     "test": "node --import tsx --test src/server/*.test.ts && node --test scripts/*.test.mjs extensions/threadex-review/*.test.js",
     "test:e2e": "node node_modules/@playwright/test/cli.js test",
     "test:e2e:headed": "node node_modules/@playwright/test/cli.js test --headed",
-    "e2e:server": "node node_modules/tsx/dist/cli.mjs e2e/support/start-server.ts",
+    "e2e:server": "node --import tsx e2e/support/start-server.ts",
     "typecheck": "node node_modules/typescript/lib/tsc.js --noEmit"
   },
   "dependencies": {

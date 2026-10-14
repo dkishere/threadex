@@ -18,7 +18,6 @@ export function isUsageLimitError(message: string) {
     normalized.includes("rate limit") ||
     normalized.includes("quota") ||
     normalized.includes("out of usage") ||
-    normalized.includes("exceeded") ||
     normalized.includes("limit reached");
   const hasResetSignal =
     normalized.includes("reset") ||

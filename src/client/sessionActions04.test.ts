@@ -1,10 +1,37 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  applyStreamItem,
   commitQueuedPromptEdit,
   editQueuedPrompt,
   insertEditedQueuedPrompt
 } from "./sessionActions04";
+import { seedReplayTargetFromMessage } from "./sessionActions05";
+
+test("replayed plain text for an item already shown as commentary is not re-appended", () => {
+  const liveItemKey = (item: { id: string; originThreadId?: string }) => `${item.originThreadId ?? ""}:${item.id}`;
+  const commentary = { id: "note", itemType: "agent_message", eventType: "item.completed", text: "Reading the runner", phase: "commentary", comment: { detail: "Reading the runner" } };
+  const target: any = { turnId: "t", assistantMessageId: "a", sessionId: "s", viewKey: 0, textByItemId: {}, liveItemEventRankById: {} };
+  seedReplayTargetFromMessage({ itemEventRank: () => 3, liveItemKey }, target, {
+    content: "",
+    segments: [{ id: "live::note", type: "live", item: commentary }],
+    liveItems: [commentary]
+  });
+  const appended: string[] = [];
+  const ctx = {
+    appendAssistantMessage: (_target: unknown, content: string) => { if (content) appended.push(content); },
+    describeStreamItem: () => "",
+    isTargetVisible: () => true,
+    liveItemKey,
+    readAgentMessageAppendText: (_target: unknown, item: { text: string }) => item.text,
+    setStatus: () => {},
+    threadIdRef: { current: null },
+    upsertLiveItem: () => {}
+  };
+  applyStreamItem(ctx, target, { id: "note", itemType: "agent_message", eventType: "item.completed", text: "Reading the runner" });
+  applyStreamItem(ctx, target, { id: "answer", itemType: "agent_message", eventType: "item.completed", text: "Done" });
+  assert.deepEqual(appended, ["Done"]);
+});
 
 function queuedPrompt(id: string, content = id) {
   return {

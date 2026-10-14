@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { appendFileSync, chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -28,9 +28,18 @@ test("prompt runner serializes burst callbacks so terminal updates are not stran
   const pendingLogPath = resolve(root, "pending.ndjson");
   const appServerExitMarkerPath = resolve(root, "app-server-exited");
   const turnParamsPath = resolve(root, "turn-params.json");
+  const nativeSessionsPath = resolve(root, "codex-home", "sessions");
+  mkdirSync(nativeSessionsPath, { recursive: true });
+  const nativeLogPath = resolve(nativeSessionsPath, "rollout-thread-1.jsonl");
+  const usageEntry = (timestamp: string, total: number) => JSON.stringify({
+    timestamp, type: "event_msg", payload: { type: "token_count", info: { total } }
+  }) + "\n";
+  writeFileSync(nativeLogPath, usageEntry(new Date().toISOString(), 10));
   const receivedEvents: string[] = [];
+  let persistedTokenSamples: Array<{ info: { total: number } }> = [];
   let turnCompletedCallbackIndex = -1;
   let appServerExitedBeforeResult = false;
+  let authSyncStartedAfterCompletion = false;
   let callbackQueue = Promise.resolve();
 
   const server = createServer(async (request, response) => {
@@ -42,6 +51,17 @@ test("prompt runner serializes burst callbacks so terminal updates are not stran
       return;
     }
     const update = JSON.parse(body);
+    if (request.url === "/api/runner/account-auth-sync") {
+      authSyncStartedAfterCompletion = receivedEvents.includes("result") && receivedEvents.includes("done");
+      // A following prompt can append to the same thread during cleanup.
+      appendFileSync(nativeLogPath, usageEntry(new Date(Date.now() + 1_000).toISOString(), 20));
+      // Simulate slow bookkeeping. Completion must already have reached the
+      // manager, allowing it to schedule the next prompt while this waits.
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 200));
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ ok: true }));
+      return;
+    }
     const current = callbackQueue.then(async () => {
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
       if (update.event === "codex" && update.data?.method === "turn/completed") {
@@ -49,6 +69,10 @@ test("prompt runner serializes burst callbacks so terminal updates are not stran
       }
       if (update.event === "result") {
         appServerExitedBeforeResult = existsSync(appServerExitMarkerPath);
+      }
+      if (update.event === "token_count") {
+        persistedTokenSamples = update.data.samples;
+        assert.equal(update.data.threadId, undefined, "late usage must not rebind the session thread");
       }
       receivedEvents.push(update.event);
       response.writeHead(200, { "Content-Type": "application/json" });
@@ -92,6 +116,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     sessionId: "session-1",
     turnId: "turn-1",
     message: "test callback burst",
+    accountId: "account-1",
+    accountAuthVersion: 1,
     fastMode: true,
     serverUrl: `http://127.0.0.1:${address.port}`,
     logPath,
@@ -125,7 +151,9 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.ok(turnCompletedCallbackIndex >= 0);
   assert.ok(turnCompletedCallbackIndex < receivedEvents.indexOf("result"));
   assert.equal(appServerExitedBeforeResult, true);
-  assert.equal(receivedEvents.at(-1), "done");
+  assert.equal(authSyncStartedAfterCompletion, true);
+  assert.ok(receivedEvents.indexOf("done") < receivedEvents.indexOf("token_count"));
+  assert.deepEqual(persistedTokenSamples.map((sample) => sample.info.total), [10]);
 });
 
 test("prompt runner uses attached source metadata before Browser Bridge", async () => {
@@ -269,6 +297,88 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.equal(entries.at(-1)?.event, "done");
 });
 
+test("prompt runner distinguishes exhausted request retries from account quota failures", async (t) => {
+  const cases = [
+    {
+      name: "generic 429 rejection",
+      message: "exceeded retry limit, last status: 429 Too Many Requests",
+      codexErrorInfo: { responseTooManyFailedAttempts: { httpStatusCode: 429 } },
+      pending: false
+    },
+    {
+      name: "explicit usage limit",
+      message: "You've hit your usage limit. Try again after reset.",
+      codexErrorInfo: "usageLimitExceeded",
+      pending: true
+    }
+  ];
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const root = mkdtempSync(resolve(tmpdir(), "prompt-runner-quota-classification-"));
+      const fakeCodexPath = resolve(root, "fake-codex.mjs");
+      const jobPath = resolve(root, "job.json");
+      const logPath = resolve(root, "runner.ndjson");
+
+      try {
+        writeFileSync(fakeCodexPath, `#!/usr/bin/env node
+import { createInterface } from "node:readline";
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method === "initialize") send({ id: request.id, result: {} });
+  if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "thread-1" } } });
+  if (request.method === "thread/goal/clear") send({ id: request.id, result: {} });
+  if (request.method === "turn/start") {
+    send({ id: request.id, result: { turn: { id: "app-turn-1" } } });
+    send({ method: "error", params: {
+      error: ${JSON.stringify({ message: scenario.message, codexErrorInfo: scenario.codexErrorInfo })},
+      willRetry: false, threadId: "thread-1", turnId: "app-turn-1"
+    } });
+  }
+});
+`, "utf8");
+        chmodSync(fakeCodexPath, 0o755);
+        writeFileSync(jobPath, JSON.stringify({
+          sessionId: "session-1",
+          turnId: "turn-1",
+          message: "test account quota classification",
+          logPath,
+          codexHome: resolve(root, "codex-home"),
+          cwd: projectRoot
+        }), "utf8");
+
+        const child = spawn(process.execPath, ["--import", "tsx", runnerPath, jobPath], {
+          cwd: projectRoot,
+          env: { ...process.env, CODEX_PATH: fakeCodexPath },
+          stdio: ["ignore", "pipe", "pipe"]
+        });
+        let stderr = "";
+        child.stderr.setEncoding("utf8");
+        child.stderr.on("data", (chunk) => { stderr += chunk; });
+        const exitCode = await new Promise<number | null>((resolveExit) => child.once("exit", resolveExit));
+        assert.equal(exitCode, scenario.pending ? 0 : 1, stderr);
+
+        const entries = readFileSync(logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+        const pending = entries.find((entry) => entry.event === "pending");
+        const error = entries.find((entry) => entry.event === "error");
+        if (scenario.pending) {
+          assert.equal(pending?.data?.reason, "rate_limit");
+          assert.match(pending?.data?.message ?? "", /Usage limit reached/);
+          assert.equal(error, undefined);
+        } else {
+          assert.equal(pending, undefined);
+          assert.equal(error?.data?.message, scenario.message);
+          assert.equal(entries.some((entry) => entry.event === "result"), false);
+        }
+        assert.ok(entries.some((entry) => entry.event === "done"));
+      } finally {
+        rmSync(root, { force: true, recursive: true });
+      }
+    });
+  }
+});
+
 test("prompt runner truncates a runaway command output stream without stopping the turn", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "prompt-runner-command-output-limit-"));
   const fakeCodexPath = resolve(root, "fake-codex.mjs");
@@ -370,7 +480,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   const request = JSON.parse(line);
   if (request.method === "initialize") send({ id: request.id, result: {} });
   if (request.method === "thread/start") {
-    writeFileSync(process.env.CAPTURED_THREAD_PATH, JSON.stringify(request.params));
+    writeFileSync(process.env.CAPTURED_THREAD_PATH, JSON.stringify({ ...request.params, inspectorEnv: Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("THREADEX_") || key === "RUNNER_SERVER_URL")) }));
     send({ id: request.id, result: { thread: { id: "thread-1" } } });
   }
   if (request.method === "thread/goal/clear") send({ id: request.id, result: {} });
@@ -418,12 +528,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   const thread = JSON.parse(readFileSync(capturedThreadPath, "utf8"));
   const args = JSON.parse(readFileSync(capturedArgsPath, "utf8"));
   assert.ok(args.includes("app-server"));
-  assert.ok(args.includes(`mcp_servers.session_inspector.command=${JSON.stringify(process.execPath)}`));
-  assert.ok(args.includes(`mcp_servers.session_inspector.args=[${JSON.stringify(resolve(projectRoot, "node_modules/tsx/dist/cli.mjs"))}, ${JSON.stringify(resolve(projectRoot, "src/server/sessionInspectorMcp.ts"))}]`));
-  assert.ok(args.includes("mcp_servers.session_inspector.tools.todo_set_plan.approval_mode=\"approve\""));
-  assert.ok(args.includes("mcp_servers.session_inspector.tools.todo_request_clarification.approval_mode=\"approve\""));
-  assert.ok(args.includes("mcp_servers.session_inspector.env.TMPDIR=\"/private/tmp\""));
-  assert.ok(args.includes("mcp_servers.session_inspector.env.THREADEX_TODO_AGENT_ROLE=\"planner\""));
+  assert.ok(args.includes("mcp_servers.session_inspector.enabled=false"));
+  assert.equal(thread.inspectorEnv.THREADEX_TODO_AGENT_ROLE, "planner");
   assert.match(thread.developerInstructions, /commentary and progress updates as plain natural-language prose only/i);
   assert.match(thread.developerInstructions, /Never wrap commentary in JSON/i);
   assert.match(thread.developerInstructions, /Threadex session ownership/i);
@@ -438,16 +544,10 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.match(thread.developerInstructions, /Code-file edit tracking/i);
   assert.match(thread.developerInstructions, /explicit prior permission for the specific alternative method and file scope/i);
   assert.match(thread.developerInstructions, /never silently fall back/i);
-  assert.equal(thread.approvalPolicy, "never");
+  assert.equal(thread.approvalPolicy, "on-request");
   assert.equal(thread.approvalsReviewer, "user");
-  assert.equal(
-    thread.config.mcp_servers.session_inspector.tools.todo_set_plan.approval_mode,
-    "approve"
-  );
-  assert.equal(
-    thread.config.mcp_servers.session_inspector.tools.todo_request_clarification.approval_mode,
-    "approve"
-  );
+  assert.equal(thread.config.mcp_servers.session_inspector.enabled, false);
+  assert.equal(thread.config.mcp_servers.session_inspector.enabled, false);
   const turn = JSON.parse(readFileSync(capturedTurnPath, "utf8"));
   assert.equal(turn.input[0].type, "text");
   assert.equal(
@@ -461,7 +561,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.match(turn.settings.developer_instructions, /original user's actual task request/);
   assert.doesNotMatch(turn.settings.developer_instructions, /compact status headline/);
   assert.match(turn.settings.developer_instructions, /appended English force-plan suffix/);
-  assert.match(turn.settings.developer_instructions, /mcp__session_inspector__todo_request_clarification/);
+  assert.match(turn.settings.developer_instructions, /session-inspector todo_request_clarification/);
   assert.match(turn.settings.developer_instructions, /todo_set_plan plans/);
   assert.match(turn.settings.developer_instructions, /item title\/details/);
   assert.match(turn.settings.developer_instructions, /activeStatus/);
@@ -469,15 +569,15 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.match(turn.settings.developer_instructions, /todo_add_comment status\/blocker\/note bodies/);
   assert.match(turn.settings.developer_instructions, /nested split items/);
   assert.match(turn.settings.developer_instructions, /todo_create_task/);
-  assert.match(turn.settings.developer_instructions, /TODO MCP PLAN COMPLETION AND MUTATION GATE/);
+  assert.match(turn.settings.developer_instructions, /TODO CLI PLAN COMPLETION AND MUTATION GATE/);
   assert.equal(
-    turn.settings.developer_instructions.match(/\[TODO MCP PLAN COMPLETION AND MUTATION GATE/g)?.length,
+    turn.settings.developer_instructions.match(/\[TODO CLI PLAN COMPLETION AND MUTATION GATE/g)?.length,
     1
   );
   assert.match(turn.settings.developer_instructions, /MUST conduct exactly one focused grill-me round/);
   assert.match(turn.settings.developer_instructions, /chronological, not a final-state check/);
   assert.deepEqual(turn.sandboxPolicy, { type: "readOnly", networkAccess: false });
-  assert.equal(turn.approvalPolicy, "never");
+  assert.equal(turn.approvalPolicy, "on-request");
 });
 
 test("prompt runner enables current-session recovery for an ordinary resumed thread", async () => {
@@ -498,7 +598,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   const request = JSON.parse(line);
   if (request.method === "initialize") send({ id: request.id, result: {} });
   if (request.method === "thread/resume") {
-    writeFileSync(process.env.CAPTURED_THREAD_PATH, JSON.stringify(request.params));
+    writeFileSync(process.env.CAPTURED_THREAD_PATH, JSON.stringify({ ...request.params, inspectorEnv: Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("THREADEX_") || key === "RUNNER_SERVER_URL")) }));
     send({ id: request.id, result: { thread: { id: request.params.threadId } } });
   }
   if (request.method === "thread/goal/clear") send({ id: request.id, result: {} });
@@ -541,13 +641,12 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.equal(exitCode, 0, stderr);
 
   const args = JSON.parse(readFileSync(capturedArgsPath, "utf8")) as string[];
-  assert.ok(args.some((arg) => arg.includes("mcp_servers.session_inspector.command")));
-  assert.ok(args.includes('mcp_servers.session_inspector.env.THREADEX_CONTINUITY_ONLY="1"'));
+  assert.ok(args.includes("mcp_servers.session_inspector.enabled=false"));
   const thread = JSON.parse(readFileSync(capturedThreadPath, "utf8"));
   const turn = JSON.parse(readFileSync(capturedTurnPath, "utf8"));
   assert.match(thread.developerInstructions, /call recover_current_session/i);
   assert.match(thread.developerInstructions, /complete user prompts and final assistant responses/i);
-  assert.doesNotMatch(thread.developerInstructions, /For Todo MCP planning|Use list_processes/);
+  assert.doesNotMatch(thread.developerInstructions, /For Todo CLI planning|Use list_processes/);
   assert.doesNotMatch(turn.settings?.developer_instructions ?? "", /recover_current_session|THREADEX_WORKTREE_REVIEW/);
 });
 
@@ -570,7 +669,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   const request = JSON.parse(line);
   if (request.method === "initialize") send({ id: request.id, result: {} });
   if (request.method === "thread/start") {
-    writeFileSync(process.env.CAPTURED_THREAD_PATH, JSON.stringify(request.params));
+    writeFileSync(process.env.CAPTURED_THREAD_PATH, JSON.stringify({ ...request.params, inspectorEnv: Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("THREADEX_") || key === "RUNNER_SERVER_URL")) }));
     send({ id: request.id, result: { thread: { id: "thread-1" } } });
   }
   if (request.method === "thread/goal/clear") send({ id: request.id, result: {} });
@@ -604,7 +703,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       response.writeHead(200, { "Content-Type": "application/json" });
       response.end(JSON.stringify({
         items: [{ id: "todo-1", title: "Existing plan item" }],
-        control: { paused: true, pauseReason: "Initial Todo MCP plan created for review. Execution has not started.", pausedBy: "agent" }
+        control: { paused: true, pauseReason: "Initial Todo CLI plan created for review. Execution has not started.", pausedBy: "agent" }
       }));
       return;
     }
@@ -618,7 +717,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   writeFileSync(jobPath, JSON.stringify({
     sessionId: "session-1",
     turnId: "turn-1",
-    message: "跟進 Todo MCP plan",
+    message: "跟進 Todo CLI plan",
     forcePlan: true,
     executionMode: "default",
     approvalPolicy: "on-request",
@@ -654,21 +753,20 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   }
 
   const args = JSON.parse(readFileSync(capturedArgsPath, "utf8"));
-  assert.ok(args.includes("mcp_servers.session_inspector.env.THREADEX_TODO_AGENT_ROLE=\"default\""));
   assert.equal(args.some((arg: string) => arg.includes("tools.todo_set_plan.approval_mode")), false);
   assert.deepEqual(controlPosts, [{
     paused: true,
-    pauseReason: "Initial Todo MCP plan created for review. Execution has not started.",
+    pauseReason: "Initial Todo CLI plan created for review. Execution has not started.",
     actor: "agent"
   }]);
 
   const thread = JSON.parse(readFileSync(capturedThreadPath, "utf8"));
-  assert.equal(thread.approvalPolicy, "never");
+  assert.equal(thread.approvalPolicy, "on-request");
   const turn = JSON.parse(readFileSync(capturedTurnPath, "utf8"));
-  assert.equal(turn.input[0].text, "跟進 Todo MCP plan");
-  assert.match(turn.settings.developer_instructions, /Todo MCP plan already exists/);
+  assert.equal(turn.input[0].text, "跟進 Todo CLI plan");
+  assert.match(turn.settings.developer_instructions, /Todo CLI plan already exists/);
   assert.match(turn.settings.developer_instructions, /Do not call todo_set_plan/);
-  assert.doesNotMatch(turn.settings.developer_instructions, /TODO MCP PLAN COMPLETION AND MUTATION GATE/);
+  assert.doesNotMatch(turn.settings.developer_instructions, /TODO CLI PLAN COMPLETION AND MUTATION GATE/);
   assert.doesNotMatch(turn.settings.developer_instructions, /first task-related action MUST/);
 });
 
@@ -715,7 +813,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   writeFileSync(jobPath, JSON.stringify({
     sessionId: "session-1",
     turnId: "turn-1",
-    message: "建立 Todo MCP plan",
+    message: "建立 Todo CLI plan",
     forcePlan: true,
     executionMode: "default",
     approvalPolicy: "on-request",
@@ -739,15 +837,15 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.equal(exitCode, 1, stderr);
   const turnInputs = readFileSync(turnStartsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
   assert.equal(turnInputs.length, 2);
-  assert.equal(turnInputs[0], `建立 Todo MCP plan\n\n${FORCE_TODO_PLAN_USER_SUFFIX}`);
-  assert.match(turnInputs[1], /^The required initial Todo MCP grill-me round is still missing for this turn\./);
+  assert.equal(turnInputs[0], `建立 Todo CLI plan\n\n${FORCE_TODO_PLAN_USER_SUFFIX}`);
+  assert.match(turnInputs[1], /^The required initial Todo CLI grill-me round is still missing for this turn\./);
   assert.equal(turnInputs[1].includes(FORCE_TODO_PLAN_USER_SUFFIX), false);
   const entries = readFileSync(logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
   assert.equal(entries.some((entry) => entry.event === "result"), false);
   assert.equal(entries.some((entry) => entry.event === "error" && /without recording the required initial grill-me clarification successfully/.test(entry.data?.message)), true);
 });
 
-test("prompt runner turns grill-me answers into a Todo MCP plan", async () => {
+test("prompt runner turns grill-me answers into a Todo CLI plan", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "prompt-runner-todo-gate-created-"));
   const fakeCodexPath = resolve(root, "fake-codex.mjs");
   const jobPath = resolve(root, "job.json");
@@ -791,7 +889,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
         control: todoFetches === 1
           ? {
               paused: true,
-              pauseReason: "Todo MCP plan needs clarification before it can be created.",
+              pauseReason: "Todo CLI plan needs clarification before it can be created.",
               pausedBy: "agent",
               context: JSON.stringify({ clarificationQuestions: ["Which outcome matters most?"] }),
               updated: "2026-08-17T10:00:00.000Z"
@@ -805,7 +903,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       response.writeHead(200, { "Content-Type": "application/json" });
       response.end(JSON.stringify({
         items: [{ id: "todo-1", title: "Created plan item" }],
-        control: { paused: true, pauseReason: "Initial Todo MCP plan created for review. Execution has not started.", pausedBy: "agent" }
+        control: { paused: true, pauseReason: "Initial Todo CLI plan created for review. Execution has not started.", pausedBy: "agent" }
       }));
       return;
     }
@@ -819,7 +917,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   writeFileSync(jobPath, JSON.stringify({
     sessionId: "session-1",
     turnId: "turn-1",
-    message: "建立 Todo MCP plan",
+    message: "建立 Todo CLI plan",
     forcePlan: true,
     todoPlanClarificationPending: true,
     executionMode: "default",
@@ -844,10 +942,10 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.equal(exitCode, 0, stderr);
   const turnInputs = readFileSync(turnStartsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
   assert.equal(turnInputs.length, 1);
-  assert.equal(turnInputs[0], `建立 Todo MCP plan\n\n${CONTINUE_TODO_PLAN_USER_SUFFIX}`);
+  assert.equal(turnInputs[0], `建立 Todo CLI plan\n\n${CONTINUE_TODO_PLAN_USER_SUFFIX}`);
   assert.deepEqual(controlPosts, [{
     paused: true,
-    pauseReason: "Initial Todo MCP plan created for review. Execution has not started.",
+    pauseReason: "Initial Todo CLI plan created for review. Execution has not started.",
     actor: "agent"
   }]);
   const entries = readFileSync(logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
@@ -856,7 +954,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.equal(entries.some((entry) => entry.event === "todo.force_plan_paused"), true);
 });
 
-test("prompt runner clarifies context-fork create_task MCP tool name", async () => {
+test("prompt runner supplies the context-fork create_task CLI command", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "prompt-runner-context-fork-tool-"));
   const fakeCodexPath = resolve(root, "fake-codex.mjs");
   const jobPath = resolve(root, "job.json");
@@ -872,7 +970,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   const request = JSON.parse(line);
   if (request.method === "initialize") send({ id: request.id, result: {} });
   if (request.method === "thread/start") {
-    writeFileSync(process.env.CAPTURED_THREAD_PATH, JSON.stringify(request.params));
+    writeFileSync(process.env.CAPTURED_THREAD_PATH, JSON.stringify({ ...request.params, inspectorEnv: Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("THREADEX_") || key === "RUNNER_SERVER_URL")) }));
     send({ id: request.id, result: { thread: { id: "thread-1" } } });
   }
   if (request.method === "thread/goal/clear") send({ id: request.id, result: {} });
@@ -928,15 +1026,15 @@ syncBuiltinESMExports();
   });
 
   const thread = JSON.parse(readFileSync(capturedThreadPath, "utf8"));
-  assert.equal(thread.config.mcp_servers.session_inspector.tools.create_task.approval_mode, "approve");
+  assert.equal(thread.config.mcp_servers.session_inspector.enabled, false);
   assert.match(thread.developerInstructions, /Never wrap commentary in JSON/i);
   assert.match(thread.developerInstructions, /Context Fork\/New task is explicit delegation/i);
   const turn = JSON.parse(readFileSync(capturedTurnPath, "utf8"));
   assert.equal(turn.input[0].text, `開 child task\n\n${CONTEXT_FORK_USER_SUFFIX}`);
-  assert.match(turn.settings.developer_instructions, /mcp__session_inspector__create_task/);
+  assert.match(turn.settings.developer_instructions, /session-inspector create_task/);
   assert.doesNotMatch(turn.settings.developer_instructions, /mcp__session_inspectorcreate_task/);
   assert.doesNotMatch(turn.settings.developer_instructions, /Use get_session with sessionId or threadId/);
-  assert.doesNotMatch(turn.settings.developer_instructions, /For Todo MCP planning/);
+  assert.doesNotMatch(turn.settings.developer_instructions, /For Todo CLI planning/);
   assert.doesNotMatch(turn.settings.developer_instructions, /Use list_processes for a compact view/);
   assert.equal(turn.sandboxPolicy.type, thread.sandbox === "workspace-write" ? "workspaceWrite" : thread.sandbox === "danger-full-access" ? "dangerFullAccess" : "readOnly");
   assert.equal(turn.approvalPolicy, thread.approvalPolicy);
@@ -1020,7 +1118,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.equal(turnInputs.length, 2);
   assert.equal(turnInputs[0], `開 child task\n\n${CONTEXT_FORK_USER_SUFFIX}`);
   assert.match(turnInputs[1], /required Threadex child task is still missing/i);
-  assert.match(turnInputs[1], /mcp__session_inspector__create_task exactly once/);
+  assert.match(turnInputs[1], /session-inspector create_task exactly once/);
   assert.match(turnInputs[1], /Do not call spawn_agent/);
   assert.ok(turnInputs[1].includes(CONTEXT_FORK_USER_SUFFIX));
   const entries = readFileSync(logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
@@ -1106,7 +1204,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   const request = JSON.parse(line);
   if (request.method === "initialize") send({ id: request.id, result: {} });
   if (request.method === "thread/start") {
-    writeFileSync(capturedThreadPath, JSON.stringify(request.params));
+    writeFileSync(capturedThreadPath, JSON.stringify({ ...request.params, inspectorEnv: Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("THREADEX_") || key === "RUNNER_SERVER_URL")) }));
     send({ id: request.id, result: { thread: { id: "thread-1" } } });
   }
   if (request.method === "thread/goal/set") {
@@ -1356,7 +1454,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   const request = JSON.parse(line);
   if (request.method === "initialize") send({ id: request.id, result: {} });
   if (request.method === "thread/start") {
-    writeFileSync(process.env.CAPTURED_THREAD_PATH, JSON.stringify(request.params));
+    writeFileSync(process.env.CAPTURED_THREAD_PATH, JSON.stringify({ ...request.params, inspectorEnv: Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("THREADEX_") || key === "RUNNER_SERVER_URL")) }));
     send({ id: request.id, result: { thread: { id: "thread-1" } } });
   }
   if (request.method === "thread/goal/clear") send({ id: request.id, result: {} });
@@ -1406,17 +1504,14 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 
   const turns = readFileSync(capturedTurnsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
   const thread = JSON.parse(readFileSync(capturedThreadPath, "utf8"));
-  assert.equal(
-    thread.config.mcp_servers.session_inspector.tools.upgrade_model.approval_mode,
-    "approve"
-  );
+  assert.equal(thread.config.mcp_servers.session_inspector.enabled, false);
   assert.equal(turns.length, 2);
   assert.equal(turns[0].model, "gpt-5.6-luna");
   assert.equal(turns[0].effort, "high");
   assert.equal(turns[0].input[0].text, "make the architecture decision");
   assert.match(turns[0].settings.developer_instructions, /\[AUTO MODEL\]/);
   assert.ok(turns[0].settings.developer_instructions.includes(`Available upgrades are ${AUTO_MODEL_ORDER.join(", ")}`));
-  assert.match(turns[0].settings.developer_instructions, /session_inspector\.upgrade_model/);
+  assert.match(turns[0].settings.developer_instructions, /session-inspector upgrade_model/);
   assert.equal(turns[1].model, "gpt-5.6-sol");
   assert.equal(turns[1].effort, "xhigh");
   assert.equal(turns[1].input[0].text, "make the architecture decision");
@@ -1792,7 +1887,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   const resultIndex = entries.findIndex((entry) => entry.event === "result");
   assert.ok(initialIndex >= 0);
   assert.ok(enrichedIndex > initialIndex);
-  assert.ok(resultIndex > enrichedIndex);
+  assert.ok(resultIndex > initialIndex);
 });
 
 test("prompt runner lets a final answer resolve an issue raised in commentary", async () => {
@@ -1829,12 +1924,14 @@ createInterface({ input: process.stdin }).on("line", (line) => {
             solutions: [{ issueKey: 1, solution: "改用 thread 的最後一個 cumulative token snapshot，避免重複計入早前 turn。" }]
           };
       send({ id: request.id, result: { turn: { id: "headline-turn" } } });
+      setTimeout(() => {
       send({ method: "item/completed", params: { threadId: "headline-thread", item: {
         id: "headline-answer", type: "agentMessage", text: JSON.stringify(response)
       } } });
       send({ method: "turn/completed", params: { threadId: "headline-thread", turn: {
         id: "headline-turn", status: "completed"
       } } });
+      }, 200);
       return;
     }
     send({ id: request.id, result: { turn: { id: "app-turn-1" } } });
@@ -1901,7 +1998,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     assert.equal(finalAnswerEntries[1].data.comment?.extracts?.[0]?.type, "answer");
 
     const resultIndex = entries.findIndex((entry) => entry.event === "result");
-    assert.ok(resultIndex > entries.indexOf(finalAnswerEntries[1]));
+    assert.ok(resultIndex > entries.indexOf(finalAnswerEntries[0]));
+    assert.ok(resultIndex < entries.indexOf(finalAnswerEntries[1]));
   } finally {
     rmSync(root, { force: true, recursive: true });
   }
@@ -2139,7 +2237,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     return;
   }
   if (request.method === "thread/start" || request.method === "thread/resume") {
-    writeFileSync(process.env.CAPTURED_THREAD_PATH, JSON.stringify(request.params));
+    writeFileSync(process.env.CAPTURED_THREAD_PATH, JSON.stringify({ ...request.params, inspectorEnv: Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("THREADEX_") || key === "RUNNER_SERVER_URL")) }));
     send({ id: request.id, result: { thread: { id: "thread-1" } } });
   }
   if (request.method === "thread/goal/clear") send({ id: request.id, result: {} });
@@ -2221,36 +2319,31 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     assert.match(turn.settings.developer_instructions, /2026-09-28T12:00:00Z/);
     assert.match(turn.settings.developer_instructions, /Preserve the user's preferred language/);
     assert.doesNotMatch(turn.settings.developer_instructions, /Historical task description|Previous request|Previous response|Full request from dashboard|Full commentary/);
-    assert.equal(config.env.THREADEX_WORKSPACE_MANAGER, "1");
-    assert.equal(config.env.THREADEX_CONTINUITY_ONLY, "0");
-    assert.equal(config.env.THREADEX_AUTO_MODEL, "0");
+    assert.equal(thread.inspectorEnv.THREADEX_WORKSPACE_MANAGER, "1");
+    assert.equal(thread.inspectorEnv.THREADEX_CONTINUITY_ONLY, "0");
+    assert.equal(thread.inspectorEnv.THREADEX_AUTO_MODEL, "0");
     assert.equal(thread.model, variant === "manager-loop-alert" ? "gpt-6-astra" : "gpt-6-luna");
     assert.equal(turn.model, variant === "manager-loop-alert" ? "gpt-6-astra" : "gpt-6-luna");
     assert.equal(turn.effort, variant === "manager-loop-alert" ? "low" : "max");
     assert.equal(thread.sandbox, "read-only");
     assert.equal(turn.sandboxPolicy.type, "readOnly");
-    assert.equal(thread.config.features.shell_tool, false);
+    assert.equal(thread.config.features.shell_tool, true);
     assert.equal(thread.config.features.multi_agent, false);
-    assert.equal(config.tools.workspace_create_task.approval_mode, "approve");
-    assert.equal(config.tools.workspace_fork_task.approval_mode, "approve");
-    assert.equal(config.tools.workspace_stop_task.approval_mode, "approve");
-    assert.equal(config.tools.workspace_continue_stronger.approval_mode, "approve");
     assert.match(thread.developerInstructions, /workspace Manager/);
     assert.match(thread.developerInstructions, /Use session history as memory/);
     assert.doesNotMatch(turn.settings.developer_instructions, /MUST use these tools instead of update_plan/);
     return;
   }
-  assert.equal(config.env.THREADEX_LIGHTWEIGHT_TODO, "1");
+  assert.equal(thread.inspectorEnv.THREADEX_LIGHTWEIGHT_TODO, "1");
   assert.doesNotMatch(thread.developerInstructions, /Workspace manager task routing policy/);
   assert.doesNotMatch(turn.settings.developer_instructions, /Workspace manager task routing policy/);
   assert.equal(turn.model, "gpt-6-astra");
   assert.equal(turn.effort, "high");
-  assert.equal(config.env.THREADEX_TODO_AGENT_ROLE, "default");
-  assert.equal(config.env.THREADEX_CONTINUITY_ONLY, "0");
-  assert.ok(config.tools.outcome_plan_set);
-  assert.equal(config.tools.todo_set_plan, undefined);
+  assert.equal(thread.inspectorEnv.THREADEX_TODO_AGENT_ROLE, "default");
+  assert.equal(thread.inspectorEnv.THREADEX_CONTINUITY_ONLY, "0");
+  assert.equal(config.enabled, false);
   assert.match(turn.settings.developer_instructions, /Lightweight Todo harness is active/);
-  assert.doesNotMatch(turn.settings.developer_instructions, /MUST conduct exactly one|Create the Todo MCP plan and execute it in a later turn/);
+  assert.doesNotMatch(turn.settings.developer_instructions, /MUST conduct exactly one|Create the Todo CLI plan and execute it in a later turn/);
   assert.notEqual(turn.settings.sandbox_policy?.type, "read-only");
 });
 

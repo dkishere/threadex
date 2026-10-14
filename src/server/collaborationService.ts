@@ -367,9 +367,11 @@ export class CollaborationService {
         const status = turn.pendingReason === "stopped" || turn.runnerExitCode === 143 || turn.runnerExitCode === 130
           ? "stopped" : turn.runnerExitCode && turn.runnerExitCode !== 0 || /^Codex error:/i.test(turn.agentResponse) ? "failed" : "completed";
         const fingerprint = stableId(turn.id, status, turn.agentResponse);
-        if (member.observed[turn.id] === fingerprint) continue;
+        const resultId = stableId(group.id, fingerprint);
+        if (member.observed[turn.id] === fingerprint && group.results.some(r => r.id === resultId)) continue;
         // A turn ending to await another worker is a checkpoint, not a completed assignment.
-        if (status === "completed" && group.messages.some(m => m.from === member.localId && m.sourceTurnId === turn.id && m.wait)) {
+        if (status === "completed" && group.messages.some(m => m.from === member.localId && m.sourceTurnId === turn.id
+          && m.wait && !m.completed && m.state !== "cancelled")) {
           await this.store.changeCollaboration(group.id, null, current => { memberOf(current, member.localId).observed[turn.id] = fingerprint; });
           continue;
         }
@@ -377,9 +379,8 @@ export class CollaborationService {
         const changes = inspection?.fileChanges ?? [];
         await this.store.changeCollaboration(group.id, null, current => {
           const worker = memberOf(current, member.localId);
-          if (worker.observed[turn.id] === fingerprint) return;
+          if (worker.observed[turn.id] === fingerprint && current.results.some(r => r.id === resultId)) return;
           worker.observed[turn.id] = fingerprint;
-          const resultId = stableId(group.id, fingerprint);
           const summary = turn.agentResponse.slice(0, 16000) || `Worker ${status} without a final answer.`;
           if (!current.results.some(r => r.id === resultId)) current.results.push({ id: resultId, localId: member.localId, sessionId: member.sessionId,
             turnId: turn.id, status, summary, changes, created: now() });

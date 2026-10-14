@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { acknowledgeSubmissionEvent, readPendingSubmissions, reconcilePendingSubmissions, savePendingSubmission, type PendingSubmission } from "./pendingSubmissions";
+import { acknowledgeSubmissionEvent, readPendingSubmissions, reconcilePendingSubmissions, savePendingSubmission, recordSubmissionError, unconfirmedPrompts, type PendingSubmission } from "./pendingSubmissions";
 import { mockSubmissionStorage } from "./pendingSubmissions.testSupport";
 
 const entry: PendingSubmission = {
@@ -45,4 +45,21 @@ test("completed result confirms delivery when start was missed", t => {
     savePendingSubmission(entry);
     acknowledgeSubmissionEvent({ type: "result", data: { sessionId: "session", turnId: entry.id } });
     assert.equal(readPendingSubmissions().length, 0);
+});
+
+test("reload exposes only this session's prompts missing from the server, retaining failure evidence", t => {
+    mockSubmissionStorage(t);
+    savePendingSubmission(entry);
+    savePendingSubmission({ ...entry, id: "stored", turnId: "stored" });
+    savePendingSubmission({ ...entry, id: "elsewhere", sessionId: "another" });
+    savePendingSubmission({ ...entry, id: "steer", kind: "steer" });
+    recordSubmissionError(entry.id, "API returned 503");
+    const recovered = unconfirmedPrompts("session", ["stored"]);
+    assert.equal(recovered.length, 1);
+    assert.equal(recovered[0].message, entry.message);
+    assert.deepEqual(recovered[0].attachments, entry.attachments);
+    assert.equal(recovered[0].lastError, "API returned 503");
+    acknowledgeSubmissionEvent({ type: "result", data: { sessionId: "session", turnId: entry.id } });
+    recordSubmissionError(entry.id, "late stream failure");
+    assert.deepEqual(unconfirmedPrompts("session", ["stored"]), []);
 });

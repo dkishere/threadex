@@ -17,7 +17,7 @@ import {
 import { createPortal } from "react-dom";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Download, ExternalLink, FileText, X } from "lucide-react";
+import { Download, ExternalLink, FileText, MessageSquare, X } from "lucide-react";
 import { isHtmlFilePath, workspaceHtmlPreviewUrl } from "./markdownUrls";
 import { CODEX_FOLLOWUP_EVENT, remarkCodexFileCitation, remarkCodexFollowup } from "./codexFollowup";
 import { UrlTagIcon } from "./UrlTagIcon";
@@ -232,6 +232,22 @@ function HtmlPreviewLink({ path, context }: { path: string; context: WorkspaceFi
       }}>
       <ExternalLink size={14} aria-hidden="true" />
     </a>
+    {context.sessionId && <button type="button" className="icon-button" aria-label="Review HTML with agent feedback" title="Review HTML with agent feedback"
+      onClick={async () => {
+        const preview = createLinkPreview("HTML review", true);
+        try {
+          const response = await fetch(`${entryUrl}?format=json`, { credentials: "same-origin" });
+          const payload = await response.json() as { url?: string; session?: { id: string; cwd: string }; error?: string };
+          if (!response.ok || !payload.url?.startsWith("/api/workspaces/html-content/") || !payload.session) {
+            throw new Error(payload.error || "Could not open the feedback preview.");
+          }
+          preview.navigate(payload.url);
+          preview.feedback(payload.session);
+        } catch (cause) {
+          preview.close();
+          setError(cause instanceof Error ? cause.message : "Could not open the feedback preview.");
+        }
+      }}><MessageSquare size={14} aria-hidden="true" /></button>}
     {readyUrl && <a href={readyUrl} target="_blank" rel="noopener noreferrer">Open prepared preview</a>}
     {error && <span role="alert">{error}</span>}
   </>;

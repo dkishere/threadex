@@ -26,7 +26,20 @@ export type PendingSubmission = {
     message: string;
     attachments: unknown[];
     settings: Record<string, unknown>;
+    lastError?: string;
 };
+
+export function recordSubmissionError(id: string, error: string) {
+    const entry = readPendingSubmissions().find(entry => entry.id === id);
+    if (!entry) return; // Acknowledged submissions must never be resurrected.
+    try { savePendingSubmission({ ...entry, lastError: error }); } catch { /* Keep the original backup. */ }
+}
+
+export function unconfirmedPrompts(sessionId: string | null, storedTurnIds: readonly string[]) {
+    const stored = new Set(storedTurnIds);
+    return readPendingSubmissions().filter(entry => entry.sessionId === sessionId &&
+        entry.kind === "prompt" && !stored.has(entry.turnId));
+}
 
 function changed() {
     window.dispatchEvent(new Event(PENDING_SUBMISSIONS_CHANGED));

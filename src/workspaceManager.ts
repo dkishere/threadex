@@ -12,15 +12,21 @@ export function visibleWorkspaceManagerMessage(message: { role: string; turnId?:
 
 export const WORKSPACE_MANAGER_VISIBLE_TURNS = 50;
 
+export type WorkspaceManagerHistoryPage = {
+  beforeTurnId: string | null;
+  hasMore: boolean;
+  requestedBeforeTurnId: string | null;
+};
+
 function recentManagerTurnIds<T>(items: readonly T[], id: (item: T) => string | undefined,
-  running: (item: T) => boolean, visible: (item: T) => boolean) {
+  running: (item: T) => boolean, visible: (item: T) => boolean, limit: number) {
   const kept = new Set<string>();
   // A live turn can precede many queued prompts. It still occupies one slot.
-  for (let index = items.length - 1; index >= 0 && kept.size < WORKSPACE_MANAGER_VISIBLE_TURNS; index--) {
+  for (let index = items.length - 1; index >= 0 && kept.size < limit; index--) {
     const item = items[index];
     if (running(item) && id(item) && visible(item)) kept.add(id(item)!);
   }
-  for (let index = items.length - 1; index >= 0 && kept.size < WORKSPACE_MANAGER_VISIBLE_TURNS; index--) {
+  for (let index = items.length - 1; index >= 0 && kept.size < limit; index--) {
     const item = items[index];
     if (id(item) && visible(item)) kept.add(id(item)!);
   }
@@ -28,17 +34,17 @@ function recentManagerTurnIds<T>(items: readonly T[], id: (item: T) => string | 
 }
 
 /** Select raw snapshot turns before attachment, timeline and Markdown preparation. */
-export function recentWorkspaceManagerTurns<T extends { id: string; status: string; agentResponse: string }>(turns: T[]): T[] {
+export function recentWorkspaceManagerTurns<T extends { id: string; status: string; agentResponse: string }>(turns: T[], limit = WORKSPACE_MANAGER_VISIBLE_TURNS): T[] {
   const visible = (turn: T) => !turn.id.startsWith("manager_") ||
     (turn.status === "done" && !isSilentManagerResponse(turn.agentResponse));
-  const kept = recentManagerTurnIds(turns, turn => turn.id, turn => turn.status === "running", visible);
+  const kept = recentManagerTurnIds(turns, turn => turn.id, turn => turn.status === "running", visible, limit);
   return turns.filter(turn => kept.has(turn.id));
 }
 
 /** Bound client state and rendering only; persisted history and runner context stay intact. */
-export function recentWorkspaceManagerMessages<T extends { role: string; turnId?: string; turnStatus?: string; content: string }>(messages: T[]): T[] {
+export function recentWorkspaceManagerMessages<T extends { role: string; turnId?: string; turnStatus?: string; content: string }>(messages: T[], limit = WORKSPACE_MANAGER_VISIBLE_TURNS): T[] {
   const visible = (message: T) => message.role !== "system" && visibleWorkspaceManagerMessage(message);
-  const kept = recentManagerTurnIds(messages, message => message.turnId, message => message.turnStatus === "running", visible);
+  const kept = recentManagerTurnIds(messages, message => message.turnId, message => message.turnStatus === "running", visible, limit);
   const notifications = new Map(messages.filter(message => message.role === "user" && message.turnId?.startsWith("manager_"))
     .map(message => [message.turnId!, parseManagerNotification(message.content)]));
   return messages.filter(message => message.turnId && kept.has(message.turnId) && visible(message))

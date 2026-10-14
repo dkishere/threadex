@@ -369,7 +369,7 @@ test("summarizer resolves only one saved account from the runner auth identity",
   }), null);
 });
 
-test("summarizer attributes usage to runner auth across null sessions and account switches", async () => {
+test("summarizer pins session credentials while unbound sessions follow workspace auth", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "session-summarizer-account-test-"));
   const codexHome = resolve(root, "workspace-codex-home");
   const fakeCodexPath = resolve(root, "fake-codex.mjs");
@@ -433,6 +433,10 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     await store.upsertWorkspace({ id: "auth-workspace", name: "Auth workspace", codexHome, cwd: root });
     await store.upsertAccount({ id: "saved-a", name: "Saved A", externalAccountId: "billing-a" });
     await store.upsertAccount({ id: "saved-b", name: "Saved B", externalAccountId: "billing-b" });
+    await store.setAccountAuth("saved-a", JSON.stringify({ auth_mode: "chatgpt", tokens: { account_id: "billing-a" } }), null);
+
+    // A different session has replaced the shared workspace credentials.
+    writeWorkspaceAuth("billing-b");
 
     await recordSummaryFixture(store, "auth-session-a", "auth-workspace", "saved-a");
     await summarizer.forceSummarizeSession("auth-session-a");
@@ -454,6 +458,14 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       { session_id: "auth-session-a", account_id: "saved-a", input_tokens: 12, output_tokens: 3 },
       { session_id: "auth-session-null", account_id: "saved-b", input_tokens: 12, output_tokens: 3 }
     ]);
+
+    // Never silently bill another workspace account when pinned auth is broken.
+    await store.setAccountAuth("saved-a", JSON.stringify({ tokens: { account_id: "billing-b" } }), null);
+    await summarizer.forceSummarizeSession("auth-session-a");
+    assert.equal((await store.getSession("auth-session-a"))?.title, "billing-a");
+    await store.setAccountAuth("saved-a", "", null);
+    await summarizer.forceSummarizeSession("auth-session-a");
+    assert.equal((await store.getSession("auth-session-a"))?.title, "billing-a");
   } finally {
     summarizer.close();
     await store.close();

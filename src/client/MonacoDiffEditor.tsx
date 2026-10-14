@@ -3,6 +3,7 @@ import EditorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
 import JsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
 import type * as Monaco from "monaco-editor";
 import type { ResponseAnnotation, ResponseAnnotationFileSource } from "./responseAnnotations";
+import { sendSelectionToComposer } from "./composerSelection";
 
 type MonacoDiffEditorProps = {
   before: string;
@@ -265,6 +266,18 @@ export function MonacoTextEditor({ value, filePath, line }: MonacoTextEditorProp
           stickyScroll: { enabled: false },
           padding: { top: 8, bottom: 8 }
         });
+        const codeEditor = editor;
+        const selectionState: MonacoEditorState = {
+          monaco,
+          diffEditor: undefined as unknown as Monaco.editor.IStandaloneDiffEditor,
+          editors: { original: codeEditor, modified: codeEditor },
+          annotationDecorations: {}
+        };
+        const propsRef = { current: { onAsk: sendSelectionToComposer } };
+        const selectionListener = codeEditor.onDidChangeCursorSelection(({ selection }) => {
+          showSelectionWidget(selectionState, codeEditor, "modified", filePath, selection, propsRef, false);
+        });
+        codeEditor.onDidDispose(() => selectionListener.dispose());
         if (line) {
           const lineNumber = Math.min(Math.max(1, line), model.getLineCount());
           editor.setPosition({ lineNumber, column: 1 });
@@ -309,7 +322,8 @@ function showSelectionWidget(
     sessionUrl?: string;
     onAsk?: (annotation: ResponseAnnotation) => void;
     onRemoveAnnotation?: () => void;
-  }>
+  }>,
+  isDiff = true
 ) {
   clearSelectionWidget(state);
   if (selection.isEmpty()) return;
@@ -327,7 +341,7 @@ function showSelectionWidget(
       endLine: selection.endLineNumber,
       endColumn: selection.endColumn
     },
-    side,
+    ...(isDiff ? { side } : {}),
     ...(latestPropsRef.current.workspaceId ? { workspaceId: latestPropsRef.current.workspaceId } : {}),
     ...(latestPropsRef.current.sessionUrl ? { sessionUrl: latestPropsRef.current.sessionUrl } : {})
   };
@@ -336,6 +350,15 @@ function showSelectionWidget(
   domNode.className = "monaco-file-quote-popover";
   domNode.setAttribute("role", "dialog");
   domNode.setAttribute("aria-label", "Annotate selected file text");
+  // Keep Monaco's mouse handler from moving the selection before a button's
+  // click completes. Leave the widget mounted throughout pointerdown/up.
+  for (const eventName of ["pointerdown", "mousedown"]) {
+    domNode.addEventListener(eventName, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+    });
+  }
+  domNode.addEventListener("click", (event) => event.stopPropagation());
 
   const icon = document.createElement("span");
   icon.className = "monaco-file-quote-icon";
@@ -347,15 +370,26 @@ function showSelectionWidget(
   const askButton = document.createElement("button");
   askButton.type = "button";
   askButton.textContent = "Annotate";
-  askButton.addEventListener("pointerdown", (event) => {
+  askButton.addEventListener("click", (event) => {
     event.preventDefault();
     event.stopPropagation();
     clearSelectionWidget(state);
     showDraftAnnotationZone(state, editor, annotation, latestPropsRef);
   });
-  domNode.append(icon, preview, askButton);
+  const composerButton = document.createElement("button");
+  composerButton.type = "button";
+  composerButton.textContent = "Send to composer";
+  composerButton.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    clearSelectionWidget(state);
+    sendSelectionToComposer(annotation);
+  });
+  domNode.append(icon, preview, composerButton);
+  if (latestPropsRef.current.onAsk && isDiff) domNode.append(askButton);
 
   const widget: Monaco.editor.IContentWidget = {
+    suppressMouseDown: true,
     getId: () => `file-quote-selection-${side}`,
     getDomNode: () => domNode,
     getPosition: () => ({

@@ -20,6 +20,7 @@ test("round-trips a response annotation source", () => {
 
   assert.deepEqual(parseResponseAnnotations(formatResponseAnnotationsPrompt([annotation], "more context")), {
     annotations: [annotation],
+    request: "more context",
     content: "explain this\n\nmore context"
   });
 });
@@ -40,6 +41,7 @@ test("round-trips a file annotation source", () => {
 
   assert.deepEqual(parseResponseAnnotations(formatResponseAnnotationsPrompt([annotation])), {
     annotations: [annotation],
+    request: "",
     content: "rename this"
   });
 });
@@ -66,6 +68,7 @@ test("accepts legacy annotations without a source and legacy response sources", 
         source: { type: "response", sessionUrl: "codex://workspace/thread", turnNumber: 3 }
       }
     ],
+    request: "request",
     content: "request"
   });
 });

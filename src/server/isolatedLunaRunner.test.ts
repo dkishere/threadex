@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
 import { buildIsolatedLunaAppServerArgs, IsolatedLunaRunner } from "./isolatedLunaRunner.js";
+import { inspectorCommand } from "./sessionInspectorCommand";
 
 test("isolated Luna runner starts a read-only app-server with no approval path", () => {
   assert.deepEqual(buildIsolatedLunaAppServerArgs(), [
@@ -18,6 +19,86 @@ test("isolated Luna runner starts a read-only app-server with no approval path",
     "-c", "tools.web_search=false",
     "-c", "tools.view_image=false"
   ]);
+});
+
+test("scratch-write jobs may run shell commands in a writable sandbox", () => {
+  const args = buildIsolatedLunaAppServerArgs([], false, true);
+  assert.ok(args.includes('sandbox_mode="workspace-write"'));
+  assert.ok(!args.includes("features.shell_tool=false"));
+  assert.ok(args.includes("tools.web_search=false"), "web search stays off unless the caller enables it");
+  assert.ok(!args.includes("sandbox_workspace_write.network_access=true"), "network stays off unless the caller enables it");
+  assert.ok(buildIsolatedLunaAppServerArgs([], false, true, true).includes("sandbox_workspace_write.network_access=true"));
+});
+
+test("scratch jobs expose a shell but grant writes only to their private directory", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "isolated-luna-scratch-test-"));
+  const capturePath = resolve(root, "requests.json");
+  const fixture = createFakeCodexFixture("isolated-luna-scratch-fixture-", `
+const requests = [];
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method === "initialize") send({ id: request.id, result: {} });
+  if (request.method === "thread/start") {
+    requests.push(request);
+    send({ id: request.id, result: { thread: { id: "thread-1" } } });
+  }
+  if (request.method === "turn/start") {
+    requests.push(request);
+    writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify(requests));
+    send({ id: request.id, result: { turn: { id: "turn-1" } } });
+    send({ method: "item/completed", params: { threadId: "thread-1", item: { id: "answer", type: "agentMessage", text: "verified" } } });
+    send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } } });
+  }
+});`);
+  const runner = fixture.runner({ name: "scratch-test", baseInstructions: "Verify in scratch.", scratchWrite: true });
+  let scratch: string | undefined;
+  try {
+    assert.equal((await runner.run("verify")).responseText, "verified");
+    const [thread, turn] = JSON.parse(readFileSync(capturePath, "utf8"));
+    scratch = thread.params.cwd;
+    assert.ok(scratch && existsSync(scratch));
+    assert.equal(thread.params.environments, undefined, "an empty environment list removes shell access");
+    assert.equal(turn.params.environments, undefined);
+    assert.deepEqual(thread.params.runtimeWorkspaceRoots, [scratch]);
+    assert.deepEqual(turn.params.sandboxPolicy, {
+      type: "workspaceWrite", writableRoots: [scratch], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true
+    });
+  } finally {
+    runner.stop();
+    fixture.cleanup();
+    rmSync(root, { recursive: true, force: true });
+  }
+  assert.equal(existsSync(scratch!), false, "verification files are removed with the runner");
+});
+
+test("isolated Codex CLI approvals keep network closed and enforce the cross-process read budget", async () => {
+  const fixture = createFakeCodexFixture("isolated-cli-approval-", `
+const decisions = [];
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method === "initialize") send({ id: request.id, result: {} });
+  if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "thread-1" } } });
+  if (request.method === "turn/start") {
+    if (request.params.sandboxPolicy.networkAccess !== false) throw new Error("Network policy was widened");
+    if (request.params.approvalPolicy !== "on-request") throw new Error("CLI approvals unavailable");
+    send({ id: request.id, result: { turn: { id: "turn-1" } } });
+    for (let id = 90; id < 94; id++) send({ id, method: "item/commandExecution/requestApproval", params: {
+      command: id === 93 ? "touch /tmp/unwanted" : ${JSON.stringify(`${inspectorCommand} get_session '{}'`)}
+    } });
+  }
+  if (request.id >= 90 && request.id < 94 && request.result) {
+    decisions.push(request.result.decision);
+    if (decisions.length === 4) {
+      send({ method: "item/completed", params: { threadId: "thread-1", item: { id: "answer", type: "agentMessage", text: JSON.stringify(decisions) } } });
+      send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } } });
+    }
+  }
+});`);
+  const runner = fixture.runner({ name: "cli-approval", baseInstructions: "Read saved history",
+    inspectorCli: { env: { THREADEX_TODO_AGENT_ROLE: "turn_grill" }, approvedCommands: ["get_session"], maxCalls: 2 } });
+  try {
+    assert.deepEqual(JSON.parse((await runner.run("inspect")).responseText), ["accept", "accept", "decline", "decline"]);
+  } finally { runner.stop(); fixture.cleanup(); }
 });
 
 test("isolated runner appends only explicitly supplied app-server config", () => {
@@ -68,7 +149,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   }
 });
 
-test("omitting timeoutMs does not schedule a runner cancellation timer", async () => {
+test("omitting timeoutMs records inbound activity without scheduling a runner cancellation timer", async () => {
   const fixture = createFakeCodexFixture("isolated-luna-no-timeout-test-", `
 createInterface({ input: process.stdin }).on("line", (line) => {
   const request = JSON.parse(line);
@@ -80,7 +161,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } } });
   }
 });`);
-  const runner = fixture.runner({ name: "no-timeout-test", baseInstructions: "Return done.", timeoutMs: undefined });
+  const events: any[] = [];
+  const runner = fixture.runner({ name: "no-timeout-test", baseInstructions: "Return done.", timeoutMs: undefined, onEvent: event => events.push(event) });
   const originalSetTimeout = globalThis.setTimeout;
   const delays: number[] = [];
   globalThis.setTimeout = ((handler: (...args: any[]) => void, timeout?: number, ...args: any[]) => {
@@ -90,6 +172,10 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   try {
     assert.equal((await runner.run("test")).responseText, "done");
     assert.deepEqual(delays, []);
+    assert.ok(events.some(event => event.method === "process.started" && typeof event.pid === "number"));
+    assert.ok(events.some(event => event.method === "item/completed" && event.params.item.text === "done"));
+    assert.ok(events.some(event => event.method === "turn/completed"));
+    assert.ok(events.every(event => event.method !== "initialize" && event.method !== "thread/start"), "outbound config is not logged");
   } finally {
     globalThis.setTimeout = originalSetTimeout;
     runner.stop();
@@ -214,6 +300,49 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   }
 });
 
+for (const scenario of ["recover", "persistent", "other"] as const) {
+  test(`isolated runner discovery auth recovery: ${scenario}`, async () => {
+    const fixture = createFakeCodexFixture("isolated-auth-recovery-", `
+import { existsSync, readFileSync } from "node:fs";
+const marker = new URL("./attempts.json", import.meta.url);
+const attempts = existsSync(marker) ? JSON.parse(readFileSync(marker, "utf8")) : [];
+attempts.push(process.env.CODEX_HOME);
+writeFileSync(marker, JSON.stringify(attempts));
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method === "initialize") send({ id: request.id, result: {} });
+  if (request.method === "thread/start") {
+    if (${JSON.stringify(scenario)} !== "recover" || attempts.length === 1) {
+      writeFileSync(new URL("./auth.json", import.meta.url), JSON.stringify({ tokens: { account_id: "refreshed-account" } }));
+      send({ id: request.id, error: { message: ${JSON.stringify(scenario === "other" ? "unrelated failure" : "workspace routing discovery unauthorized (401)")} } });
+    } else send({ id: request.id, result: { thread: { id: "recovered" } } });
+  }
+  if (request.method === "turn/start") {
+    send({ id: request.id, result: {} });
+    send({ method: "item/completed", params: { threadId: "recovered", item: { type: "agentMessage", text: "recovered" } } });
+    send({ method: "turn/completed", params: { threadId: "recovered", turn: { status: "completed" } } });
+  }
+});`);
+    const runner = fixture.runner({ name: "auth-recovery", baseInstructions: "Reply briefly." });
+    try {
+      if (scenario === "recover") {
+        const result = await runner.run("test");
+        assert.equal(result.responseText, "recovered");
+        assert.equal(result.authIdentity.externalAccountId, "refreshed-account");
+      }
+      else await assert.rejects(runner.run("test"), scenario === "other" ? /unrelated failure/ : /unauthorized \(401\)/);
+      const attempts: string[] = JSON.parse(readFileSync(resolve(fixture.root, "attempts.json"), "utf8"));
+      assert.equal(attempts.length, scenario === "other" ? 1 : 2);
+      assert.equal(new Set(attempts).size, attempts.length);
+      if (scenario !== "other") assert.equal(existsSync(attempts[0]), false);
+      if (scenario === "persistent") assert.equal(existsSync(attempts[1]), false);
+    } finally {
+      runner.stop();
+      fixture.cleanup();
+    }
+  });
+}
+
 function createFakeCodexFixture(prefix: string, body: string) {
   const root = mkdtempSync(resolve(tmpdir(), prefix));
   const fakeCodexPath = resolve(root, "fake-codex.mjs");
@@ -228,7 +357,8 @@ ${body}
   chmodSync(fakeCodexPath, 0o755);
   process.env.CODEX_PATH = fakeCodexPath;
   return {
-    runner: (options: Pick<ConstructorParameters<typeof IsolatedLunaRunner>[0], "name" | "baseInstructions" | "freshThreadPerRun" | "maxRunsPerProcess" | "workspaceCwd" | "allowWorkspaceRead" | "timeoutMs">) => new IsolatedLunaRunner({
+    root,
+    runner: (options: Pick<ConstructorParameters<typeof IsolatedLunaRunner>[0], "name" | "baseInstructions" | "freshThreadPerRun" | "maxRunsPerProcess" | "workspaceCwd" | "allowWorkspaceRead" | "scratchWrite" | "timeoutMs" | "onEvent" | "inspectorCli">) => new IsolatedLunaRunner({
       model: "gpt-5.6-luna",
       reasoningEffort: "none",
       timeoutMs: 2_000,

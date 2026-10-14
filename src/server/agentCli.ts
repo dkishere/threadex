@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { modelTokenUsageFromCodexExecJson } from "./modelTokenUsage";
@@ -37,10 +37,11 @@ export function createEphemeralAgentHome(input: {
   sourceHomeCandidates: Array<string | null | undefined>;
   allowMissingAuth?: boolean;
   copyConfig?: boolean;
+  authRaw?: string;
 }) {
   const home = mkdtempSync(resolve(tmpdir(), input.prefix));
   const sourceHome = resolveAgentHome(input.sourceHomeCandidates);
-  if (!sourceHome && !input.allowMissingAuth) {
+  if (!sourceHome && !input.authRaw && !input.allowMissingAuth) {
     rmSync(home, { recursive: true, force: true });
     throw new Error("Unable to find local agent CLI auth in the configured source homes; configure an agent home or log in locally.");
   }
@@ -53,6 +54,10 @@ export function createEphemeralAgentHome(input: {
         copyFileSync(sourcePath, targetPath);
       }
     }
+  }
+
+  if (input.authRaw) {
+    writeFileSync(resolve(home, "auth.json"), input.authRaw, { encoding: "utf8", mode: 0o600 });
   }
 
   return {

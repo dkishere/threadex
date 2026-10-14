@@ -1,5 +1,12 @@
 # Repository Instructions
 
+## Project Independence and Documentation Scope
+
+- Threadex is an independent project, unrelated to FairShot or any other company or organization.
+- Keep all Threadex documentation, decisions, RFCs, and agent instructions in this repository only.
+- Do not apply another company's or organization's documentation or decision-recording workflow to Threadex, or write Threadex records into their repositories.
+- An external skill or framework's location does not make Threadex part of its owning company or organization.
+
 ## Directory Layout
 
 - Client React code lives in `src/client`.

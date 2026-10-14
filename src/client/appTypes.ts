@@ -135,6 +135,7 @@ export type SlashTrigger = {
 
 export type ComposerSuggestion =
   | { kind: "mode"; mode: Exclude<ExecutionMode, "default">; name: string; description: string }
+  | { kind: "todo"; name: string; description: string }
   | ({ kind: "skill" } & SkillSuggestion)
   | { kind: "path"; name: string; path: string; description: string; scope: "file" | "directory"; insertText: string }
   | { kind: "keyword"; name: string; description: string; scope: "keyword"; insertText: string };
@@ -450,6 +451,9 @@ export type StreamTarget = {
   viewKey: number;
   textByItemId: Record<string, string>;
   liveItemEventRankById: Record<string, number>;
+  // Items already shown as commentary; their plain-text events (Claude streams
+  // text before classifying it, and replays resend them) must not re-append.
+  commentaryItemKeys?: Set<string>;
   replayTextSkipChars?: number;
   completed?: boolean;
 };
@@ -574,6 +578,9 @@ export type ProfileAnalytics = {
 export type SessionTurnRecord = {
   id: string;
   sessionId: string;
+  nativeThreadId?: string | null;
+  provider?: "codex" | "claude" | null;
+  nativeUpdatedAt?: string | null;
   loopMode?: boolean;
   accountId: string | null;
   userInput: string;

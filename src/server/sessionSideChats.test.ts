@@ -21,8 +21,9 @@ test("side-chat history is scoped, bounded, and does not inspect the transcript"
     await store.recordSessionSideChat({ sessionId: "two", workspaceId: "default", question: "Other", answer: "Other", model: "fixture" });
     const page = await store.listSessionSideChats("one");
     assert.equal(page?.sideChats.length, 100);
-    assert.equal(page?.sideChats[0].question, "Question 0");
-    assert.equal(page?.sideChats.at(-1)?.question, "Question 99");
+    // The chat room shows the latest messages, oldest first.
+    assert.equal(page?.sideChats[0].question, "Question 1");
+    assert.equal(page?.sideChats.at(-1)?.question, "Question 100");
     assert.ok(page?.sideChats.every(chat => chat.sessionId === "one"));
     assert.deepEqual(page?.sideChatPage, { offset: 0, limit: 100, total: 101, hasMore: true });
   } finally {

@@ -7,11 +7,11 @@ export function ResponseQuotePopover({ quote, onChange, onAsk, onAskSideChat }: 
   onAsk: () => void;
   onAskSideChat?: () => void;
 }) {
-  return <div className="response-quote-popover" style={{ left: quote.left, top: quote.top }} role="dialog" aria-label="Ask about selected response text" onMouseUp={(event) => event.stopPropagation()}>
+  return <div className="response-quote-popover" style={{ left: quote.left, top: quote.top }} role="dialog" aria-label="Send selected text to composer" onMouseUp={(event) => event.stopPropagation()}>
     <Quote aria-hidden="true" />
     <span>{quote.text}</span>
     <textarea aria-label="Annotation (optional)" placeholder="Add a note or question (optional)…" rows={2} value={quote.annotation ?? ""} onChange={(event) => onChange({ ...quote, annotation: event.target.value })} />
-    <button type="button" onClick={onAsk}>Ask</button>
+    <button type="button" onClick={onAsk}>Send to composer</button>
     {onAskSideChat && <button type="button" onClick={onAskSideChat}>Ask side chat</button>}
   </div>;
 }

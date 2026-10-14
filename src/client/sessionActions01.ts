@@ -1,6 +1,7 @@
 // @ts-nocheck
+import { sessionSnapshotUrl } from "./workspaceManagerHistory";
 import { DEFAULT_MODEL } from "../modelCatalog";
-import { savePendingSubmission, removePendingSubmission, beginSubmission, finishSubmission, isSubmissionSending } from "./pendingSubmissions";
+import { savePendingSubmission, removePendingSubmission, beginSubmission, finishSubmission, isSubmissionSending, readPendingSubmissions, recordSubmissionError } from "./pendingSubmissions";
 
 function preserveSubmission(ctx, entry) {
     try {
@@ -198,6 +199,9 @@ export async function stopCurrentTurn(ctx, turnId) {
 
 export function captureResponseQuoteSelection(ctx, event) {
     const { activeWorkspace, buildCodexReference, elementForSelectionNode, sessionId, setResponseQuotePopover, threadId } = ctx;
+        // The document capture listener runs before the popover's mouseup handler.
+        // Focusing its textarea can collapse the selection without dismissing it.
+        if (event.target?.closest?.(".response-quote-popover")) return;
         const selection = window.getSelection();
         if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
             setResponseQuotePopover(null);
@@ -205,8 +209,9 @@ export function captureResponseQuoteSelection(ctx, event) {
         }
         const startElement = elementForSelectionNode(selection.anchorNode);
         const endElement = elementForSelectionNode(selection.focusNode);
-        const startMessage = startElement?.closest(".message.assistant");
-        const endMessage = endElement?.closest(".message.assistant");
+        if (startElement?.closest(".response-quote-popover, .monaco-editor") || endElement?.closest(".response-quote-popover, .monaco-editor")) return;
+        const startMessage = startElement?.closest(".message") ?? startElement?.closest(".markdown-content");
+        const endMessage = endElement?.closest(".message") ?? endElement?.closest(".markdown-content");
         const startsInResponseText = Boolean(startElement?.closest(".markdown-content"));
         const endsInResponseText = Boolean(endElement?.closest(".markdown-content"));
         if (!startMessage || startMessage !== endMessage || !startsInResponseText || !endsInResponseText) {
@@ -251,7 +256,7 @@ export function captureResponseQuoteSelection(ctx, event) {
 
 export function askAboutResponseQuote(ctx, quote) {
     const { inputEditorRef, setComposerResponseQuote, setResponseQuotePopover } = ctx;
-        setComposerResponseQuote({ text: quote.text, source: quote.source, annotation: quote.annotation?.trim() });
+        setComposerResponseQuote((current) => [...(current ?? []), { text: quote.text, source: quote.source, annotation: quote.annotation?.trim() }]);
         setResponseQuotePopover(null);
         window.getSelection()?.removeAllRanges();
         window.requestAnimationFrame(() => inputEditorRef.current?.focus());
@@ -273,25 +278,22 @@ export async function submit(ctx, event, modeOverride?: string) {
         const linkReferences = composerSessionLinks
             .filter((link) => !input.includes(composerLinkToken(link.id)))
             .map((link) => formatComposerLinkMarkdown(link));
-        const inlineAnnotation = composerResponseQuote?.source?.type === "file"
-            ? composerResponseQuote.annotation?.trim() ?? ""
-            : "";
+        const annotations = composerResponseQuote ?? [];
         const standaloneRequest = [inputMessage, ...linkReferences].filter(Boolean).join("\n");
-        const plainMessage = standaloneRequest || inlineAnnotation ||
-            (attachments.length > 0 ? "Review the attached file(s)." : "");
-        if (!plainMessage) {
+        const plainMessage = standaloneRequest || (attachments.length > 0 ? "Review the attached file(s)." : "");
+        if (!plainMessage && !annotations.length) {
             return;
         }
-        const message = composerResponseQuote
-            ? formatResponseAnnotationsPrompt([{
-                    text: composerResponseQuote.text,
-                    annotation: inlineAnnotation || inputMessage || plainMessage,
-                    source: composerResponseQuote.source
-                }], inlineAnnotation ? standaloneRequest : linkReferences.join("\n"))
+        const message = annotations.length
+            ? formatResponseAnnotationsPrompt(annotations, plainMessage)
             : plainMessage;
         const turnSkills = selectedSkills.filter((skill) => message.includes(`$${skill.name}`));
         const forcePlan = composerTodoPlanModeEnabled;
         const submissionMode = modeOverride ?? composerMode;
+        if (ctx.roundtableEnabled && submissionMode !== "steer") {
+            await ctx.startRoundtable(message, attachments, turnSkills);
+            return;
+        }
         if (ctx.concurrentSourceTurnId && submissionMode !== "steer") {
             await ctx.startConcurrent(message, attachments, turnSkills);
             return;
@@ -323,6 +325,23 @@ export async function submit(ctx, event, modeOverride?: string) {
 }
 
 export async function startChatTurn(ctx, message, turnAttachments, turnExecutionMode, turnSkills, contextForkRequest, forcePlan, clearComposer, grillOrigin = undefined, submissionId: string | undefined = undefined) {
+    const saved = submissionId ? readPendingSubmissions().find(entry => entry.id === submissionId) : undefined;
+    if (saved) {
+        if (saved.sessionId !== ctx.sessionIdRef.current) throw new Error("Return to the original session to retry this prompt.");
+        message = saved.message;
+        turnAttachments = saved.attachments;
+        turnExecutionMode = saved.settings.executionMode ?? "default";
+        turnSkills = saved.settings.skills ?? [];
+        contextForkRequest = saved.settings.contextFork === true;
+        forcePlan = saved.settings.forcePlan === true;
+        grillOrigin = saved.settings.grillOrigin;
+        clearComposer = false;
+        const preferences = saved.settings.modelPreferences;
+        ctx = { ...ctx,
+            ...(preferences ? { currentModelPreferences: () => preferences, selectedModel: preferences.selectedModel } : {}),
+            ...(saved.settings.approvalPolicy ? { approvalPolicy: saved.settings.approvalPolicy } : {})
+        };
+    }
     const { AUTO_MODEL_VALUE, activeAccount, activeWorkspace, activeWorkspaceIdRef, approvalPolicy, clearComposerInputDraft, clearComposerSessionLinks, composerDraftSessionIdRef, currentModelPreferences, explicitNewSessionRef, handleStreamEvent, isLikelyBackendDisconnect, markTurnFinished, markTurnRunning, modelPreferencesWorkspaceIdRef, moveStoredComposerDraft, newSessionBaseSessionIdRef, newSessionProjectRef, noteBackendDisconnect, noteBackendRequestSucceeded, patchAssistantMessage, persistedModelPreferencesWorkspaceIdRef, readEventStream, reconnectRunner, registerStreamTarget, restoreKnownActiveSessionBeforeSend, resumeThreadId, scheduleLoadSessions, selectedModel, sessionAutoModel, sessionIdRef, setActiveSessionId, setActiveTurnId, setAttachments, setComposerResponseQuote, setMessages, setResponseQuotePopover, setSelectedSkills, setSessionId, setSlashTrigger, setStatus, stickToMessageBottomRef, streamTargetsRef, unregisterStreamTarget, updateNavigationUrl, useLoadBalanceInWorkspace, viewKeyRef } = ctx;
         const workspaceId = currentWorkspaceId(activeWorkspaceIdRef, activeWorkspace);
         if (isSubmissionSending(sessionIdRef.current)) return false;
@@ -334,6 +353,7 @@ export async function startChatTurn(ctx, message, turnAttachments, turnExecution
         const submission = {
             id: turnId, turnId, sessionId: provisionalSessionId, workspaceId, kind: "prompt", message,
             attachments: turnAttachments,
+            ...(saved ? { createdAt: saved.createdAt, lastError: saved.lastError } : {}),
             settings: { executionMode: turnExecutionMode, skills: turnSkills, contextFork: contextForkRequest,
                 forcePlan, grillOrigin, modelPreferences: submittedModelPreferences, approvalPolicy,
                 fastMode: submittedModelPreferences.fastMode === true }
@@ -456,9 +476,13 @@ export async function startChatTurn(ctx, message, turnAttachments, turnExecution
             if (!response.body) throw new Error("The chat response was empty.");
             noteBackendRequestSucceeded();
             scheduleLoadSessions();
-            await readEventStream(response.body, (streamEvent) => handleStreamEvent(streamEvent, target));
+            await readEventStream(response.body, (streamEvent) => {
+                if (streamEvent.type === "error") recordSubmissionError(turnId, streamEvent.data?.message ?? "Request failed before delivery was confirmed.");
+                handleStreamEvent(streamEvent, target);
+            });
         }
         catch (error) {
+            recordSubmissionError(turnId, error instanceof Error ? error.message : String(error));
             if (isLikelyBackendDisconnect(error)) {
                 noteBackendDisconnect();
             }
@@ -480,6 +504,12 @@ export async function startChatTurn(ctx, message, turnAttachments, turnExecution
         finally {
             unregisterStreamTarget(target, turnId);
         }
+        } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            recordSubmissionError(turnId, detail);
+            markTurnFinished(turnId);
+            setStatus(`Prompt not sent: ${detail}`);
+            return false;
         } finally {
             finishSubmission(turnId);
         }
@@ -556,7 +586,7 @@ export async function steerPrompt(ctx, message, steerAttachments, clearComposer,
             if (clearComposer) {
                 const restoredResponseAnnotations = parseResponseAnnotations(message);
                 setComposerInput((current) => current || restoredResponseAnnotations?.content || message);
-                setComposerResponseQuote((current) => current ?? restoredResponseAnnotations?.annotations[0] ?? null);
+                setComposerResponseQuote((current) => current ?? restoredResponseAnnotations?.annotations ?? null);
                 setAttachments((current) => current.length > 0 ? current : steerAttachments);
                 setSelectedSkills((current) => current.length > 0 ? current : steerSkills);
                 setComposerForcePlanNextPrompt((current) => current || forcePlan);
@@ -801,6 +831,7 @@ export async function refreshSelectedSessionSnapshot(ctx, targetSessionId, turnI
     const { applySelectedSessionSnapshot, isLikelyBackendDisconnect, noteBackendDisconnect, noteBackendRequestSucceeded, pendingReconciliationTurnIdsRef, reconcilingTurnIdsRef, sessionIdRef, setStatus } = ctx;
         if (sessionIdRef.current !== targetSessionId)
             return;
+        const expectedViewKey = ctx.viewKeyRef?.current;
         const reconciliationKey = turnId ?? `session:${targetSessionId}`;
         if (reconcilingTurnIdsRef.current.has(reconciliationKey)) {
             // Terminal events commonly arrive as turn/completed, result, then
@@ -814,12 +845,12 @@ export async function refreshSelectedSessionSnapshot(ctx, targetSessionId, turnI
             do {
                 pendingReconciliationTurnIdsRef.current.delete(reconciliationKey);
                 try {
-                    const response = await fetch(`/api/sessions/${encodeURIComponent(targetSessionId)}/snapshot`, { cache: "no-store" });
+                    const response = await fetch(sessionSnapshotUrl(targetSessionId, ctx.workspaceManagerView, undefined, turnId), { cache: "no-store" });
                     if (!response.ok)
                         throw new Error(`API returned ${response.status}`);
                     noteBackendRequestSucceeded();
                     const payload = (await response.json());
-                    if (sessionIdRef.current !== targetSessionId || !payload.session)
+                    if (sessionIdRef.current !== targetSessionId || !payload.session || ctx.viewKeyRef?.current !== expectedViewKey)
                         return;
                     applySelectedSessionSnapshot(payload);
                     const turn = turnId ? payload.turns?.find((candidate) => candidate.id === turnId) : null;

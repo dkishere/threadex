@@ -1,11 +1,13 @@
 import { ChevronRight, Quote } from "lucide-react";
 import type { ResponseAnnotation } from "./responseAnnotations";
+import { MarkdownContent } from "./MarkdownContent";
 
 export function ResponseAnnotationList({ annotations }: { annotations: ResponseAnnotation[] }) {
   return (
     <div className="response-annotation-list" aria-label="Referenced excerpts">
       {annotations.map((annotation, index) => (
-        <details className="response-annotation-attachment" key={`${index}:${annotation.text}`}>
+        <div className="response-annotation-attachment" key={`${index}:${annotation.text}`}>
+        <details className="response-annotation-excerpt">
           <summary>
             <span className="response-annotation-icon" aria-hidden="true">
               <Quote />
@@ -18,6 +20,8 @@ export function ResponseAnnotationList({ annotations }: { annotations: ResponseA
           </summary>
           <blockquote>{annotation.text}</blockquote>
         </details>
+        {annotation.annotation && <div className="response-annotation-comment"><MarkdownContent>{annotation.annotation}</MarkdownContent></div>}
+        </div>
       ))}
     </div>
   );

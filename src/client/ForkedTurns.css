@@ -1,12 +1,7 @@
 .forked-turns {
-  padding: 8px;
-  overflow: auto;
-  flex-shrink: 0;
-  max-height: 45%;
-}
-.forked-turns h3 {
-  margin: 0 0 8px;
-  font-size: 12px;
+  margin-top: 12px;
+  padding-left: 16px;
+  border-left: 2px solid var(--turn-accent, #64748b);
 }
 .forked-turn {
   padding: 8px 0;

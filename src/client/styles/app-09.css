@@ -645,7 +645,7 @@ button.attachment-thumb {
   background: #ffffff;
 }
 
-.response-annotation-attachment > summary {
+.response-annotation-excerpt > summary {
   display: flex;
   align-items: center;
   gap: 9px;
@@ -656,11 +656,11 @@ button.attachment-thumb {
   list-style: none;
 }
 
-.response-annotation-attachment > summary::-webkit-details-marker {
+.response-annotation-excerpt > summary::-webkit-details-marker {
   display: none;
 }
 
-.response-annotation-attachment > summary:hover {
+.response-annotation-excerpt > summary:hover {
   background: #f4f4f5;
 }
 
@@ -714,11 +714,11 @@ button.attachment-thumb {
   transition: transform 140ms ease;
 }
 
-.response-annotation-attachment[open] .response-annotation-chevron {
+.response-annotation-excerpt[open] .response-annotation-chevron {
   transform: rotate(90deg);
 }
 
-.response-annotation-attachment > blockquote {
+.response-annotation-excerpt > blockquote {
   margin: 0;
   padding: 9px 11px 10px;
   border-top: 1px solid #e4e4e7;
@@ -728,6 +728,20 @@ button.attachment-thumb {
   line-height: 17px;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
+}
+
+.response-annotation-comment {
+  padding: 10px 12px;
+  border-top: 1px solid #e4e4e7;
+  overflow-wrap: anywhere;
+}
+
+.response-annotation-comment > .markdown-content > :first-child {
+  margin-top: 0;
+}
+
+.response-annotation-comment > .markdown-content > :last-child {
+  margin-bottom: 0;
 }
 
 .response-quote-popover {

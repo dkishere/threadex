@@ -3,6 +3,7 @@ import test from "node:test";
 import { buildTurnGrillMidTurnInputs, buildTurnGrillPrompt } from "./turnGrill";
 import { buildTurnGrillInspectorConfig, buildTurnGrillSessionContext, isLongTurnGrill, turnGrillModel, TURN_GRILL_INSTRUCTIONS } from "./turnGrill";
 import { createTurnGrillHistoryReader } from "./turnGrillContext";
+import { detectConversationLanguage } from "./conversationLanguage";
 import { USER_INPUT_METHOD, asyncAnswerText, asyncInputParams } from "../userInputRequest";
 import type { SessionRecord } from "./sessionStore";
 
@@ -13,8 +14,7 @@ test("grill supplies a session URL and reuses only the existing inspector read t
     sessionId: "local_test", workspaceId: "workspace-a", turnId: "turn-a", currentTurnNumber: 2, totalTurns: 3
   });
   const config = buildTurnGrillInspectorConfig(session, "http://127.0.0.1:8787", "turn-a");
-  assert.deepEqual(config.enabled_tools, ["get_session"]);
-  assert.deepEqual(Object.keys(config.tools), ["get_session"]);
+  assert.deepEqual(config.approvedCommands, ["get_session"]);
   assert.equal(config.env.THREADEX_SESSION_ID, "local_test");
   assert.equal(config.env.THREADEX_TODO_AGENT_ROLE, "turn_grill");
   assert.equal(config.env.THREADEX_GRILL_TURN_ID, "turn-a");
@@ -45,7 +45,7 @@ test("single-turn grills can look up their source turn", () => {
   const context = buildTurnGrillSessionContext(session, "only", [{ id: "only" }]);
   assert.equal(context.currentTurnNumber, 1);
   assert.equal(context.totalTurns, 1);
-  assert.deepEqual(buildTurnGrillInspectorConfig(session, "http://localhost:8787", "only").enabled_tools, ["get_session"]);
+  assert.deepEqual(buildTurnGrillInspectorConfig(session, "http://localhost:8787", "only").approvedCommands, ["get_session"]);
   const read = createTurnGrillHistoryReader(session.id, "only");
   assert.equal(read({}).turnId, "only");
 });
@@ -64,8 +64,22 @@ test("grill sends compact direct evidence and excludes embedded source, instruct
   assert.deepEqual(JSON.parse(buildTurnGrillPrompt(input)), {
     userInput: input.userInput,
     agentResponse: input.agentResponse,
-    fileChanges: input.fileChanges
+    fileChanges: input.fileChanges,
+    autoLoop: false
   });
+});
+
+test("grill answers in the session language, not the target turn's short prompt", () => {
+  const responseLanguage = detectConversationLanguage(["可唔可以用 Claude 做 summariser", "照住改，做成 configurable", "go"]);
+  assert.equal(responseLanguage, "Traditional Chinese/Cantonese");
+  const prompt = JSON.parse(buildTurnGrillPrompt({ userInput: "go", agentResponse: "Done", fileChanges: [], responseLanguage }));
+  assert.equal(prompt.responseLanguage, "Traditional Chinese/Cantonese");
+  assert.match(TURN_GRILL_INSTRUCTIONS, /Write md and responseMd in responseLanguage/);
+});
+
+test("grill issues are atomic questions", () => {
+  assert.match(TURN_GRILL_INSTRUCTIONS, /Each issue is one atomic question/);
+  assert.match(TURN_GRILL_INSTRUCTIONS, /Never bundle numbered sub-questions/);
 });
 
 test("grill includes answered QA and manual steers in time order without duplicating async answers", () => {
@@ -123,4 +137,10 @@ test("long turns switch to source-first review guidance", () => {
   assert.equal(turnGrillModel(isLongTurnGrill({ userInput: "short", agentResponse: "short", tokenIn: 100_000, tokenOut: 1 })), "gpt-6-sol");
   assert.equal(isLongTurnGrill({ userInput: "x".repeat(100_000), agentResponse: "", tokenIn: 0, tokenOut: 0 }), true);
   assert.match(TURN_GRILL_INSTRUCTIONS, /Read the named project files yourself/);
+});
+
+test("configured griller models replace the default promotion pair", () => {
+  const models = { grillModel: "claude-haiku-5-5", grillLongModel: "claude-sonnet-5-5" };
+  assert.equal(turnGrillModel(false, models), "claude-haiku-5-5");
+  assert.equal(turnGrillModel(true, models), "claude-sonnet-5-5");
 });

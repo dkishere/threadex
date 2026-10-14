@@ -38,6 +38,8 @@ export default defineConfig({
         SESSION_DATA_DIR: dataDir,
         SESSION_DB_PATH: resolve(dataDir, "session-manager.duckdb"),
         CODEX_HOME: resolve(dataDir, "codex-home"),
+        // Keep the default workspace (and its injected skills and rules) out of the real ~/.codex.
+        THREADEX_DEFAULT_WORKSPACE_CODEX_HOME: resolve(dataDir, "codex-home"),
         CODEX_WORKDIR: root,
         CODEX_ACC_STORE_DIR: resolve(dataDir, "codex-acc"),
         DUCKDB_HOME_DIRECTORY: resolve(dataDir, "duckdb-home"),

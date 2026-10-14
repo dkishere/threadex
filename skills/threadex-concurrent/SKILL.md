@@ -5,7 +5,7 @@ description: Coordinate Threadex Concurrent workers and main using group-local I
 
 # Threadex Concurrent
 
-Threadex injects this entire skill into participating runners automatically, including fresh workers and follow-up turns. This injected copy counts as reading the skill: do not open or `cat` its file. Your injected identity and roster identify your group, local ID, main session and teammates; refresh live state with `concurrent_status` on the session-inspector MCP server before routing work.
+Threadex injects this entire skill into participating runners automatically, including fresh workers and follow-up turns. This injected copy counts as reading the skill: do not open or `cat` its file. Your injected identity and roster identify your group, local ID, main session and teammates; refresh live state with `concurrent_status` on the session-inspector CLI before routing work.
 
 ## Talk to teammates
 
@@ -13,7 +13,7 @@ First anchor yourself to the injected local ID, Threadex session ID and current 
 
 An incoming task is your assignment. A follow-up is addressed to you and may request work, correct it, or supply information. A result or delivery notice is evidence to assess and may unblock your remaining work; it is not an instruction to repeat reported work. Current corrections take precedence over historical assumptions. The original assigned request supplies continuity, not a reason to undo later changes in scope.
 
-Use the session-inspector MCP tools `concurrent_status` and `concurrent_send`. These address existing Threadex sessions, not native subagents. Use the roster's stable local IDs (`main`, `c1`, `c2`, …), never guessed native thread IDs. If you own the work, perform it here; do not route it to yourself or merely acknowledge its delivery. Route a dependency or follow-up to another member only when that other member owns the needed work. This Concurrent group authorizes messages within this group, not unrelated delegation or external messages.
+Use the session-inspector CLI commands `concurrent_status` and `concurrent_send`. These address existing Threadex sessions, not native subagents. Use the roster's stable local IDs (`main`, `c1`, `c2`, …), never guessed native thread IDs. If you own the work, perform it here; do not route it to yourself or merely acknowledge its delivery. Route a dependency or follow-up to another member only when that other member owns the needed work. This Concurrent group authorizes messages within this group, not unrelated delegation or external messages.
 
 Call `concurrent_send` with these arguments (substitute the real teammate and request):
 

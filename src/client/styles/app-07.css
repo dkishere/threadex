@@ -464,6 +464,18 @@
   line-height: 1;
 }
 
+.structured-comment-activity-count.structured-comment-edit-tag {
+  gap: 5px;
+  padding: 4px 7px;
+  border: 1px solid #86efac;
+  border-radius: 6px;
+  background: #dcfce7;
+  color: #166534;
+  font-size: 12px;
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
+}
+
 .structured-comment-activity-count > svg {
   width: 13px;
   height: 13px;

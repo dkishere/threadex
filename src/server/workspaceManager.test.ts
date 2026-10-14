@@ -7,7 +7,23 @@ import express from "express";
 import { SessionStore } from "./sessionStore";
 import { openPostgresSessionConnection, postgresSchemaFromStoreId } from "./sessionDb";
 import { WorkspaceManagerService, WORKSPACE_MANAGER_INSTRUCTIONS, workspaceManagerEvent, workspaceManagerContext,
-  loopTaskHasNoOutput, loopTaskHealthPrompt, nextStrongerWorkspaceModel, parseLoopTaskHealthAssessment } from "./workspaceManager";
+  loopTaskHasNoOutput, loopTaskHealthPrompt, nextStrongerWorkspaceModel, parseLoopTaskHealthAssessment, currentThreadModel } from "./workspaceManager";
+import type { SessionTurnRecord } from "./sessionStore";
+
+test("a thread's current model comes from its running turn, then its latest turn, then its preference", () => {
+  const turn = (id: string, status: string, model: string | null, requestMetadata?: Record<string, unknown>) =>
+    ({ id, status, model, requestMetadata }) as unknown as SessionTurnRecord;
+  const preferences = { selectedModel: "gpt-6-sol", selectedEffort: "medium" };
+  assert.deepEqual(currentThreadModel([
+    turn("running", "running", "claude-sonnet-5-5", { modelReasoningEffort: "high" }),
+    turn("later", "done", "gpt-6-luna")
+  ], preferences), { model: "claude-sonnet-5-5", effort: "high" });
+  assert.deepEqual(currentThreadModel([turn("latest", "done", null, { model: "claude-haiku-5-5" })], preferences),
+    { model: "claude-haiku-5-5", effort: "medium" });
+  assert.deepEqual(currentThreadModel([turn("auto", "done", null, { model: "auto" })], preferences),
+    { model: "gpt-6-sol", effort: "medium" });
+  assert.deepEqual(currentThreadModel([], preferences), { model: "gpt-6-sol", effort: "medium" });
+});
 import { WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS } from "./workspaceManagerRouting";
 import { isSilentManagerResponse, recentWorkspaceManagerMessages, recentWorkspaceManagerTurns, visibleWorkspaceManagerMessage, type WorkspaceManagerEvent } from "../workspaceManager";
 

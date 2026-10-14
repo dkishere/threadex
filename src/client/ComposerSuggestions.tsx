@@ -41,7 +41,7 @@ export function ComposerSuggestionMenu({ suggestions, activeIndex, onSelect, loa
     >
       <span className="slash-suggestion-name">/{suggestion.name}</span>
       <span className="slash-suggestion-description">{suggestion.description}</span>
-      <small>{suggestion.kind === "mode" ? "Mode" : suggestion.scope}</small>
+      <small>{suggestion.kind === "mode" || suggestion.kind === "todo" ? "Mode" : suggestion.scope}</small>
     </button>)}
     {suggestions.length === 0 && <span className="slash-suggestions-empty">{loading ? "Loading suggestions…" : "No matching suggestions"}</span>}
   </div>;

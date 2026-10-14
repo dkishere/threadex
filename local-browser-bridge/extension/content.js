@@ -76,13 +76,16 @@
             return;
         }
         const requestId = crypto.randomUUID();
-        const timeout = setTimeout(() => finish({ ok: false, error: "Threadex did not confirm the attachment. Check its tab before trying again." }), 60000);
+        const timeout = setTimeout(() => finish({ ok: false, error: "Threadex did not confirm the attachment. Check its tab before trying again." }), 60_000);
         function onResult(event) {
-            if (!(event instanceof CustomEvent) || typeof event.detail !== "string") return;
+            if (!(event instanceof CustomEvent) || typeof event.detail !== "string")
+                return;
             try {
                 const result = JSON.parse(event.detail);
-                if (result.requestId === requestId) finish(result);
-            } catch { /* Ignore unrelated page events. */ }
+                if (result.requestId === requestId)
+                    finish(result);
+            }
+            catch { /* Ignore unrelated page events. */ }
         }
         function finish(result) {
             clearTimeout(timeout);
@@ -135,7 +138,8 @@
             await showContextMenu(x, y, element.isConnected ? element : document.documentElement, screenshot);
     }
     function onPointerDown(event) {
-        if (event.button !== 2) removeSelectionShield();
+        if (event.button !== 2)
+            removeSelectionShield();
         if (event.shiftKey && event.button === 2 && !menuHost?.contains(event.target)) {
             // Stop the host page from turning a Shift+right-click gesture into a text
             // selection or another page-owned pointer interaction before contextmenu.
@@ -170,11 +174,15 @@
         selectionShield = undefined;
     }
     function onSelectionKeyUp(event) {
-        if (event.key === "Shift") removeSelectionShield();
+        if (event.key === "Shift")
+            removeSelectionShield();
     }
     function selectionTarget(x, y) {
-        if (selectionShield) selectionShield.style.pointerEvents = "none";
+        if (selectionShield)
+            selectionShield.style.pointerEvents = "none";
         const hit = document.elementFromPoint(x, y) ?? document.documentElement;
+        // Disabled controls often opt out of hit testing. Only consider controls
+        // beneath the hit's ancestry, so unrelated overlapping UI cannot win.
         const controls = [...document.querySelectorAll(":disabled,[aria-disabled='true']")];
         const candidates = controls.filter((element) => {
             const rect = element.getBoundingClientRect();
@@ -315,7 +323,32 @@
         }
         return Object.keys(values).length ? { values, matchedPrefixes } : null;
     }
+    // Prefer rare class names: they are both stable selectors and useful code-search
+    // terms. Utility classes such as `flex` are too common to qualify.
+    const maxAnchorClassCount = 5;
     function cssPath(element) {
+        return semanticCssPath(element) ?? structuralCssPath(element);
+    }
+    function semanticCssPath(element) {
+        const parts = [];
+        for (let node = element; node && parts.length < 8; node = node.parentElement) {
+            if (node.id) {
+                parts.unshift(`#${CSS.escape(node.id)}`);
+                break;
+            }
+            const anchorClass = rarestClass(node);
+            let part = node.tagName.toLowerCase() + (anchorClass ? `.${CSS.escape(anchorClass)}` : "");
+            const siblings = node.parentElement ? [...node.parentElement.children].filter((sibling) => sibling.matches(part)) : [];
+            if (siblings.length > 1)
+                part += `:nth-of-type(${nthOfType(node)})`;
+            parts.unshift(part);
+            if (anchorClass && matchesOnly(parts.join(" > "), element))
+                break;
+        }
+        const selector = parts.join(" > ");
+        return selector && matchesOnly(selector, element) ? selector : null;
+    }
+    function structuralCssPath(element) {
         const parts = [];
         for (let node = element; node && parts.length < 8; node = node.parentElement) {
             if (node.id) {
@@ -325,10 +358,38 @@
             let part = node.tagName.toLowerCase();
             const siblings = node.parentElement ? [...node.parentElement.children].filter((sibling) => sibling.tagName === node.tagName) : [];
             if (siblings.length > 1)
-                part += `:nth-of-type(${siblings.indexOf(node) + 1})`;
+                part += `:nth-of-type(${nthOfType(node)})`;
             parts.unshift(part);
         }
         return parts.join(" > ") || null;
+    }
+    function rarestClass(node) {
+        let best = null;
+        for (const name of node.classList) {
+            if (name.startsWith("local-browser-bridge"))
+                continue;
+            const count = document.getElementsByClassName(name).length;
+            if (count <= maxAnchorClassCount && (!best || count < best.count))
+                best = { name, count };
+        }
+        return best?.name ?? null;
+    }
+    function nthOfType(node) {
+        let index = 1;
+        for (let sibling = node.previousElementSibling; sibling; sibling = sibling.previousElementSibling) {
+            if (sibling.tagName === node.tagName)
+                index += 1;
+        }
+        return index;
+    }
+    function matchesOnly(selector, element) {
+        try {
+            const matches = document.querySelectorAll(selector);
+            return matches.length === 1 && matches[0] === element;
+        }
+        catch {
+            return false;
+        }
     }
     function createMenu(x, y, element) {
         const host = document.createElement("div");
@@ -447,7 +508,8 @@
     function showError(error) { window.alert(`Local Browser Bridge: ${errorMessage(error)}`); }
     function showMenuNotice(message, error = false) {
         const panel = menuHost?.shadowRoot?.querySelector(".panel");
-        if (!panel) return;
+        if (!panel)
+            return;
         let notice = panel.querySelector(".notice");
         if (!notice) {
             notice = document.createElement("p");

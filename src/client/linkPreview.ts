@@ -1,3 +1,5 @@
+import { attachAcpPreviewBridge } from "./acpPreviewBridge";
+
 export function isStandaloneApp() {
   return window.matchMedia("(display-mode: standalone), (display-mode: window-controls-overlay)").matches ||
     (navigator as Navigator & { standalone?: boolean }).standalone === true;
@@ -19,6 +21,21 @@ export function createLinkPreview(title: string, htmlPreview = false, externalUr
   const actions = document.createElement("div");
   actions.style.cssText = "display:flex;flex-shrink:0;align-items:center";
   let previewFrame: HTMLIFrameElement | null = null;
+  let detachFeedback: (() => void) | null = null;
+  let feedbackSession: { id: string; cwd: string } | null = null;
+  const feedback = document.createElement("button");
+  feedback.type = "button";
+  feedback.textContent = "Enable agent feedback";
+  feedback.hidden = true;
+  feedback.onclick = () => {
+    if (detachFeedback) {
+      detachFeedback(); detachFeedback = null;
+      feedback.textContent = "Enable agent feedback";
+    } else if (feedbackSession && previewFrame?.contentWindow) {
+      detachFeedback = attachAcpPreviewBridge(previewFrame.contentWindow, feedbackSession);
+      feedback.textContent = "Disconnect agent feedback";
+    }
+  };
   const refresh = previewIconButton("Refresh preview", "M20 7v5h-5 M20 12a8 8 0 1 0-2.34 5.66 M20 7l-2.34-2.66");
   refresh.disabled = true;
   refresh.onclick = () => {
@@ -32,7 +49,7 @@ export function createLinkPreview(title: string, htmlPreview = false, externalUr
   };
   const close = previewIconButton("Close preview", "M6 6l12 12 M6 18L18 6");
   close.onclick = () => dialog.close();
-  actions.append(refresh, close);
+  actions.append(feedback, refresh, close);
   if (externalUrl) {
     const external = document.createElement("a");
     external.href = externalUrl;
@@ -52,12 +69,17 @@ export function createLinkPreview(title: string, htmlPreview = false, externalUr
   let closed = false;
   dialog.addEventListener("close", () => {
     closed = true;
+    detachFeedback?.();
     dialog.remove();
     if (previousFocus instanceof HTMLElement && previousFocus.isConnected) previousFocus.focus();
   }, { once: true });
   dialog.showModal();
   return {
     close: () => dialog.close(),
+    feedback(session: { id: string; cwd: string }) {
+      feedbackSession = session;
+      feedback.hidden = false;
+    },
     navigate(url: string) {
       if (closed) return;
       const frame = document.createElement("iframe");
