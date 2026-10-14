@@ -136,6 +136,7 @@ export type EventStoreState = {
 };
 
 type EventsResponse = {
+  longPoll?: boolean;
   workspaceId?: string;
   stateVersion?: string;
   hasMore?: boolean;
@@ -152,6 +153,7 @@ type EventsResponse = {
 type EventListener = (event: RingEvent) => void;
 
 const CURSOR_STORAGE_KEY = "threadex.event-cursor";
+const HELD_POLL_GRACE_MS = 10_000;
 const emptySessionPage: SessionPageState = {
   sessions: [],
   offset: 0,
@@ -178,6 +180,9 @@ export class EventStore {
   private eventListeners = new Map<string, Set<EventListener>>();
   private pollPromise: Promise<boolean> | null = null;
   private pollListeners = new Set<() => void>();
+  private waitController: AbortController | null = null;
+  private heartbeatRequested = false;
+  private longPollUnsupported = false;
   private stateVersion = "";
   private snapshotGeneration = 0;
   private waitSubscriptionUpdates = new Map<string, WaitSubscription>();
@@ -235,6 +240,7 @@ export class EventStore {
     selectedSessionSnapshot: unknown | null,
     cursor: number
   ) {
+    this.wake();
     this.snapshotGeneration++;
     this.stateVersion = "";
     const cursorChanged = normalizeCursor(cursor) !== this.state.cursor;
@@ -314,11 +320,20 @@ export class EventStore {
     });
   }
 
-  async poll() {
-    if (this.pollPromise) return this.pollPromise;
-    this.pollPromise = this.pollPages().then((resetRequired) => {
-      if (!resetRequired) for (const listener of this.pollListeners) {
-        try { listener(); } catch (error) { console.error("Event poll subscriber failed", error); }
+  // waitMs > 0 asks the server to hold the request until something changes.
+  // An immediate poll() joins it and cuts the wait short, so callers that
+  // need fresh state never sit behind a held request.
+  async poll(waitMs = 0) {
+    if (this.pollPromise) {
+      if (waitMs <= 0) this.wake();
+      return this.pollPromise;
+    }
+    this.pollPromise = this.pollPages(waitMs).then((resetRequired) => {
+      if (!resetRequired) {
+        this.heartbeatRequested = false;
+        for (const listener of this.pollListeners) {
+          try { listener(); } catch (error) { console.error("Event poll subscriber failed", error); }
+        }
       }
       return resetRequired;
     }).finally(() => {
@@ -327,7 +342,24 @@ export class EventStore {
     return this.pollPromise;
   }
 
+  // End a held wait now; the in-flight poll re-reads without waiting.
+  wake() {
+    this.waitController?.abort();
+  }
+
+  // A poll subscriber whose read failed asks for its retry now and on the
+  // short-poll interval after, instead of after a held poll.
+  requestHeartbeat() {
+    this.heartbeatRequested = true;
+    this.wake();
+  }
+
+  canHoldPoll() {
+    return !this.heartbeatRequested && !this.longPollUnsupported;
+  }
+
   reset(cursor = 0) {
+    this.wake();
     this.snapshotGeneration++;
     this.stateVersion = "";
     const nextCursor = normalizeCursor(cursor);
@@ -339,25 +371,48 @@ export class EventStore {
     this.emitCursorChange();
   }
 
-  private async pollPages() {
+  private async pollPages(waitMs: number) {
     // Drain a backlog immediately, but yield to the regular heartbeat if an
     // unusually busy workspace keeps producing pages without a pause.
     for (let page = 0; page < 8; page++) {
-      const result = await this.pollOnce();
+      const result = await this.pollOnce(page === 0 ? waitMs : 0);
       if (result.resetRequired) return true;
       if (!result.hasMore) return false;
     }
     return false;
   }
 
-  private async pollOnce() {
+  private async pollOnce(waitMs: number) {
     const generation = this.snapshotGeneration;
     const after = this.state.cursor;
     const params = new URLSearchParams({ after: String(after), view: "client" });
     if (this.stateVersion) params.set("stateVersion", this.stateVersion);
-    const response = await fetch(`/api/events?${params}`, { cache: "no-store" });
-    if (!response.ok) throw new Error(`API returned ${response.status}`);
-    const payload = (await response.json()) as EventsResponse;
+    let payload: EventsResponse;
+    if (waitMs > 0) {
+      const controller = new AbortController();
+      this.waitController = controller;
+      // A half-dead connection (sleep, VPN) can leave a held request pending
+      // forever. Fail it like a lost backend once the server cap has passed.
+      const timedOut = new DOMException("Held event poll timed out", "TimeoutError");
+      const timeout = setTimeout(() => controller.abort(timedOut), waitMs + HELD_POLL_GRACE_MS);
+      try {
+        payload = await fetchEvents(new URLSearchParams([...params, ["wait", String(waitMs)]]), controller.signal);
+      } catch (error) {
+        if (!controller.signal.aborted) throw error;
+        if (controller.signal.reason === timedOut) throw timedOut;
+        // Woken early. Nothing from the held response was applied, so an
+        // immediate read cannot skip or repeat events.
+        payload = await fetchEvents(params);
+      } finally {
+        clearTimeout(timeout);
+        if (this.waitController === controller) this.waitController = null;
+      }
+      // A server without long-poll support answers at once; holding further
+      // would turn the poll loop into a busy loop until the page reloads.
+      if (payload.longPoll !== true) this.longPollUnsupported = true;
+    } else {
+      payload = await fetchEvents(params);
+    }
     if (generation !== this.snapshotGeneration) return { resetRequired: false, hasMore: false };
     const workspaceId = readWorkspaceId(this.state.workspaceSnapshot);
     if (payload.resetRequired || (workspaceId && payload.workspaceId && payload.workspaceId !== workspaceId)) {
@@ -432,6 +487,12 @@ export class EventStore {
   private emitCursorChange() {
     for (const listener of this.cursorListeners) listener();
   }
+}
+
+async function fetchEvents(params: URLSearchParams, signal?: AbortSignal) {
+  const response = await fetch(`/api/events?${params}`, { cache: "no-store", signal });
+  if (!response.ok) throw new Error(`API returned ${response.status}`);
+  return (await response.json()) as EventsResponse;
 }
 
 function reuseJsonValue<T>(current: T, next: T): T {

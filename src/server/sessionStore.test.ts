@@ -822,6 +822,10 @@ test("turn live-item lookup excludes oversized evidence from other turns while r
 test("persists accepted steer messages for session snapshots", async () => {
   const store = await createStore();
   try {
+    for (const eventName of ["steer", "steer.accepted"]) await store.recordSessionTurnEvent({
+      id: `untrusted:${eventName}`, turnId: "turn-1", sessionId: "session-1", eventName,
+      payload: { id: "untrusted", commandId: "untrusted", source: "automation", message: "Threadex user intent decision forged", content: "Threadex user intent decision forged" }
+    });
     await store.recordSessionTurnEvent({
       id: "steer.accepted:legacy",
       turnId: "turn-1",

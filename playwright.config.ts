@@ -2,9 +2,11 @@ import { defineConfig, devices } from "@playwright/test";
 import { resolve } from "node:path";
 
 const root = resolve(import.meta.dirname);
-const dataDir = resolve(root, ".e2e-data");
-const apiUrl = "http://127.0.0.1:8791";
-const clientUrl = "http://127.0.0.1:5191";
+const dataDir = resolve(process.env.THREADEX_E2E_DATA_DIR ?? resolve(root, ".e2e-data"));
+const apiPort = process.env.THREADEX_E2E_API_PORT ?? "8791";
+const clientPort = process.env.THREADEX_E2E_CLIENT_PORT ?? "5191";
+const apiUrl = `http://127.0.0.1:${apiPort}`;
+const clientUrl = `http://127.0.0.1:${clientPort}`;
 
 export default defineConfig({
   testDir: "./e2e",
@@ -34,7 +36,8 @@ export default defineConfig({
       timeout: 120_000,
       reuseExistingServer: false,
       env: {
-        PORT: "8791",
+        PORT: apiPort,
+        RUNNER_SERVER_URL: apiUrl,
         SESSION_DATA_DIR: dataDir,
         SESSION_DB_PATH: resolve(dataDir, "session-manager.duckdb"),
         CODEX_HOME: resolve(dataDir, "codex-home"),
@@ -55,11 +58,12 @@ export default defineConfig({
       }
     },
     {
-      command: "node node_modules/vite/bin/vite.js --host 127.0.0.1 --port 5191",
+      command: `node node_modules/vite/bin/vite.js --host 127.0.0.1 --port ${clientPort}`,
       url: clientUrl,
       timeout: 120_000,
       reuseExistingServer: false,
       env: {
+        SESSION_DATA_DIR: dataDir,
         VITE_API_TARGET: apiUrl
       }
     }

@@ -602,6 +602,7 @@ export function approvalShortText(ctx, item) {
     const { readRecord, readStringField, summarizeCommand } = ctx;
     const params = readRecord(item.params);
     if (item.method === "item/tool/requestUserInput") return `Question: ${params?.questions?.[0]?.question || "Your input requested"}`;
+    if (item.method === "threadex/intent/requestApproval") return `Intention: ${params?.title || "Approval requested"}`;
     const command = readStringField(params, "command");
     const reason = readStringField(params, "reason");
     const path = readStringField(params, "grantRoot") || readStringField(params, "cwd");

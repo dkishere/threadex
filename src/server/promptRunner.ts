@@ -13,6 +13,8 @@ import { WORKSPACE_MANAGER_MODEL, WORKSPACE_MANAGER_EFFORT,
 import { recordLiveGitProvenance } from "./gitProvenance";
 import { buildThreadexTurnReference } from "../codexReference";
 import { USER_INPUT_METHOD, inputQuestions, inputResponse, asyncInputQuestions, asyncInputParams, asyncAnswerText } from "../userInputRequest";
+import { INTENT_APPROVAL_TOOL, intentRequest, intentTurnInstructions } from "../intentApproval";
+import { automationSteerItem, AUTOMATION_STEER_NOTICE, type SteerSource } from "./steerSource";
 import { LIGHTWEIGHT_TODO_INSTRUCTIONS } from "./lightweightTodo";
 import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import {
@@ -212,6 +214,7 @@ type ApprovalRequestPayload = {
 
 type RunnerSteerCommand = {
   id: string;
+  source?: SteerSource;
   message: string;
   attachments?: SavedAttachment[];
   skills?: RequestedSkill[];
@@ -1276,6 +1279,7 @@ function readPositiveInteger(value: string | undefined, fallback: number) {
 }
 
 class AppServerClient {
+  private rootThreadId: string | null = null;
   private child: ChildProcessWithoutNullStreams | null = null;
   private stopPromise: Promise<void> | null = null;
   private nextId = 1;
@@ -1379,7 +1383,9 @@ class AppServerClient {
       this.pending.set(id, { resolve: resolveRpc, reject: rejectRpc });
       this.send({ id, method, params });
     });
-    return withTimeout(promise, 30_000, `${method} timed out`);
+    const result = await withTimeout(promise, 30_000, `${method} timed out`);
+    if (["thread/start", "thread/resume", "thread/fork"].includes(method)) this.rootThreadId = readThreadIdFromPayload(result) ?? null;
+    return result;
   }
 
   async stop(): Promise<void> {
@@ -1467,6 +1473,12 @@ class AppServerClient {
     }
 
     if (typeof message.method === "string" && id !== null) {
+      if (message.method === "item/tool/call" && readObject(message.params)?.tool === INTENT_APPROVAL_TOOL.name) {
+        // Leave the stdout reader free: the host delivers the decision using turn/steer
+        // before this tool returns, and that RPC needs its reply drained here.
+        void this.handleIntentApproval(id, message.params);
+        return;
+      }
       if (message.method === USER_INPUT_METHOD) {
         if (!inputQuestions(message.params).length) {
           this.send({ id, error: { code: -32602, message: "Invalid user input questions" } });
@@ -1524,6 +1536,32 @@ class AppServerClient {
       request.reject(error);
     }
     this.pending.clear();
+  }
+
+  private async handleIntentApproval(id: number | string, params: unknown) {
+    try {
+      const intent = intentRequest(readObject(params)?.arguments);
+      if (!intent || !job.serverUrl || planningTurnIsReadOnly(job)) throw new Error("Intent approval requires a valid scope and an active execution turn.");
+      if (readObject(params)?.threadId !== this.rootThreadId) throw new Error("Only the owning Threadex agent can request intention approval; ask it to handle this request.");
+      const base = job.serverUrl.replace(/\/$/, "");
+      const request = readObject(await postJson(`${base}/api/intent-approvals`, {
+        sessionId: job.sessionId, turnId: job.turnId, intent
+      }, 30000));
+      const approvalId = readString(request?.approvalId);
+      if (!approvalId) throw new Error("Host did not create an approval request.");
+      const question = { approvalId, canceled: false };
+      this.questions.set(id, question);
+      while (!this.closed && !question.canceled) {
+        const result = readObject(await postJson(`${base}/api/intent-approvals/${encodeURIComponent(approvalId)}/result`, {}, 30000));
+        if (result?.pending !== true) {
+          this.send({ id, result: { success: true, contentItems: [{ type: "inputText", text: JSON.stringify(result) }] } });
+          return;
+        }
+        await sleep(1000);
+      }
+    } catch (error) {
+      if (!this.closed) this.send({ id, result: { success: false, contentItems: [{ type: "inputText", text: `No authorization granted: ${errorMessage(error)}` }] } });
+    } finally { this.questions.delete(id); }
   }
 }
 
@@ -1698,8 +1736,10 @@ function buildThreadStartParams(job: RunnerJob, developerInstructions?: string) 
     sandbox: job.workspaceManager ? "read-only" : defaultThreadOptions.sandbox,
     ...approvalSettings,
     config: buildThreadConfig(job),
+    ...(!planningTurnIsReadOnly(job) && !job.workspaceManager ? { dynamicTools: [{ type: "function", ...INTENT_APPROVAL_TOOL }] } : {}),
     developerInstructions: [
       developerInstructions,
+      !job.workspaceManager ? intentTurnInstructions(job.turnId) : undefined,
       gitProvenanceDeveloperInstructions(job),
       !job.workspaceManager && !job.contextForkRequest ? SESSION_RECOVERY_INSTRUCTIONS : undefined
     ].filter(Boolean).join("\n\n") || null,
@@ -1717,6 +1757,7 @@ function buildThreadResumeParams(threadId: string, job: RunnerJob, developerInst
     config: buildThreadConfig(job),
     developerInstructions: [
       developerInstructions,
+      !job.workspaceManager ? intentTurnInstructions(job.turnId) : undefined,
       gitProvenanceDeveloperInstructions(job),
       !job.workspaceManager && !job.contextForkRequest ? SESSION_RECOVERY_INSTRUCTIONS : undefined
     ].filter(Boolean).join("\n\n") || null,
@@ -1796,6 +1837,10 @@ function startSteerControlLoop(
         let sent = false;
         try {
           if (finished) throw new Error("The target turn has already finished; steer was not sent.");
+          const automation = command.source !== "user" && command.source !== "intent-approval";
+          if (automation) await appServer.rpc("thread/inject_items", {
+            threadId, items: [automationSteerItem(command.message)]
+          });
           await emitDeveloperInstructionsEvent("steer", 0, command.developerInstructions);
           sent = true;
           const response = await appServer.rpc("turn/steer", {
@@ -1803,9 +1848,9 @@ function startSteerControlLoop(
             expectedTurnId: appTurnId,
             input: buildRunnerInput({
               ...job,
-              message: command.message,
-              attachments: command.attachments ?? [],
-              skills: command.skills ?? []
+              message: automation ? AUTOMATION_STEER_NOTICE : command.message,
+              attachments: automation ? [] : command.attachments ?? [],
+              skills: automation ? [] : command.skills ?? []
             }),
             ...(command.developerInstructions
               ? { settings: { developer_instructions: command.developerInstructions } }
@@ -1815,6 +1860,7 @@ function startSteerControlLoop(
           result = { ok: true, commandId: command.id, turnId: job.turnId, appTurnId: responseTurnId };
           await emitEvent("steer.accepted", {
             commandId: command.id,
+            source: command.source ?? "automation",
             appTurnId: responseTurnId,
             message: command.message
           });
@@ -1952,6 +1998,7 @@ function readSteerCommands(): RunnerSteerCommand[] {
     .filter((value): value is Record<string, unknown> => Boolean(value))
     .map((value) => ({
       id: readString(value.id) ?? "",
+      source: value.source === "user" || value.source === "intent-approval" ? value.source as SteerSource : "automation" as const,
       message: readString(value.message) ?? "",
       attachments: Array.isArray(value.attachments) ? (value.attachments as SavedAttachment[]) : [],
       skills: Array.isArray(value.skills) ? (value.skills as RequestedSkill[]) : [],
@@ -1991,6 +2038,7 @@ function buildSessionInspectorCliConfig(job: RunnerJob) {
   return {
     approvedCommands: [
       "recover_current_session", "get_session", "search_sessions",
+      ...(!planningTurnIsReadOnly(job) && !job.workspaceManager && !isClaudeModel(job.model) ? ["request_intent_approval"] : []),
       ...(job.workspaceManager || job.managerConcurrent ? WORKSPACE_MANAGER_TOOLS.map(tool => tool.name) : []),
       ...(job.lightweightTodo ? ["outcome_plan_get", "outcome_plan_set"] : []),
       ...(job.autoModelEnabled ? ["upgrade_model"] : []),
@@ -2091,6 +2139,7 @@ function todoPlanningRequested(job: RunnerJob) {
 
 function runnerDeveloperInstructions(job: RunnerJob, includeStartupSnapshot = true) {
   const instructions = [
+    !job.workspaceManager ? intentTurnInstructions(job.turnId) : undefined,
     inspectorInstructions,
     job.globalAgentInstructions?.trim()
       ? `User's global agent instructions (apply across Threadex workspaces):\n${job.globalAgentInstructions}`

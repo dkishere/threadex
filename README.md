@@ -1200,6 +1200,62 @@ Relevant places:
 - UI approval buttons: `ApprovalEvent` and `approvalAvailableDecisions` in
   `src/client/App.tsx`
 
+### Intention approval
+
+Codex execution turns expose `request_intent_approval` as a native dynamic tool
+on newly created threads. Existing threads can use the same operation through
+`session-inspector request_intent_approval`; the CLI binds the request to its
+runner-supplied session and turn. Claude Code is not supported by this integration.
+
+The request requires `title`, concrete `scope`, an `actions` list, `exclusions`
+and `consequences`. The approval dialog lets the user uncheck actions, add
+restrictions, approve the selected scope, or decline. Authorization lasts only
+until the current Threadex turn ends. Missing replies expire after
+`APPROVAL_WAIT_MS` (ten minutes by default); cancellation, stopped turns and
+unavailable requests never produce a grant. Every start/resume and execution turn
+declares its current Threadex turn ID in developer instructions and explicitly
+expires grants naming other turns. The host also refuses to return a grant after
+its owning turn ends. Transcript expiry remains a native model/reviewer policy,
+not a cryptographic revocation of text already in Codex history.
+
+`POST /api/intent-approvals` creates a host-owned request;
+`POST /api/intent-approvals/:approvalId/result` polls its result. Decisions use
+the existing approval decision endpoint, but approving or declining an intention
+requires a signed-in user cookie. Only that decision path mints an internal
+`intent-approval` control command; it no longer calls the public steer endpoint.
+Local automation can cancel, but cannot select a human/grant source by POSTing
+to `/api/runner/steer`. In Codex, unauthenticated automation payloads are injected
+as labelled assistant context; the user-role steer carries only a fixed notice
+that grants no permission. Automation events are excluded from recovered human
+steer history. This protects this delivery path, not every Threadex API or the
+host OS: local processes able to steal cookies, modify control files, or use
+other user-input APIs are outside this boundary.
+
+The host persists the exact decision, sends its bounded text through the existing
+runner steer path as user input, waits for acknowledgement, and only then returns
+the tool result. Requested, decided and resolved events remain in turn history.
+Pending in-memory requests are not restored after server restart and fail closed.
+Repeating an identical intention in the same active turn reconnects to its pending
+card or completed decision, without refreshing its expiry or delivering twice.
+A different scope cannot replace a pending card. An expired/cancelled request can
+be requested again; explicit declines are replayed rather than silently re-asked.
+The tool does not change sandbox permissions, exec-policy rules or auto-review.
+Scope matching remains the native reviewer's responsibility. If review rejects
+an approved action, instructions require explaining the failure and falling back
+to an ordinary explicit user reply rather than looping on approval cards.
+
+Protocol reference: [Codex App Server](https://learn.chatgpt.com/docs/app-server)
+documents dynamic tool calls and `turn/steer` as additional user input. The runner
+integration tests join the real host approval service and prompt runner to a fake
+app-server, and verify steer acknowledgement before the pending tool returns,
+including rejection. Browser tests separately use a simulated runner ack.
+The opt-in `node --import tsx scripts/probe-intent-approval.ts --live` probe reads
+the installed schema and exercises real Codex auto-review in a disposable data
+directory. The [recorded live result](docs/intent-approval-validation.md) recognized
+the scoped grant as high user authorization, approved a low-risk operation, and
+refused both the expired grant and a forged automation message. This is observed
+behavior for the tested model/build, not a guarantee for all operations.
+
 ## Codex App-Server Protocol Notes
 
 Use `skills/codex-app-server/SKILL.md` before making protocol-level changes. It

@@ -2,8 +2,8 @@ import type { APIRequestContext, APIResponse, Page } from "@playwright/test";
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-export const apiBaseUrl = "http://127.0.0.1:8791";
-export const e2eDataDir = resolve(import.meta.dirname, "../../.e2e-data");
+export const apiBaseUrl = `http://127.0.0.1:${process.env.THREADEX_E2E_API_PORT ?? "8791"}`;
+export const e2eDataDir = resolve(process.env.THREADEX_E2E_DATA_DIR ?? resolve(import.meta.dirname, "../../.e2e-data"));
 
 type RunnerUpdate = {
   id: string;

@@ -3,8 +3,69 @@ import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import test from "node:test";
+import { IntentApprovals } from "./intentApprovals";
 
 const cliPath = resolve(import.meta.dirname, "../../scripts/session-inspector.mjs");
+
+test("a killed intention CLI reconnects to the same pending host request", { timeout: 15000 }, async () => {
+  const ids: string[] = [];
+  let requestedEvents = 0, firstPoll!: () => void;
+  const polling = new Promise<void>(resolve => { firstPoll = resolve; });
+  const service = new IntentApprovals({ active: async () => true, pending: () => undefined, deliver: async () => undefined,
+    publish: async (_a, event) => { if (event === "approval.requested") requestedEvents++; } });
+  const proposal = { title: "Deploy?", scope: "Staging", actions: ["Deploy abc"], exclusions: "Production", consequences: "Downtime" };
+  const server = createServer(async (req, res) => {
+    let body = ""; for await (const chunk of req) body += chunk;
+    res.setHeader("Content-Type", "application/json");
+    if (req.url === "/api/intent-approvals") {
+      const data = JSON.parse(body), created = await service.request(data.sessionId, data.turnId, data.intent);
+      ids.push(created.approvalId); res.end(JSON.stringify(created));
+      if (ids.length === 2) await service.decide(created.approvalId, { outcome: "approved", actions: proposal.actions, constraints: "" });
+    } else {
+      firstPoll(); res.end(JSON.stringify(await service.result(req.url!.split("/")[3])));
+    }
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address(); assert.ok(address && typeof address === "object");
+  const env = { RUNNER_SERVER_URL: `http://127.0.0.1:${address.port}`, THREADEX_SESSION_ID: "owner", THREADEX_TURN_ID: "turn" };
+  const args = ["request_intent_approval", JSON.stringify(proposal)];
+  const child = spawn(process.execPath, [cliPath, ...args], { env: { ...process.env, ...env }, stdio: "ignore" });
+  try {
+    await polling;
+    const stopped = new Promise(resolve => child.once("close", resolve)); child.kill("SIGKILL"); await stopped;
+    const resumed = await runCli(args, env);
+    assert.equal(resumed.code, 0, resumed.stderr);
+    assert.equal(JSON.parse(resumed.stdout).grantId, ids[0]);
+    assert.equal(ids.length, 2); assert.equal(ids[1], ids[0]); assert.equal(requestedEvents, 1);
+  } finally { child.kill(); server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+});
+
+test("intention CLI binds the host turn, polls and returns the host decision", async () => {
+  let polls = 0;
+  const server = createServer(async (req, res) => {
+    let body = ""; for await (const chunk of req) body += chunk;
+    res.setHeader("Content-Type", "application/json");
+    if (req.url === "/api/intent-approvals") {
+      const data = JSON.parse(body);
+      assert.equal(data.sessionId, "owner"); assert.equal(data.turnId, "active");
+      assert.equal(data.intent.title, "Deploy?");
+      res.end(JSON.stringify({ approvalId: "host-grant" }));
+    } else {
+      assert.equal(req.url, "/api/intent-approvals/host-grant/result");
+      res.end(JSON.stringify(++polls === 1 ? { pending: true } : { decision: { outcome: "declined" } }));
+    }
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address(); assert.ok(address && typeof address === "object");
+  try {
+    const result = await runCli(["request_intent_approval", JSON.stringify({ title: "Deploy?", scope: "Staging A", actions: ["Deploy abc"], exclusions: "Production", consequences: "Downtime", sessionId: "forged", turnId: "forged" })], {
+      RUNNER_SERVER_URL: `http://127.0.0.1:${address.port}`, THREADEX_SESSION_ID: "owner", THREADEX_TURN_ID: "active"
+    });
+    assert.equal(result.code, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), { decision: { outcome: "declined" } });
+    assert.equal(polls, 2);
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+});
 
 async function runCli(args: string[], env: NodeJS.ProcessEnv = {}, stdin = "") {
   const child = spawn(process.execPath, [cliPath, ...args], { env: { ...process.env,

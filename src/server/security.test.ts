@@ -12,6 +12,7 @@ test("password gate, proxy isolation, rotation, CSRF, logout and persistence", a
   const app = express();
   app.use("/api", createSecurity(file));
   app.get("/api/private", (_req, res) => res.json({ secret: true }));
+  app.get("/api/user-authenticated", (_req, res) => res.json({ authenticated: res.locals.threadexUserAuthenticated === true }));
   app.get("/api/stream", (_req, res) => { res.setHeader("Content-Type", "text/event-stream"); res.write("data: connected\n\n"); });
   const server = app.listen(0, "127.0.0.1");
   await new Promise<void>(resolve => server.once("listening", resolve));
@@ -30,6 +31,8 @@ test("password gate, proxy isolation, rotation, CSRF, logout and persistence", a
     const setup = await request("security/password", { password });
     assert.equal(setup.status, 200);
     const cookie = setup.headers.get("set-cookie")!.split(";")[0];
+    assert.deepEqual(await (await fetch(`${base}/api/user-authenticated`)).json(), { authenticated: false });
+    assert.deepEqual(await (await request("user-authenticated", undefined, { cookie })).json(), { authenticated: true });
     const savedToken = (await setup.json()).token;
     assert.equal(savedToken, cookie.slice("threadex_session=".length));
     const restored = await request("security/restore", { token: savedToken }, remote);

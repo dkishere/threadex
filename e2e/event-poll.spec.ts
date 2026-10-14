@@ -93,16 +93,11 @@ test("compact completion events still recover the full answer after terminal SSE
   await selectSession(request, session.id);
   await interruptTerminalStreams(page);
   let compactResult = false;
-  let completeOnNextPoll = false;
-  await page.route("**/api/events?**", async route => {
-    if (completeOnNextPoll) {
-      completeOnNextPoll = false;
-      // Publish after the browser captures its poll cursor. A concurrent full
-      // snapshot can otherwise recover the answer before this event is polled.
-      await runnerUpdate(request, { id: "compact-result-recovery", sessionId: session.id, turnId, event: "result", data: { reply: "Full answer recovered from the saved turn", tokenIn: 2, tokenOut: 3 } });
-    }
-    await route.continue();
-  });
+  let heldPolls = 0;
+  const isHeldPoll = (url: string) => url.includes("/api/events?") && new URL(url).searchParams.has("wait");
+  page.on("request", request => { if (isHeldPoll(request.url())) heldPolls++; });
+  page.on("requestfinished", request => { if (isHeldPoll(request.url())) heldPolls--; });
+  page.on("requestfailed", request => { if (isHeldPoll(request.url())) heldPolls--; });
   page.on("response", async response => {
     if (!response.url().includes("/api/events?")) return;
     const body = await response.json().catch(() => ({}));
@@ -110,26 +105,96 @@ test("compact completion events still recover the full answer after terminal SSE
   });
   await page.goto(`/?workspaceId=default&sessionId=${session.id}`);
   await expect(page.getByRole("button", { name: "Stop agent", exact: true })).toBeVisible();
-  completeOnNextPoll = true;
+  // Publish while a held poll has captured the cursor: it must wake and
+  // deliver the event before a concurrent full snapshot could recover it.
+  await expect.poll(() => heldPolls).toBeGreaterThan(0);
+  await runnerUpdate(request, { id: "compact-result-recovery", sessionId: session.id, turnId, event: "result", data: { reply: "Full answer recovered from the saved turn", tokenIn: 2, tokenOut: 3 } });
   await expect(page.getByText("Full answer recovered from the saved turn", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Stop agent", exact: true })).toHaveCount(0);
   await expect.poll(() => compactResult).toBe(true);
 });
 
-test("browser uses versioned idle polls without clearing loaded monitor state", async ({ page, request }) => {
+test("browser holds versioned idle polls without clearing loaded monitor state", async ({ page, request }) => {
+  test.slow();
   await selectSession(request, scenarioSessions.switchBeta.id);
+  const requests: URL[] = [];
   const polls: any[] = [];
-  const versions: Array<string | null> = [];
+  page.on("request", request => {
+    if (request.url().includes("/api/events?")) requests.push(new URL(request.url()));
+  });
   page.on("response", async response => {
     if (!response.url().includes("/api/events?")) return;
     const body = await response.json().catch(() => null);
-    if (!body) return;
-    polls.push(body);
-    versions.push(new URL(response.url()).searchParams.get("stateVersion"));
+    if (body) polls.push(body);
   });
   await page.goto(`/?workspaceId=default&sessionId=${scenarioSessions.switchBeta.id}`);
-  await expect.poll(() => polls.length).toBeGreaterThanOrEqual(2);
-  expect(versions[0]).toBeNull();
-  expect(versions[1]).toBe(polls[0].stateVersion);
+  await expect.poll(() => requests.length).toBeGreaterThanOrEqual(2);
+  expect(requests[0].searchParams.get("stateVersion")).toBeNull();
+  expect(requests[1].searchParams.get("stateVersion")).toBe(polls[0].stateVersion);
+  expect(requests[1].searchParams.get("wait")).toBe("20000");
+  // Nothing changes while idle, so the server holds the poll until it expires.
+  await page.waitForTimeout(1_000);
+  expect(polls).toHaveLength(1);
+  await expect.poll(() => polls.length, { timeout: 30_000 }).toBeGreaterThanOrEqual(2);
+  expect(polls[1].events).toEqual([]);
   expect(polls[1]).not.toHaveProperty("processMonitors");
+});
+
+test("a lost event poll reconnects with a short poll before holding again", async ({ page, request }) => {
+  await selectSession(request, scenarioSessions.switchBeta.id);
+  const waits: Array<string | null> = [];
+  let failNext = true;
+  await page.route("**/api/events?**", async route => {
+    waits.push(new URL(route.request().url()).searchParams.get("wait"));
+    if (failNext) {
+      failNext = false;
+      await route.abort("connectionreset");
+      return;
+    }
+    await route.continue();
+  });
+  await page.goto(`/?workspaceId=default&sessionId=${scenarioSessions.switchBeta.id}`);
+  // A reconnect waits one short-poll interval, then the restore snapshot.
+  await expect.poll(() => waits.length, { timeout: 15_000 }).toBeGreaterThanOrEqual(3);
+  // Held, then the restore uses a short poll instead of waiting out a held one.
+  expect(waits.slice(0, 3)).toEqual(["20000", null, "20000"]);
+});
+
+test("only one tab per browser holds an event poll open", async ({ page, request }) => {
+  await selectSession(request, scenarioSessions.switchBeta.id);
+  const url = `/?workspaceId=default&sessionId=${scenarioSessions.switchBeta.id}`;
+  const holder = await page.context().newPage();
+  const tabs = { holder, other: page };
+  const held = { holder: 0, other: 0 };
+  const shortPolls = { holder: 0, other: 0 };
+  let maxHeld = 0;
+  const isEventPoll = (url: string) => url.includes("/api/events?");
+  const isHeld = (url: string) => isEventPoll(url) && new URL(url).searchParams.has("wait");
+  for (const name of ["holder", "other"] as const) {
+    tabs[name].on("request", request => {
+      if (!isEventPoll(request.url())) return;
+      if (!isHeld(request.url())) { shortPolls[name]++; return; }
+      held[name]++;
+      maxHeld = Math.max(maxHeld, held.holder + held.other);
+    });
+    const finished = (request: { url(): string }) => { if (isHeld(request.url())) held[name]--; };
+    tabs[name].on("requestfinished", finished);
+    tabs[name].on("requestfailed", finished);
+  }
+  try {
+    await holder.goto(url);
+    await expect.poll(() => held.holder).toBe(1);
+    await page.goto(url);
+    // The other tab keeps the short-poll interval while the holder holds.
+    await expect.poll(() => shortPolls.other, { timeout: 15_000 }).toBeGreaterThanOrEqual(2);
+    expect(held.other).toBe(0);
+    expect(maxHeld).toBe(1);
+    // Closing the holder releases its lease to the remaining tab.
+    await holder.close();
+    held.holder = 0;
+    await expect.poll(() => held.other).toBe(1);
+    expect(maxHeld).toBe(1);
+  } finally {
+    if (!holder.isClosed()) await holder.close();
+  }
 });

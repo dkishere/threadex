@@ -13,7 +13,11 @@ test("Await ack highlights follow server summaries, actions acknowledge the visi
   const actions: any[] = [];
   const summaries = () => [{ sessionId: session.id, turnId, revision: saved.revision, pending: grillAwaitingAck(saved) }];
   await page.route("**/api/events?**", async (route) => {
-    const response = await route.fetch();
+    // The mocked grill state lives outside the server, which therefore cannot
+    // wake a held poll when it changes. Read it without holding.
+    const url = new URL(route.request().url());
+    url.searchParams.delete("wait");
+    const response = await route.fetch({ url: url.toString() });
     await route.fulfill({ json: { ...await response.json(), grillSummaries: summaries() } });
   });
   await page.route("**/api/sessions/*/grills", (route) => route.fulfill({ json: { turnIds: [turnId], summaries: summaries() } }));

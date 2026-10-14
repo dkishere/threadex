@@ -21,6 +21,10 @@ export function changedEventState(state: EventPollState & { versions: EventState
   };
 }
 
+export function isClientEventType(type: string) {
+  return clientTypes.has(type);
+}
+
 export function clientEvent(event: RingEvent): RingEvent | null {
   if (!clientTypes.has(event.type)) return null;
   const data = event.payload && typeof event.payload === "object" ? event.payload as Record<string, unknown> : {};
@@ -38,6 +42,38 @@ export function clientEvent(event: RingEvent): RingEvent | null {
     case "session.title.updated": payload = { title: data.title }; break;
   }
   return { ...event, payload };
+}
+
+// Held /api/events requests. A ring publish wakes every waiter so it can
+// re-read its own page; waiters also time out to re-check polled state.
+export class EventWaiters {
+  private wakers = new Set<() => void>();
+
+  get size() {
+    return this.wakers.size;
+  }
+
+  // Resolves true when woken by notify(), false on timeout or abort.
+  wait(ms: number, signal?: AbortSignal) {
+    return new Promise<boolean>((resolve) => {
+      if (signal?.aborted) { resolve(false); return; }
+      const finish = (woken: boolean) => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        this.wakers.delete(onWake);
+        resolve(woken);
+      };
+      const onWake = () => finish(true);
+      const onAbort = () => finish(false);
+      const timer = setTimeout(() => finish(false), Math.max(0, ms));
+      signal?.addEventListener("abort", onAbort, { once: true });
+      this.wakers.add(onWake);
+    });
+  }
+
+  notify() {
+    for (const wake of [...this.wakers]) wake();
+  }
 }
 
 export function clientEventPage(entries: readonly RingEvent[], workspaceId: string, after: number, limits = { count: 128, bytes: 128 * 1024 }) {

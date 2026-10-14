@@ -1,5 +1,7 @@
-import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
+import type { APIRequestContext, Page } from "@playwright/test";
+import { expect, test } from "./support/authenticated-test";
 import {
+  apiBaseUrl,
   appendMockRunnerSequence,
   interruptTerminalStreams,
   postJson,
@@ -185,7 +187,7 @@ test("reload restores the locally selected session when the active pointer was c
 
   await expect(page.locator(".content-header h1")).toHaveText(session.title);
   await expect.poll(async () => {
-    const snapshot = await request.get("http://127.0.0.1:8791/api/workspace/snapshot");
+    const snapshot = await request.get(`${apiBaseUrl}/api/workspace/snapshot`);
     return (await snapshot.json()).activeSessionId;
   }).toBe(session.id);
 });

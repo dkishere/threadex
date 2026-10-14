@@ -14,6 +14,9 @@ import { recordLiveGitProvenance } from "./gitProvenance";
 import { installGitWorktreeReviewHooks } from "./gitWorktreeGuard";
 import { changedFilePaths } from "./changedFilePaths";
 import { USER_INPUT_METHOD, inputResponse } from "../userInputRequest";
+import { INTENT_APPROVAL_METHOD } from "../intentApproval";
+import { IntentApprovals } from "./intentApprovals";
+import { httpSteerSource, type SteerSource } from "./steerSource";
 import { isAutoModel, isAutoEffort } from "../autoModelCatalog";
 import { buildAutoModelState, selectAutoModel, shouldEnableAutoModel } from "./autoModelSelector";
 import { AutoModelSettings, createAutoModelSettingsRouter } from "./autoModelSettings";
@@ -140,7 +143,7 @@ import {
 } from "./pendingTurnRouting";
 import { DEFAULT_TURN_RING_MAX_BYTES, TurnRingLog } from "./turnRingLog";
 import { EventRingLog, type RingEvent } from "./eventRingLog";
-import { changedEventState, clientEventPage, versionEventState } from "./eventPoll";
+import { changedEventState, clientEventPage, EventWaiters, isClientEventType, versionEventState } from "./eventPoll";
 import type { EventStateVersions } from "../eventProtocol";
 import { canInlineWorkspaceFile, resolveWorkspaceFilePath } from "./workspaceFiles";
 import { runnerStartupIsWithinGrace } from "./runnerWatchdog";
@@ -574,6 +577,7 @@ type RunnerSteerRequest = {
 
 type RunnerSteerCommand = {
   id: string;
+  source?: SteerSource;
   message: string;
   attachments: SavedAttachment[];
   skills: RequestedSkill[];
@@ -894,6 +898,34 @@ let codexSessionTitlePollRunning = false;
 let codexSessionFilePollTimer: NodeJS.Timeout | null = null;
 let codexSessionFilePollRunning = false;
 const pendingApprovals = new Map<string, PendingApproval>();
+const intentApprovals = new IntentApprovals({
+  active: async (sessionId, turnId) => {
+    const turn = await sessionStore.getSessionTurn(turnId);
+    return !!turn && turn.sessionId === sessionId && turn.status === "running" && !isClaudeModel(turn.model)
+      && !!turn.runnerPid && isProcessAlive(turn.runnerPid);
+  },
+  pending: (approval, pending) => {
+    if (pending) pendingApprovals.set(approval.approvalId, approval);
+    else pendingApprovals.delete(approval.approvalId);
+  },
+  publish: async (approval, event, decision, error) => {
+    const id = `${approval.approvalId}:${event}`;
+    const data = { ...approval, ...(decision !== undefined ? { decision } : {}), ...(error ? { error } : {}) };
+    await sessionStore.recordSessionTurnEvent({ id, sessionId: approval.sessionId, turnId: approval.turnId, eventName: event, payload: data });
+    await publishRunnerUpdateEvent({ id, sessionId: approval.sessionId, turnId: approval.turnId, event, data });
+  },
+  deliver: async (approval, message) => {
+    const turn = await sessionStore.getSessionTurn(approval.turnId);
+    if (!turn || turn.sessionId !== approval.sessionId || turn.status !== "running" || !turn.runnerPid) throw new Error("The approval turn is no longer running.");
+    const command: RunnerSteerCommand = { id: crypto.randomUUID(), source: "intent-approval", message, attachments: [], skills: [] };
+    mkdirSync(runnerControlDir, { recursive: true });
+    appendFileSync(runnerControlPath(turn.id), `${JSON.stringify(command)}\n`, "utf8");
+    const result = await waitForRunnerSteerResult(command.id, turn.id, turn.runnerPid);
+    if (!result.ok) throw new Error(result.error || "The user decision could not be delivered to the active turn.");
+    await sessionStore.recordSessionTurnEvent({ id: `steer:${command.id}`, sessionId: turn.sessionId, turnId: turn.id,
+      eventName: "steer", payload: { id: command.id, content: message, source: command.source, attachments: [] } });
+  }
+}, approvalWaitMs);
 const listedSkillsByWorkspace = new Map<string, RequestedSkill[]>();
 const sessionSummarizerEnabled = !["0", "false"].includes(
   (process.env.SESSION_SUMMARIZER_ENABLED ?? "true").trim().toLowerCase()
@@ -909,6 +941,13 @@ const pendingRetryFallbackMs = parseDurationMs(
 );
 const eventRingCapacity = Math.max(1, Number.parseInt(process.env.EVENT_RING_CAPACITY ?? "4096", 10) || 4096);
 const eventRingLog = new EventRingLog(eventRingLogPath, eventRingCapacity);
+const eventWaiters = new EventWaiters();
+const eventWaitMaxMs = 25_000;
+// Grill, wait and monitor state changes publish no client event. Rechecking
+// at the old running-poll interval keeps them as fast as before; the shared
+// one-second supplement cache bounds the cost across held requests.
+const eventWaitStateRecheckMs = 750;
+const eventWaitCoalesceMs = 100;
 const workspaceManager = new WorkspaceManagerService(sessionStore, {
   schedule: schedulePendingTurnsForSession,
   assessLoopTask: (workspaceId, prompt) => sessionSummarizer.assessLoopTask(workspaceId, prompt),
@@ -1595,14 +1634,36 @@ app.delete("/api/process-monitors/:monitorId", async (req: Request<{ monitorId: 
 app.get("/api/events", async (req, res) => {
   const after = Math.max(0, Number.parseInt(typeof req.query.after === "string" ? req.query.after : "0", 10) || 0);
   try {
-    const workspace = await sessionStore.getActiveWorkspace();
     if (req.query.view === "client") {
-      const page = clientEventPage(eventRingLog.entries, workspace.id, after);
-      if (page.resetRequired) { res.json(page); return; }
-      const supplement = await getEventPollSupplement(workspace);
-      res.json({ ...page, ...changedEventState(supplement, typeof req.query.stateVersion === "string" ? req.query.stateVersion : "") });
-      return;
+      // wait=<ms> holds the request until a client event or polled state
+      // change, so visible tabs get events at once without a poll interval.
+      // longPoll tells the client this server honours wait.
+      const knownState = typeof req.query.stateVersion === "string" ? req.query.stateVersion : "";
+      const waitMs = Math.min(eventWaitMaxMs, Math.max(0, Number.parseInt(typeof req.query.wait === "string" ? req.query.wait : "0", 10) || 0));
+      const deadline = Date.now() + waitMs;
+      const closed = new AbortController();
+      res.on("close", () => closed.abort());
+      for (;;) {
+        const workspace = await sessionStore.getActiveWorkspace();
+        const state = changedEventState(await getEventPollSupplement(workspace), knownState);
+        // Read the page and register the waiter with no await in between, so
+        // a publish cannot slip past this request until the next recheck.
+        const page = clientEventPage(eventRingLog.entries, workspace.id, after);
+        if (page.resetRequired) { res.json({ ...page, longPoll: true }); return; }
+        const remaining = deadline - Date.now();
+        // Also answer once many non-client events pass, so a held cursor
+        // cannot fall out of the ring and force a full snapshot reload.
+        if (page.events.length > 0 || state.stateVersion !== knownState || page.nextPos - after >= eventRingCapacity / 4 || remaining <= 0 || shuttingDown) {
+          if (!closed.signal.aborted) res.json({ ...page, ...state, longPoll: true });
+          return;
+        }
+        const woken = await eventWaiters.wait(Math.min(remaining, eventWaitStateRecheckMs), closed.signal);
+        if (closed.signal.aborted) return;
+        // Let a burst such as result + done land in one response.
+        if (woken) await sleep(eventWaitCoalesceMs);
+      }
     }
+    const workspace = await sessionStore.getActiveWorkspace();
     const oldestPos = eventRingLog.entries[0]?.pos ?? 0;
     const latestPos = eventRingLog.latestPosition;
     const resetRequired = after > 0 && (latestPos === 0 || after > latestPos || after < oldestPos - 1);
@@ -5143,12 +5204,13 @@ app.post("/api/runner/steer", async (req: Request<object, object, RunnerSteerReq
     const session = await sessionStore.getSession(turn.sessionId);
     const command: RunnerSteerCommand = {
       id: commandId,
+      source: httpSteerSource(res.locals.threadexUserAuthenticated === true),
       message,
       developerInstructions: clientLayoutInstructions(req.body.clientLayout),
       attachments: saveUploadedAttachments(uploadDir, `steer-${commandId}`, req.body.attachments),
       skills: resolveRequestedSkills(req.body.skills, session?.workspaceId ?? "")
     };
-    await turnRingLog.appendUserPrompt({
+    if (command.source !== "automation") await turnRingLog.appendUserPrompt({
       eventId: `prompt:${turn.id}:steer:${commandId}`,
       source: "runner.steer",
       sessionId: turn.sessionId,
@@ -5183,6 +5245,7 @@ app.post("/api/runner/steer", async (req: Request<object, object, RunnerSteerReq
       payload: {
         id: commandId,
         content: message,
+        source: command.source,
         attachments: attachmentPayload,
         forcePlan: req.body.forcePlan === true
       }
@@ -5432,7 +5495,7 @@ app.post("/api/pending-turns/:turnId/steer", async (
     deliveryAttempted = true;
     const steerResponse = await fetch(`${serverUrl.replace(/\/$/, "")}/api/runner/steer`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...(req.headers.cookie ? { cookie: req.headers.cookie } : {}) },
       body: JSON.stringify({
         turnId: active.id, sessionId, message,
         attachments: attachments.map(({ id, name, mimeType, size, path }) => ({ id, name, type: mimeType, size, path })),
@@ -5475,6 +5538,20 @@ app.post("/api/pending-turns/:turnId/steer", async (
   }
 });
 
+app.post("/api/intent-approvals", async (req, res) => {
+  const { sessionId, turnId, intent } = req.body ?? {};
+  if (typeof sessionId !== "string" || typeof turnId !== "string") {
+    res.status(400).json({ error: "sessionId and turnId are required." }); return;
+  }
+  try { res.json(await intentApprovals.request(sessionId, turnId, intent)); }
+  catch (error) { res.status(409).json({ error: errorMessage(error) }); }
+});
+
+app.post("/api/intent-approvals/:approvalId/result", async (req, res) => {
+  try { res.json(await intentApprovals.result(req.params.approvalId)); }
+  catch (error) { res.status(500).json({ error: errorMessage(error) }); }
+});
+
 app.get("/api/approvals", (req, res) => {
   const turnId = typeof req.query.turnId === "string" ? req.query.turnId : null;
   const sessionId = typeof req.query.sessionId === "string" ? req.query.sessionId : null;
@@ -5487,6 +5564,9 @@ app.get("/api/approvals", (req, res) => {
 });
 
 app.post("/api/approvals/request", async (req: Request<object, object, ApprovalRequestBody>, res: Response) => {
+  if (req.body.method === INTENT_APPROVAL_METHOD || (req.body.approvalId && pendingApprovals.get(req.body.approvalId)?.method === INTENT_APPROVAL_METHOD)) {
+    res.status(400).json({ error: "Use the host-owned intention request endpoint." }); return;
+  }
   const approval = approvalFromRequest(req.body);
   if (!approval) {
     res.status(400).json({ error: "Invalid approval request." });
@@ -5501,6 +5581,9 @@ app.post("/api/approvals/request", async (req: Request<object, object, ApprovalR
 app.post("/api/approvals/:approvalId/wait", async (req: Request<{ approvalId: string }>, res: Response) => {
   const approvalId = req.params.approvalId;
   const approval = pendingApprovals.get(approvalId);
+  if (approval?.method === INTENT_APPROVAL_METHOD) {
+    res.status(400).json({ error: "Use the intention result endpoint." }); return;
+  }
   if (!approval) {
     res.status(409).json({ error: "Approval request is no longer pending.", stale: true, approvalId });
     return;
@@ -5531,6 +5614,17 @@ app.post("/api/approvals/:approvalId/wait", async (req: Request<{ approvalId: st
 app.post("/api/approvals/:approvalId/decision", async (req: Request<{ approvalId: string }, object, ApprovalDecisionBody>, res: Response) => {
   const approvalId = req.params.approvalId;
   const approval = pendingApprovals.get(approvalId);
+  if (approval?.method === INTENT_APPROVAL_METHOD) {
+    // Local runner automation may cancel a request, but must never approve itself.
+    if (req.body.decision !== "cancel" && res.locals.threadexUserAuthenticated !== true) {
+      res.status(403).json({ error: "Sign in to Threadex to decide an intention approval." }); return;
+    }
+    try {
+      await intentApprovals.decide(approvalId, req.body.decision);
+      res.json({ ok: true, resolvedApprovalIds: [approvalId] });
+    } catch (error) { res.status(409).json({ error: errorMessage(error) }); }
+    return;
+  }
   if (!approval) {
     res.status(409).json({ error: "Approval request is no longer pending.", stale: true, approvalId });
     return;
@@ -6459,6 +6553,8 @@ async function shutdown(signal: string) {
   }
   shuttingDown = true;
   console.log(`Received ${signal}; shutting down Threadex.`);
+  // Answer held event polls now so closing the server is not delayed.
+  eventWaiters.notify();
 
   clearInterval(watchdog);
   if (loopRecoveryTimer) clearInterval(loopRecoveryTimer);
@@ -11005,7 +11101,7 @@ function prepareEventStream(res: Response) {
 }
 
 async function publishRingEvent(input: Omit<RingEvent, "pos" | "timestamp"> & { timestamp?: string }) {
-  await eventRingLog.append(input);
+  if (await eventRingLog.append(input) && isClientEventType(input.type)) eventWaiters.notify();
   await workspaceManager.observe({ ...input, timestamp: input.timestamp ?? new Date().toISOString() });
 }
 

@@ -1,0 +1,9 @@
+.intent-approval-card h3 { margin: 0; font-size: 1rem; }
+.intent-approval-card dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px 14px; margin: 0; }
+.intent-approval-card dt { font-weight: 600; }
+.intent-approval-card dd { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.intent-constraints { display: grid; gap: 6px; }
+.intent-constraints textarea { width: 100%; min-height: 64px; resize: vertical; padding: 8px; color: inherit; background: transparent; border: 1px solid var(--border); border-radius: 6px; font: inherit; }
+.intent-approval-card footer { flex-wrap: wrap; }
+.intent-approval-card footer button:first-of-type { color: #475569; background: #fff; border: 1px solid #cbd5e1; }
+@media (max-width: 520px) { .intent-approval-card dl { grid-template-columns: 1fr; gap: 4px; } .intent-approval-card dd { margin-bottom: 8px; } }

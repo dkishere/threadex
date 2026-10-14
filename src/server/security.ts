@@ -98,6 +98,7 @@ export function createSecurity(file: string) {
   });
   router.use((req, res, next) => {
     if (authenticated(req)) {
+      res.locals.threadexUserAuthenticated = true;
       active.add(res);
       const timer = setTimeout(() => res.end(), Math.min(2_147_483_647, Number(token(req).split(".")[0]) - Date.now()));
       timer.unref();

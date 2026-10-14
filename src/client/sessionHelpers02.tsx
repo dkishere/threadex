@@ -1,5 +1,7 @@
 // @ts-nocheck
 import { UserInputRequestCard } from "./UserInputRequestCard";
+import { IntentApprovalCard } from "./IntentApprovalCard";
+import { INTENT_APPROVAL_METHOD } from "../intentApproval";
 import { USER_INPUT_METHOD } from "../userInputRequest";
 export function ServerPrefixPanel(ctx, { block }) {
     const { ChevronRight, FileText, ListChecks, TerminalSquare, _jsx, _jsxs } = ctx;
@@ -559,6 +561,7 @@ export function FileChangeEvent(ctx, { item }) {
 }
 
 export function ApprovalEvent(ctx, { item, onDecisionSubmitted, compact = false }) {
+    if (item.method === INTENT_APPROVAL_METHOD) return ctx._jsx(IntentApprovalCard, { item, onDecisionSubmitted });
     if (item.method === USER_INPUT_METHOD) return ctx._jsx(UserInputRequestCard, { item, onDecisionSubmitted });
     const { FileEditIcon, TerminalSquare, _jsx, _jsxs, approvalAvailableDecisions, approvalDecisionLabel, readRecord, readStringField, summarizeCommand, useState } = ctx;
     const [submittingDecision, setSubmittingDecision] = useState(null);

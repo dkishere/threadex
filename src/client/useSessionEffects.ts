@@ -2,7 +2,14 @@
 import { useEffect, useLayoutEffect } from "react";
 import { deferSnapshotWrite } from "./deferredSnapshot";
 import { CLIENT_EVENT_TYPES } from "../eventProtocol";
+import { EventPollLease } from "./eventPollLease";
 import { recentWorkspaceManagerMessages } from "../workspaceManager";
+// Below the server's 25s cap and common proxy idle timeouts.
+const EVENT_LONG_POLL_MS = 20_000;
+const EVENT_LONG_POLL_MIN_GAP_MS = 250;
+// One per tab: it outlives effect re-runs so a re-run cannot let another tab
+// take the lease while this tab's held request is still open.
+const eventPollLease = new EventPollLease();
 
 export function useSessionEffects(ctx) {
   const { accountPopoverRef, activeGearIndex, activePromptTurnIds, activeTurnId, activeTurnIdRef, activeWorkspace, approvalPolicy, backendConnection, backendConnectionRef, bumpViewKey, composerDraftSessionIdRef, currentModelPreferences, currentRunningTurnId, currentSessionIsRunning, currentSessionIsStopping, didBootReconnectRef, effectiveParentSessionId, escStopArmedRef, escStopTimerRef, eventStore, executionMode, explicitNewSessionRef, findAssistantMessageId, forcePlanNextPrompt, forkNextPrompt, gearProfiles, handleDurableEvent, hasRunningTurn, inlinePromptEditor, inlinePromptEditorRef, isAccountLoginOpen, isAccountPopoverOpen, isBootstrapped, isLikelyBackendDisconnect, isSessionSearchOpen, isSettingsOpen, latestMessagesRef, loadContext, loadSessionSearchPage, loadSessionsTimerRef, loadWorkspaceSnapshot, messageIndicatorMarks, messageScrollIndicatorRef, messageScrollTopRef, messages, messagesRef, modelPreferencesEditRevisionRef, navigationTargetRef, noteBackendDisconnect, noteBackendRequestSucceeded, patchStoredComposerDraft, persistModelPreferences, profileAccountId, profileWorkspaceId, promptTurns, promptTurnsScrollRef, queuedModelPreferencesRevisionRef, queuedPrompts, queuedPromptsBySession, queuedPromptsRef, readNavigationTarget, reconnectRunner, reconnectingTurnIdsRef, refreshSelectedSessionSnapshot, resetAccountLoginDialog, resetEscStopPrompt, resizeEditor, responseQuotePopover, restoreBackendConnection, resumeThreadId, runningSessionCount, selectedEffort, selectedModel, sessionExecutionStatusesRef, sessionId, sessionIdRef, sessionSearchQuery, setActivePromptTurnIds, setClockNow, setComposerResponseQuote, setIsAccountPopoverOpen, setIsLoadingProfileAnalytics, setIsLoadingSkills, setIsSettingsOpen, setParentSessionTodo, setPendingApprovalSessionIds, setProfileAnalytics, setProfileAnalyticsError, setProfileWorkspaceId, setResponseQuotePopover, setSelectedSkills, setSessionExecutionStatuses, setSkillSuggestions, setSlashSuggestionIndex, setStatus, setsEqual, settingsSection, showToast, skillSuggestions, slashTrigger, status, stickToMessageBottomRef, stopCurrentTurn, switchingSessionTitle, threadId, toastTimerRef, updateMessageIndicatorPositions, updateMessageViewportIndicator, useLoadBalanceInWorkspace, viewKeyRef, writeStoredSession } = ctx;
@@ -305,11 +312,39 @@ useEffect(() => {
 useEffect(() => {
         if (!isBootstrapped)
             return;
+        // One visible tab per browser holds a long poll so events arrive as
+        // they are published. Other tabs short-poll: hidden ones still raise
+        // task notifications without holding one of the browser's few
+        // HTTP/1.1 connections to this host. A reconnect also short-polls so
+        // the backend is restored as soon as it answers.
         let cancelled = false;
         let timer = null;
+        let polling = false;
+        function mayHold() {
+            return document.visibilityState === "visible"
+                && backendConnectionRef.current !== "reconnecting"
+                && eventStore.canHoldPoll();
+        }
+        function pollNow() {
+            if (polling || cancelled)
+                return;
+            if (timer !== null)
+                window.clearTimeout(timer);
+            void pollEvents();
+        }
         async function pollEvents() {
+            timer = null;
+            polling = true;
+            const startedAt = Date.now();
+            let held = false;
+            let succeeded = false;
             try {
-                const resetRequired = await eventStore.poll();
+                // Keep the lease through reconnects and retry heartbeats; only
+                // hiding the tab hands it to another one.
+                if (mayHold())
+                    held = await eventPollLease.acquire();
+                const resetRequired = await eventStore.poll(held ? EVENT_LONG_POLL_MS : 0);
+                succeeded = true;
                 if (cancelled)
                     return;
                 const shouldRestoreBackend = backendConnectionRef.current === "reconnecting";
@@ -326,18 +361,57 @@ useEffect(() => {
                     noteBackendDisconnect();
             }
             finally {
+                polling = false;
                 if (!cancelled) {
-                    timer = window.setTimeout(pollEvents, currentSessionIsRunning ? 750 : 2_500);
+                    // After a successful poll, hold again at once when allowed,
+                    // e.g. right after a reconnect. Failures keep the interval
+                    // as back-off, and the floor stops a hot loop if
+                    // something answers held polls at once.
+                    timer = window.setTimeout(pollEvents, succeeded && mayHold() && eventPollLease.held
+                        ? Math.max(0, EVENT_LONG_POLL_MIN_GAP_MS - (Date.now() - startedAt))
+                        : currentSessionIsRunning ? 750 : 2_500);
                 }
             }
         }
+        function onVisibilityChange() {
+            if (document.visibilityState !== "visible") {
+                // Release the held connection; the loop drops to short polls.
+                eventPollLease.releaseLease();
+                eventStore.wake();
+            }
+            else if (polling) {
+                // After sleep the held request may sit on a dead connection.
+                eventStore.wake();
+            }
+            else {
+                pollNow();
+            }
+        }
+        function onFocusChange() {
+            if (document.hasFocus())
+                pollNow();
+            else if (!eventPollLease.held)
+                eventStore.wake();
+        }
         void pollEvents();
+        document.addEventListener("visibilitychange", onVisibilityChange);
+        window.addEventListener("focus", onFocusChange);
+        window.addEventListener("blur", onFocusChange);
         return () => {
             cancelled = true;
+            document.removeEventListener("visibilitychange", onVisibilityChange);
+            window.removeEventListener("focus", onFocusChange);
+            window.removeEventListener("blur", onFocusChange);
             if (timer !== null)
                 window.clearTimeout(timer);
         };
     }, [isBootstrapped, currentSessionIsRunning]);
+useEffect(() => {
+        // Another request may detect the outage first. Do not leave the
+        // restore waiting behind a held poll on a live backend.
+        if (backendConnection === "reconnecting")
+            eventStore.wake();
+    }, [backendConnection]);
 useEffect(() => {
         // Background Concurrent/Round Table/Grill work can start without a
         // foreground runner event. Keep discovering activity even from idle.

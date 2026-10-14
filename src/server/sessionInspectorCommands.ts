@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { AUTO_MODEL_ORDER } from "../modelCatalog";
+import { INTENT_APPROVAL_TOOL, intentRequest } from "../intentApproval";
+import { AUTO_MODEL_ORDER, isClaudeModel } from "../modelCatalog";
 import type { CollaborationView } from "../collaboration";
 import { WORKSPACE_MANAGER_TOOLS, WORKSPACE_MANAGER_ACTIONS } from "./workspaceManagerTools";
 import { createTurnGrillHistoryReader } from "./turnGrillContext";
@@ -95,6 +96,7 @@ const todoPlanItemSchema: Record<string, unknown> = {
 };
 
 const tools: ToolSpec[] = [
+  INTENT_APPROVAL_TOOL,
   {
     name: "recover_current_session",
     description:
@@ -734,7 +736,7 @@ const collaborationTools: ToolSpec[] = [{
 }];
 
 export function toolsForAgent() {
-  const base = [...baseToolsForAgent()];
+  const base = [...baseToolsForAgent()].filter(tool => tool.name !== INTENT_APPROVAL_TOOL.name || !isClaudeModel(managerModel));
   if (managerConcurrent && !["side_chat", "turn_grill"].includes(todoAgentRole)) {
     base.push(...WORKSPACE_MANAGER_TOOLS.filter(tool => todoAgentRole !== "planner" ||
       ["workspace_status", "workspace_search_tasks", "workspace_inspect_task"].includes(tool.name)));
@@ -784,6 +786,18 @@ export async function runCommand(name: string, args: Record<string, unknown>) {
 
   if (!name || !isToolExposed(name)) {
     throw new Error(`Command is not available to this ${todoAgentRole} agent: ${name ?? "unknown"}`);
+  }
+
+  if (name === "request_intent_approval") {
+    const intent = intentRequest(args);
+    if (!intent || !managerSessionId || !managerTurnId) throw new Error("A valid bounded intention and active Threadex turn are required.");
+    const request = await postJson("/api/intent-approvals", { sessionId: managerSessionId, turnId: managerTurnId, intent }) as { approvalId: string };
+    // Poll briefly so the CLI does not depend on a long HTTP connection surviving.
+    while (true) {
+      const result = await postJson(`/api/intent-approvals/${encodeURIComponent(request.approvalId)}/result`, {}) as { pending?: boolean };
+      if (!result.pending) return result;
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
   }
 
   if (name === "concurrent_status" || name === "concurrent_send") {

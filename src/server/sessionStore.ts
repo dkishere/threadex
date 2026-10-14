@@ -10603,6 +10603,8 @@ export class SessionStore {
         continue;
       }
       const steer = payload as Record<string, unknown>;
+      // Automation is assistant context, never a recovered human permission grant.
+      if (steer.source === "automation") continue;
       // `steer.accepted` was the event emitted by older runners.  It already
       // contains the accepted command and is the only durable trace for steers
       // created before explicit `steer` persistence was added.

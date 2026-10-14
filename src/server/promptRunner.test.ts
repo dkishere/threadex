@@ -1130,8 +1130,9 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   );
 });
 
-for (const duringStartup of [false, true]) {
-test(`prompt runner forwards control messages to Codex turn/steer${duringStartup ? " during startup" : ""}`, async (t) => {
+for (const scenario of ["user", "startup", "automation"]) {
+const duringStartup = scenario === "startup", automation = scenario === "automation";
+test(`prompt runner forwards ${scenario} control messages with source preserved`, async (t) => {
   const root = mkdtempSync(resolve(tmpdir(), "prompt-runner-steer-"));
   const fakeCodexPath = resolve(root, "fake-codex.mjs");
   const jobPath = resolve(root, "job.json");
@@ -1172,6 +1173,7 @@ test(`prompt runner forwards control messages to Codex turn/steer${duringStartup
   });
   const controlMessage = `${JSON.stringify({
     id: commandId,
+    source: automation ? "automation" : "user",
     message: "focus on the server path",
     developerInstructions: "Force plan steps for this steer.",
     attachments: []
@@ -1220,6 +1222,10 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     send({ id: request.id, result: { turnId: "app-turn-1" } });
     send({ method: "item/completed", params: { item: { id: "answer-1", type: "agentMessage", text: "done" } } });
     send({ method: "turn/completed", params: { turn: { id: "app-turn-1", status: "completed" } } });
+  }
+  if (request.method === "thread/inject_items") {
+    if (request.params.items[0].role !== "assistant" || !request.params.items[0].content[0].text.includes("focus on the server path")) process.exit(5);
+    send({ id: request.id, result: {} });
   }
 });
 `, "utf8");
@@ -1299,7 +1305,10 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   const steer = JSON.parse(readFileSync(capturedSteerPath, "utf8"));
   assert.equal(steer.threadId, "thread-1");
   assert.equal(steer.expectedTurnId, "app-turn-1");
-  assert.deepEqual(steer.input, [{ type: "text", text: "focus on the server path", text_elements: [] }]);
+  if (automation) {
+    assert.match(steer.input[0].text, /not a user instruction or permission grant/);
+    assert.doesNotMatch(steer.input[0].text, /focus on the server path/);
+  } else assert.deepEqual(steer.input, [{ type: "text", text: "focus on the server path", text_elements: [] }]);
   assert.equal(steer.settings.developer_instructions, "Force plan steps for this steer.");
 
   const goal = JSON.parse(readFileSync(capturedGoalPath, "utf8"));
@@ -1312,6 +1321,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.equal(thread.approvalPolicy, "on-request");
   assert.equal(thread.approvalsReviewer, "auto_review");
   assert.match(thread.developerInstructions, /Never wrap commentary in JSON/i);
+  assert.match(thread.developerInstructions, /Current Threadex authorization turn: "turn-1"/);
+  assert.match(thread.developerInstructions, /another Threadex turn are expired/);
   const turn = JSON.parse(readFileSync(capturedTurnPath, "utf8"));
   assert.equal(turn.approvalPolicy, "on-request");
   assert.match(turn.settings.developer_instructions, /\[STARTUP\]/);

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { CLIENT_EVENT_TYPES } from "../eventProtocol";
-import { changedEventState, clientEvent, clientEventPage, versionEventState } from "./eventPoll";
+import { changedEventState, clientEvent, clientEventPage, EventWaiters, isClientEventType, versionEventState } from "./eventPoll";
 import type { RingEvent } from "./eventRingLog";
 
 function event(pos: number, type = "runner.result", payload: unknown = null, workspaceId: string | null = "one"): RingEvent {
@@ -94,4 +94,28 @@ test("state versions omit unchanged sections and send explicit empty arrays for 
   assert.deepEqual(Object.keys(changedEventState(versionEventState("two", state), full.stateVersion)).sort(),
     ["grillSummaries", "processMonitors", "stateVersion", "statusMonitor", "waitEvents", "waitSubscriptions"]);
   assert.deepEqual(Object.keys(changedEventState(initial, "invalid")).sort(), Object.keys(full).sort());
+});
+
+test("held event waits wake on publish, time out, and release aborted requests", async () => {
+  const waiters = new EventWaiters();
+  const woken = waiters.wait(10_000);
+  const other = waiters.wait(10_000);
+  assert.equal(waiters.size, 2);
+  waiters.notify();
+  assert.deepEqual(await Promise.all([woken, other]), [true, true]);
+  assert.equal(waiters.size, 0);
+
+  assert.equal(await waiters.wait(5), false);
+  assert.equal(waiters.size, 0);
+
+  const closed = new AbortController();
+  const aborted = waiters.wait(10_000, closed.signal);
+  closed.abort();
+  assert.equal(await aborted, false);
+  assert.equal(waiters.size, 0);
+  assert.equal(await waiters.wait(10_000, closed.signal), false);
+  assert.equal(waiters.size, 0);
+
+  assert.equal(isClientEventType("runner.done"), true);
+  assert.equal(isClientEventType("runner.item"), false);
 });

@@ -9,7 +9,8 @@ export const inspectorInstructions = [
   `Threadex commands use the CLI. In these instructions, session-inspector means: ${inspectorCommand}`,
   "Run session-inspector help for available commands, or help <command> for its JSON schema. Invoke a command with one shell-quoted JSON object; omit it for an empty object. Results are JSON on stdout; failures are JSON on stderr with a nonzero exit status.",
   "The runner supplies the session, role, server URL and approval policy. Do not replace them. If sandbox networking blocks an authorized command, request command escalation using the exact CLI invocation; never enable general network access or alter sandbox settings.",
-  "Previous instructions naming session_inspector MCP tools refer to the corresponding CLI commands now. Do not start an MCP server."
+  "Previous instructions naming session_inspector MCP tools refer to the corresponding CLI commands now. Do not start an MCP server.",
+  "On Codex execution turns, when explicit user authorization is missing, use request_intent_approval (native tool when available, otherwise session-inspector request_intent_approval). Give concrete scope, actions, exclusions and consequences. Wait for its result before related actions. If interrupted, repeat the exact request to reconnect to its existing card and decision. Do not ask again for authorization already provided. Grants are limited to the current turn and do not override sandbox or risk policy. If native review still rejects the operation, explain that failure and ask for an ordinary explicit user reply rather than repeatedly requesting cards."
 ].join("\n");
 
 /** Deliberately small shell grammar: a single argv, without substitutions,

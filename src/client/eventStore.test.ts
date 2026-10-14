@@ -192,6 +192,76 @@ test("structurally identical monitor payloads preserve the render snapshot", asy
   }
 });
 
+test("an immediate poll cuts a held wait short and delivers each event once", async (t) => {
+  const store = new EventStore();
+  const urls: URL[] = [];
+  const positions: number[] = [];
+  store.subscribeTo(["runner.done"], event => { positions.push(event.pos); });
+  const done = { pos: 1, eventId: "1", type: "runner.done", workspaceId: "one", sessionId: "session", turnId: "turn", payload: null, timestamp: "now" };
+  t.mock.method(globalThis, "fetch", (url: string, init?: RequestInit) => {
+    const parsed = new URL(url, "http://fixture");
+    urls.push(parsed);
+    if (!parsed.searchParams.has("wait")) return Promise.resolve(Response.json({ events: [done], nextPos: 1 }));
+    // A held request answers only when aborted, like the server's long poll.
+    return new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+    });
+  });
+  const held = store.poll(20_000);
+  const immediate = store.poll();
+  assert.equal(await held, false);
+  assert.equal(await immediate, false);
+  assert.deepEqual(urls.map(url => url.searchParams.get("wait")), ["20000", null]);
+  assert.equal(urls[1].searchParams.get("after"), "0");
+  assert.deepEqual(positions, [1]);
+  assert.equal(store.getCursor(), 1);
+});
+
+test("a held poll that never answers fails as a lost backend after the grace period", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const store = new EventStore();
+  t.mock.method(globalThis, "fetch", (_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+    init?.signal?.addEventListener("abort", () => reject(init.signal!.reason));
+  }));
+  const held = store.poll(20_000);
+  t.mock.timers.tick(29_999);
+  await Promise.resolve();
+  t.mock.timers.tick(1);
+  await assert.rejects(held, (error: unknown) => error instanceof DOMException && error.name === "TimeoutError");
+});
+
+test("held polls stop when the server answers without long-poll support", async (t) => {
+  const store = new EventStore();
+  const payloads = [{ longPoll: true, nextPos: 0 }, { nextPos: 0 }];
+  t.mock.method(globalThis, "fetch", async () => Response.json(payloads.shift()));
+  await store.poll(20_000);
+  assert.equal(store.canHoldPoll(), true);
+  await store.poll(20_000);
+  assert.equal(store.canHoldPoll(), false);
+});
+
+test("a failed feature read wakes the held poll and short-polls until its retry heartbeat", async (t) => {
+  const store = new EventStore();
+  const waits: Array<string | null> = [];
+  let heartbeats = 0;
+  store.subscribePoll(() => { heartbeats++; });
+  t.mock.method(globalThis, "fetch", (url: string, init?: RequestInit) => {
+    const wait = new URL(url, "http://fixture").searchParams.get("wait");
+    waits.push(wait);
+    if (!wait) return Promise.resolve(Response.json({ longPoll: true, nextPos: 0 }));
+    return new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(init.signal!.reason));
+    });
+  });
+  const held = store.poll(20_000);
+  store.requestHeartbeat();
+  assert.equal(store.canHoldPoll(), false);
+  assert.equal(await held, false);
+  assert.deepEqual(waits, ["20000", null]);
+  assert.equal(heartbeats, 1);
+  assert.equal(store.canHoldPoll(), true);
+});
+
 test("identical session pages do not notify full-state subscribers", () => {
   const store = new EventStore();
   let stateNotifications = 0;

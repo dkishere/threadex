@@ -157,6 +157,7 @@ export function TurnGrillPanel({ sessionId, turnId, mainBusy, onImplement, actio
       } catch { if (!controller.signal.aborted) {
         loaded = false;
         setError("Could not reach the review server. Reconnecting…");
+        eventStore.requestHeartbeat();
       } }
       finally { inFlight = false; if (!controller.signal.aborted) setLoading(false); }
     }
