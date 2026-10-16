@@ -17,6 +17,56 @@ class RoundtableService extends Service {
 
 const actors = [newRoundtableActor({ model: DEFAULT_MODEL, effort: "low" }), newRoundtableActor({ model: MODEL_CATALOG.claudeSonnet.id, effort: "high" })];
 const response = (responseText: string) => ({ responseText, usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } });
+
+for (const completedCount of [0, 1, 2]) test(`skip thinking actors settles with ${completedCount} completed answers`, async () => {
+  const store = await fixture();
+  const cast = [...actors, newRoundtableActor({ model: DEFAULT_MODEL })];
+  const started: RoundtableInference[] = [];
+  const service = new RoundtableService({ store, summarizerModel: () => DEFAULT_MODEL, run: async input => {
+    const index = started.push(input) - 1;
+    if (index < completedCount) return response(`Answer ${index}`);
+    await new Promise<void>(resolve => input.signal.addEventListener("abort", () => resolve(), { once: true }));
+    return response("Late result must not replace skipped status");
+  } });
+  try {
+    await service.create("host", { turnId: "rt_skip", message: "Discuss", actors: cast });
+    await until(async () => started.length === 3 && (await store.getRoundtableRound("rt_skip"))!.answers.filter(answer => answer.status === "done").length === completedCount);
+    for (const actor of cast.slice(completedCount)) await service.skip("host", "rt_skip", actor.id);
+    await service.idle("rt_skip");
+    const round = (await store.getRoundtableRound("rt_skip"))!;
+    assert.equal(round.status, completedCount === 0 ? "stopped" : completedCount === 1 ? "done" : "host");
+    assert.ok(round.answers.slice(completedCount).every(answer => answer.status === "skipped" && !answer.text));
+    assert.ok(started.slice(completedCount).every(input => input.signal.aborted));
+    if (completedCount === 1) assert.equal((await store.getSessionTurn("rt_skip"))!.agentResponse, "Answer 0");
+    if (completedCount === 0) assert.match(round.error!, /Agent aborted/);
+    if (completedCount === 2) {
+      const evidence = JSON.parse(roundtableHostPrompt(round).split("\n\n")[3]);
+      assert.equal(evidence.responses.length, 2);
+      assert.doesNotMatch(roundtableHostInstructions(round), new RegExp(cast[2].name));
+    }
+  } finally { service.stopAll(); await service.idle("rt_skip"); await store.close(); }
+});
+
+test("skip failed actor returns the saved answer without rerunning actors", async () => {
+  const store = await fixture();
+  let calls = 0;
+  const service = new RoundtableService({ store, summarizerModel: () => DEFAULT_MODEL, run: async () => {
+    if (++calls === 2) throw new Error("Actor failed");
+    return response("Saved answer");
+  } });
+  try {
+    await service.create("host", { turnId: "rt_failed_skip", message: "Discuss", actors });
+    await until(async () => (await store.getRoundtableRound("rt_failed_skip"))?.status === "error");
+    await service.idle("rt_failed_skip");
+    await assert.rejects(service.skip("wrong-session", "rt_failed_skip", actors[1].id), /not found/);
+    await service.skip("host", "rt_failed_skip", actors[1].id);
+    const round = (await store.getRoundtableRound("rt_failed_skip"))!;
+    assert.equal(round.status, "done");
+    assert.equal(round.summary, "Saved answer");
+    assert.equal(calls, 2);
+    await service.skip("host", "rt_failed_skip", actors[1].id);
+  } finally { service.stopAll(); await service.idle("rt_failed_skip"); await store.close(); }
+});
 async function until(check: () => Promise<boolean>) {
   const deadline = Date.now() + 10_000;
   while (!await check()) { if (Date.now() > deadline) throw new Error("Timed out waiting for round table state"); await new Promise(resolve => setTimeout(resolve, 20)); }
@@ -300,7 +350,8 @@ test("host JSON becomes a validated synthesis with derived consensus and disagre
     await store.updateSessionTurn({ id: "rt_synthesis", status: "done", runnerExitCode: 0, tokenIn: 0, tokenOut: 0,
       agentResponse: "```json\n" + JSON.stringify({ issues: [{ topic: "Direction", positions: [{ view: "Wait for data", actors: [a, b] }] }] }) + "\n```" });
     const round = (await store.getRoundtableRound("rt_synthesis"))!;
-    assert.equal(round.synthesis?.issues[0].topic, "Direction");
+    assert.ok(round.synthesis && round.synthesis.template !== "summary");
+    assert.equal(round.synthesis.issues[0].topic, "Direction");
     assert.match(round.summary, /\*\*Consensus\*\*/);
     assert.equal((await store.getSessionTurn("rt_synthesis"))?.agentResponse, round.summary, "history keeps readable markdown, not raw JSON");
     await service.create("host", { turnId: "rt_malformed", message: "Continue", actors });
@@ -314,6 +365,49 @@ test("host JSON becomes a validated synthesis with derived consensus and disagre
     assert.equal((await store.getRoundtableRound("rt_malformed"))?.synthesis, null);
     assert.equal((await store.getSessionTurn("rt_malformed"))?.agentResponse, malformed, "invalid attribution must not erase a position and invent consensus");
   } finally { service.stopAll(); await service.idle("rt_synthesis"); await store.close(); }
+});
+
+test("the host classifies a review into summary, persists readable output and continues by collecting evidence", async () => {
+  const store = await fixture();
+  const calls: RoundtableInference[] = [];
+  const service = new RoundtableService({ store, summarizerModel: () => DEFAULT_MODEL, run: async input => {
+    calls.push(input);
+    return response(input.systemPrompt.startsWith("Prepare focused context") ? "Review context" : "A retry bug needs a test.");
+  } });
+  const settle = async (turnId: string, agentResponse: string) => {
+    await until(async () => (await store.getRoundtableRound(turnId))?.status === "host");
+    await service.idle(turnId);
+    await store.claimPendingSessionTurn(turnId, "host");
+    await store.updateSessionTurn({ id: turnId, status: "done", runnerExitCode: 0, tokenIn: 0, tokenOut: 0, agentResponse });
+    return (await store.getRoundtableRound(turnId))!;
+  };
+  try {
+    const created = await service.create("host", { turnId: "rt_review", message: "Review the retry code", actors });
+    assert.match(roundtableHostInstructions(created), /First classify.*then choose/);
+    const hostPrompt = roundtableHostPrompt(created);
+    assert.match(hostPrompt, /Disagreement between actors does not by itself make a review or research task a decision/);
+    assert.match(hostPrompt, /Reclassify a new user prompt/);
+    const output = { taskType: "code_review", template: "summary", overview: "A retry bug needs attention; runtime tests were not run.",
+      sections: [{ title: "Findings", items: [{ text: "Add a test for [retry](https://example.com/retry).", actors: actors.map(actor => actor.name) }] }] };
+    const round = await settle("rt_review", "```json\n" + JSON.stringify(output) + "\n```");
+    assert.deepEqual(round.synthesis, output);
+    assert.match(round.summary, /\*\*Findings\*\*/);
+    assert.match(round.summary, /https:\/\/example.com\/retry/);
+    assert.doesNotMatch(round.summary, /Consensus|Disagreements/);
+    assert.equal((await store.getSessionTurn(round.turnId))?.agentResponse, round.summary);
+    assert.deepEqual((await store.inspectSession({ sessionId: "host", turnId: round.turnId }))?.turns[0].roundtable?.synthesis, output);
+    await service.create("host", { turnId: "rt_review_next", message: "Next round: actors, continue the discussion.", actors, continueFrom: round.turnId });
+    await until(async () => (await store.getRoundtableRound("rt_review_next"))?.status === "host");
+    const nextPrompt = JSON.parse(calls.at(-1)!.prompt);
+    assert.equal(nextPrompt.userPrompt, "Review the retry code");
+    assert.match(nextPrompt.nextRound.instruction, /Build on the collected findings/);
+    assert.doesNotMatch(nextPrompt.nextRound.instruction, /sharpen the disagreements/);
+    const malformed = JSON.stringify({ ...output, taskType: "decision" });
+    const fallback = await settle("rt_review_next", malformed);
+    assert.equal(fallback.synthesis, null, "a summary cannot be mislabelled as a decision");
+    assert.equal(fallback.summary, malformed, "invalid host output is preserved verbatim");
+    assert.equal((await store.getSessionTurn(fallback.turnId))?.agentResponse, malformed);
+  } finally { service.stopAll(); await service.idle("rt_review"); await service.idle("rt_review_next"); await store.close(); }
 });
 
 test("minor differences stay within consensus and reject invalid detail attribution", () => {

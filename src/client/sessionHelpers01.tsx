@@ -898,7 +898,16 @@ export function actionGroupTitle(ctx, items, groupType) {
 
 }
 
-export function CompletedTurn(ctx, { message, steerMessages, codexSessionId, sessionId, workspaceId, conclusionOnly = false }) {
+function PromptSuggestion({ Lightbulb, Pencil, Send, _jsx, _jsxs }, suggestion, actions) {
+    return _jsxs("div", { className: "turn-prompt-suggestion", role: "group", "aria-label": "Suggested next prompt", children: [
+        _jsx(Lightbulb, { className: "turn-prompt-suggestion-icon", "aria-hidden": "true" }),
+        _jsx("span", { className: "turn-prompt-suggestion-text", title: suggestion, children: suggestion }),
+        _jsxs("button", { className: "secondary", type: "button", "aria-label": "Edit suggested prompt", title: "Put this prompt in the composer to edit", onClick: () => actions.fill(suggestion), children: [_jsx(Pencil, { "aria-hidden": "true" }), "Edit"] }),
+        _jsxs("button", { className: "secondary primary", type: "button", "aria-label": "Send suggested prompt", title: "Send this prompt now", onClick: () => actions.send(suggestion), children: [_jsx(Send, { "aria-hidden": "true" }), "Send"] })
+    ] }, "prompt-suggestion");
+}
+
+export function CompletedTurn(ctx, { message, steerMessages, codexSessionId, sessionId, workspaceId, conclusionOnly = false, promptSuggestionActions = undefined }) {
     const { MarkdownContent, TimelineEntries, TurnChangeList, TurnIssueTracker, _Fragment, _jsx, _jsxs, appendSteerSegment, collectFileChanges, compactTimelineEntries, compareSteerMessages, isDisplayableLiveItem, isDisplayableMessageSegment, latestTurnIssueTracker, liveItemKey, removeLastTextSegment, withTurnLevelStatus } = ctx;
     const conclusion = message.conclusion || message.content;
     if (conclusionOnly) {
@@ -934,7 +943,8 @@ export function CompletedTurn(ctx, { message, steerMessages, codexSessionId, ses
     const stepSegments = withTurnLevelStatus(removeLastTextSegment(segments), false).filter(isDisplayableMessageSegment);
     const changes = collectFileChanges(message.liveItems ?? []);
     const issueTracker = latestTurnIssueTracker([segments, message.liveItems ?? []]);
-    return (_jsxs("div", { style: { display: "contents" }, children: [_jsx("span", { "data-copy-markdown": conclusion || "", hidden: true }), _jsx("div", { className: stepSegments.length > 0 ? "completed-turn-steps" : undefined, "aria-label": "Completed turn steps", children: _jsx(TimelineEntries, { anchorPrefix: message.id, completed: true, entries: compactTimelineEntries(stepSegments), sessionId: sessionId }) }, "steps"), _jsx(MarkdownContent, { className: "turn-conclusion", children: conclusion || "Turn completed without a final agent message." }, "conclusion"), issueTracker && _jsx(TurnIssueTracker, { tracker: issueTracker, codexSessionId: codexSessionId, sessionId: sessionId, turnId: message.turnId, workspaceId: workspaceId }, "issues"), changes.length > 0 && _jsx(TurnChangeList, { changes: changes, sessionId: sessionId, turnId: message.turnId }, "changes")] }));
+    const promptSuggestion = promptSuggestionActions ? message.promptSuggestion?.trim() : "";
+    return (_jsxs("div", { style: { display: "contents" }, children: [_jsx("span", { "data-copy-markdown": conclusion || "", hidden: true }), _jsx("div", { className: stepSegments.length > 0 ? "completed-turn-steps" : undefined, "aria-label": "Completed turn steps", children: _jsx(TimelineEntries, { anchorPrefix: message.id, completed: true, entries: compactTimelineEntries(stepSegments), sessionId: sessionId }) }, "steps"), _jsx(MarkdownContent, { className: "turn-conclusion", children: conclusion || "Turn completed without a final agent message." }, "conclusion"), promptSuggestion && PromptSuggestion(ctx, promptSuggestion, promptSuggestionActions), issueTracker && _jsx(TurnIssueTracker, { tracker: issueTracker, codexSessionId: codexSessionId, sessionId: sessionId, turnId: message.turnId, workspaceId: workspaceId }, "issues"), changes.length > 0 && _jsx(TurnChangeList, { changes: changes, sessionId: sessionId, turnId: message.turnId }, "changes")] }));
 
 }
 

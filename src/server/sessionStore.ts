@@ -1,6 +1,6 @@
 import { DEFAULT_MODEL, defaultGearProfiles, type ModelProvider } from "../modelCatalog";
 import type { LightweightTodo } from "../lightweightTodo";
-import { parseRoundtableSynthesis, roundtableResponse, roundtableRunning, roundtableSynthesisMarkdown, type RoundtableRound } from "../roundtable";
+import { parseRoundtableConclusion, roundtableResponse, roundtableRunning, roundtableSynthesisMarkdown, type RoundtableRound } from "../roundtable";
 import { parseSideChatActorJson, type SideChatActor } from "../sideChatRoom";
 import type { CollaborationFork, CollaborationGroup } from "../collaboration";
 import type { ProcessCommandParameter, ProcessCommandValues } from "../processCommandParameters";
@@ -77,8 +77,9 @@ export type SessionTitleSource = "initial" | "summarizer" | "user";
 const activeSessionDisplaySql = `WITH RECURSIVE direct_activity AS (
   SELECT session_id FROM session_turn WHERE status = 'running'
   UNION SELECT session_id FROM session_turn_grill WHERE document::jsonb->>'status' = 'running'
-  UNION SELECT session_id FROM session_roundtable_round
-    WHERE document::jsonb->>'status' IN ('queued', 'context', 'actors', 'host')
+  UNION SELECT r.session_id FROM session_roundtable_round r
+    JOIN session_turn t ON t.id = r.turn_id AND t.session_id = r.session_id
+    WHERE r.document::jsonb->>'status' IN ('queued', 'context', 'actors', 'host')
 ), concurrent_members AS (
   SELECT g.state->>'mainSessionId' AS main_session_id, member->>'sessionId' AS session_id,
     member->>'localId' AS local_id, g.state AS group_state
@@ -559,6 +560,8 @@ export type SessionTurnRecord = {
   runnerHeartbeat: string | null;
   /** Exact elapsed time reported in the runner's final result, when available. */
   executionDurationMs?: number;
+  /** Native predicted next prompt from the runner's final result (Claude only). */
+  promptSuggestion?: string;
   runnerLogPath: string | null;
   runnerExitCode: number | null;
   lastEventName: string | null;
@@ -728,6 +731,7 @@ type SessionInspectFileChangeTotals = {
 
 export type SessionFullInspection = {
   session: SessionRecord;
+  backgroundActivity?: Record<string, unknown>[];
   turns: SessionInspectTurnRecord[];
   turnPage: SessionInspectPage;
   sideChats?: SessionSideChatRecord[];
@@ -1162,6 +1166,14 @@ const resultExecutionDurationSelectSql = `
       AND result_event.event_name = 'result'
   ) AS execution_duration_ms,
   (
+    SELECT json_extract_string(suggestion_event.payload, '$.promptSuggestion')
+    FROM session_turn_event AS suggestion_event
+    WHERE suggestion_event.turn_id = session_turn.id
+      AND suggestion_event.event_name = 'result'
+    ORDER BY suggestion_event.created DESC, suggestion_event.id DESC
+    LIMIT 1
+  ) AS prompt_suggestion,
+  (
     SELECT json_extract_string(tier_event.payload, '$.serviceTier')
     FROM session_turn_event AS tier_event
     WHERE tier_event.turn_id = session_turn.id
@@ -1250,6 +1262,7 @@ type SessionTurnRow = {
   turn_model?: unknown;
   turn_reasoning_effort?: unknown;
   requested_service_tier?: unknown;
+  prompt_suggestion?: unknown;
   token_in?: unknown;
   token_out?: unknown;
   turn_usage_input_tokens?: unknown;
@@ -2629,9 +2642,10 @@ export class SessionStore {
     const round = rows[0] ? JSON.parse(String(rows[0].document)) as RoundtableRound : null;
     if (round?.status !== "host") return;
     const failed = !stopped && Boolean(input.runnerExitCode);
-    const synthesis = stopped || failed ? null : parseRoundtableSynthesis(input.agentResponse, round.answers.map(answer => answer.actor.name));
+    const completed = round.answers.filter(answer => answer.status === "done");
+    const synthesis = stopped || failed ? null : parseRoundtableConclusion(input.agentResponse, completed.map(answer => answer.actor.name));
     // Unparseable host output is kept verbatim so nothing is lost.
-    const summary = stopped || failed ? "" : synthesis ? roundtableSynthesisMarkdown(synthesis, round.answers.length) : input.agentResponse;
+    const summary = stopped || failed ? "" : synthesis ? roundtableSynthesisMarkdown(synthesis, completed.length) : input.agentResponse;
     const next: RoundtableRound = { ...round, revision: round.revision + 1, status: stopped ? "stopped" : failed ? "error" : "done",
       summary, synthesis,
       error: stopped ? "Host stopped. Retry to summarise the saved actor answers."
@@ -4474,8 +4488,19 @@ export class SessionStore {
         };
       }
 
+      const backgroundActivity = await (await connection.run(`
+        SELECT 'roundtable' AS kind, r.turn_id, r.document::jsonb->>'status' AS status,
+          t.status AS turn_status
+        FROM session_roundtable_round r LEFT JOIN session_turn t ON t.id = r.turn_id
+        WHERE r.session_id = $sessionId
+        UNION ALL
+        SELECT 'grill', g.turn_id, g.document::jsonb->>'status', t.status
+        FROM session_turn_grill g LEFT JOIN session_turn t ON t.id = g.turn_id
+        WHERE g.session_id = $sessionId
+        LIMIT 100`, { sessionId: session.id })).getRowObjectsJS();
       return {
         session,
+        backgroundActivity,
         turns: turns.map((turn) => ({
           ...turn,
           ...(roundtables.has(turn.id) ? { roundtable: roundtables.get(turn.id)! } : {}),
@@ -4783,6 +4808,23 @@ export class SessionStore {
 
   async listSessionSteerMessages(sessionId: string, turnIds?: string[]): Promise<Record<string, SessionSteerMessageRecord[]>> {
     return this.read(async (connection) => this.listSessionSteerMessagesWithConnection(connection, sessionId, turnIds));
+  }
+
+  /** Whether a signed-in user approved Claude sandbox escapes for this session. */
+  async hasSessionSandboxEscapeGrant(sessionId: string): Promise<boolean> {
+    return this.read(async (connection) => {
+      const result = await connection.run(
+        `
+          SELECT 1 AS granted
+          FROM session_turn_event
+          WHERE session_id = $sessionId
+            AND event_name = 'sandbox.escape_grant'
+          LIMIT 1
+        `,
+        { sessionId }
+      );
+      return (await result.getRowObjectsJS()).length > 0;
+    });
   }
 
   async listSessionAutoModelProviders(sessionId: string, turnIds?: string[]): Promise<Record<string, { provider: SessionAutoModelProvider; confidence?: number }>> {
@@ -7689,7 +7731,7 @@ export class SessionStore {
   async deleteQueuedSessionTurn(id: string, sessionId: string, reservedForSteer = false, reservedForFork = false, steerDelivered = false): Promise<boolean> {
     return this.write(async (connection) => {
       const result = await connection.run(
-        `DELETE FROM session_turn
+        `WITH deleted_turn AS (DELETE FROM session_turn
          WHERE id = $id AND session_id = $sessionId AND status = 'todo'
            AND last_event_name IS DISTINCT FROM 'queue.edit_reserved'
            AND (($reservedForFork = true AND pending_reason IS DISTINCT FROM 'stopped'
@@ -7699,7 +7741,10 @@ export class SessionStore {
              OR ($reservedForSteer = false AND $reservedForFork = false
                AND last_event_name IS DISTINCT FROM 'queue.steer_reserved'
                AND last_event_name IS DISTINCT FROM 'queue.fork_reserved'))))
-         RETURNING id`,
+         RETURNING id), deleted_round AS (
+           DELETE FROM session_roundtable_round
+           WHERE session_id = $sessionId AND turn_id IN (SELECT id FROM deleted_turn)
+         ) SELECT id FROM deleted_turn`,
         { id, sessionId, reservedForSteer, reservedForFork }
       );
       if ((await result.getRowObjectsJS()).length === 0) return false;
@@ -7708,7 +7753,7 @@ export class SessionStore {
       // Removing an uncertain steer reservation is not proof of delivery.
       await connection.run(`UPDATE workspace_manager_event
         SET summary = (summary::jsonb || jsonb_build_object(
-          'status', $outcome, 'deliveryState', $outcome, 'informationalOnly', true))::text
+          'status', $outcome::text, 'deliveryState', $outcome::text, 'informationalOnly', true))::text
         WHERE session_id = $sessionId AND turn_id = $id AND type = 'task.prompted'`,
         { id, sessionId, outcome: steerDelivered ? "steered" : reservedForFork ? "forked" : "removed" });
       await connection.run("DELETE FROM execution_approval_policy WHERE owner_id = $ownerId", { ownerId: `turn:${sessionId}:${id}` });
@@ -8637,6 +8682,12 @@ export class SessionStore {
   private async open() {
     const connection = await openPostgresSessionConnection(undefined, this.postgresSchema);
     this.connection = connection;
+    // Discussion workers open their own stores at the same moment as the server.
+    await connection.withSchemaLock(() => this.migrate(connection));
+    return connection;
+  }
+
+  private async migrate(connection: SessionDbConnection) {
     await connection.run(`CREATE TABLE IF NOT EXISTS collaboration_group (
       id VARCHAR PRIMARY KEY, state JSONB NOT NULL
     )`);
@@ -9582,7 +9633,6 @@ export class SessionStore {
         )
     `);
     await this.refreshSessionTurnFtsIndex(connection);
-    return connection;
   }
 
   private async backfillSessionLiveItems(connection: SessionDbConnection): Promise<void> {
@@ -12678,6 +12728,7 @@ function toSessionTurnRecord(row: SessionTurnRow): SessionTurnRecord {
   const status = sessionTurnStatusValue(row.status);
   const reasoningEffort = nullableString(row.turn_reasoning_effort);
   const executionDurationMs = nullableNumber(row.execution_duration_ms);
+  const promptSuggestion = nullableString(row.prompt_suggestion);
   const requestMetadata = parseJsonRecord(row.request_metadata);
   return {
     id: stringValue(row.id),
@@ -12702,6 +12753,7 @@ function toSessionTurnRecord(row: SessionTurnRow): SessionTurnRecord {
     runnerStarted: nullableString(row.runner_started),
     runnerHeartbeat: nullableString(row.runner_heartbeat),
     ...(executionDurationMs === null ? {} : { executionDurationMs }),
+    ...(promptSuggestion ? { promptSuggestion } : {}),
     runnerLogPath: nullableString(row.runner_log_path),
     runnerExitCode: nullableNumber(row.runner_exit_code),
     lastEventName: nullableString(row.last_event_name),

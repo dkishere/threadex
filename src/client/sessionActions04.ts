@@ -390,6 +390,7 @@ export function handleStreamEvent(ctx, event, target) {
             }
             patchAssistantMessage(target, event.data.reply, false, "done", {
                 conclusion: event.data.reply,
+                promptSuggestion: event.data.promptSuggestion,
                 executionDurationMs: event.data.elapsedMs,
                 completedAt: new Date().toISOString(),
                 preserveContent: true
@@ -456,6 +457,7 @@ export function patchAssistantMessage(ctx, target, content, pending, turnStatus,
                 pending,
                 turnStatus: turnStatus ?? message.turnStatus,
                 ...(options.conclusion !== undefined ? { conclusion: options.conclusion } : {}),
+                ...(options.promptSuggestion !== undefined ? { promptSuggestion: options.promptSuggestion } : {}),
                 ...(options.executionDurationMs !== undefined
                     ? { executionDurationMs: options.executionDurationMs }
                     : {}),

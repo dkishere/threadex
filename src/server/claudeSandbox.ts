@@ -1,5 +1,5 @@
 import { realpathSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import type { AppServerThreadOptions } from "./codexConfig";
 
@@ -52,11 +52,15 @@ export function claudeSandboxOptions(mode: ClaudeSandboxMode, cwd: string, prote
     // Writable turns may use loopback so local test databases and dev servers work without
     // sandbox escapes. Accepted risk: loopback also reaches Threadex's own API, which trusts
     // direct local requests (security.ts), and its Postgres. Read-only turns stay closed.
+    // Writable turns also share the uv cache and the Docker socket so routine builds and image
+    // checks need no escape. Accepted risk: Docker socket access is effectively host access.
     network: { allowedDomains: [], deniedDomains: ["*"], strictAllowlist: true, allowManagedDomainsOnly: true,
-      allowAllUnixSockets: false, allowUnixSockets: [], allowLocalBinding: mode !== "read-only" },
+      allowAllUnixSockets: false,
+      allowUnixSockets: mode === "read-only" ? [] : ["/var/run/docker.sock", resolve(homedir(), ".docker", "run", "docker.sock")],
+      allowLocalBinding: mode !== "read-only" },
     filesystem: {
       disabled: false,
-      allowWrite: mode === "read-only" ? [] : [resolve(cwd), tmpdir(), "/tmp"],
+      allowWrite: mode === "read-only" ? [] : [resolve(cwd), tmpdir(), "/tmp", process.env.UV_CACHE_DIR || resolve(homedir(), ".cache", "uv")],
       denyWrite: [...protectedPaths, ...[".git", ".agents", ".codex", ".claude"].map(name => resolve(cwd, name)), ...(mode === "read-only" ? [resolve(cwd)] : [])]
     }
   };

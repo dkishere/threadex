@@ -87,6 +87,8 @@ export type ClaudeRunnerContext = {
   mcpServers: Record<string, { type: "stdio"; command: string; args: string[]; env: Record<string, string> }>;
   allowedTools: string[];
   approvedInspectorCommands?: string[];
+  /** The user approved sandbox escapes for this session in an earlier turn. */
+  sandboxEscapesApproved?: boolean;
   extraEnv: Record<string, string>;
   emitEvent: (event: string, data: unknown, options?: { waitForCallback?: boolean }) => Promise<unknown>;
   appendInternalLog: (event: string, data: unknown) => void;
@@ -174,17 +176,22 @@ export async function runClaudeTurn(ctx: ClaudeRunnerContext, sdkOverride?: SdkM
     cwd: ctx.cwd, mode: sandboxMode, tool, args, protectedPaths: ctx.protectedPaths
   });
   const boundaryDecisions = new Map<string, PermissionResult>();
+  let escapesApproved = ctx.sandboxEscapesApproved === true;
   const checkBoundary = async (tool: string, args: Record<string, unknown>, toolUseID: string, options: CanUseToolOptions = {}): Promise<PermissionResult | null> => {
     const reason = boundary(tool, args);
     if (!reason) return null;
     // approval_policy=never disables escalation, it never disables the sandbox.
     if (ctx.readOnly || sandboxMode === "read-only" || ctx.autoApproveAll) return { behavior: "deny", message: reason };
+    const escape = tool === "Bash" && args.dangerouslyDisableSandbox === true;
+    if (escape && escapesApproved) return { behavior: "allow", updatedInput: args };
     const key = JSON.stringify([toolUseID, tool, args]);
     const saved = boundaryDecisions.get(key);
     if (saved) return saved;
     const request = approvalRequestFor(ctx, tool, args, toolUseID, { ...options, decisionReason: `${reason} Approval grants this action outside the sandbox boundary.` });
-    const decision = await ctx.requestApproval({ approvalId: randomUUID(), requestId: toolUseID,
-      method: request.method, params: request.params, isCanceled: () => Boolean(options.signal?.aborted) });
+    const decision = await ctx.requestApproval({ approvalId: randomUUID(), requestId: toolUseID, method: request.method,
+      params: escape ? { ...request.params, sandboxEscape: true } : request.params, isCanceled: () => Boolean(options.signal?.aborted) });
+    // One session approval covers every later escape; the server persists it for later turns (sandbox.escape_grant).
+    if (escape && decision === "acceptForSession") escapesApproved = true;
     const result: PermissionResult = decision === "accept" || decision === "acceptForSession"
       ? { behavior: "allow", updatedInput: args }
       : { behavior: "deny", message: reason };
@@ -207,6 +214,7 @@ export async function runClaudeTurn(ctx: ClaudeRunnerContext, sdkOverride?: SdkM
   let rateLimitMessage: string | null = null;
   let limitReached = false;
   let nativeActivity = false;
+  let promptSuggestion: string | null = null;
   const usage: ClaudeUsage = { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 };
   let costUsd = 0;
 
@@ -268,6 +276,9 @@ export async function runClaudeTurn(ctx: ClaudeRunnerContext, sdkOverride?: SdkM
     ...(claudeEffort(ctx.reasoningEffort, ctx.model) ? { effort: claudeEffort(ctx.reasoningEffort, ctx.model) } : {}),
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
     includePartialMessages: true,
+    // The suggestion follows the final result; the loop below keeps reading
+    // after the inbox closes, so it arrives before the stream ends.
+    promptSuggestions: true,
     permissionMode: ctx.permissionMode,
     canUseTool,
     systemPrompt: { type: "preset", preset: "claude_code", append: ctx.appendSystemPrompt },
@@ -345,8 +356,12 @@ export async function runClaudeTurn(ctx: ClaudeRunnerContext, sdkOverride?: SdkM
           } else {
             failure = `Claude API error (${output.error})${output.text ? `: ${output.text}` : ""}`;
           }
+        } else if (output.kind === "prompt_suggestion") {
+          promptSuggestion = output.suggestion;
         } else if (output.kind === "result") {
           results += 1;
+          // Only a suggestion after the last result predicts the next prompt.
+          promptSuggestion = null;
           if (output.usage) {
             usage.inputTokens += output.usage.inputTokens;
             usage.outputTokens += output.usage.outputTokens;
@@ -429,7 +444,8 @@ export async function runClaudeTurn(ctx: ClaudeRunnerContext, sdkOverride?: SdkM
     elapsedMs: Date.now() - startedAt,
     reply: mapper.lastAgentText || "Turn completed without a final agent message.",
     tokenIn: usage.inputTokens + usage.cacheReadInputTokens + usage.cacheCreationInputTokens,
-    tokenOut: usage.outputTokens
+    tokenOut: usage.outputTokens,
+    ...(promptSuggestion ? { promptSuggestion } : {})
   }, { waitForCallback: true });
   await ctx.emitEvent("done", { ok: true }, { waitForCallback: true });
 }

@@ -7,6 +7,46 @@ import { parseSessionListSearchTerms, SessionStore } from "./sessionStore.js";
 import { buildTurnGrillMidTurnInputs } from "./turnGrill.js";
 import { USER_INPUT_METHOD } from "../userInputRequest.js";
 
+test("sandbox escape grants persist across turns and stay within their session", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "session-escape-grants-"));
+  const path = resolve(root, "threadex.postgres");
+  const store = new SessionStore(path);
+  await store.ready();
+  try {
+    for (const id of ["approved", "other"]) {
+      await store.upsertSession({ id, cwd: root, title: id });
+      await store.recordSessionTurn({ id: `${id}-turn`, sessionId: id, userInput: "test",
+        agentResponse: "", tokenIn: 0, tokenOut: 0, status: "done" });
+    }
+    await store.recordSessionTurnEvent({ id: "grant", turnId: "approved-turn", sessionId: "approved",
+      eventName: "sandbox.escape_grant", payload: { approvalId: "approval-1" } });
+    await store.recordSessionTurn({ id: "next-turn", sessionId: "approved", userInput: "continue",
+      agentResponse: "", tokenIn: 0, tokenOut: 0, status: "done" });
+    assert.equal(await store.hasSessionSandboxEscapeGrant("approved"), true);
+    assert.equal(await store.hasSessionSandboxEscapeGrant("other"), false);
+  } finally {
+    await store.close();
+  }
+  const reopened = new SessionStore(path);
+  await reopened.ready();
+  try {
+    assert.equal(await reopened.hasSessionSandboxEscapeGrant("approved"), true);
+  } finally {
+    await reopened.close();
+  }
+});
+
+test("stores opened concurrently on a new schema both migrate it", async () => {
+  // Parallel side-chat workers open stores together; unserialised DDL failed with "tuple concurrently updated".
+  const path = resolve(mkdtempSync(resolve(tmpdir(), "session-concurrent-open-")), "threadex.postgres");
+  const stores = Array.from({ length: 4 }, () => new SessionStore(path));
+  try {
+    await Promise.all(stores.map(store => store.ready()));
+  } finally {
+    await Promise.all(stores.map(store => store.close()));
+  }
+});
+
 test("sidebar pages hide Concurrent workers but preserve ordinary child sessions", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "session-concurrent-sidebar-"));
   const store = new SessionStore(resolve(root, "threadex.postgres"));
@@ -1117,10 +1157,12 @@ test("runner start time is retained and completed turns expose the runner-report
       turnId: "turn-1",
       sessionId: "session-1",
       eventName: "result",
-      payload: { elapsedMs: 311_296 }
+      payload: { elapsedMs: 311_296, promptSuggestion: "Now add tests" }
     });
     assert.equal((await store.getSessionTurn("turn-1"))?.executionDurationMs, 311_296);
     assert.equal((await store.listSessionTurns("session-1"))[0]?.executionDurationMs, 311_296);
+    assert.equal((await store.getSessionTurn("turn-1"))?.promptSuggestion, "Now add tests");
+    assert.equal((await store.listSessionTurns("session-1"))[0]?.promptSuggestion, "Now add tests");
   } finally {
     await store.close();
   }

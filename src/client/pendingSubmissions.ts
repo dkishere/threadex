@@ -76,7 +76,8 @@ export function removePendingSubmission(id: string) {
     try {
         window.localStorage.removeItem(PREFIX + id);
         changed();
-    } catch { /* Retain the backup if storage becomes unavailable. */ }
+        return true;
+    } catch { return false; /* Retain the backup if storage becomes unavailable. */ }
 }
 
 const STARTED_MESSAGES = new Set([
@@ -106,7 +107,7 @@ export function reconcilePendingSubmissions(sessionId: string, turns: Array<{
     for (const entry of readPendingSubmissions()) {
         if (entry.sessionId !== sessionId || entry.kind !== "prompt") continue;
         const turn = turns.find(turn => turn.id === entry.turnId);
-        if (turn && (turn.status === "done" || turn.runnerStarted || turn.runnerPid)) {
+        if (turn && (entry.settings.queued === true || turn.status === "done" || turn.runnerStarted || turn.runnerPid)) {
             removePendingSubmission(entry.id);
         }
     }

@@ -7,7 +7,26 @@ import { IntentApprovals } from "./intentApprovals";
 
 const cliPath = resolve(import.meta.dirname, "../../scripts/session-inspector.mjs");
 
-test("a killed intention CLI reconnects to the same pending host request", { timeout: 15000 }, async () => {
+test("Manager connection failure reports its cause and exact escalation entrypoint", async () => {
+  const server = createServer();
+  await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
+  const address = server.address(); assert.ok(address && typeof address === "object");
+  await new Promise<void>(done => server.close(() => done()));
+  const result = await runCli(["workspace_status"], {
+    RUNNER_SERVER_URL: `http://127.0.0.1:${address.port}`,
+    THREADEX_WORKSPACE_MANAGER: "1", THREADEX_SESSION_ID: "manager", THREADEX_TURN_ID: "turn"
+  });
+  assert.equal(result.code, 1);
+  const failure = JSON.parse(result.stderr);
+  assert.equal(failure.error, "fetch failed");
+  assert.equal(failure.code, "ECONNREFUSED");
+  assert.ok(failure.hint.includes(process.execPath));
+  assert.ok(failure.hint.includes(cliPath));
+  assert.match(failure.hint, /sandbox_permissions=require_escalated/);
+  assert.match(failure.hint, /npm wrappers are not automatically approved/);
+});
+
+test("a killed intention CLI reconnects to the same pending host request", { timeout: 15000 }, async (t) => {
   const ids: string[] = [];
   let requestedEvents = 0, firstPoll!: () => void;
   const polling = new Promise<void>(resolve => { firstPoll = resolve; });
@@ -27,12 +46,16 @@ test("a killed intention CLI reconnects to the same pending host request", { tim
   });
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   const address = server.address(); assert.ok(address && typeof address === "object");
-  const env = { RUNNER_SERVER_URL: `http://127.0.0.1:${address.port}`, THREADEX_SESSION_ID: "owner", THREADEX_TURN_ID: "turn" };
+  const env = { RUNNER_SERVER_URL: `http://127.0.0.1:${address.port}`, THREADEX_SESSION_ID: "owner", THREADEX_TURN_ID: "turn", THREADEX_MODEL: "gpt-6-luna" };
   const args = ["request_intent_approval", JSON.stringify(proposal)];
-  const child = spawn(process.execPath, [cliPath, ...args], { env: { ...process.env, ...env }, stdio: "ignore" });
+  const child = spawn(process.execPath, [cliPath, ...args], { env: { ...process.env, ...env }, stdio: "ignore", signal: t.signal });
+  const exited = new Promise<void>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", () => resolve());
+  });
   try {
-    await polling;
-    const stopped = new Promise(resolve => child.once("close", resolve)); child.kill("SIGKILL"); await stopped;
+    await Promise.race([polling, exited.then(() => { throw new Error("Intention CLI exited before polling the host request"); })]);
+    child.kill("SIGKILL"); await exited;
     const resumed = await runCli(args, env);
     assert.equal(resumed.code, 0, resumed.stderr);
     assert.equal(JSON.parse(resumed.stdout).grantId, ids[0]);
@@ -59,7 +82,7 @@ test("intention CLI binds the host turn, polls and returns the host decision", a
   const address = server.address(); assert.ok(address && typeof address === "object");
   try {
     const result = await runCli(["request_intent_approval", JSON.stringify({ title: "Deploy?", scope: "Staging A", actions: ["Deploy abc"], exclusions: "Production", consequences: "Downtime", sessionId: "forged", turnId: "forged" })], {
-      RUNNER_SERVER_URL: `http://127.0.0.1:${address.port}`, THREADEX_SESSION_ID: "owner", THREADEX_TURN_ID: "active"
+      RUNNER_SERVER_URL: `http://127.0.0.1:${address.port}`, THREADEX_SESSION_ID: "owner", THREADEX_TURN_ID: "active", THREADEX_MODEL: "gpt-6-luna"
     });
     assert.equal(result.code, 0, result.stderr);
     assert.deepEqual(JSON.parse(result.stdout), { decision: { outcome: "declined" } });
@@ -356,6 +379,44 @@ test("side-chat role exposes stored-session reads only", async () => {
     
   }
 });
+
+for (const running of [false, true]) {
+test(`interactive side chat ${running ? "queues" : "starts"} host work and rejects other sessions`, async () => {
+  const received: Array<{ url?: string; body: any }> = [];
+  const server = createServer(async (request, response) => {
+    let text = "";
+    for await (const chunk of request) text += chunk;
+    received.push({ url: request.url, body: JSON.parse(text) });
+    response.setHeader("Content-Type", "application/json");
+    response.end(JSON.stringify(request.url === "/api/session-inspector/session"
+      ? { session: { id: "host", workspaceId: "workspace" }, turns: running ? [{ id: "busy" }] : [] }
+      : { ok: true }));
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address(); assert.ok(address && typeof address === "object");
+  const rpc = cliHarness({ env: { ...process.env, RUNNER_SERVER_URL: `http://127.0.0.1:${address.port}`,
+    THREADEX_SESSION_ID: "host", THREADEX_TODO_AGENT_ROLE: "side_chat", THREADEX_SIDE_CHAT_HOST_PROMPT: "1",
+    THREADEX_WORKSPACE_MANAGER: "0", THREADEX_CONTINUITY_ONLY: "0", THREADEX_LIGHTWEIGHT_TODO: "0",
+    THREADEX_APPROVAL_POLICY: "granular" } });
+  try {
+    const listed = await rpc(1, "tools/list");
+    assert.deepEqual((listed.result as any).tools.map((tool: any) => tool.name), ["get_session", "search_sessions", "prompt_session"]);
+    const rejected = await rpc(2, "tools/call", { name: "prompt_session", arguments: { sessionId: "other", message: "Do it" } });
+    assert.match(JSON.stringify(rejected), /only prompt its host session/);
+    assert.equal(received.length, 0);
+    const result = await rpc(3, "tools/call", { name: "prompt_session", arguments: {
+      sessionId: "host", message: "Check the PR and report back", approvalPolicy: "never", queueIfRunning: false
+    } });
+    assert.equal((result.result as any).isError, undefined);
+    assert.equal(received[1].url, running ? "/api/pending-turns" : "/api/chat");
+    assert.deepEqual(received[1].body, { sessionId: "host", workspaceId: "workspace",
+      message: "Check the PR and report back", approvalPolicy: "granular" });
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+}
 
 test("recover_current_session reads completed turns from the managed session without an id", async () => {
   const received: Array<{ url: string | undefined; body: Record<string, unknown> }> = [];

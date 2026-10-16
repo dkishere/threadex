@@ -43,3 +43,13 @@ test("only writable turns may use loopback", () => {
   assert.equal(writable.network.allowLocalBinding, true);
   assert.equal(readOnly.network.allowLocalBinding, false);
 });
+
+test("only writable turns share the uv cache and the Docker socket", () => {
+  const writable = claudeSandboxOptions("workspace-write", "/repo").sandbox;
+  const readOnly = claudeSandboxOptions("read-only", "/repo").sandbox;
+  assert.ok("network" in writable && "network" in readOnly);
+  assert.ok(writable.network.allowUnixSockets.includes("/var/run/docker.sock"));
+  assert.ok(writable.filesystem.allowWrite.some(path => path.endsWith("uv")));
+  assert.deepEqual(readOnly.network.allowUnixSockets, []);
+  assert.deepEqual(readOnly.filesystem.allowWrite, []);
+});

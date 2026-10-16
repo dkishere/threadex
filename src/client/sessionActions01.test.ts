@@ -263,6 +263,49 @@ test("ordinary queue writes once to the backend and does not create a frontend q
   assert.equal(readPendingSubmissions().length, 0);
 });
 
+test("retrying a saved queue item retains its ID, settings and draft through failure and acknowledgement", async t => {
+  mockSubmissionStorage(t);
+  const saved = {
+    id: "saved-queue", turnId: "saved-queue", sessionId: "session", workspaceId: "original-workspace",
+    kind: "prompt" as const, createdAt: "2026-10-15T08:50:28Z", message: "Original queued prompt",
+    attachments: [{ name: "context.txt" }], settings: {
+      queued: true, model: "claude-opus-5-5", modelReasoningEffort: "high", approvalPolicy: "granular",
+      executionMode: "goal", forcePlan: true, contextFork: true, skills: [{ name: "original-skill", path: "/skill" }]
+    }
+  };
+  savePendingSubmission(saved);
+  const ctx = {
+    sessionIdRef: { current: "session" }, activeWorkspaceIdRef: { current: "changed-workspace" },
+    queueRetryRef: { current: null }, requestSettings: { model: "changed-model" },
+    clearComposerInputDraft: () => { throw new Error("Retry must preserve the current draft"); },
+    showQueuedPromptReceipt() {}, setStatus() {}, async refreshSelectedSessionSnapshot() {}
+  };
+  const requests: any[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string, options?: RequestInit) => {
+    assert.equal(url, "/api/pending-turns");
+    requests.push(JSON.parse(String(options?.body)));
+    return requests.length === 1 ? Response.json({ error: "Queue unavailable" }, { status: 503 })
+      : Response.json({ ok: true, duplicate: true, turn: { id: saved.id, status: "todo" } });
+  });
+  const retry = () => enqueuePrompt(ctx, "changed draft", "queue", "default", [], [], false, false, true, saved.id);
+  assert.equal(await retry(), false);
+  assert.equal(readPendingSubmissions()[0].lastError, "Queue unavailable");
+  assert.equal(readPendingSubmissions()[0].createdAt, saved.createdAt);
+  assert.equal(isSubmissionSending("session"), false);
+  assert.equal(await retry(), true);
+  assert.deepEqual(requests[0], requests[1]);
+  assert.equal(requests[0].turnId, saved.id);
+  assert.equal(requests[0].message, saved.message);
+  assert.equal(requests[0].workspaceId, saved.workspaceId);
+  assert.deepEqual(requests[0].attachments, saved.attachments);
+  for (const [key, value] of Object.entries(saved.settings)) assert.deepEqual(requests[0][key], value);
+  assert.deepEqual(readPendingSubmissions(), []);
+  assert.throws(retry, /no longer available/);
+  savePendingSubmission(saved);
+  ctx.sessionIdRef.current = "other-session";
+  assert.throws(retry, /original session/);
+});
+
 test("new-session input is already backed up while session restoration is pending", async t => {
   mockSubmissionStorage(t);
   const ctx = {

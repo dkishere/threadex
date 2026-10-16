@@ -1,0 +1,31 @@
+.actor-multi-select { width: 100%; min-width: 0; color: #334155; }
+.actor-multi-select .actor-picker-trigger { display: flex; align-items: center; gap: 10px; width: 100%; padding: 10px 12px; border: 1px solid #dbe1e8; border-radius: 10px; background: #fff; color: #334155; text-align: left; cursor: pointer; }
+.actor-picker-avatars { display: flex; align-items: center; flex-shrink: 0; }
+.actor-multi-select .actor-picker-avatars .actor-avatar { width: 28px; height: 28px; border: 2px solid #fff; border-radius: 9px; }
+.actor-picker-avatars .actor-avatar + .actor-avatar { margin-left: -8px; }
+.actor-picker-summary { display: flex; flex: 1; flex-direction: column; gap: 3px; min-width: 0; }
+.actor-multi-select .actor-picker-summary strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.actor-picker-summary small, .actor-picker-description small { color: #64748b; font-size: 11px; }
+.actor-picker-dropdown { position: fixed; margin: 0; padding: 0; box-sizing: border-box; overflow: hidden; border: 1px solid #dbe1e8; border-radius: 12px; background: #fff; color: #334155; box-shadow: 0 8px 24px #0f172a20; }
+.actor-picker-dropdown:popover-open { display: flex; flex-direction: column; }
+.actor-picker-search { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid #f1f5f9; }
+.actor-multi-select .actor-picker-search input { width: 100%; min-width: 0; padding: 4px; border: 0; background: transparent; color: #0f172a; font: inherit; font-size: 12px; }
+.actor-picker-options { min-height: 0; max-height: min(320px, 40dvh); overflow-y: auto; overscroll-behavior: contain; padding: 5px; }
+.actor-picker-search, .actor-picker-footer { flex-shrink: 0; }
+.actor-multi-select .actor-picker-option { display: flex; align-items: center; gap: 10px; margin: 0; padding: 9px; border-radius: 8px; cursor: pointer; }
+.actor-picker-option:hover { background: #f8fafc; }
+.actor-picker-option[data-selected=true] { background: #f5f3ff; }
+.actor-picker-option:has(input:disabled) { cursor: default; opacity: .65; }
+.actor-multi-select .actor-picker-option input { flex: 0 0 auto; width: 16px; height: 16px; margin: 0; padding: 0; accent-color: #7c3aed; }
+.actor-multi-select .actor-picker-option .actor-avatar { width: 36px; height: 36px; border-radius: 10px; }
+.actor-picker-description { display: flex; flex: 1; flex-direction: column; min-width: 0; gap: 3px; }
+.actor-multi-select .actor-picker-description strong { font-size: 12px; overflow-wrap: anywhere; }
+.actor-picker-description > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #94a3b8; font-size: 11px; }
+.actor-picker-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px; border-top: 1px solid #f1f5f9; }
+.actor-picker-footer small, .actor-picker-empty { color: #64748b; font-size: 11px; }
+.actor-multi-select .actor-picker-footer button { display: inline-flex; align-items: center; gap: 5px; padding: 4px 0; border: 0; background: transparent; color: #7c3aed; font: inherit; font-size: 12px; cursor: pointer; }
+.actor-picker-empty { padding: 10px; }
+.actor-multi-select :is(button,input):focus-visible { outline: 2px solid #8b5cf6; outline-offset: 2px; }
+.actor-multi-select button:disabled { opacity: .6; cursor: default; }
+.roundtable-customise-actors { margin-top: 12px; }
+.roundtable-customise-actors > summary { cursor: pointer; color: #64748b; font-size: 12px; padding: 6px 0; }

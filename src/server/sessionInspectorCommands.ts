@@ -757,7 +757,8 @@ function baseToolsForAgent() {
     );
   }
   if (todoAgentRole === "side_chat") {
-    return tools.filter((tool) => tool.name === "get_session" || tool.name === "search_sessions");
+    return tools.filter((tool) => tool.name === "get_session" || tool.name === "search_sessions" ||
+      (tool.name === "prompt_session" && process.env.THREADEX_SIDE_CHAT_HOST_PROMPT === "1"));
   }
   if (todoAgentRole === "planner") {
     return tools.filter((tool) =>
@@ -1215,6 +1216,14 @@ async function askSession(input: SessionQuestionInput) {
 }
 
 async function promptSession(input: SessionPromptInput) {
+  if (todoAgentRole === "side_chat") {
+    if (!managerSessionId || (input.sessionId && input.sessionId !== managerSessionId) ||
+      (input.threadId && input.threadId !== managerThreadId)) {
+      throw new Error("Side chat may only prompt its host session.");
+    }
+    // Keep normal host defaults and approval handling; side chat supplies only the requested message.
+    input = { sessionId: managerSessionId, message: input.message, queueIfRunning: true };
+  }
   if (!apiBaseUrl) {
     throw new Error("SESSION_INSPECTOR_SERVER_URL is required for prompt_session.");
   }

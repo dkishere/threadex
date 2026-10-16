@@ -644,6 +644,9 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.ok(args.includes("mcp_servers.session_inspector.enabled=false"));
   const thread = JSON.parse(readFileSync(capturedThreadPath, "utf8"));
   const turn = JSON.parse(readFileSync(capturedTurnPath, "utf8"));
+  assert.equal(thread.threadId, "thread-1");
+  assert.equal(thread.excludeTurns, true);
+  assert.equal(turn.threadId, "thread-1");
   assert.match(thread.developerInstructions, /call recover_current_session/i);
   assert.match(thread.developerInstructions, /complete user prompts and final assistant responses/i);
   assert.doesNotMatch(thread.developerInstructions, /For Todo CLI planning|Use list_processes/);
@@ -2316,6 +2319,9 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   const thread = JSON.parse(readFileSync(capturedThreadPath, "utf8"));
   const turn = JSON.parse(readFileSync(capturedTurnPath, "utf8"));
   const config = thread.config.mcp_servers.session_inspector;
+  if (["worker-resume", "manager-resume", "manager-event"].includes(variant)) {
+    assert.equal(thread.excludeTurns, true, `${variant} must resume without returning full history`);
+  }
   const worktreeReviewGuidance = /THREADEX_WORKTREE_(?:REVIEW|REASON)|HOW TO SKIP|Threadex automatically installs Git pre-commit\/pre-push hooks/;
   assert.doesNotMatch(turn.settings.developer_instructions, worktreeReviewGuidance);
   assert.doesNotMatch(thread.developerInstructions, worktreeReviewGuidance);
@@ -2324,6 +2330,10 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   if (workspaceManagerRole) {
     assert.equal(thread.threadId, ["manager-resume", "manager-event"].includes(variant) ? "thread-old" : undefined);
     assert.equal(thread.developerInstructions, WORKSPACE_MANAGER_INSTRUCTIONS, `${variant} must install the current policy at thread scope`);
+    assert.match(thread.developerInstructions, /Threadex commands use the CLI/);
+    assert.match(thread.developerInstructions, /sandbox_permissions=require_escalated/);
+    assert.match(thread.developerInstructions, /Do not use npm run/);
+    assert.ok(!turn.settings.developer_instructions.includes("Threadex commands use the CLI"));
     assert.equal(thread.developerInstructions.split(WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS).length - 1, 1);
     assert.ok(!turn.settings.developer_instructions.includes(WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS));
     assert.match(turn.settings.developer_instructions, /worker-turn-1/);

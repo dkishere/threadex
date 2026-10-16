@@ -83,6 +83,8 @@ type RunnerJob = {
   claudeAccountLabel?: string | null;
   claudeConfigDir?: string | null;
   claudeAuthSourceDir?: string | null;
+  /** A signed-in user approved Claude sandbox escapes for this session. */
+  sandboxEscapesApproved?: boolean;
   collaboration?: { groupId: string; fork: CollaborationFork | null; priorContext: string };
   workspaceManager?: boolean;
   managerConcurrent?: boolean;
@@ -172,6 +174,8 @@ const THREADEX_DEVELOPER_INSTRUCTIONS = [
 
 // Claude tends to chain tool calls silently; ask for one short line per intent so the UI shows what it is doing.
 const CLAUDE_PROGRESS_INSTRUCTIONS = "Progress updates: before each group of tool calls that share one intent (for example reading related files, searching for a symbol, or running a test suite), write one short sentence in the user's language saying what you are about to do and why. Cover the whole group with that single sentence; do not comment on every individual call, and write a new one only when the intent changes.";
+// Reuse the session grant instead of asking the user again in prose.
+const CLAUDE_SANDBOX_INSTRUCTIONS = "Sandbox escapes: prefer running Bash inside the sandbox. Loopback networking (localhost, 127.0.0.1), the workspace, temporary directories, the uv cache and the Docker socket work inside the sandbox. When a sandbox restriction is established, use dangerouslyDisableSandbox for affected commands without asking for confirmation in prose; Threadex handles approval. Once the user approves an escape for the session, later escapes in this session, including later turns, run without another approval. Reuse that authorization without repeating a known sandbox failure.";
 
 type JsonRpcMessage = Record<string, unknown> & {
   id?: unknown;
@@ -1067,6 +1071,7 @@ async function runClaudeRunnerTurn() {
       appendSystemPrompt: [
         THREADEX_DEVELOPER_INSTRUCTIONS,
         CLAUDE_PROGRESS_INSTRUCTIONS,
+        CLAUDE_SANDBOX_INSTRUCTIONS,
         gitProvenanceDeveloperInstructions(job),
         !job.contextForkRequest ? SESSION_RECOVERY_INSTRUCTIONS : undefined,
         turnInstructions
@@ -1079,6 +1084,7 @@ async function runClaudeRunnerTurn() {
       mcpServers: {},
       allowedTools: [],
       approvedInspectorCommands: cli.approvedCommands,
+      sandboxEscapesApproved: job.sandboxEscapesApproved === true,
       extraEnv: {
         ...cli.env,
         ...(job.claudeConfigDir ? { CLAUDE_CONFIG_DIR: job.claudeConfigDir } : {}),
@@ -1751,6 +1757,8 @@ function buildThreadResumeParams(threadId: string, job: RunnerJob, developerInst
   const approvalSettings = runnerApprovalSettings(job);
   return {
     threadId,
+    // Resume restores model context; the runner only needs metadata in the reply.
+    excludeTurns: true,
     cwd: job.cwd ?? defaultThreadOptions.cwd,
     sandbox: job.workspaceManager ? "read-only" : defaultThreadOptions.sandbox,
     ...approvalSettings,
@@ -2140,7 +2148,7 @@ function todoPlanningRequested(job: RunnerJob) {
 function runnerDeveloperInstructions(job: RunnerJob, includeStartupSnapshot = true) {
   const instructions = [
     !job.workspaceManager ? intentTurnInstructions(job.turnId) : undefined,
-    inspectorInstructions,
+    !job.workspaceManager ? inspectorInstructions : undefined,
     job.globalAgentInstructions?.trim()
       ? `User's global agent instructions (apply across Threadex workspaces):\n${job.globalAgentInstructions}`
       : undefined,

@@ -22,11 +22,14 @@ test("legacy selected actors use the saved preset avatar after loading and reope
   }, { sessionId, model: MODEL_CATALOG.astra.id });
   await selectSession(request, sessionId);
   await page.goto(`/?workspaceId=default&sessionId=${sessionId}`);
-  await page.getByRole("button", { name: "Round table settings", exact: true }).click();
+  const toggle = page.getByRole("button", { name: "Round table mode", exact: true });
+  await expect(toggle).toHaveAttribute("aria-pressed", "false");
+  await toggle.click();
   const image = page.getByRole("dialog", { name: "Round table settings" }).getByRole("img", { name: "AstraXH avatar" });
   await expect(image).toHaveAttribute("src", avatar);
   await page.reload();
-  await page.getByRole("button", { name: "Round table settings", exact: true }).click();
+  await expect(toggle).toHaveAttribute("aria-pressed", "false");
+  await toggle.click();
   await expect(image).toHaveAttribute("src", avatar);
 });
 
@@ -65,20 +68,23 @@ test("saved actors can be edited in Settings, selected as defaults and reused in
   await page.getByRole("button", { name: "Close navigation", exact: true }).click();
   await page.getByRole("button", { name: "Round table mode", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Round table settings" });
+  await dialog.getByText("Customise selected actors", { exact: true }).click();
   await expect(dialog.locator(".roundtable-actor-grid .actor-avatar img").first()).toHaveAttribute("src", /^data:image\/webp;base64,/);
   await dialog.getByRole("button", { name: "Edit actor 1", exact: true }).click();
   await expect(dialog.getByLabel("Actor 1 name")).toHaveValue("Sceptic");
   await expect(dialog.getByLabel("Actor 1 effort")).toHaveValue("max");
   await expect(dialog.getByLabel("Actor 1 model")).toHaveValue(MODEL_CATALOG.claudeSonnet.id);
   await expect(dialog.getByLabel("Actor 1 system prompt")).toHaveValue("Challenge the assumptions");
-  await dialog.getByLabel("Preset actor").selectOption(library.actors[1].id);
-  await expect(dialog.locator(".roundtable-actor-tile")).toHaveCount(2);
-  await dialog.getByRole("button", { name: "Add", exact: true }).click();
+  const removedName = await dialog.locator(".roundtable-actor-tile").nth(1).locator("strong").innerText();
+  await dialog.getByRole("button", { name: "Select actors", exact: true }).click();
+  await dialog.getByRole("checkbox", { name: "Builder", exact: true }).check();
   await expect(dialog.locator(".roundtable-actor-tile")).toHaveCount(3);
-  await dialog.getByRole("button", { name: "Remove actor 2", exact: true }).click();
+  await dialog.getByRole("checkbox", { name: removedName, exact: true }).uncheck();
+  await page.keyboard.press("Escape");
   await dialog.getByRole("button", { name: "Edit actor 2", exact: true }).click();
   await expect(dialog.getByLabel("Actor 2 system prompt")).toHaveValue("Consider feasibility");
-  await dialog.getByRole("button", { name: "Add new actor…", exact: true }).click();
+  await dialog.getByRole("button", { name: "Select actors", exact: true }).click();
+  await dialog.getByRole("button", { name: "Manage actors", exact: true }).click();
   const popup = page.getByRole("dialog", { name: "Agent actor settings", exact: true });
   await expect(popup).toBeVisible();
   const added = popup.getByRole("region", { name: "Saved actor 3" });
@@ -88,18 +94,20 @@ test("saved actors can be edited in Settings, selected as defaults and reused in
   await popup.getByRole("button", { name: "Save actors", exact: true }).click();
   await expect(popup.getByRole("status")).toContainText("Saved.");
   await popup.getByRole("button", { name: "Close actor settings" }).click();
-  await dialog.getByLabel("Preset actor").selectOption(library.actors[2].id);
-  await dialog.getByRole("button", { name: "Add", exact: true }).click();
+  await dialog.getByRole("button", { name: "Select actors", exact: true }).click();
+  await dialog.getByRole("checkbox", { name: "Designer", exact: true }).check();
+  await page.keyboard.press("Escape");
   await expect(dialog.locator(".roundtable-actor-tile").last().locator("img")).toHaveAttribute("src", /lorelei/);
   await dialog.getByRole("button", { name: "Edit actor 2", exact: true }).click();
   await dialog.screenshot({ path: "/private/tmp/threadex-roundtable-avatar-grid.png" });
   await page.reload();
-  await page.getByRole("button", { name: "Round table settings", exact: true }).click();
+  await page.getByRole("button", { name: "Round table mode", exact: true }).click();
+  await dialog.getByText("Customise selected actors", { exact: true }).click();
   await expect(dialog.locator(".roundtable-actor-tile").nth(1)).toContainText("Builder");
   await expect(dialog.locator(".roundtable-actor-tile")).toHaveCount(3);
 });
 
-test("composer round table toggle configures actors beside Concurrent, shows progress and keeps following prompts in the host", async ({ page, request }) => {
+test("composer round table highlights the input and requires re-enabling for each prompt", async ({ page, request }) => {
   const session = scenarioSessions.switchAlpha;
   await selectSession(request, session.id);
   const baseline = await (await request.get(`${apiBaseUrl}/api/sessions/${session.id}/snapshot`)).json();
@@ -131,10 +139,17 @@ test("composer round table toggle configures actors beside Concurrent, shows pro
   });
   await page.goto(`/?workspaceId=default&sessionId=${session.id}`);
   const toggle = page.getByRole("button", { name: "Round table mode", exact: true });
+  const surface = page.locator(".composer .composer-shell");
   await expect(toggle).toHaveAttribute("aria-pressed", "false");
+  await expect(surface).toHaveCSS("background-color", "rgb(255, 255, 255)");
   await toggle.click();
+  await page.mouse.move(0, 0);
+  await expect(toggle).toContainText("Next prompt only");
+  await expect(surface).toHaveCSS("background-color", "rgb(245, 243, 255)");
+  await expect(toggle).toHaveCSS("background-color", "rgb(124, 58, 237)");
   const settings = page.getByRole("dialog", { name: "Round table settings" });
   await expect(settings).toBeVisible();
+  await settings.getByText("Customise selected actors", { exact: true }).click();
   await expect(settings.locator(".roundtable-actor-tile")).toHaveCount(2);
   await settings.getByRole("button", { name: "Edit actor 1", exact: true }).click();
   await expect(settings.getByLabel("Actor 1 model")).toHaveValue(normalizeModelId(baseline.modelPreferences.gearProfiles[0].model));
@@ -152,6 +167,7 @@ test("composer round table toggle configures actors beside Concurrent, shows pro
   await settings.getByRole("button", { name: "Close round table settings" }).click();
   const composer = page.getByRole("textbox", { name: "Message", exact: true });
   await composer.fill("Discuss the migration options");
+  await surface.screenshot({ path: "/private/tmp/threadex-roundtable-composer-active.png" });
   await page.getByRole("button", { name: "Send", exact: true }).click();
   const progress = page.locator(".messages .roundtable-turn").first();
   await expect(progress).toContainText("Actors thinking");
@@ -159,11 +175,16 @@ test("composer round table toggle configures actors beside Concurrent, shows pro
   await expect(page.getByRole("button", { name: "Edit queued prompt", exact: true })).toHaveCount(0);
   await expect(progress.locator(".roundtable-answer")).toHaveCount(2);
   await expect(progress.locator(".actor-avatar img")).toHaveCount(2);
-  await expect(toggle).toHaveAttribute("aria-pressed", "true");
+  await expect(toggle).toHaveAttribute("aria-pressed", "false");
+  await expect(surface).toHaveCSS("background-color", "rgb(255, 255, 255)");
   await expect(composer).not.toContainText("Discuss the migration options");
   await expect(page.getByRole("button", { name: "Steer", exact: true })).toHaveCount(0);
+  await toggle.click();
+  await expect(settings.locator(".roundtable-actor-tile")).toHaveCount(2);
+  await settings.getByRole("button", { name: "Close round table settings" }).click();
   await composer.fill("Also consider rollout cost");
   await page.getByRole("button", { name: "Queue", exact: true }).click();
+  await expect(toggle).toHaveAttribute("aria-pressed", "false");
   expect(submissions).toHaveLength(2);
   expect(submissions.map(body => body.sessionId)).toEqual([session.id, session.id]);
   expect(submissions[1].actors).toEqual(submissions[0].actors);
@@ -180,7 +201,7 @@ test("composer round table toggle configures actors beside Concurrent, shows pro
   await expect(progress).toContainText("proposal");
   await progress.screenshot({ path: "/private/tmp/threadex-roundtable-progress.png" });
   await page.reload();
-  await expect(toggle).toHaveAttribute("aria-pressed", "true");
+  await expect(toggle).toHaveAttribute("aria-pressed", "false");
   await expect(page.locator(".messages-pane > .messages")).toContainText("Host conclusion: stage the migration");
   const [firstActor, secondActor] = rounds[0].answers.map(answer => answer.actor.name);
   rounds[0].synthesis = { issues: [
@@ -233,13 +254,58 @@ test("composer round table toggle configures actors beside Concurrent, shows pro
   await expect(card).toBeVisible();
   await expect.poll(() => card.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
   await card.screenshot({ path: "/private/tmp/threadex-roundtable-synthesis-mobile.png" });
+  await page.evaluate(sessionId => localStorage.removeItem(`threadex.roundtable:default:${sessionId}`), session.id);
   await page.reload();
+  await expect(toggle).toHaveAttribute("aria-pressed", "false");
   await expect(card.getByRole("region", { name: "Consensus" })).toContainText("Start with");
   await expect(card.getByRole("region", { name: "Consensus" })).toContainText("Stage the migration");
   await page.getByRole("button", { name: "Round table settings", exact: true }).click();
   await expect(settings).toBeVisible();
   await expect.poll(() => settings.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
   await settings.screenshot({ path: "/private/tmp/threadex-roundtable-mobile.png" });
+  await settings.getByRole("button", { name: "Close round table settings" }).click();
+  await toggle.click();
+  await settings.getByRole("button", { name: "Close round table settings" }).click();
+  await expect(surface).toHaveCSS("background-color", "rgb(245, 243, 255)");
+  await expect(toggle.locator(".roundtable-toggle-count")).toBeVisible();
+  await expect.poll(() => surface.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+  await surface.screenshot({ path: "/private/tmp/threadex-roundtable-composer-mobile-active.png" });
+
+  // The host classifies the queued prompt independently of the prior decision.
+  rounds[1].status = "done";
+  rounds[1].answers.forEach(answer => { answer.status = "done"; answer.text = `${answer.actor.name}'s review evidence`; });
+  rounds[1].synthesis = { taskType: "code_review", template: "summary", overview: "One retry bug and a test gap need attention.", sections: [
+    { title: "Findings", items: [
+      { text: "**P1:** Retry can duplicate writes. See [retry code](https://example.com/retry).", actors: [firstActor, secondActor] },
+      { text: "No test covers reconnection after a partial write.", actors: [firstActor] }
+    ] },
+    { title: "Open questions", items: [{ text: "The server's retry guarantee remains unverified.", actors: [secondActor] }] }
+  ] };
+  rounds[1].summary = "One retry bug and a test gap need attention.\n\n**Findings**\n\n- Retry can duplicate writes.";
+  rounds[1].revision++;
+  const summaryCard = page.locator('.messages .roundtable-synthesis[data-template="summary"]');
+  await expect(summaryCard).toBeVisible();
+  await expect(summaryCard.locator(".roundtable-template")).toHaveText("Code review · Summary");
+  await expect(summaryCard).toContainText("One retry bug and a test gap");
+  await expect(summaryCard.getByRole("region", { name: "Findings", exact: true }).locator(".roundtable-summary-item")).toHaveCount(2);
+  await expect(summaryCard.getByRole("link", { name: "retry code", exact: true })).toHaveAttribute("href", "https://example.com/retry");
+  await expect(summaryCard.locator('[aria-label="Contributors"]')).toHaveCount(3);
+  await expect(summaryCard.getByRole("region", { name: "Open questions", exact: true })).toContainText("unverified");
+  await expect(summaryCard).not.toContainText("No position recorded");
+  await expect(summaryCard.getByRole("region", { name: "Consensus", exact: true })).toHaveCount(0);
+  await expect(summaryCard.getByRole("region", { name: "Disagreements", exact: true })).toHaveCount(0);
+  await expect(summaryCard.getByRole("button", { name: "Next round", exact: true })).toBeEnabled();
+  await expect.poll(() => summaryCard.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+  await summaryCard.screenshot({ path: "/private/tmp/threadex-roundtable-summary-mobile.png" });
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await summaryCard.screenshot({ path: "/private/tmp/threadex-roundtable-summary.png" });
+  await summaryCard.locator(".roundtable-responses > summary").click();
+  await summaryCard.locator(".roundtable-answer > summary").first().click();
+  await expect(summaryCard).toContainText(`${firstActor}'s review evidence`);
+  await page.reload();
+  await expect(summaryCard.locator(".roundtable-template")).toHaveText("Code review · Summary");
+  await expect(page.locator('.messages .roundtable-synthesis[data-template="decision"] .roundtable-template')).toHaveText("Decision");
+  expect(await page.locator('.messages [data-copy-markdown]').evaluateAll(elements => elements.map(element => element.getAttribute("data-copy-markdown")))).toContain(rounds[1].summary);
 });
 
 test("round table mode works before the first host session exists", async ({ page, request }) => {
@@ -264,6 +330,7 @@ test("round table mode works before the first host session exists", async ({ pag
   expect(body.turnId).toMatch(/^rt_/);
   expect(body.actors).toHaveLength(2);
   await expect(composer).toHaveText("A new round table topic");
+  await expect(page.getByRole("button", { name: "Round table mode", exact: true })).toHaveAttribute("aria-pressed", "true");
   const firstId = body.turnId;
   await page.getByRole("button", { name: "Send", exact: true }).click();
   await expect.poll(() => body.turnId).toBe(firstId);
@@ -271,4 +338,23 @@ test("round table mode works before the first host session exists", async ({ pag
   await expect(page.getByRole("button", { name: "Round table mode", exact: true })).toHaveAttribute("aria-pressed", "false");
   await page.reload();
   await expect(page.getByRole("button", { name: "Round table mode", exact: true })).toHaveAttribute("aria-pressed", "false");
+  await page.getByRole("button", { name: "Round table mode", exact: true }).click();
+  await page.getByRole("button", { name: "Close round table settings" }).click();
+  const adoptedSessionId = scenarioSessions.switchBeta.id;
+  await page.route("**/api/roundtable/turns", route => {
+    body = route.request().postDataJSON();
+    const round: RoundtableRound = { turnId: body.turnId, sessionId: adoptedSessionId, prompt: body.message, revision: 1,
+      created: new Date().toISOString(), status: "actors", context: "", summarizerModel: DEFAULT_MODEL,
+      hostModel: DEFAULT_MODEL, hostEffort: "high", answers: body.actors.map((actor: any) => ({ actor, text: "", status: "running", error: null })),
+      summary: "", error: null, tokenIn: 0, tokenOut: 0 };
+    return route.fulfill({ status: 202, json: { sessionId: adoptedSessionId, round } });
+  });
+  await composer.fill("A successful new round table topic");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`sessionId=${adoptedSessionId}`));
+  const toggle = page.getByRole("button", { name: "Round table mode", exact: true });
+  await expect(toggle).toHaveAttribute("aria-pressed", "false");
+  await expect(composer).not.toContainText("A successful new round table topic");
+  await toggle.click();
+  await expect(page.getByRole("dialog", { name: "Round table settings" }).locator(".roundtable-actor-tile strong")).toHaveText(body.actors.map((actor: any) => actor.name));
 });

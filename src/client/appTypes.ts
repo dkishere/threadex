@@ -56,6 +56,8 @@ export type ChatMessage = {
   createdAt?: string;
   completedAt?: string;
   conclusion?: string;
+  /** Native predicted next prompt reported with the turn result (Claude only). */
+  promptSuggestion?: string;
   turnStatus?: "done" | "todo" | "running";
   pendingReason?: "queued" | "rate_limit" | "auth" | "stopped" | null;
   queueSteerReserved?: boolean;
@@ -198,7 +200,7 @@ export type StreamEvent =
       type: "pending";
       data: { sessionId: string; turnId?: string; threadId?: string; message: string; queued?: boolean; stopped?: boolean };
     }
-  | { type: "result"; data: { sessionId: string; turnId?: string; threadId?: string; elapsedMs: number; reply: string } }
+  | { type: "result"; data: { sessionId: string; turnId?: string; threadId?: string; elapsedMs: number; reply: string; promptSuggestion?: string } }
   | { type: "done"; data: { ok: true } }
   | { type: "error"; data: { message: string; needsLogin?: boolean; account?: AccountRecord } };
 
@@ -590,6 +592,7 @@ export type SessionTurnRecord = {
   /** The reasoning effort recorded when this turn began, if it is available. */
   reasoningEffort?: string | null;
   requestedServiceTier?: "fast" | "default";
+  promptSuggestion?: string;
   liveItems?: StreamItem[];
   steerMessages?: Array<{
     id: string;

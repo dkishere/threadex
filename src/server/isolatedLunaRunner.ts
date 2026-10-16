@@ -3,6 +3,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs
 import { tmpdir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { readAccountAuthIdentity, type AccountAuthIdentity } from "./accountAuth";
+import { approvedBrowserBridgeCommand, browserBridgeEnvironment, browserBridgeInstructions, type BrowserBridgeCliConfig } from "./browserBridgeCommand";
+import { approvedGitHubReadCommand, githubReadEnvironment, githubReadInstructions, type GitHubReadCliConfig } from "./githubReadCommand";
 import {
   agentCliExecutable,
   createEphemeralAgentHome,
@@ -43,6 +45,8 @@ export type IsolatedLunaRunnerOptions = {
   appServerConfigArgs?: string[];
   threadConfig?: Record<string, unknown>;
   inspectorCli?: InspectorCliConfig;
+  browserBridgeCli?: BrowserBridgeCliConfig;
+  githubReadCli?: GitHubReadCliConfig;
   outputSchema?: Record<string, unknown>;
   allowMissingAuth?: boolean;
   /** Explicitly expose this project directory to an otherwise isolated read-only job. */
@@ -95,6 +99,10 @@ export class IsolatedLunaRunner {
   private eventError: Error | null = null;
 
   constructor(private readonly options: IsolatedLunaRunnerOptions) {}
+
+  private get hasCliApprovals() {
+    return Boolean(this.options.inspectorCli || this.options.browserBridgeCli || this.options.githubReadCli);
+  }
 
   async run(input: string, options: IsolatedLunaRunOptions = {}) {
     if (this.runInProgress) {
@@ -152,12 +160,12 @@ export class IsolatedLunaRunner {
         effort: options.reasoningEffort ?? this.options.reasoningEffort,
         summary: "none",
         // An empty list removes the execution environment; scratch jobs keep the default local one for shell.
-        ...(this.options.scratchWrite || this.options.inspectorCli ? {} : { environments: [] }),
+        ...(this.options.scratchWrite || this.hasCliApprovals ? {} : { environments: [] }),
         ...(this.options.outputSchema ? { outputSchema: this.options.outputSchema } : {}),
         sandboxPolicy: this.options.scratchWrite && this.ephemeralWorkspace
           ? { type: "workspaceWrite", writableRoots: [this.ephemeralWorkspace], networkAccess: this.options.networkAccess === true, excludeTmpdirEnvVar: true, excludeSlashTmp: true }
           : { type: "readOnly", networkAccess: false },
-        approvalPolicy: this.options.inspectorCli ? "on-request" : "never"
+        approvalPolicy: this.hasCliApprovals ? "on-request" : "never"
       });
       turnStarted = true;
       return await withTimeout(completion, this.options.timeoutMs, `${this.options.name} turn timed out.`);
@@ -211,7 +219,7 @@ export class IsolatedLunaRunner {
       agentCliExecutable(),
       buildIsolatedLunaAppServerArgs([
         ...(this.options.appServerConfigArgs ?? []),
-        ...(this.options.inspectorCli ? ["-c", 'approval_policy="on-request"', "-c", "features.shell_tool=true", "-c", "features.unified_exec=true"] : [])
+        ...(this.hasCliApprovals ? ["-c", 'approval_policy="on-request"', "-c", "features.shell_tool=true", "-c", "features.unified_exec=true"] : [])
       ], this.options.allowWorkspaceRead === true, this.options.scratchWrite === true,
         this.options.scratchWrite === true && this.options.networkAccess === true),
       {
@@ -219,6 +227,8 @@ export class IsolatedLunaRunner {
         env: {
           ...process.env,
           ...this.options.inspectorCli?.env,
+          ...(this.options.browserBridgeCli ? browserBridgeEnvironment(this.options.browserBridgeCli) : {}),
+          ...(this.options.githubReadCli ? githubReadEnvironment(this.options.githubReadCli) : {}),
           HOME: this.agentHome.home,
           AGENT_CLI_HOME: this.agentHome.home,
           CODEX_HOME: this.agentHome.home,
@@ -270,14 +280,17 @@ export class IsolatedLunaRunner {
       cwd: this.workspace,
       model,
       baseInstructions: this.options.baseInstructions,
-      developerInstructions: [this.options.inspectorCli ? inspectorInstructions : undefined, this.options.developerInstructions].filter(Boolean).join("\n\n") || null,
+      developerInstructions: [this.options.inspectorCli ? inspectorInstructions : undefined,
+        this.options.browserBridgeCli ? browserBridgeInstructions(this.options.browserBridgeCli) : undefined,
+        this.options.githubReadCli ? githubReadInstructions(this.options.githubReadCli) : undefined,
+        this.options.developerInstructions].filter(Boolean).join("\n\n") || null,
       dynamicTools: [],
-      ...(this.options.scratchWrite || this.options.inspectorCli ? {} : { environments: [] }),
+      ...(this.options.scratchWrite || this.hasCliApprovals ? {} : { environments: [] }),
       selectedCapabilityRoots: [],
       runtimeWorkspaceRoots: (this.options.allowWorkspaceRead || this.options.scratchWrite) && this.workspace ? [this.workspace] : [],
       ephemeral: true,
       sandbox: this.options.scratchWrite ? "workspace-write" : "read-only",
-      approvalPolicy: this.options.inspectorCli ? "on-request" : "never",
+      approvalPolicy: this.hasCliApprovals ? "on-request" : "never",
       personality: "none",
       config: {
         features: { memories: false },
@@ -342,8 +355,11 @@ export class IsolatedLunaRunner {
       return;
     }
     if (id !== null && typeof message.method === "string") {
-      if (["item/commandExecution/requestApproval", "execCommandApproval"].includes(message.method) && this.options.inspectorCli) {
-        const approved = this.approveInspector(readObject(message.params)?.command);
+      if (["item/commandExecution/requestApproval", "execCommandApproval"].includes(message.method) && this.hasCliApprovals) {
+        const command = readObject(message.params)?.command;
+        const approved = this.approveInspector(command) || Boolean(this.options.browserBridgeCli &&
+          approvedBrowserBridgeCommand(command, this.options.browserBridgeCli, this.ephemeralWorkspace)) ||
+          Boolean(this.options.githubReadCli && approvedGitHubReadCommand(command, this.options.githubReadCli));
         this.send({ id, result: { decision: message.method === "execCommandApproval"
           ? (approved ? "approved" : "denied") : (approved ? "accept" : "decline") } });
         return;

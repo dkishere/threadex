@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { runCommand, toolsForAgent } from "./sessionInspectorCommands";
-import { inspectorAliases as aliases } from "./sessionInspectorCommand";
+import { inspectorAliases as aliases, inspectorCommand } from "./sessionInspectorCommand";
 
 // All operations require the owning Threadex HTTP server.
 
@@ -44,6 +44,12 @@ async function main() {
 try {
   process.stdout.write(`${JSON.stringify(await main())}\n`);
 } catch (error) {
-  process.stderr.write(`${JSON.stringify({ error: error instanceof Error ? error.message : String(error) })}\n`);
+  const message = error instanceof Error ? error.message : String(error);
+  const cause = error instanceof Error && error.cause && typeof error.cause === "object"
+    ? error.cause as { code?: unknown } : undefined;
+  process.stderr.write(`${JSON.stringify({ error: message,
+    ...(typeof cause?.code === "string" ? { code: cause.code } : {}),
+    ...(message === "fetch failed" ? { hint: `If sandbox networking blocked this authorized request, retry with command escalation (Codex: sandbox_permissions=require_escalated) using ${inspectorCommand} and the same command/JSON arguments. npm wrappers are not automatically approved. If an escalated request still fails, report the connection error; do not change runner identity, server URL or sandbox settings.` } : {})
+  })}\n`);
   process.exitCode = 1;
 }

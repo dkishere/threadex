@@ -50,7 +50,8 @@ export type ClaudeMapperOutput =
       numTurns: number | null;
     }
   | { kind: "rate_limit"; status: string; resetsAt: string | null; info: Record<string, unknown> }
-  | { kind: "api_error"; error: string; text: string };
+  | { kind: "api_error"; error: string; text: string }
+  | { kind: "prompt_suggestion"; suggestion: string };
 
 type TextKind = "text" | "thinking";
 
@@ -103,6 +104,10 @@ export class ClaudeStreamMapper {
       ...this.classifyPendingText(record.subtype === "success" && record.is_error !== true ? "final_answer" : "commentary"),
       this.handleResult(record)
     ];
+    if (type === "prompt_suggestion") {
+      const suggestion = readString(record.suggestion)?.trim();
+      return suggestion ? [{ kind: "prompt_suggestion", suggestion }] : [];
+    }
     if (type === "rate_limit_event") {
       const info = readObject(record.rate_limit_info) ?? {};
       return [{

@@ -1,11 +1,37 @@
 .unconfirmed-prompts {
-    border: 1px solid var(--border, #7776);
-    border-radius: 8px;
-    padding: 10px 12px;
-    max-height: 240px;
+    flex-shrink: 0;
+    min-width: 0;
+    margin: 12px 16px 16px;
+    border: 1px solid #f1d5a5;
+    border-radius: 12px;
+    padding: 16px;
+    max-height: min(320px, 40vh);
     overflow: auto;
-    font-size: 13px;
+    background: #fffbf3;
+    color: #334155;
+    font-size: 12px;
+    line-height: 1.5;
 }
-.unconfirmed-prompts p { margin: 6px 0; }
-.unconfirmed-prompts > div + div { margin-top: 12px; }
-.unconfirmed-prompt-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.unconfirmed-prompts p { margin: 0; }
+.unconfirmed-prompts-header { display: flex; align-items: flex-start; gap: 9px; }
+.unconfirmed-prompts-header > svg { flex: 0 0 auto; width: 16px; height: 16px; margin-top: 2px; color: #b7791f; }
+.unconfirmed-prompts-header strong { display: flex; align-items: center; gap: 7px; color: #784d16; font-weight: 650; }
+.unconfirmed-prompts-header p { margin-top: 4px; color: #786850; }
+.unconfirmed-prompts-count { padding: 0 6px; border-radius: 5px; background: #f7e8cc; font-size: 10px; }
+.unconfirmed-prompts-list { display: grid; gap: 12px; margin: 14px 0 0; padding: 0; list-style: none; }
+.unconfirmed-prompt { display: grid; min-width: 0; gap: 12px; padding: 14px 16px; border: 1px solid #eee5d7; border-radius: 8px; background: #fff; }
+.unconfirmed-prompt-text { max-height: 96px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.unconfirmed-prompt-attachments { display: flex; align-items: center; gap: 5px; color: #64748b; }
+.unconfirmed-prompt-attachments svg { width: 12px; height: 12px; }
+.unconfirmed-prompt-error { color: #b42318; overflow-wrap: anywhere; }
+.unconfirmed-prompts > .unconfirmed-prompt-error { margin-top: 8px; }
+.unconfirmed-prompt-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.unconfirmed-prompt-actions button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 30px; padding: 5px 9px; border: 1px solid transparent; border-radius: 6px; cursor: pointer; font-size: 11px; font-weight: 600; transition: background 120ms, border-color 120ms; }
+.unconfirmed-prompt-actions svg { width: 13px; height: 13px; }
+.unconfirmed-prompt-actions .unconfirmed-prompt-retry { background: #f1f5f9; border-color: #e2e8f0; color: #334155; }
+.unconfirmed-prompt-retry:hover:not(:disabled) { background: #e2e8f0; }
+.unconfirmed-prompt-cancel { background: transparent; color: #64748b; }
+.unconfirmed-prompt-cancel:hover { background: #fff1f2; color: #b42318; }
+.unconfirmed-prompt-actions button:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
+.unconfirmed-prompt-actions button:disabled { opacity: .5; cursor: wait; }

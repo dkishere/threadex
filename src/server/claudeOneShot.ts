@@ -1,5 +1,7 @@
 import { tmpdir } from "node:os";
 import { inspectorApprovalGate, inspectorInstructions, type InspectorCliConfig } from "./sessionInspectorCommand";
+import { approvedBrowserBridgeCommand, browserBridgeEnvironment, browserBridgeInstructions, type BrowserBridgeCliConfig } from "./browserBridgeCommand";
+import { approvedGitHubReadCommand, githubReadEnvironment, githubReadInstructions, type GitHubReadCliConfig } from "./githubReadCommand";
 import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
@@ -25,6 +27,8 @@ export type ClaudeOneShotOptions = {
   cwd?: string;
   reasoningEffort?: string;
   timeoutMs?: number;
+  /** Reset the timeout whenever the SDK emits output or tool activity. */
+  idleTimeout?: boolean;
   signal?: AbortSignal;
   onEvent?: (event: unknown) => void;
   mcpServers?: Record<string, { type: "stdio"; command: string; args: string[]; env: Record<string, string> }>;
@@ -33,6 +37,8 @@ export type ClaudeOneShotOptions = {
   /** Tools that run without approval; every other tool call is denied. */
   allowedTools?: string[];
   inspectorCli?: InspectorCliConfig;
+  browserBridgeCli?: BrowserBridgeCliConfig;
+  githubReadCli?: GitHubReadCliConfig;
   maxTurns?: number;
   /**
    * A private writable directory (also the cwd) for scripts. Bash runs in the
@@ -92,6 +98,7 @@ async function runClaudeOneShotQuery(options: ClaudeOneShotOptions, home: string
   const sdk = sdkOverride ?? await loadSdk();
   const allowed = new Set(options.allowedTools ?? []);
   const approveInspector = options.inspectorCli ? inspectorApprovalGate(options.inspectorCli) : () => false;
+  const hasCliApprovals = Boolean(options.inspectorCli || options.browserBridgeCli || options.githubReadCli);
   const mapper = new ClaudeStreamMapper();
   const abortController = new AbortController();
   const abort = () => abortController.abort();
@@ -114,35 +121,42 @@ async function runClaudeOneShotQuery(options: ClaudeOneShotOptions, home: string
     prompt: input(),
     options: {
       cwd: scratch ?? options.cwd ?? tmpdir(),
-      ...(scratch ? { sandbox: { enabled: true, failIfUnavailable: true, allowUnsandboxedCommands: Boolean(options.inspectorCli), autoAllowBashIfSandboxed: !options.inspectorCli,
+      ...(scratch ? { sandbox: { enabled: true, failIfUnavailable: true, allowUnsandboxedCommands: hasCliApprovals, autoAllowBashIfSandboxed: !hasCliApprovals,
         ...(options.allowLocalNetwork ? { network: { allowLocalBinding: true } } : {}) } } : {}),
       model: options.model,
       ...(effort ? { effort } : {}),
-      systemPrompt: [options.inspectorCli ? inspectorInstructions : undefined, options.systemPrompt].filter(Boolean).join("\n\n"),
+      systemPrompt: [options.inspectorCli ? inspectorInstructions : undefined,
+        options.browserBridgeCli ? browserBridgeInstructions(options.browserBridgeCli) : undefined,
+        options.githubReadCli ? githubReadInstructions(options.githubReadCli) : undefined, options.systemPrompt].filter(Boolean).join("\n\n"),
       settingSources: [],
       persistSession: options.persistSession === true,
-      ...(options.onEvent ? { includePartialMessages: true } : {}),
+      ...(options.onEvent || options.idleTimeout ? { includePartialMessages: true } : {}),
       ...(options.resume ? { resume: options.resume } : {}),
-      tools: [...new Set([...(options.builtinTools ?? []), ...(options.inspectorCli ? ["Bash"] : [])])],
+      tools: [...new Set([...(options.builtinTools ?? []), ...(hasCliApprovals ? ["Bash"] : [])])],
       ...(options.mcpServers && Object.keys(options.mcpServers).length ? { mcpServers: options.mcpServers, strictMcpConfig: true } : {}),
       // Bare allowedTools entries skip canUseTool, so scratch jobs leave every decision to it.
-      ...(allowed.size && !scratch && !options.inspectorCli ? { allowedTools: [...allowed] } : {}),
+      ...(allowed.size && !scratch && !hasCliApprovals ? { allowedTools: [...allowed] } : {}),
       canUseTool: async (toolName: string, toolInput: Record<string, unknown>) => (
-        toolName === "Bash" && approveInspector(toolInput.command)
+        toolName === "Bash" && (approveInspector(toolInput.command) || Boolean(options.browserBridgeCli &&
+          approvedBrowserBridgeCommand(toolInput.command, options.browserBridgeCli, scratch)) ||
+          Boolean(options.githubReadCli && approvedGitHubReadCommand(toolInput.command, options.githubReadCli)))
       ) || (allowed.has(toolName) && !outsideScratch(toolName, toolInput) && !(toolName === "Bash" && toolInput.dangerouslyDisableSandbox === true))
         ? { behavior: "allow", updatedInput: toolInput }
         : { behavior: "deny", message: scratch && allowed.has(toolName) ? `Write only inside ${scratch}.` : "This background task may not use that tool." },
       permissionMode: "default",
       ...(options.maxTurns ? { maxTurns: options.maxTurns } : {}),
       abortController,
-      env: claudeEnvironment(process.env, { ...options.inspectorCli?.env, CLAUDE_CONFIG_DIR: home, ...(!options.configDir ? { THREADEX_CLAUDE_DEFAULT_AUTH: "1" } : {}) }),
+      env: claudeEnvironment(process.env, { ...options.inspectorCli?.env,
+        ...(options.browserBridgeCli ? browserBridgeEnvironment(options.browserBridgeCli) : {}),
+        ...(options.githubReadCli ? githubReadEnvironment(options.githubReadCli) : {}),
+        CLAUDE_CONFIG_DIR: home, ...(!options.configDir ? { THREADEX_CLAUDE_DEFAULT_AUTH: "1" } : {}) }),
       ...(process.env.THREADEX_CLAUDE_PATH ? { pathToClaudeCodeExecutable: process.env.THREADEX_CLAUDE_PATH } : {})
     }
   });
 
   options.signal?.addEventListener("abort", abort, { once: true });
   if (options.signal?.aborted) abort();
-  const timer = options.timeoutMs ? setTimeout(() => abortController.abort(), options.timeoutMs) : null;
+  let timer = options.timeoutMs ? setTimeout(() => abortController.abort(), options.timeoutMs) : null;
   const usage: ClaudeUsage = { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 };
   let failure: string | null = null;
   let rateLimitMessage: string | null = null;
@@ -151,6 +165,10 @@ async function runClaudeOneShotQuery(options: ClaudeOneShotOptions, home: string
   let finished = false;
   try {
     for await (const message of query) {
+      if (options.idleTimeout && timer && !abortController.signal.aborted) {
+        clearTimeout(timer);
+        timer = setTimeout(() => abortController.abort(), options.timeoutMs);
+      }
       options.onEvent?.(message);
       for (const output of mapper.handle(message)) {
         if (output.kind === "session") {
@@ -178,7 +196,7 @@ async function runClaudeOneShotQuery(options: ClaudeOneShotOptions, home: string
     }
   } catch (error) {
     failure = failure ?? (abortController.signal.aborted
-      ? options.signal?.aborted ? "Claude request cancelled." : `Claude ${options.model} timed out after ${options.timeoutMs}ms.`
+      ? options.signal?.aborted ? "Claude request cancelled." : `Claude ${options.model} timed out after ${options.timeoutMs}ms${options.idleTimeout ? " without output" : ""}.`
       : error instanceof Error ? error.message : String(error));
   } finally {
     options.signal?.removeEventListener("abort", abort);

@@ -15,11 +15,12 @@ export const inspectorInstructions = [
 
 /** Deliberately small shell grammar: a single argv, without substitutions,
  * redirects, operators, assignments, or command wrappers. JSON stays data. */
-export function inspectorArgv(command: unknown): string[] | null {
+export function inspectorArgv(command: unknown, depth = 0): string[] | null {
+  if (depth > 4) return null;
   if (Array.isArray(command)) {
     if (!command.every(value => typeof value === "string")) return null;
     if (command.length === 3 && /(?:^|\/)(?:ba|z)?sh$/.test(command[0]) && ["-c", "-lc"].includes(command[1])) {
-      return inspectorArgv(command[2]);
+      return inspectorArgv(command[2], depth + 1);
     }
     return command;
   }
@@ -33,7 +34,15 @@ export function inspectorArgv(command: unknown): string[] | null {
       else word += char;
     } else if (quoteChar === '"') {
       if (char === '"') quoteChar = "";
-      else if (char === "$" || char === "`" || char === "\\") return null;
+      else if (char === "$" || char === "`") return null;
+      else if (char === "\\") {
+        // Codex serializes its shell argv as a quoted command string. Decode
+        // only literal double-quote escapes, then validate the inner shell too.
+        const next = command[i + 1];
+        if (!next || !['"', "\\", "$", "`"].includes(next)) return null;
+        word += next;
+        i++;
+      }
       else word += char;
     } else if (char === "'" || char === '"') {
       quoteChar = char; active = true;
@@ -46,7 +55,7 @@ export function inspectorArgv(command: unknown): string[] | null {
   }
   if (quoteChar) return null;
   if (active) words.push(word);
-  return words;
+  return inspectorArgv(words, depth + 1);
 }
 
 export function approvedInspectorCommand(command: unknown, allowed: readonly string[]): boolean {

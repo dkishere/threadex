@@ -114,6 +114,16 @@ test("add, log in, select and report on a Claude account", async () => {
     assert.equal(waiting.body.complete, false);
 
     loggedIn = true;
+    const stillAuthorizing = await call(base, `/api/claude-accounts/login/${created.body.login.loginId}`);
+    assert.equal(stillAuthorizing.body.complete, false, "old credentials must not complete a new login");
+    assert.equal(logins.has(created.body.login.loginId), true, "pending browser authorization must not be terminated");
+    assert.equal(available.length, 0);
+    const login = logins.get(created.body.login.loginId)!;
+    login.exited = true;
+    login.exitCode = 1;
+    const failed = await call(base, `/api/claude-accounts/login/${login.id}`);
+    assert.equal(failed.body.complete, false, "a failed login must not succeed using old credentials");
+    login.exitCode = 0;
     const done = await call(base, `/api/claude-accounts/login/${created.body.login.loginId}`);
     assert.equal(done.body.complete, true);
     assert.equal(done.body.account.email, "dk@example.com");

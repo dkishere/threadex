@@ -1,8 +1,9 @@
 import { modelLabel as modelOptionLabel, supportsUltraEffort, normalizeModelEffort } from "../modelCatalog";
-import { Bot, LockKeyhole, Loader2, Quote, RotateCcw, Send, UserPlus, X } from "lucide-react";
+import { Bot, LockKeyhole, Loader2, Quote, RotateCcw, Send, X } from "lucide-react";
 import { FormEvent, KeyboardEvent, useEffect, useRef, useState } from "react";
 import type { RoundtableActor } from "../roundtable";
-import { actorFromPreset, roundtableLibraryEndpoint, syncRoundtableDraftAvatars, type RoundtableLibrary, type RoundtablePreset } from "../roundtablePresets";
+import { roundtableLibraryEndpoint, syncRoundtableDraftAvatars, type RoundtableLibrary, type RoundtablePreset } from "../roundtablePresets";
+import { ActorMultiSelect } from "./ActorMultiSelect";
 import { findMentionTrigger, mentionedActors, SIDE_CHAT_MAX_ACTORS, sideChatSpeaker, type SideChatActor } from "../sideChatRoom";
 import { ActorAvatar } from "./ActorAvatar";
 import { apiJson } from "./apiClient";
@@ -13,7 +14,7 @@ import type { ChatMessage } from "./appTypes";
 import { formatResponseAnnotationsPrompt, type ResponseAnnotation } from "./responseAnnotations";
 import { annotationLabel } from "./ResponseAnnotationList";
 import { RoundtableLibraryPopup } from "./Roundtable";
-import { askSession, loadSideChats, type SessionSideChat } from "./sessionApi";
+import { askSession, controlSideChat, loadSideChatState, type SessionSideChat } from "./sessionApi";
 import { buildSideChatRounds, type OutgoingSideChatReply } from "./sideChatRounds";
 import { readSideChatPreferences, saveSideChatPreferences } from "./sideChatPreferences";
 import {
@@ -81,11 +82,13 @@ export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady,
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const sessionGeneration = useRef(0);
   const loadedSession = useRef<string | null>(null);
+  const submitting = useRef(new Set<string>());
   const activeGear = gearProfiles[activeGearIndex] ?? gearProfiles[0];
   const actors = syncRoundtableDraftAvatars(roster, presets);
   const isSending = outgoing.some((reply) => reply.status === "pending");
   const mentionOptions = mention ? actors.filter((actor) => actor.name.toLowerCase().includes(mention.query.toLowerCase())) : [];
   const rounds = buildSideChatRounds(messages, outgoing);
+  const scrollKey = `${messages.length}:${messages.at(-1)?.id}:${outgoing.map(reply => `${reply.key}:${reply.status}`).join(",")}`;
 
   useEffect(() => {
     saveSideChatPreferences({ gearProfiles, activeGearIndex });
@@ -136,10 +139,11 @@ export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady,
   }, [active]);
 
   useEffect(() => {
-    if (!active || !sessionReady || loadedSession.current === sessionId) return;
+    if (!active || !sessionReady) return;
     const controller = new AbortController();
-    setIsLoading(true);
-    void loadSideChats(sessionId, controller.signal).then((sideChats) => {
+    if (loadedSession.current !== sessionId) setIsLoading(true);
+    let timer: number;
+    const refresh = () => void loadSideChatState(sessionId, controller.signal).then(({ sideChats, jobs = [] }) => {
       if (!controller.signal.aborted) {
         loadedSession.current = sessionId;
         setMessages((current) => {
@@ -147,30 +151,46 @@ export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady,
           return [...sideChats, ...current.filter((entry) => !savedIds.has(entry.id))];
         });
         setError(null);
+        const pending: OutgoingSideChatReply[] = jobs.map(job => ({
+          key: `${job.roundId}:${job.actor?.id ?? "default"}`, jobId: job.id,
+          roundId: job.roundId, actor: job.actor, question: job.question, model: job.model, effort: job.effort,
+          replyToId: job.replyToId, status: job.status === "running" ? "pending" : "failed",
+          error: job.error ?? (job.status === "stopped" ? "Stopped by the user." : undefined)
+        }));
+        setOutgoing(current => {
+          const savedKeys = new Set(sideChats.map(entry => `${entry.roundId}:${entry.actor?.id ?? "default"}`));
+          const pendingKeys = new Set(pending.map(reply => reply.key));
+          return [...pending.filter(reply => !submitting.current.has(reply.key)), ...current.filter(reply =>
+            submitting.current.has(reply.key) || (!savedKeys.has(reply.key) && !pendingKeys.has(reply.key)))];
+        });
       }
     }).catch((loadError) => {
       if (controller.signal.aborted) return;
       setError(loadError instanceof Error ? loadError.message : "Unable to load side chat");
     }).finally(() => {
-      if (!controller.signal.aborted) setIsLoading(false);
+      if (!controller.signal.aborted) { setIsLoading(false); timer = window.setTimeout(refresh, 1500); }
     });
-    return () => controller.abort();
+    refresh();
+    return () => { controller.abort(); window.clearTimeout(timer); };
   }, [active, sessionId, sessionReady]);
 
   useEffect(() => {
     const element = scrollRef.current;
     if (element) element.scrollTop = element.scrollHeight;
-  }, [isLoading, outgoing, messages]);
+  }, [isLoading, scrollKey]);
 
   /** Every addressed speaker answers in parallel; each reply appears as soon as it is saved. */
   function dispatch(replies: OutgoingSideChatReply[]) {
+    replies = replies.map(reply => ({ ...reply, requestId: reply.requestId ?? crypto.randomUUID() }));
     const generation = sessionGeneration.current;
     const keys = new Set(replies.map((reply) => reply.key));
     setOutgoing((current) => [...current.filter((reply) => !keys.has(reply.key)), ...replies.map((reply) => ({ ...reply, status: "pending" as const, error: undefined }))]);
     setError(null);
     const participants = actors.map((actor) => actor.name);
     for (const reply of replies) {
+      submitting.current.add(reply.key);
       void askSession({
+        requestId: reply.requestId,
         sessionId,
         question: reply.question,
         model: reply.model,
@@ -178,15 +198,19 @@ export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady,
         ...(reply.actor ? { actor: reply.actor, participants } : {}),
         roundId: reply.roundId,
         ...(reply.replyToId ? { replyToId: reply.replyToId } : {})
-      }).then((sideChat) => {
+      }).then(({ sideChat, jobId }) => {
         if (sessionGeneration.current !== generation) return;
+        if (!sideChat) {
+          setOutgoing(current => current.map(item => item.key === reply.key ? { ...item, jobId } : item));
+          return;
+        }
         setMessages((current) => [...current.filter((entry) => entry.id !== sideChat.id), sideChat]);
         setOutgoing((current) => current.filter((item) => item.key !== reply.key));
       }).catch((sendError) => {
         if (sessionGeneration.current !== generation) return;
         const message = sendError instanceof Error ? sendError.message : "Unable to send side-chat message";
         setOutgoing((current) => current.map((item) => item.key === reply.key ? { ...item, status: "failed", error: message } : item));
-      });
+      }).finally(() => submitting.current.delete(reply.key));
     }
   }
 
@@ -293,34 +317,8 @@ export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady,
   return (
     <aside className="side-chat-panel" aria-label="Read-only side chat">
       <div className="side-chat-roster" aria-label="Side chat actors">
-        {actors.length === 0 ? (
-          <span className="side-chat-roster-actor" title="Uses the gearbox model below until you add actors">
-            <span className="actor-avatar side-chat-default-avatar"><Bot aria-hidden="true" /></span>
-            <span>Default · {modelOptionLabel(activeGear.model)}</span>
-          </span>
-        ) : actors.map((actor) => (
-          <span className="side-chat-roster-actor" key={actor.id} title={`${actor.name} · ${modelOptionLabel(actor.model)} · ${actor.effort}`}>
-            <ActorAvatar actor={actor} />
-            <span>{actor.name}</span>
-            <button type="button" aria-label={`Remove ${actor.name}`} disabled={isSending} onClick={() => changeRoster(roster.filter((item) => item.id !== actor.id))}><X aria-hidden="true" /></button>
-          </span>
-        ))}
-        <select
-          className="side-chat-roster-add"
-          aria-label="Add actor"
-          value=""
-          disabled={isSending || actors.length >= SIDE_CHAT_MAX_ACTORS}
-          onChange={(event) => {
-            const preset = presets.find((item) => item.id === event.target.value);
-            if (preset) changeRoster([...roster, actorFromPreset(preset)]);
-          }}
-        >
-          <option value="">Add actor…</option>
-          {presets.filter((preset) => !actors.some((actor) => actor.presetId === preset.id)).map((preset) => (
-            <option key={preset.id} value={preset.id}>{preset.name} · {modelOptionLabel(preset.model)}</option>
-          ))}
-        </select>
-        <button type="button" className="side-chat-roster-manage" aria-label="Manage agent actors" title="Manage agent actors" onClick={() => setLibraryOpen(true)}><UserPlus aria-hidden="true" /></button>
+        <ActorMultiSelect actors={actors} presets={presets} onChange={changeRoster} onManage={() => setLibraryOpen(true)}
+          max={SIDE_CHAT_MAX_ACTORS} disabled={isSending} emptyLabel={`Default · ${modelOptionLabel(activeGear.model)}`} />
       </div>
       <div ref={scrollRef} className="side-chat-messages messages" aria-live="polite">
         {isLoading ? (
@@ -342,12 +340,17 @@ export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady,
                   <article className="side-chat-bubble" data-status={reply.status} key={reply.key}>
                     <header>{speakerHeader(reply.actor, reply.model, reply.effort, reply.replyToId)}</header>
                     {reply.status === "pending" ? (
-                      <div className="side-chat-state side-chat-thinking"><Loader2 className="spin" aria-hidden="true" /> Thinking…</div>
+                      <div className="side-chat-state side-chat-thinking"><Loader2 className="spin" aria-hidden="true" /> Thinking…
+                        {reply.jobId && <button type="button" onClick={() => void controlSideChat(sessionId, reply.jobId!, "stop").catch(error => setError(String(error)))}>Stop</button>}
+                      </div>
                     ) : (
                       <div className="side-chat-error" role="alert">
                         <span>{reply.error}</span>
-                        <button type="button" disabled={isSending} onClick={() => dispatch([reply])}><RotateCcw aria-hidden="true" />Retry</button>
-                        <button type="button" onClick={() => setOutgoing((current) => current.filter((entry) => entry.key !== reply.key))} aria-label="Dismiss"><X aria-hidden="true" /></button>
+                        <button type="button" disabled={isSending} onClick={() => dispatch([{ ...reply, requestId: reply.jobId ? undefined : reply.requestId, jobId: undefined }])}><RotateCcw aria-hidden="true" />Retry</button>
+                        <button type="button" onClick={() => {
+                          if (reply.jobId) void controlSideChat(sessionId, reply.jobId, "dismiss").catch(error => setError(String(error)));
+                          setOutgoing((current) => current.filter((entry) => entry.key !== reply.key));
+                        }} aria-label="Dismiss"><X aria-hidden="true" /></button>
                       </div>
                     )}
                   </article>

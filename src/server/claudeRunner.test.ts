@@ -157,6 +157,26 @@ test("boundary escalation asks once for the exact action and respects a denial",
     }, seen));
 });
 
+test("one session approval covers every later sandbox escape", async () => {
+  const run = async (overrides: Partial<ClaudeRunnerContext>, decision: string) => {
+    const calls: any[] = [];
+    const decisions: string[] = [];
+    await runClaudeTurn(context({ ...overrides, requestApproval: async input => { calls.push(input); return decision; } }).ctx,
+      fakeSdk(async function* (_user, _turn, canUseTool) {
+        yield init;
+        for (const command of ["git init", "cat > /etc/x <<'EOF'\nx\nEOF", "node e2e.mjs"]) {
+          decisions.push((await canUseTool("Bash", { command, dangerouslyDisableSandbox: true }, { toolUseID: command })).behavior);
+        }
+        yield success("ok");
+      }, { prompts: [] }));
+    return { decisions, asked: calls.map(call => call.params.command), flagged: calls.every(call => call.params.sandboxEscape === true) };
+  };
+  assert.deepEqual(await run({}, "acceptForSession"), { decisions: ["allow", "allow", "allow"], asked: ["git init"], flagged: true });
+  // A grant from an earlier turn needs no card; a one-off approval keeps asking.
+  assert.deepEqual(await run({ sandboxEscapesApproved: true }, "decline"), { decisions: ["allow", "allow", "allow"], asked: [], flagged: true });
+  assert.deepEqual((await run({}, "accept")).asked.length, 3);
+});
+
 test("a downgraded auto mode switches to acceptEdits and logs the mismatch", async () => {
   async function run(reported: string, withSetter = true) {
     const modes: string[] = [];
@@ -228,6 +248,28 @@ test("a turn streams items, routes Bash approval and publishes the result", asyn
   assert.equal(result?.data.tokenIn, 100);
   assert.equal(result?.data.tokenOut, 20);
   assert.equal(emitted.at(-1)?.event, "done");
+});
+
+test("the native prompt suggestion after the final result is published with it", async () => {
+  const seen = { prompts: [] as any[] } as { options?: Record<string, unknown>; prompts: any[] };
+  const sdk = fakeSdk(async function* () {
+    yield init;
+    yield success("Done.");
+    yield { type: "prompt_suggestion", suggestion: "  Now add tests  ", uuid: "u1", session_id: "claude-123" };
+  }, seen);
+  const { ctx, emitted } = context({ threadId: "claude:claude-123" });
+  await runClaudeTurn(ctx, sdk);
+  assert.equal(seen.options?.promptSuggestions, true);
+  assert.equal(emitted.find((entry) => entry.event === "result")?.data.promptSuggestion, "Now add tests");
+
+  const stale = fakeSdk(async function* () {
+    yield init;
+    yield { type: "prompt_suggestion", suggestion: "Stale", uuid: "u2", session_id: "claude-123" };
+    yield success("Done.");
+  }, { prompts: [] });
+  const second = context({ threadId: "claude:claude-123" });
+  await runClaudeTurn(second.ctx, stale);
+  assert.equal("promptSuggestion" in (second.emitted.find((entry) => entry.event === "result")?.data ?? {}), false);
 });
 
 test("resume uses the stored Claude session and a Codex thread gets a handoff note", async () => {

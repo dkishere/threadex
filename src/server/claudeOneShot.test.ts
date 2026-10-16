@@ -4,9 +4,39 @@ import { runClaudeOneShot as runQuery, type ClaudeOneShotOptions } from "./claud
 import { existsSync, rmSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { inspectorCommand } from "./sessionInspectorCommand";
+import { githubReadArgv } from "./githubReadCommand";
 import type { SdkModule } from "./claudeRunner";
 
 type CanUseTool = (name: string, input: Record<string, unknown>) => Promise<any>;
+
+for (const stalls of [false, true]) {
+  test(`idle timeout ${stalls ? "aborts after output stops" : "allows output beyond the total timeout"}`, async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const sdk: SdkModule = { query: ({ options }) => {
+      assert.equal(options.includePartialMessages, true);
+      const controller = options.abortController as AbortController;
+      async function* messages() {
+        for (let i = 0; i < 4; i++) {
+          t.mock.timers.tick(60);
+          assert.equal(controller.signal.aborted, false);
+          yield { type: "stream_event", event: { type: "content_block_delta", index: 0,
+            delta: { type: "text_delta", text: "working" } } };
+        }
+        if (stalls) {
+          t.mock.timers.tick(101);
+          assert.equal(controller.signal.aborted, true);
+          throw new Error("SDK aborted");
+        }
+        yield { type: "result", subtype: "success", is_error: false, result: "Done" };
+      }
+      return Object.assign(messages(), { close() {} });
+    } };
+    const result = runClaudeOneShot({ model: "claude-sonnet-5-5", prompt: "Discuss", systemPrompt: "Discuss",
+      timeoutMs: 100, idleTimeout: true }, sdk);
+    if (stalls) await assert.rejects(result, /100ms without output/);
+    else assert.equal((await result).responseText, "Done");
+  });
+}
 
 function runClaudeOneShot(options: ClaudeOneShotOptions, sdk: SdkModule) {
   return runQuery({ ...options, ...(options.persistSession ? { sessionScope: options.sessionScope ?? "test-workspace:test-session" } : {}) }, sdk,
@@ -141,6 +171,33 @@ test("only allowed tools may run", async () => {
   assert.deepEqual(decisions[0].updatedInput, { turnId: "t1" });
   assert.deepEqual(seen.options!.tools, ["Read"]);
   assert.equal(seen.options!.strictMcpConfig, true);
+});
+
+test("Claude actors receive host CLI configs and approve standalone browser and GitHub reads", async () => {
+  const seen: { options?: Record<string, unknown>; prompts: any[] } = { prompts: [] };
+  const decisions: string[] = [];
+  const bridge = { executable: "/trusted/bin/browser-bridge", dataDir: "/host/browser-config" };
+  const github = { executable: "/trusted/bin/gh", configDir: "/host/gh-config", hostHome: "/host" };
+  await runClaudeOneShot({ model: "claude-sonnet-5-5", prompt: "Read the PR comments", systemPrompt: "Discussion only",
+    scratchDir: "/private/tmp/scratch", builtinTools: ["Bash", "Write"], allowedTools: ["Bash", "Write"], browserBridgeCli: bridge, githubReadCli: github
+  }, fakeSdk(async function* (canUseTool) {
+    for (const command of [
+      `${bridge.executable} tabs`, `${bridge.executable} evaluate 42 'document.body.innerText'`,
+      `${bridge.executable} tabs; curl https://example.com`, "curl https://example.com", "gh pr view 14",
+      `${bridge.executable} screenshot 42 /host/project/overwrite.png`,
+      [...githubReadArgv(github), "pr", "view", "14", "--repo", "owner/repo", "--comments"].map(value => `'${value}'`).join(" "),
+      `${github.executable} api repos/owner/repo/pulls/14/comments --paginate`,
+      `${github.executable} api repos/owner/repo/pulls/14/comments -X POST`
+    ]) decisions.push((await canUseTool("Bash", { command, dangerouslyDisableSandbox: true })).behavior);
+    decisions.push((await canUseTool("Write", { file_path: "/host/project/app.ts", content: "" })).behavior);
+    yield { type: "result", subtype: "success", is_error: false, result: "Read", usage: {} };
+  }, seen));
+  assert.deepEqual(decisions, ["allow", "allow", "deny", "deny", "deny", "deny", "allow", "allow", "deny", "deny"]);
+  assert.equal((seen.options!.env as Record<string, string>).LOCAL_BROWSER_BRIDGE_DATA_DIR, bridge.dataDir);
+  assert.equal((seen.options!.env as Record<string, string>).GH_CONFIG_DIR, github.configDir);
+  assert.match(String(seen.options!.systemPrompt), /Browser Bridge CLI/);
+  assert.deepEqual(seen.options!.sandbox, { enabled: true, failIfUnavailable: true, allowUnsandboxedCommands: true, autoAllowBashIfSandboxed: false });
+  assert.equal(seen.options!.allowedTools, undefined);
 });
 
 test("a persisted request reports its Claude session and can be resumed", async () => {

@@ -6,6 +6,8 @@ import { IsolatedLunaRunner } from "./isolatedLunaRunner";
 import { runClaudeOneShot } from "./claudeOneShot";
 import { buildSideChatSessionInspectorConfig } from "./sessionQuestion";
 import type { SessionRecord } from "./sessionStore";
+import { resolveBrowserBridgeCli } from "./browserBridgeCommand";
+import { resolveGitHubReadCli } from "./githubReadCommand";
 
 const ROUNDTABLE_RULES = [
   "You are participating in a Threadex round table: discussion and analysis only.",
@@ -21,7 +23,7 @@ const ACTOR_TOOLS_RULE = [
 const NO_TOOLS_RULE = "Use only the supplied conversation context; do not invoke tools.";
 const CLAUDE_ACTOR_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch"];
 
-/** Actor tools: the host session through Session Inspector, the web, and a private scratch directory. */
+/** Actor tools: Session Inspector, web search, Browser Bridge, GitHub reads, and private scratch. */
 export type RoundtableActorTools = { serverUrl: string; session: SessionRecord };
 export type RoundtableInference = {
   model: string; effort: string; systemPrompt: string; prompt: string;
@@ -30,10 +32,21 @@ export type RoundtableInference = {
   onEvent?: (provider: "codex" | "claude", event: unknown) => void;
 };
 
+export function roundtableInstructions(input: Pick<RoundtableInference, "actorTools" | "systemPrompt">) {
+  const workspace = input.actorTools ? [
+    `Host project working directory: ${JSON.stringify(input.actorTools.session.cwd)}.`,
+    "Resolve the user's relative project paths (including @path references) against that host directory, never against your scratch cwd. The empty scratch directory does not mean the host project is missing.",
+    "You may inspect host project files and Git changes read-only. Use absolute file paths and explicitly set the command working directory to the host directory or the requested repository for read-only commands. Keep all generated files and verification scripts in your private scratch directory; never modify the host project."
+  ].join(" ") : "";
+  return [...ROUNDTABLE_RULES, input.actorTools ? ACTOR_TOOLS_RULE : NO_TOOLS_RULE, workspace, "", input.systemPrompt].join("\n");
+}
+
 export async function runRoundtableInference(input: RoundtableInference) {
   input.signal.throwIfAborted();
-  const instructions = [...ROUNDTABLE_RULES, input.actorTools ? ACTOR_TOOLS_RULE : NO_TOOLS_RULE, "", input.systemPrompt].join("\n");
+  const instructions = roundtableInstructions(input);
   const inspector = input.actorTools && buildSideChatSessionInspectorConfig(input.actorTools);
+  const browserBridgeCli = input.actorTools ? resolveBrowserBridgeCli() : undefined;
+  const githubReadCli = input.actorTools ? resolveGitHubReadCli() : undefined;
   if (isClaudeModel(input.model)) {
     const cwd = mkdtempSync(join(tmpdir(), "threadex-roundtable-"));
     try {
@@ -44,6 +57,8 @@ export async function runRoundtableInference(input: RoundtableInference) {
           scratchDir: cwd,
           builtinTools: CLAUDE_ACTOR_TOOLS,
           inspectorCli: inspector,
+          browserBridgeCli,
+          githubReadCli,
           allowedTools: CLAUDE_ACTOR_TOOLS
         } : {}) });
     } finally { rmSync(cwd, { recursive: true, force: true }); }
@@ -56,7 +71,9 @@ export async function runRoundtableInference(input: RoundtableInference) {
     ...(inspector ? {
       scratchWrite: true,
       inspectorCli: inspector,
-      appServerConfigArgs: ["-c", "tools.web_search=true"],
+      browserBridgeCli,
+      githubReadCli,
+      appServerConfigArgs: ["-c", "tools.web_search=true", ...(browserBridgeCli ? ["-c", "tools.view_image=true"] : [])],
       threadConfig: { tools: { web_search: true } }
     } : {}) });
   const abort = () => runner.stop();

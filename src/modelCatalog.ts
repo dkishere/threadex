@@ -8,9 +8,9 @@ export const MODEL_CATALOG = {
   gpt54: { id: "gpt-5.4", label: "5.4", ultra: false, autoLowEffort: false, aliases: [] },
   mini: { id: "gpt-5.4-mini", label: "5.4-mini", ultra: false, autoLowEffort: false, aliases: [] },
   // Claude models run through the Claude Agent SDK instead of Codex (see server/claudeRunner.ts).
-  claudeOpus: { id: "claude-opus-5-5", label: "Claude Opus 5.5", ultra: false, autoLowEffort: false, aliases: ["opus"] },
-  claudeSonnet: { id: "claude-sonnet-5-5", label: "Claude Sonnet 5.5", ultra: false, autoLowEffort: false, aliases: ["sonnet"] },
-  claudeHaiku: { id: "claude-haiku-5-5", label: "Claude Haiku 5.5", ultra: false, autoLowEffort: false, aliases: ["haiku"] }
+  claudeOpus: { id: "claude-opus-5-5", label: "Opus 5.5", ultra: false, autoLowEffort: false, aliases: ["opus"] },
+  claudeSonnet: { id: "claude-sonnet-5-5", label: "Sonnet 5.5", ultra: false, autoLowEffort: false, aliases: ["sonnet"] },
+  claudeHaiku: { id: "claude-haiku-5-5", label: "Haiku 5.5", ultra: false, autoLowEffort: false, aliases: ["haiku"] }
 } as const;
 
 export type ModelProvider = "codex" | "claude";

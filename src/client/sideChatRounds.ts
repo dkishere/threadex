@@ -3,6 +3,8 @@ import type { SessionSideChat } from "./sessionApi";
 
 /** One reply request still in flight, or one that failed and can be retried. */
 export type OutgoingSideChatReply = {
+  jobId?: string;
+  requestId?: string;
   key: string;
   roundId: string;
   actor: RoundtableActor | null;

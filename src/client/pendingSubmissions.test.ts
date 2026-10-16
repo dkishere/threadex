@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { acknowledgeSubmissionEvent, readPendingSubmissions, reconcilePendingSubmissions, savePendingSubmission, recordSubmissionError, unconfirmedPrompts, type PendingSubmission } from "./pendingSubmissions";
+import { acknowledgeSubmissionEvent, readPendingSubmissions, reconcilePendingSubmissions, removePendingSubmission, savePendingSubmission, recordSubmissionError, unconfirmedPrompts, type PendingSubmission } from "./pendingSubmissions";
 import { mockSubmissionStorage } from "./pendingSubmissions.testSupport";
 
 const entry: PendingSubmission = {
@@ -45,6 +45,32 @@ test("completed result confirms delivery when start was missed", t => {
     savePendingSubmission(entry);
     acknowledgeSubmissionEvent({ type: "result", data: { sessionId: "session", turnId: entry.id } });
     assert.equal(readPendingSubmissions().length, 0);
+});
+
+test("a stored queue entry confirms delivery even before its runner starts", t => {
+    mockSubmissionStorage(t);
+    savePendingSubmission(entry);
+    savePendingSubmission({ ...entry, id: "queued", turnId: "queued", settings: { queued: true } });
+    reconcilePendingSubmissions("session", [{ id: entry.id, status: "running" }, { id: "queued", status: "todo" }]);
+    assert.deepEqual(readPendingSubmissions(), [entry]);
+});
+
+test("cancel discards only the selected backup and a late failure cannot restore it", t => {
+    mockSubmissionStorage(t);
+    savePendingSubmission(entry);
+    const other = { ...entry, id: "other", turnId: "other", sessionId: "another-session" };
+    savePendingSubmission(other);
+    assert.equal(removePendingSubmission(entry.id), true);
+    recordSubmissionError(entry.id, "late failure");
+    assert.deepEqual(readPendingSubmissions(), [other]);
+});
+
+test("failed cancellation keeps the saved prompt and reports failure", t => {
+    const storage = mockSubmissionStorage(t);
+    savePendingSubmission(entry);
+    t.mock.method(storage, "removeItem", () => { throw new Error("Storage unavailable"); });
+    assert.equal(removePendingSubmission(entry.id), false);
+    assert.deepEqual(readPendingSubmissions(), [entry]);
 });
 
 test("reload exposes only this session's prompts missing from the server, retaining failure evidence", t => {

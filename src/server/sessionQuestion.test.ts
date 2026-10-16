@@ -84,9 +84,13 @@ test("Claude side chats resume one Claude session per Threadex session", async (
     assert.deepEqual(calls.map((call) => call.resume), [null, "claude-1"]);
     assert.equal(calls[0].persistSession, true);
     assert.equal(calls[0].timeoutMs, 600_000);
+    assert.equal(calls[0].idleTimeout, true);
     assert.equal(calls[0].configDir, "/accounts/a");
     assert.deepEqual(calls[0].allowedTools, ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch"]);
-    assert.deepEqual(calls[0].inspectorCli?.approvedCommands, ["get_session", "search_sessions"]);
+    assert.deepEqual(calls[0].inspectorCli?.approvedCommands, ["get_session", "search_sessions", "prompt_session"]);
+    assert.equal(calls[0].inspectorCli?.env.THREADEX_SIDE_CHAT_HOST_PROMPT, "1");
+    assert.match(calls[0].systemPrompt, /When the user explicitly asks/);
+    assert.doesNotMatch(calls[0].systemPrompt, /Never ask another side-chat agent, prompt a session/);
     assert.equal(calls[0].mcpServers, undefined);
     assert.match(calls[0].systemPrompt, /side chat for Threadex session claude-side-chat/);
     // Investigates read-only: writes only in a stable private scratch cwd, loopback but no external network.
@@ -177,6 +181,8 @@ test("Codex side chats sign in with the managed account and restart when its log
     assert.equal(options.scratchWrite, true, "writes stay in the runner's private scratch workspace");
     assert.equal(options.allowWorkspaceRead, undefined, "the project is never the writable cwd");
     assert.equal(options.networkAccess, true);
+    assert.ok(options.inspectorCli?.approvedCommands.includes("prompt_session"));
+    assert.equal(options.inspectorCli?.env.THREADEX_SIDE_CHAT_HOST_PROMPT, "1");
     assert.equal(options.timeoutMs, 600_000);
     assert.ok(options.appServerConfigArgs?.includes("tools.web_search=true"));
     assert.match(options.developerInstructions ?? "", /project directory \(read by absolute path\): "\/tmp\/project"/);

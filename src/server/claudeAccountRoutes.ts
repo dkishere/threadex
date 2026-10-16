@@ -181,6 +181,11 @@ export function createClaudeAccountRouter(input: {
       ops.finishLogin(login.id);
       return void res.status(404).json({ error: "Claude account was deleted." });
     }
+    // Existing credentials can still report loggedIn while a replacement login
+    // is waiting for browser approval. Never kill that login based on old auth.
+    if (!login.exited || login.exitCode !== 0) {
+      return void res.json({ complete: false, account, ...loginPayload(login) });
+    }
     const status = await ops.readStatus(account.configDir);
     if (status.loggedIn) {
       ops.finishLogin(login.id);

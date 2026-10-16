@@ -636,7 +636,20 @@ export function addSteerMessage(ctx, sessionId, turnId, content, steerAttachment
     
 }
 
-export function enqueuePrompt(ctx, message, kind, mode, skills, promptAttachments, contextFork, forcePlan, clearComposer = true) {
+export function enqueuePrompt(ctx, message, kind, mode, skills, promptAttachments, contextFork, forcePlan, clearComposer = true, submissionId: string | undefined = undefined) {
+    const saved = submissionId ? readPendingSubmissions().find(entry => entry.id === submissionId) : undefined;
+    if (submissionId && !saved) throw new Error("This saved prompt is no longer available.");
+    if (saved) {
+        if (saved.sessionId !== ctx.sessionIdRef.current) throw new Error("Return to the original session to retry this prompt.");
+        message = saved.message;
+        promptAttachments = saved.attachments;
+        mode = saved.settings.executionMode ?? "default";
+        skills = saved.settings.skills ?? [];
+        contextFork = saved.settings.contextFork === true;
+        forcePlan = saved.settings.forcePlan === true;
+        clearComposer = false;
+        ctx = { ...ctx, requestSettings: saved.settings };
+    }
     const {
         activeWorkspaceIdRef, clearComposerInputDraft, clearComposerSessionLinks,
         isLikelyBackendDisconnect, noteBackendDisconnect, noteBackendRequestSucceeded,
@@ -645,11 +658,13 @@ export function enqueuePrompt(ctx, message, kind, mode, skills, promptAttachment
         setSlashTrigger, setStatus
     } = ctx;
     const sessionId = sessionIdRef.current;
+    if (isSubmissionSending(sessionId)) return false;
     const requestKey = JSON.stringify({ sessionId, message, kind, mode, skills, promptAttachments, contextFork, forcePlan, requestSettings: ctx.requestSettings });
-    const id = queueRetryRef.current?.key === requestKey ? queueRetryRef.current.id : crypto.randomUUID();
+    const id = saved?.id ?? (queueRetryRef.current?.key === requestKey ? queueRetryRef.current.id : crypto.randomUUID());
     if (!sessionId || !preserveSubmission(ctx, {
         id, turnId: id, sessionId,
-        workspaceId: activeWorkspaceIdRef.current, kind: "prompt", message,
+        ...(saved ? { createdAt: saved.createdAt } : {}),
+        workspaceId: saved?.workspaceId ?? activeWorkspaceIdRef.current, kind: "prompt", message,
         attachments: promptAttachments,
         settings: { queued: true, executionMode: mode, skills, contextFork, forcePlan, ...ctx.requestSettings }
     })) return false;
@@ -666,7 +681,7 @@ export function enqueuePrompt(ctx, message, kind, mode, skills, promptAttachment
                     ...ctx.requestSettings,
                     sessionId,
                     turnId: id,
-                    workspaceId: activeWorkspaceIdRef.current ?? undefined,
+                    workspaceId: saved?.workspaceId ?? activeWorkspaceIdRef.current ?? undefined,
                     message,
                     attachments: promptAttachments,
                     executionMode: mode,
@@ -697,6 +712,7 @@ export function enqueuePrompt(ctx, message, kind, mode, skills, promptAttachment
             return true;
         }
         catch (error) {
+            recordSubmissionError(id, error instanceof Error ? error.message : String(error));
             if (isLikelyBackendDisconnect?.(error)) noteBackendDisconnect?.();
             setStatus(`Queue failed: ${error instanceof Error ? error.message : "Unknown error"}`);
             return false;

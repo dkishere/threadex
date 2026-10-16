@@ -630,6 +630,52 @@
   margin-top: 12px;
 }
 
+.turn-prompt-suggestion {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 6px 6px 6px 10px;
+  border: 1px dashed #d4d4d8;
+  border-radius: 8px;
+  color: #52525b;
+  font-size: 12px;
+}
+
+.turn-prompt-suggestion-icon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: #a1a1aa;
+}
+
+.turn-prompt-suggestion-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.turn-prompt-suggestion .secondary {
+  flex: none;
+  width: auto;
+  min-height: 26px;
+  margin-top: 0;
+  padding: 0 10px;
+  gap: 5px;
+  font-size: 12px;
+}
+
+.turn-prompt-suggestion .secondary svg {
+  width: 13px;
+  height: 13px;
+}
+
+.turn-prompt-suggestion + .turn-issue-tracker {
+  margin-top: 12px;
+}
+
 .plan-step-card {
   display: grid;
   gap: 0;

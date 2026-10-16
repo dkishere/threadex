@@ -45,9 +45,24 @@ export async function loadSideChats(sessionId: string, signal: AbortSignal) {
   )).sideChats;
 }
 
+export type SideChatJob = {
+  id: string; roundId: string; actor: RoundtableActor | null; question: string;
+  model: string; effort: string; replyToId?: string;
+  status: "running" | "error" | "stopped"; error?: string;
+};
+export function loadSideChatState(sessionId: string, signal: AbortSignal) {
+  return apiJson<{ sideChats: SessionSideChat[]; jobs?: SideChatJob[] }>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/side-chats`, { signal, fresh: true });
+}
+
+export function controlSideChat(sessionId: string, jobId: string, action: "stop" | "dismiss") {
+  return apiJson(`/api/sessions/${encodeURIComponent(sessionId)}/side-chats/${encodeURIComponent(jobId)}/control`, { method: "POST", body: { action } });
+}
+
 export async function askSession(body: {
+  requestId?: string;
   sessionId: string; question: string; model: string; modelReasoningEffort: string;
   actor?: RoundtableActor | null; roundId?: string; replyToId?: string; participants?: string[];
 }) {
-  return (await apiJson<{ sideChat: SessionSideChat }>("/api/session-inspector/ask", { method: "POST", body })).sideChat;
+  return apiJson<{ sideChat?: SessionSideChat; jobId?: string }>("/api/session-inspector/ask", { method: "POST", body: { ...body, async: true } });
 }

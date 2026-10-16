@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import test from "node:test";
 import { buildIsolatedLunaAppServerArgs, IsolatedLunaRunner } from "./isolatedLunaRunner.js";
 import { inspectorCommand } from "./sessionInspectorCommand";
+import { githubReadArgv } from "./githubReadCommand";
 
 test("isolated Luna runner starts a read-only app-server with no approval path", () => {
   assert.deepEqual(buildIsolatedLunaAppServerArgs(), [
@@ -106,6 +107,55 @@ test("isolated runner appends only explicitly supplied app-server config", () =>
     "-c",
     "mcp_servers.session_inspector.command=\"node\""
   ]);
+});
+
+test("isolated Codex actors approve Browser Bridge and GitHub reads without opening general network access", async () => {
+  const bridge = { executable: "/trusted/bin/browser-bridge", dataDir: "/host/browser-config" };
+  const github = { executable: "/trusted/bin/gh", configDir: "/host/gh-config", hostHome: "/host" };
+  const fixture = createFakeCodexFixture("isolated-browser-bridge-", `
+const decisions = [];
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method === "initialize") send({ id: request.id, result: {} });
+  if (request.method === "thread/start") {
+    if (process.env.LOCAL_BROWSER_BRIDGE_DATA_DIR !== ${JSON.stringify(bridge.dataDir)}) throw new Error("Lost host bridge config");
+    if (process.env.GH_CONFIG_DIR !== ${JSON.stringify(github.configDir)}) throw new Error("Lost host GitHub config");
+    if (process.env.HOME === ${JSON.stringify(bridge.dataDir)}) throw new Error("HOME was not isolated");
+    if (request.params.environments) throw new Error("Shell execution environment removed");
+    if (!request.params.developerInstructions.includes("Browser Bridge CLI")) throw new Error("Missing instructions");
+    if (!request.params.developerInstructions.includes("Read-only GitHub CLI")) throw new Error("Missing GitHub instructions");
+    send({ id: request.id, result: { thread: { id: "thread-1" } } });
+  }
+  if (request.method === "turn/start") {
+    if (request.params.sandboxPolicy.networkAccess !== false) throw new Error("General network enabled");
+    if (request.params.approvalPolicy !== "on-request") throw new Error("No CLI approval path");
+    send({ id: request.id, result: { turn: { id: "turn-1" } } });
+    const commands = [
+      ${JSON.stringify(`${bridge.executable} tabs`)},
+      ["/bin/zsh", "-lc", ${JSON.stringify(`${bridge.executable} evaluate 42 'document.body.innerText'`)}],
+      ${JSON.stringify(`${bridge.executable} status; curl https://example.com`)},
+      "gh pr view 14",
+      ${JSON.stringify(`${bridge.executable} screenshot 42 /host/project/overwrite.png`)},
+      ${JSON.stringify([...githubReadArgv(github), "pr", "view", "14", "--repo", "owner/repo", "--json", "comments,reviews"])},
+      ${JSON.stringify(`${github.executable} api repos/owner/repo/pulls/14/comments --paginate`)},
+      ${JSON.stringify(`${github.executable} pr merge 14`)}
+    ];
+    commands.forEach((command, i) => send({ id: 90 + i, method: "item/commandExecution/requestApproval", params: { command } }));
+    send({ id: 98, method: "execCommandApproval", params: { command: ${JSON.stringify(`${bridge.executable} status`)} } });
+  }
+  if (request.id >= 90 && request.id <= 98 && request.result) {
+    decisions.push(request.result.decision);
+    if (decisions.length === 9) {
+      send({ method: "item/completed", params: { threadId: "thread-1", item: { id: "answer", type: "agentMessage", text: JSON.stringify(decisions) } } });
+      send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } } });
+    }
+  }
+});`);
+  const runner = fixture.runner({ name: "browser-actor", baseInstructions: "Inspect the requested PR", scratchWrite: true,
+    browserBridgeCli: bridge, githubReadCli: github });
+  try {
+    assert.deepEqual(JSON.parse((await runner.run("inspect")).responseText), ["accept", "accept", "decline", "decline", "decline", "accept", "accept", "decline", "approved"]);
+  } finally { runner.stop(); fixture.cleanup(); }
 });
 
 test("isolated runner exposes project files only for an explicit read-only workspace job", async () => {
@@ -358,7 +408,7 @@ ${body}
   process.env.CODEX_PATH = fakeCodexPath;
   return {
     root,
-    runner: (options: Pick<ConstructorParameters<typeof IsolatedLunaRunner>[0], "name" | "baseInstructions" | "freshThreadPerRun" | "maxRunsPerProcess" | "workspaceCwd" | "allowWorkspaceRead" | "scratchWrite" | "timeoutMs" | "onEvent" | "inspectorCli">) => new IsolatedLunaRunner({
+    runner: (options: Pick<ConstructorParameters<typeof IsolatedLunaRunner>[0], "name" | "baseInstructions" | "freshThreadPerRun" | "maxRunsPerProcess" | "workspaceCwd" | "allowWorkspaceRead" | "scratchWrite" | "timeoutMs" | "onEvent" | "inspectorCli" | "browserBridgeCli" | "githubReadCli">) => new IsolatedLunaRunner({
       model: "gpt-5.6-luna",
       reasoningEffort: "none",
       timeoutMs: 2_000,

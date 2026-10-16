@@ -28,6 +28,8 @@ export type SessionDbConnection = {
   run(sql: string, params?: Record<string, SessionDbValue>): Promise<SessionDbResult>;
   checkpoint(): Promise<void>;
   close(): Promise<void>;
+  /** Serialises schema DDL across processes; concurrent DDL fails with "tuple concurrently updated". */
+  withSchemaLock<T>(operation: () => Promise<T>): Promise<T>;
   startDuckDbUi(assetUrl: string, uiPort: number): Promise<void>;
   stopDuckDbUi(): Promise<void>;
   tryLoadVss(): Promise<boolean>;
@@ -73,7 +75,7 @@ export async function openPostgresSessionConnection(
 ): Promise<SessionDbConnection> {
   const pool = new Pool({ connectionString });
   const connection = new PostgresSessionConnection(pool, schema);
-  await connection.installCompatibilityFunctions();
+  await connection.withSchemaLock(() => connection.installCompatibilityFunctions());
   return connection;
 }
 
@@ -144,6 +146,24 @@ class PostgresSessionConnection implements SessionDbConnection {
 
   async close() {
     await this.pool.end();
+  }
+
+  async withSchemaLock<T>(operation: () => Promise<T>): Promise<T> {
+    const key = `threadex.schema:${this.schema ?? "public"}`;
+    const client = await this.pool.connect();
+    let unlocked = false;
+    try {
+      await client.query("SELECT pg_advisory_lock(hashtext($1))", [key]);
+      try {
+        return await operation();
+      } finally {
+        await client.query("SELECT pg_advisory_unlock(hashtext($1))", [key]);
+        unlocked = true;
+      }
+    } finally {
+      // Discarding the session releases a lock that could not be released explicitly.
+      client.release(!unlocked);
+    }
   }
 
   async startDuckDbUi() {

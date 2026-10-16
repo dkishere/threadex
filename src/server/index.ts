@@ -22,6 +22,7 @@ import { buildAutoModelState, selectAutoModel, shouldEnableAutoModel } from "./a
 import { AutoModelSettings, createAutoModelSettingsRouter } from "./autoModelSettings";
 import { HelperModelSettings, createHelperModelSettingsRouter } from "./helperModelSettings";
 import { RoundtableActorSettings, createRoundtableActorSettingsRouter } from "./roundtableActorSettings";
+import { DiscussionJobs, readJobJson, writeJobJson } from "./discussionJobs";
 import { GlobalAgentInstructions, createGlobalAgentInstructionsRouter } from "./globalAgentInstructions";
 import { RunnerProcessRegistry } from "./runnerProcessRegistry";
 import { clientLayoutInstructions } from "./clientLayoutInstructions";
@@ -110,7 +111,6 @@ import {
 import { LocalBrowserBridgeClient, LocalBrowserBridgeError } from "./localBrowserBridgeClient";
 import { buildStartupSnapshot } from "./startupSnapshot";
 import {
-  answerSessionQuestion,
   answerTransientSessionQuestion,
   isSideChatReasoningEffort,
   stopSessionQuestionRunners
@@ -486,6 +486,8 @@ type RunnerJob = {
   claudeAccountLabel?: string | null;
   claudeConfigDir?: string | null;
   claudeAuthSourceDir?: string | null;
+  /** A signed-in user approved Claude sandbox escapes for this session. */
+  sandboxEscapesApproved?: boolean;
   collaboration?: { groupId: string; fork: CollaborationFork | null; priorContext: string };
   workspaceManager?: boolean;
   managerConcurrent?: boolean;
@@ -617,6 +619,8 @@ type SessionSearchRequest = SessionSearchInput;
 type SessionVectorSearchRequest = SessionVectorSearchInput;
 
 type SessionQuestionRequest = {
+  async?: boolean;
+  requestId?: string;
   sessionId?: string;
   threadId?: string;
   workspaceId?: string;
@@ -1124,7 +1128,9 @@ app.use("/api/settings/helper-models", createHelperModelSettingsRouter(helperMod
 app.use("/api/settings/roundtable-actors", createRoundtableActorSettingsRouter(new RoundtableActorSettings(resolve(dataDir, "roundtable-actors.json"))));
 app.use("/api/settings/global-instructions", createGlobalAgentInstructionsRouter(globalAgentInstructions));
 app.use("/api/quick-chat", createQuickChatRouter(resolve(dataDir, "quick-chat-sessions.json")));
+const discussionJobs = new DiscussionJobs(resolve(dataDir, "discussion-jobs"));
 const roundtableService = new RoundtableService({
+  jobs: discussionJobs,
   logDir: resolve(dataDir, "roundtable-logs"),
   store: sessionStore, summarizerModel: () => helperModelSettings.read().summarizerModel, serverUrl,
   recordUsage: recordBackgroundModelUsage,
@@ -4235,10 +4241,36 @@ app.get("/api/sessions/:sessionId/side-chats", async (req, res) => {
   try {
     const result = await sessionStore.listSessionSideChats(req.params.sessionId);
     if (!result) { res.status(404).json({ error: "Session not found." }); return; }
-    res.json(result);
+    const latest = new Map<string, ReturnType<typeof discussionJobs.list>[number]>();
+    for (const job of discussionJobs.list(req.params.sessionId).filter(job => job.kind === "side-chat").sort((a, b) => a.created.localeCompare(b.created))) {
+      latest.set(`${job.payload.record.roundId ?? job.id}:${job.payload.room.actor?.id ?? "default"}`, job);
+    }
+    const saved = new Set(result.sideChats.map(entry => entry.id));
+    const jobs = [...latest.values()].filter(job => !saved.has(job.id)
+      && !readJobJson(resolve(discussionJobs.path(job.sessionId, job.id), "dismissed.json")))
+      .flatMap(job => {
+        const state = discussionJobs.state(job);
+        if (state.status === "done") return [];
+        return [{ id: job.id, roundId: job.payload.record.roundId ?? job.id, actor: job.payload.room.actor,
+          question: job.payload.question, model: job.payload.model, effort: job.payload.reasoningEffort,
+          replyToId: job.payload.record.replyToId, ...state }];
+      });
+    res.json({ ...result, jobs });
   } catch (error) {
     res.status(500).json({ error: errorMessage(error) });
   }
+});
+
+app.post("/api/sessions/:sessionId/side-chats/:jobId/control", async (req, res) => {
+  try {
+    const job = discussionJobs.list(req.params.sessionId).find(job => job.id === req.params.jobId && job.kind === "side-chat");
+    if (!job) { res.status(404).json({ error: "Side-chat job not found." }); return; }
+    if (req.body.action === "stop") await discussionJobs.stop(job);
+    else if (req.body.action === "dismiss" && discussionJobs.state(job).status !== "running") {
+      writeJobJson(resolve(discussionJobs.path(job.sessionId, job.id), "dismissed.json"), {});
+    } else { res.status(400).json({ error: "Invalid side-chat action." }); return; }
+    res.json({ ok: true });
+  } catch (error) { res.status(500).json({ error: errorMessage(error) }); }
 });
 
 app.get("/api/session-inspector/fork-source/:sessionId/:turnId", async (req, res) => {
@@ -4605,28 +4637,18 @@ app.post("/api/session-inspector/ask", async (
       res.status(404).json({ error: "The side-chat message to reply to was not found." });
       return;
     }
-    const messageId = `side_chat_${crypto.randomUUID()}`;
-    const codexAccount = await sessionCodexAccount(context.session);
-    const answer = await answerSessionQuestion({
-      question,
-      context: { session: context.session },
-      workspace,
-      serverUrl,
-      model: requestedModel,
-      reasoningEffort: requestedEffort,
-      resolveClaudeConfigDir: async () => (await sessionStore.resolveClaudeAccount({
-        workspaceId: context.session.workspaceId, sessionId: context.session.id
-      }))?.configDir ?? null,
-      authRaw: codexAccount.authRaw,
-      room: { actor, participants: participants as string[], history, replyTo, messageId }
-    });
+    if (req.body.requestId !== undefined && (typeof req.body.requestId !== "string" || !/^[a-zA-Z0-9_-]{1,100}$/.test(req.body.requestId))) {
+      res.status(400).json({ error: "Invalid side-chat request ID." }); return;
+    }
+    const messageId = `side_chat_${req.body.requestId
+      ? createHash("sha256").update(JSON.stringify([context.session.id, req.body.requestId])).digest("hex")
+      : crypto.randomUUID()}`;
     const sourceSessionId = req.body.sourceSessionId?.trim()
       ? await resolveRequestedSessionId(req.body.sourceSessionId.trim())
       : null;
     const sourceThreadId = req.body.sourceThreadId?.trim() || null;
     const sourceTurnId = req.body.sourceTurnId?.trim() || null;
-    const sideChat = await sessionStore.recordSessionSideChat({
-      id: messageId,
+    const record = {
       roundId,
       actor: actor ? sideChatActorSnapshot(actor) : null,
       replyToId,
@@ -4636,23 +4658,21 @@ app.post("/api/session-inspector/ask", async (
       sourceThreadId,
       sourceTurnId,
       question,
-      answer: answer.answer,
-      model: answer.model,
       contextTurnCount: context.turnPage.total,
       contextFilter: req.body.q?.trim() || null,
       mode: "isolated_ephemeral_thread"
-    });
-    await recordBackgroundModelUsage({
-      id: `background:session_question:${sideChat.id}`,
-      task: "session_question",
-      source: "app_server",
-      workspaceId: context.session.workspaceId,
-      sessionId: context.session.id,
-      // Claude usage is not attributable to a Codex account.
-      accountId: isClaudeModel(answer.model) ? null : codexAccount.accountId,
-      model: answer.model,
-      usage: answer.usage
-    });
+    };
+    const job = discussionJobs.start({ id: messageId, sessionId: context.session.id, kind: "side-chat",
+      created: new Date().toISOString(), payload: { question, serverUrl, record,
+        requestFingerprint: createHash("sha256").update(JSON.stringify({ question, roundId, replyToId,
+          sourceSessionId, sourceThreadId, sourceTurnId, requestedModel, requestedEffort, actor, participants })).digest("hex"),
+        model: actor?.model ?? requestedModel ?? DEFAULT_MODEL, reasoningEffort: actor?.effort ?? requestedEffort ?? "medium",
+        room: { actor, participants, history, replyTo, messageId } } });
+    if (req.body.async === true) { res.status(202).json({ jobId: job.id }); return; }
+    // Existing inspector clients can still wait synchronously; browser clients reconnect by job ID.
+    while (discussionJobs.state(job).status === "running") await sleep(250);
+    const sideChat = (await sessionStore.listSessionSideChats(context.session.id))?.sideChats.find(entry => entry.id === job.id);
+    if (!sideChat) throw new Error(discussionJobs.state(job).error ?? "Side-chat job stopped without an answer.");
     res.json({
       session: {
         id: context.session.id,
@@ -4663,8 +4683,8 @@ app.post("/api/session-inspector/ask", async (
       },
       question,
       turnCount: context.turnPage.total,
-      model: answer.model,
-      answer: answer.answer,
+      model: sideChat.model,
+      answer: sideChat.answer,
       sideChat
     });
   } catch (error) {
@@ -5653,6 +5673,15 @@ app.post("/api/approvals/:approvalId/decision", async (req: Request<{ approvalId
   } catch (error) {
     console.warn(`Failed to persist approval decision ${approvalId}: ${errorMessage(error)}`);
   }
+  // Later Claude turns reuse this approval; only a signed-in user's decision can grant it.
+  if (decision === "acceptForSession" && readObject(approval.params)?.sandboxEscape === true && res.locals.threadexUserAuthenticated === true) {
+    try {
+      await sessionStore.recordSessionTurnEvent({ id: `${approvalId}:sandbox.escape_grant`, turnId: approval.turnId,
+        sessionId: approval.sessionId, eventName: "sandbox.escape_grant", payload: { approvalId } });
+    } catch (error) {
+      console.warn(`Failed to persist sandbox escape grant ${approvalId}: ${errorMessage(error)}`);
+    }
+  }
 
   const resolvedApprovalIds = resolveApprovalWithRelated(approvalId, decision);
   res.json({ ok: true, resolvedApprovalIds });
@@ -6536,7 +6565,14 @@ void startApiServer();
 const watchdog = setInterval(() => {
   if (watchdogRunning) return;
   watchdogRunning = true;
-  void checkRunningTurns().finally(() => { watchdogRunning = false; });
+  void checkRunningTurns().then(async () => {
+    // Detached discussion workers can release a host into the queue while the
+    // server is offline, including just after its one-time startup queue scan.
+    const pending = await sessionStore.listPendingSessionTurns();
+    for (const sessionId of new Set(pending.filter(item => item.turn.requestMetadata?.roundtable === true).map(item => item.session.id))) {
+      await schedulePendingTurnsForSession(sessionId);
+    }
+  }).catch(error => console.warn("Discussion queue recovery:", errorMessage(error))).finally(() => { watchdogRunning = false; });
 }, runnerWatchdogMs);
 watchdog.unref();
 
@@ -8007,7 +8043,8 @@ async function spawnOwnedPromptRunner(
     ...job,
     turnNumber: (await sessionStore.getSessionTurnReferences({ sessionId: job.sessionId })).find(turn => turn.turnId === job.turnId)?.turnNumber,
     codexHome,
-    ...(claudeConfigDir ? { claudeConfigDir, claudeAuthSourceDir } : {}),
+    ...(claudeConfigDir ? { claudeConfigDir, claudeAuthSourceDir,
+      sandboxEscapesApproved: await sessionStore.hasSessionSandboxEscapeGrant(job.sessionId) } : {}),
     ...(claudeAccount
       ? { claudeAccountId: claudeAccount.id, claudeAccountLabel: claudeAccount.email ? `${claudeAccount.name} (${claudeAccount.email})` : claudeAccount.name }
       : {})
@@ -9470,6 +9507,8 @@ async function processRunnerUpdate(
   update: Required<Pick<RunnerUpdateRequest, "id" | "sessionId" | "turnId" | "event">> & RunnerUpdateRequest,
   options: { refreshRunnerHeartbeat?: boolean } = {}
 ) {
+  // Sandboxed commands can reach this endpoint over loopback; grants come only from user decisions.
+  if (update.event === "sandbox.escape_grant") return;
   await runnerUpdateQueue.run(update.id, async () => {
     const stateApplied = await applyRunnerUpdate(update, options);
     if (stateApplied && update.event === "item" && changedFilePaths(update.data).length) {

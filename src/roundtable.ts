@@ -7,7 +7,7 @@ export type RoundtableAttempt = {
   status: "running" | "done" | "error" | "stopped" | "interrupted";
   eventCount: number; lastEvent: string; error?: string;
 };
-export type RoundtableAnswer = { actor: RoundtableActor; status: "waiting" | "running" | "done" | "error"; text: string; error: string | null; attempts?: RoundtableAttempt[] };
+export type RoundtableAnswer = { actor: RoundtableActor; status: "waiting" | "running" | "done" | "error" | "skipped"; text: string; error: string | null; attempts?: RoundtableAttempt[] };
 export type RoundtableRound = {
   turnId: string; sessionId: string; revision: number; prompt: string; created: string;
   status: "queued" | "context" | "actors" | "host" | "done" | "error" | "stopped";
@@ -16,10 +16,16 @@ export type RoundtableRound = {
   /** Set on a "Next round" without a new user prompt: actors continue the source round's topic. */
   continuation?: { turnId: string; topic: string };
   hostModel: string; hostEffort: string;
-  summary: string; synthesis?: RoundtableSynthesis | null; error: string | null; tokenIn: number; tokenOut: number;
+  summary: string; synthesis?: RoundtableConclusion | null; error: string | null; tokenIn: number; tokenOut: number;
 };
 /** Host output: each issue lists distinct positions and the actors (by name) who hold them. */
-export type RoundtableSynthesis = { issues: { topic: string; positions: { view: string; actors: string[]; details?: { actors: string[]; detail: string }[] }[] }[] };
+export type RoundtableSynthesis = { template?: "decision"; taskType?: "decision"; issues: { topic: string; positions: { view: string; actors: string[]; details?: { actors: string[]; detail: string }[] }[] }[] };
+export type RoundtableSummary = {
+  template: "summary"; taskType: "code_review" | "research" | "summary";
+  overview: string; sections: { title: string; items: { text: string; actors: string[] }[] }[];
+};
+export type RoundtableConclusion = RoundtableSynthesis | RoundtableSummary;
+export const ROUNDTABLE_TASK_LABELS = { decision: "Decision", code_review: "Code review", research: "Research", summary: "Summary" };
 export type RoundtableIssueKind = "consensus" | "disagreement" | "partial";
 
 /** Derived, never model-asserted: consensus needs every actor on one position. */
@@ -74,8 +80,41 @@ export function parseRoundtableSynthesis(text: string, actorNames: string[]): Ro
   return { issues };
 }
 
+/** The host classifies the task before choosing a template. Legacy issues-only output is a decision. */
+export function parseRoundtableConclusion(text: string, actorNames: string[]): RoundtableConclusion | null {
+  const body = text.match(/```(?:json)?\s*([\s\S]*?)```/)?.[1] ?? text;
+  let raw;
+  try { raw = JSON.parse(body.trim()); } catch { return null; }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  if (raw.template === undefined || raw.template === "decision") {
+    if (raw.template === "decision" ? raw.taskType !== "decision" : raw.taskType !== undefined) return null;
+    if (raw.sections !== undefined || raw.overview !== undefined) return null;
+    const decision = parseRoundtableSynthesis(text, actorNames);
+    return decision && (raw.template === "decision" ? { ...decision, taskType: "decision", template: "decision" } : decision);
+  }
+  if (raw.template !== "summary" || !["code_review", "research", "summary"].includes(raw.taskType)
+    || typeof raw.overview !== "string" || !raw.overview.trim() || !Array.isArray(raw.sections) || raw.issues !== undefined) return null;
+  const known = new Set(actorNames);
+  if (!known.size || known.size !== actorNames.length) return null;
+  const sections: RoundtableSummary["sections"] = [];
+  for (const section of raw.sections) {
+    if (typeof section?.title !== "string" || !section.title.trim() || !Array.isArray(section.items) || !section.items.length) return null;
+    const items: RoundtableSummary["sections"][number]["items"] = [];
+    for (const item of section.items) {
+      if (typeof item?.text !== "string" || !item.text.trim() || !Array.isArray(item.actors) || !item.actors.length
+        || item.actors.some((name: unknown) => typeof name !== "string" || !known.has(name))) return null;
+      items.push({ text: item.text.trim(), actors: [...new Set<string>(item.actors)] });
+    }
+    sections.push({ title: section.title.trim(), items });
+  }
+  return { template: "summary", taskType: raw.taskType, overview: raw.overview.trim(), sections };
+}
+
 /** Readable form kept in the host turn for history, search, copy and the next round's context. */
-export function roundtableSynthesisMarkdown(synthesis: RoundtableSynthesis, actorCount: number) {
+export function roundtableSynthesisMarkdown(synthesis: RoundtableConclusion, actorCount: number) {
+  if (synthesis.template === "summary") return [synthesis.overview, ...synthesis.sections.map(section =>
+    `**${section.title}**\n\n${section.items.map(item => `- ${item.text.replace(/\n/g, "\n  ")} — ${item.actors.join(", ")}`).join("\n")}`
+  )].join("\n\n");
   const sections: [RoundtableIssueKind, string][] = [["consensus", "Consensus"], ["disagreement", "Disagreements"], ["partial", "Other points"]];
   return sections.flatMap(([kind, title]) => {
     const issues = synthesis.issues.filter(issue => roundtableIssueKind(issue, actorCount) === kind);

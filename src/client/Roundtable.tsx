@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { CheckCircle2, Users, Loader2, MessageSquare, Plus, Repeat, Scale, Trash2, X } from "lucide-react";
+import { CheckCircle2, Users, Loader2, MessageSquare, Repeat, Scale, X } from "lucide-react";
 import { MODEL_OPTIONS, modelLabel, normalizeModelEffort } from "../modelCatalog";
-import { newRoundtableActor, roundtableEfforts, roundtableIssueKind, roundtableRunning, roundtableStatus, type RoundtableActor, type RoundtableIssueKind, type RoundtableRound, type RoundtableSynthesis } from "../roundtable";
+import { ROUNDTABLE_TASK_LABELS, newRoundtableActor, roundtableEfforts, roundtableIssueKind, roundtableRunning, roundtableStatus, type RoundtableActor, type RoundtableIssueKind, type RoundtableRound, type RoundtableConclusion } from "../roundtable";
 import { apiJson } from "./apiClient";
-import { actorFromPreset, defaultRoundtableActors, syncRoundtableDraftAvatars, roundtableLibraryEndpoint, type RoundtableLibrary, type RoundtablePreset } from "../roundtablePresets";
+import { defaultRoundtableActors, syncRoundtableDraftAvatars, roundtableLibraryEndpoint, type RoundtableLibrary, type RoundtablePreset } from "../roundtablePresets";
+import { ActorMultiSelect } from "./ActorMultiSelect";
 import { MarkdownContent } from "./MarkdownContent";
 import { ActorAvatar } from "./ActorAvatar";
 import { RoundtableActorsPanel } from "./RoundtableActorsPanel";
@@ -13,10 +14,11 @@ import "./Roundtable.css";
 type Draft = { enabled: boolean; actors: RoundtableActor[] };
 const draftKey = (workspaceId: string | null, sessionId: string | null) => `threadex.roundtable:${workspaceId ?? "default"}:${sessionId ?? "new"}`;
 function readDraft(key: string): Draft | null {
-  try { const value = JSON.parse(localStorage.getItem(key) ?? "null"); return value && Array.isArray(value.actors) ? { ...value, enabled: key.endsWith(":new") ? false : value.enabled } : null; }
+  try { const value = JSON.parse(localStorage.getItem(key) ?? "null"); return value && Array.isArray(value.actors) ? { enabled: false, actors: value.actors } : null; }
   catch { return null; }
 }
-function saveDraft(key: string, draft: Draft) { try { localStorage.setItem(key, JSON.stringify(draft)); } catch { /* The in-memory draft still works. */ } }
+// Remember the cast, but require an explicit toggle for each prompt.
+function saveDraft(key: string, draft: Draft) { try { localStorage.setItem(key, JSON.stringify({ actors: draft.actors })); } catch { /* The in-memory draft still works. */ } }
 
 export function useRoundtable({ sessionId, workspaceId, gearProfiles, onChanged }: {
   sessionId: string | null; workspaceId: string | null; gearProfiles: { model: string; effort: string }[];
@@ -74,7 +76,7 @@ export function useRoundtable({ sessionId, workspaceId, gearProfiles, onChanged 
         setView({ sessionId, rounds: data.rounds });
         const last = data.rounds.at(-1);
         if (!readDraft(key) && last) {
-          const restored = { enabled: true, actors: last.answers.map(answer => answer.actor) };
+          const restored = { enabled: false, actors: last.answers.map(answer => answer.actor) };
           saveDraft(key, restored); setDraft({ key, value: restored });
         }
         const revision = data.rounds.map(round => `${round.turnId}:${round.revision}`).join("|");
@@ -121,10 +123,18 @@ export function useRoundtable({ sessionId, workspaceId, gearProfiles, onChanged 
     setActors: (next: RoundtableActor[]) => change({ enabled, actors: next }),
     disable: () => { if (enabled) change({ enabled: false, actors }); },
     adopt: (id: string) => {
-      saveDraft(draftKey(workspaceId, id), { enabled: true, actors });
+      const next = { enabled: false, actors };
+      saveDraft(draftKey(workspaceId, id), next);
+      if (currentKey.current === key) { change(next); setOpen(false); }
       if (!sessionId) { try { localStorage.removeItem(key); } catch { /* Optional draft cleanup. */ } }
     },
     refresh: () => setRefreshToken(token => token + 1),
+    skip: async (round: RoundtableRound, actorId: string) => {
+      try {
+        await apiJson(`/api/roundtable/sessions/${encodeURIComponent(round.sessionId)}/turns/${encodeURIComponent(round.turnId)}/actors/${encodeURIComponent(actorId)}/skip`, { method: "POST", body: {} });
+        setRefreshToken(token => token + 1);
+      } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+    },
     retry: async (round: RoundtableRound) => {
       try {
         await apiJson(`/api/roundtable/sessions/${encodeURIComponent(round.sessionId)}/turns/${encodeURIComponent(round.turnId)}/retry`, { method: "POST", body: { revision: round.revision } });
@@ -139,7 +149,6 @@ export type RoundtableController = ReturnType<typeof useRoundtable>;
 
 export function RoundtableSettings({ controller }: { controller: RoundtableController }) {
   const [editing, setEditing] = useState<string | null>(null);
-  const [selectedPreset, setSelectedPreset] = useState("");
   const [libraryOpen, setLibraryOpen] = useState(false);
   const [anchor, setAnchor] = useState<Element | null>(null);
   const root = useRef<HTMLDivElement>(null);
@@ -166,14 +175,17 @@ export function RoundtableSettings({ controller }: { controller: RoundtableContr
         <button type="button" onClick={() => controller.setOpen(false)} aria-label="Close round table settings"><X /></button></header>
       <div className="roundtable-settings-body">
         <p>Send the topic in the composer. Actors discuss independently; the host brings their points together.</p>
-        <p className="roundtable-note">Actors can read host context, search the web and verify ideas in a private scratch directory. They cannot implement project changes. Settings apply to the next prompt.</p>
+        <p className="roundtable-note">The host identifies the task first: Decision compares choices and differences; Summary brings together code review findings, research and ideas.</p>
+        <p className="roundtable-note">Actors can read host context, search the web and verify ideas in a private scratch directory. They cannot implement project changes. Enable Round table for each prompt; it turns off after sending. Your actors are remembered.</p>
         {controller.error && <p role="alert">{controller.error}</p>}
+        <ActorMultiSelect actors={controller.actors} presets={controller.presets} onChange={controller.setActors}
+          onManage={() => setLibraryOpen(true)} min={2} />
+        <details className="roundtable-customise-actors"><summary>Customise selected actors</summary>
         <div className="roundtable-actor-grid" aria-label="Selected actors">
           {controller.actors.map((actor, index) => <div className="roundtable-actor-tile" key={actor.id}>
             <button type="button" className="roundtable-actor-select" aria-label={`Edit actor ${index + 1}`} aria-expanded={editing === actor.id} onClick={() => setEditing(editing === actor.id ? null : actor.id)}>
               <ActorAvatar actor={actor} /><strong>{actor.name}</strong><small>{modelLabel(actor.model)} · {actor.effort}</small>
             </button>
-            <button type="button" className="roundtable-tile-remove" disabled={controller.actors.length <= 2} aria-label={`Remove actor ${index + 1}`} onClick={() => controller.setActors(controller.actors.filter(item => item.id !== actor.id))}><X size={12} /></button>
           </div>)}
         </div>
         {controller.actors.map((actor, index) => editing === actor.id && <fieldset key={actor.id}><legend>Actor {index + 1}</legend>
@@ -182,13 +194,7 @@ export function RoundtableSettings({ controller }: { controller: RoundtableContr
           <label>Effort<select aria-label={`Actor ${index + 1} effort`} value={actor.effort} onChange={event => change(actor.id, { effort: event.target.value })}>{roundtableEfforts(actor.model).map(effort => <option key={effort} value={effort}>{effort}</option>)}</select></label>
           <label>System prompt<textarea aria-label={`Actor ${index + 1} system prompt`} rows={3} maxLength={8000} value={actor.systemPrompt} onChange={event => change(actor.id, { systemPrompt: event.target.value })} /></label>
         </fieldset>)}
-        <div className="roundtable-preset-picker"><select aria-label="Preset actor" value={selectedPreset} onChange={event => setSelectedPreset(event.target.value)}>
-          <option value="">Choose a saved actor…</option>{controller.presets.map(preset => <option key={preset.id} value={preset.id}>{preset.name} · {modelLabel(preset.model)}</option>)}
-        </select><button type="button" className="roundtable-add" disabled={controller.actors.length >= 8 || !controller.presets.some(preset => preset.id === selectedPreset)} onClick={() => {
-          const preset = controller.presets.find(item => item.id === selectedPreset);
-          if (preset) { controller.setActors([...controller.actors, actorFromPreset(preset)]); setSelectedPreset(""); }
-        }}><Plus size={14} />Add</button></div>
-        <button type="button" className="roundtable-new-preset" onClick={() => setLibraryOpen(true)}><Plus size={14} />Add new actor…</button>
+        </details>
         {latest && <RoundtableTurn round={latest} onRetry={() => void controller.retry(latest)} nextRound={controller.nextRoundFor(latest)} />}
       </div>
     </section>}
@@ -205,9 +211,16 @@ export function RoundtableLibraryPopup({ onClose }: { onClose: () => void }) {
   </dialog>;
 }
 
-function RoundtableAnswers({ round }: { round: RoundtableRound }) {
+function RoundtableAnswers({ round, onSkip }: { round: RoundtableRound; onSkip?: (actorId: string) => Promise<void> }) {
+  const [skipping, setSkipping] = useState<string[]>([]);
   return round.answers.map(answer => <details key={answer.actor.id} className="roundtable-answer">
-    <summary><ActorAvatar actor={answer.actor} /><span>{answer.actor.name}</span><small>{modelLabel(answer.actor.model)} · {answer.actor.effort}</small><span data-status={answer.status}>{answer.status === "running" ? "Thinking…" : answer.status}</span></summary>
+    <summary><ActorAvatar actor={answer.actor} /><span>{answer.actor.name}</span><small>{modelLabel(answer.actor.model)} · {answer.actor.effort}</small><span data-status={answer.status}>{answer.status === "running" ? "Thinking…" : answer.status}</span>
+      {onSkip && ["actors", "error"].includes(round.status) && ["running", "error"].includes(answer.status) && <button type="button" aria-label={`Skip ${answer.actor.name}`} disabled={skipping.includes(answer.actor.id)} onClick={event => {
+        event.preventDefault(); event.stopPropagation();
+        setSkipping(ids => [...ids, answer.actor.id]);
+        void onSkip(answer.actor.id).finally(() => setSkipping(ids => ids.filter(id => id !== answer.actor.id)));
+      }}>{skipping.includes(answer.actor.id) ? "Skipping…" : "Skip"}</button>}
+    </summary>
     {answer.text && <MarkdownContent>{answer.text}</MarkdownContent>}
     {answer.error && <p role="alert">{answer.error}</p>}
     {answer.attempts?.map((attempt, index) => <p className="roundtable-activity" key={attempt.id}>
@@ -260,19 +273,29 @@ function RoundtableContextButton({ round }: { round: RoundtableRound }) {
   </>;
 }
 
-function RoundtableSynthesisCard({ round, synthesis, nextRound }: { round: RoundtableRound; synthesis: RoundtableSynthesis; nextRound?: NextRound }) {
+function RoundtableSynthesisCard({ round, synthesis, nextRound }: { round: RoundtableRound; synthesis: RoundtableConclusion; nextRound?: NextRound }) {
+  const completed = round.answers.filter(answer => answer.status === "done");
   const actors = new Map(round.answers.map(answer => [answer.actor.name, answer.actor]));
   const actorOrder = new Map(round.answers.map((answer, index) => [answer.actor.name, index]));
   const rank = (names: string[]) => Math.min(...names.map(name => actorOrder.get(name) ?? Infinity));
   const byActors = <T extends { actors: string[] },>(items: T[]) => [...items].sort((a, b) => rank(a.actors) - rank(b.actors));
-  const tags = (names: string[]) => <span className="roundtable-supporters" aria-label="Supported by">{[...names].sort((a, b) => rank([a]) - rank([b])).map(name => <span key={name} className="roundtable-supporter">
+  const tags = (names: string[]) => <span className="roundtable-supporters" aria-label={synthesis.template === "summary" ? "Contributors" : "Supported by"}>{[...names].sort((a, b) => rank([a]) - rank([b])).map(name => <span key={name} className="roundtable-supporter">
     {actors.has(name) && <ActorAvatar actor={actors.get(name)!} />}{name}</span>)}</span>;
-  return <section className="roundtable-turn roundtable-synthesis" aria-label="Round table synthesis" data-status={round.status}>
-    <header><Users aria-hidden="true" /><strong>Round table</strong><small>{round.answers.length} actors · {synthesis.issues.length} topics</small>
+  return <section className="roundtable-turn roundtable-synthesis" aria-label="Round table synthesis" data-status={round.status} data-template={synthesis.template ?? "decision"}>
+    <header><Users aria-hidden="true" /><strong>Round table</strong><small>{round.answers.length} actors · {synthesis.template === "summary" ? `${synthesis.sections.reduce((count, section) => count + section.items.length, 0)} points` : `${synthesis.issues.length} topics`}</small>
+      <span className="roundtable-template">{ROUNDTABLE_TASK_LABELS[synthesis.taskType ?? "decision"]}{synthesis.template === "summary" && synthesis.taskType !== "summary" ? " · Summary" : ""}</span>
       <RoundtableContextButton round={round} />
       <span className="roundtable-cast">{round.answers.map(answer => <ActorAvatar key={answer.actor.id} actor={answer.actor} />)}</span></header>
-    {SYNTHESIS_GROUPS.map(({ kind, title, Icon }) => {
-      const issues = synthesis.issues.filter(issue => roundtableIssueKind(issue, round.answers.length) === kind);
+    {synthesis.template === "summary" ? <>
+      <MarkdownContent className="roundtable-overview">{synthesis.overview}</MarkdownContent>
+      {synthesis.sections.map((section, index) => <section key={index} className="roundtable-group roundtable-summary-group" aria-label={section.title}>
+        <h4>{section.title}<small>{section.items.length}</small></h4>
+        <ul>{section.items.map((item, itemIndex) => <li key={itemIndex} className="roundtable-summary-item">
+          <MarkdownContent>{item.text}</MarkdownContent>{tags(item.actors)}
+        </li>)}</ul>
+      </section>)}
+    </> : SYNTHESIS_GROUPS.map(({ kind, title, Icon }) => {
+      const issues = synthesis.issues.filter(issue => roundtableIssueKind(issue, completed.length) === kind);
       return issues.length > 0 && <section key={kind} className="roundtable-group" data-kind={kind} aria-label={title}>
         <h4><Icon aria-hidden="true" />{title}<small>{issues.length}</small></h4>
         <ul>{issues.map((issue, index) => <li key={index} className="roundtable-issue">
@@ -287,8 +310,8 @@ function RoundtableSynthesisCard({ round, synthesis, nextRound }: { round: Round
               </div>
               : <span key={detailIndex}>{tags(item.actors)}</span>)}
           </div>)}</div>
-          {round.answers.some(answer => !issue.positions.some(position => position.actors.includes(answer.actor.name))) &&
-            <p className="roundtable-unaddressed">No position recorded: {round.answers.filter(answer => !issue.positions.some(position => position.actors.includes(answer.actor.name))).map(answer => answer.actor.name).join(", ")}</p>}
+          {completed.some(answer => !issue.positions.some(position => position.actors.includes(answer.actor.name))) &&
+            <p className="roundtable-unaddressed">No position recorded: {completed.filter(answer => !issue.positions.some(position => position.actors.includes(answer.actor.name))).map(answer => answer.actor.name).join(", ")}</p>}
         </li>)}</ul>
       </section>;
     })}
@@ -298,13 +321,13 @@ function RoundtableSynthesisCard({ round, synthesis, nextRound }: { round: Round
 }
 
 /** `nextRound` is offered only for the session's latest completed round. */
-export function RoundtableTurn({ round, onRetry, nextRound }: { round: RoundtableRound; onRetry: () => void; nextRound?: NextRound }) {
+export function RoundtableTurn({ round, onRetry, onSkip, nextRound }: { round: RoundtableRound; onRetry: () => void; onSkip?: (actorId: string) => Promise<void>; nextRound?: NextRound }) {
   if (round.status === "done" && round.synthesis) return <RoundtableSynthesisCard round={round} synthesis={round.synthesis} nextRound={nextRound} />;
   const working = roundtableRunning(round);
   return <section className="roundtable-turn" aria-label="Round table progress" data-status={round.status}>
     <header>{working ? <Loader2 className="spin" aria-hidden="true" /> : <Users aria-hidden="true" />}<strong>Round table</strong><span role="status">{roundtableStatus(round)}</span>{round.status === "done" && <RoundtableContextButton round={round} />}</header>
     <ol className="roundtable-stages"><li data-active={round.status === "context"}>Preparing context</li><li data-active={round.status === "actors"}>Actors thinking</li><li data-active={round.status === "host"}>Concluding</li></ol>
-    <RoundtableAnswers round={round} />
+    <RoundtableAnswers round={round} onSkip={onSkip} />
     {round.error && <p className="roundtable-error" role="alert">{round.error}</p>}
     {["error", "stopped"].includes(round.status) && <button type="button" onClick={onRetry}>Retry unfinished work</button>}
     {round.status === "done" && <NextRoundButton nextRound={nextRound} />}
