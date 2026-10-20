@@ -15,6 +15,9 @@ export type SubagentTranscriptTurn = {
 export type SubagentTranscriptResponse = {
   sessionId: string;
   threadId: string;
+  model?: string;
+  reasoningEffort?: string;
+  delegatedPrompt?: string;
   turns: SubagentTranscriptTurn[];
 };
 
@@ -22,7 +25,10 @@ type AppServerThread = {
   id: string;
   sessionId: string | null;
   parentThreadId: string | null;
+  forkedFromId: string | null;
   path: string | null;
+  model: string | null;
+  reasoningEffort: string | null;
   turns: unknown[];
 };
 
@@ -67,7 +73,10 @@ export function readAppServerThread(result: unknown): AppServerThread | null {
     id,
     sessionId: boundedIdentifier(thread.sessionId),
     parentThreadId: boundedIdentifier(thread.parentThreadId),
+    forkedFromId: boundedIdentifier(thread.forkedFromId),
     path: boundedString(thread.path, 4_096) || null,
+    model: boundedString(thread.model, 256) || null,
+    reasoningEffort: boundedString(thread.reasoningEffort, 128) || null,
     turns: Array.isArray(thread.turns) ? thread.turns : []
   };
 }
@@ -195,9 +204,20 @@ export function normalizeSubagentTranscript(input: {
     turn.items = mergeItemsById([...turn.items, item]);
   }
 
+  const delegatedInput = thread.forkedFromId ? undefined : turns.flatMap((turn) => turn.items)
+    .find((item) => item.itemType === "agent_message" && item.phase === "delegated_task");
+  const recordedPrompt = Object.values(input.liveItemsByTurn ?? {}).flat().map(readObject)
+    .find((item) => item?.itemType === "subagent" && item.tool === "record_spawn_prompt"
+      && Array.isArray(item.receiverThreadIds) && item.receiverThreadIds.includes(input.threadId)
+      && typeof item.prompt === "string")?.prompt;
+
   return {
     sessionId: input.sessionId,
     threadId: input.threadId,
+    ...(thread.model ? { model: thread.model } : {}),
+    ...(thread.reasoningEffort ? { reasoningEffort: thread.reasoningEffort } : {}),
+    ...(delegatedInput?.itemType === "agent_message" ? { delegatedPrompt: delegatedInput.text } : {}),
+    ...(typeof recordedPrompt === "string" ? { delegatedPrompt: boundedString(recordedPrompt, MAX_TEXT_CHARS) } : {}),
     turns: boundTranscriptTurns(turns)
   };
 }

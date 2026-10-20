@@ -5,6 +5,57 @@ import { formatResponseAnnotationsPrompt, parseResponseAnnotations, type Respons
 import { mockSubmissionStorage } from "./pendingSubmissions.testSupport";
 import { acknowledgeSubmissionEvent, isSubmissionSending, readPendingSubmissions, savePendingSubmission } from "./pendingSubmissions";
 import { toSessionPageState } from "./sessionUtils";
+import { emptyComposerDraft, isEmptyComposerDraft, normalizeComposerDraft } from "./sessionHelpers03";
+
+test("Managed mode survives an otherwise empty draft and older drafts default off", () => {
+  const ctx = { emptyComposerDraft: () => emptyComposerDraft({}) };
+  assert.equal(normalizeComposerDraft(ctx, { input: "" }).managedMode, false);
+  const draft = normalizeComposerDraft(ctx, { managedMode: true });
+  assert.equal(draft.managedMode, true);
+  assert.equal(isEmptyComposerDraft({}, draft), false);
+  assert.equal(isEmptyComposerDraft({}, emptyComposerDraft({})), true);
+});
+
+test("Managed mode does not prepend instructions to any submitted message", async () => {
+  for (const route of ["direct", "queue", "fork", "steer", "off", "roundtable", "concurrent"]) {
+    let sent = "";
+    const capture = async (message: string) => { sent = message; };
+    await submit({
+      managedMode: route !== "off", input: "Execute the plan", attachments: [], selectedSkills: [],
+      composerSessionLinks: [], composerResponseQuote: null, executionMode: "default",
+      composerMode: route === "steer" ? "steer" : "queue",
+      currentSessionIsRunning: ["queue", "fork", "steer"].includes(route),
+      forkNextPrompt: route === "fork", sessionIdRef: { current: `managed-${route}` },
+      replaceComposerLinkTokens: (value: string) => value,
+      startChatTurn: capture, queuePrompt: capture, enqueuePrompt: capture, steerPrompt: capture,
+      roundtableEnabled: route === "roundtable", startRoundtable: capture,
+      concurrentSourceTurnId: route === "concurrent" ? "source" : null, startConcurrent: capture,
+      setComposerForkNextPrompt() {}
+    }, undefined);
+    assert.equal(sent, "Execute the plan", route);
+  }
+});
+
+test("fork keeps loop on the child route and passes round table fork intent", async () => {
+  for (const running of [false, true]) for (const mode of ["default", "loop", "roundtable"]) {
+    const calls: unknown[][] = [];
+    const ctx = {
+      input: "Child work", attachments: [], selectedSkills: [], composerSessionLinks: [],
+      replaceComposerLinkTokens: (value: string) => value, sessionIdRef: { current: "fork-mode-test" },
+      currentSessionIsRunning: running, composerMode: "queue", forkNextPrompt: true,
+      executionMode: mode === "loop" ? "loop" : "default", roundtableEnabled: mode === "roundtable",
+      startRoundtable: async (...args: unknown[]) => { calls.push(["roundtable", ...args]); },
+      startChatTurn: async (...args: unknown[]) => { calls.push(["chat", ...args]); },
+      enqueuePrompt: async (...args: unknown[]) => { calls.push(["queue", ...args]); },
+      setComposerExecutionMode() {}, setComposerForkNextPrompt() {}
+    };
+    await submit(ctx, undefined);
+    assert.deepEqual(calls, mode === "roundtable"
+      ? [["roundtable", "Child work", [], [], true]]
+      : running ? [["queue", "Child work", "queue", mode, [], [], true, undefined]]
+        : [["chat", "Child work", [], mode, [], true, undefined]]);
+  }
+});
 
 test("adding and submitting multiple quotes preserves each source and annotation", async t => {
   const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
@@ -137,7 +188,7 @@ test("retry preserves original ID, prompt, attachments and model while persistin
   mockSubmissionStorage(t);
   savePendingSubmission({ id: "original", turnId: "original", sessionId: "session", workspaceId: "workspace",
     kind: "prompt", message: "俾個好D既outliner role prompt", createdAt: "2026-10-13T16:49:25Z",
-    attachments: [{ name: "context.txt" }], settings: { modelPreferences: { selectedModel: "gpt-6-astra", selectedEffort: "xhigh" }, approvalPolicy: "granular" } });
+    attachments: [{ name: "context.txt" }], settings: { managedMode: true, modelPreferences: { selectedModel: "gpt-6-astra", selectedEffort: "xhigh" }, approvalPolicy: "granular" } });
   let body: Record<string, unknown> = {};
   t.mock.method(globalThis, "fetch", async (_url: string, options?: RequestInit) => {
     body = JSON.parse(String(options?.body));
@@ -147,6 +198,8 @@ test("retry preserves original ID, prompt, attachments and model while persistin
   assert.equal(body.turnId, "original");
   assert.equal(body.sessionId, "session");
   assert.equal(body.message, "俾個好D既outliner role prompt");
+  assert.equal(body.managedMode, true);
+  assert.equal(readPendingSubmissions()[0].settings.managedMode, true);
   assert.equal(body.model, "gpt-6-astra");
   assert.equal(body.modelReasoningEffort, "xhigh");
   assert.equal(body.approvalPolicy, "granular");
@@ -166,6 +219,21 @@ test("a failure before fetch remains recoverable and releases sending state", as
   await startChatTurn(ctx, "keep this", [], "default", [], false, false, false);
   assert.equal(readPendingSubmissions()[0].lastError, "View setup failed");
   assert.equal(isSubmissionSending("session"), false);
+});
+
+test("Managed mode is saved and posted as metadata while the user message stays unchanged", async t => {
+  mockSubmissionStorage(t);
+  const ctx = { ...recoveryContext(), managedMode: true };
+  let body: Record<string, unknown> = {};
+  t.mock.method(globalThis, "fetch", async (_url: string, options?: RequestInit) => {
+    body = JSON.parse(String(options?.body));
+    return new Response("");
+  });
+  await startChatTurn(ctx, "Execute the plan", [], "default", [], false, false, false);
+  assert.equal(body.message, "Execute the plan");
+  assert.equal(body.managedMode, true);
+  assert.equal(readPendingSubmissions()[0].message, "Execute the plan");
+  assert.equal(readPendingSubmissions()[0].settings.managedMode, true);
 });
 
 test("start ack releases the composer while the response stream is still open", async t => {
@@ -269,7 +337,7 @@ test("retrying a saved queue item retains its ID, settings and draft through fai
     id: "saved-queue", turnId: "saved-queue", sessionId: "session", workspaceId: "original-workspace",
     kind: "prompt" as const, createdAt: "2026-10-15T08:50:28Z", message: "Original queued prompt",
     attachments: [{ name: "context.txt" }], settings: {
-      queued: true, model: "claude-opus-5-5", modelReasoningEffort: "high", approvalPolicy: "granular",
+      queued: true, managedMode: true, model: "claude-opus-5-5", modelReasoningEffort: "high", approvalPolicy: "granular",
       executionMode: "goal", forcePlan: true, contextFork: true, skills: [{ name: "original-skill", path: "/skill" }]
     }
   };

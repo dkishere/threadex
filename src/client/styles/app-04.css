@@ -843,8 +843,9 @@
 .prompt-turn-copy { display: -webkit-box; align-self: center; overflow: hidden; font-size: 12px; line-height: 1.45; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
 .prompt-turn-copy > p { margin: 0; }
 .prompt-turn-summary { display: grid; align-content: start; gap: 3px; min-width: 0; }
-.prompt-turn-tags { gap: 4px; margin: 0; }
-.prompt-turn-tags .prompt-tag { min-height: 16px; padding: 0 5px; font-size: 9px; }
+.prompt-tags.prompt-turn-tags { align-items: center; gap: 4px; margin: 0; }
+.prompt-turn-tags .prompt-tag { min-height: 16px; padding: 0 5px; gap: 3px; font-size: 9px; }
+.prompt-turn-tags .prompt-tag svg { display: block; flex: 0 0 auto; width: 11px; height: 11px; }
 .prompt-turn-actions { display: flex; justify-content: flex-end; gap: 3px; margin-top: 0; }
 .prompt-turn-details > .prompt-turn-actions { grid-column: -2 / -1; justify-self: end; }
 .prompt-turn-actions .message-action-icon { width: 24px; height: 24px; border: 0; border-radius: 5px; background: transparent; color: #71717a; }

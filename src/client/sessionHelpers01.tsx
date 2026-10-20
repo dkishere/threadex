@@ -660,6 +660,13 @@ export function timelineAnchorId(ctx, messageId, entryId) {
 export function compactTimelineEntries(ctx, segments) {
     const { compactLiveItemGroup } = ctx;
     const entries = [];
+    // Child-attributed messages and tool activity belong inside their agent
+    // card. Keep the underlying events for the lazily loaded child transcript.
+    const childThreadIds = new Set(segments.flatMap((segment) =>
+        segment.type === "live" && segment.item.itemType === "subagent"
+            ? segment.item.receiverThreadIds ?? [] : []));
+    segments = segments.filter((segment) => segment.type !== "live" ||
+        !segment.item.originThreadId || !childThreadIds.has(segment.item.originThreadId));
     const subagentItems = segments.flatMap((segment) => segment.type === "live" && segment.item.itemType === "subagent"
         ? [{ id: segment.id, item: segment.item }]
         : []);
@@ -711,6 +718,13 @@ function groupSubagentItems(items) {
     const records = items.flatMap(({ id, item }) => {
         const agents = Array.isArray(item.agents) ? item.agents : [];
         const receiverThreadIds = [...new Set((item.receiverThreadIds ?? []).filter(Boolean))];
+        if (item.tool === "spawn_agent" && receiverThreadIds.length === 0 && agents.length === 1) {
+            return [{
+                segmentId: id,
+                aliases: [`identity:${item.id}`],
+                item: { ...item, agents }
+            }];
+        }
         if (receiverThreadIds.length > 0) {
             return receiverThreadIds.map((threadId) => {
                 const agent = agents.find((candidate) => candidate.id === threadId) ??
@@ -743,7 +757,8 @@ function groupSubagentItems(items) {
 
         const label = item.label?.trim();
         if (!label) return [];
-        const agent = agents.find((candidate) => candidate.name === label || candidate.id === label);
+        const agent = agents.find((candidate) => candidate.name === label || candidate.id === label) ||
+            (agents.length === 1 ? agents[0] : undefined);
         const aliases = [`name:${label}`];
         if (agent?.id) aliases.push(`identity:${agent.id}`);
         return [{
@@ -785,8 +800,8 @@ function groupSubagentItems(items) {
 
     return [...groupedRecords.values()].map((group) => {
         const activityUpdates = group.map(({ item }) => item);
-        const latestItem = activityUpdates.at(-1);
-        const labels = activityUpdates.map((item) => item.label?.trim()).filter(Boolean);
+        const latestItem = activityUpdates.filter((item) => !["record_spawn_prompt", "record_followup_prompt"].includes(item.tool)).at(-1) ?? activityUpdates.at(-1);
+        const labels = activityUpdates.filter((item) => !["record_spawn_prompt", "record_followup_prompt"].includes(item.tool)).map((item) => item.label?.trim()).filter(Boolean);
         const receiverThreadIds = [...new Set(activityUpdates.flatMap((item) => item.receiverThreadIds ?? []))];
         const agentUpdates = new Map();
         for (const item of activityUpdates) {

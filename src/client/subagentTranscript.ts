@@ -23,6 +23,9 @@ export type SubagentTranscriptTurn = {
 export type SubagentTranscriptPayload = {
   sessionId: string;
   threadId: string;
+  model?: string;
+  reasoningEffort?: string;
+  delegatedPrompt?: string;
   turns: SubagentTranscriptTurn[];
   partial?: boolean;
   source?: string;
@@ -104,6 +107,9 @@ export function parseSubagentTranscriptPayload(value: unknown): SubagentTranscri
   return {
     sessionId: value.sessionId,
     threadId: value.threadId,
+    model: typeof value.model === "string" ? value.model : undefined,
+    reasoningEffort: typeof value.reasoningEffort === "string" ? value.reasoningEffort : undefined,
+    delegatedPrompt: typeof value.delegatedPrompt === "string" ? value.delegatedPrompt : undefined,
     turns,
     partial: value.partial === true ? true : undefined,
     source: typeof value.source === "string" ? value.source : undefined,

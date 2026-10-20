@@ -7,6 +7,29 @@ import { IntentApprovals } from "./intentApprovals";
 
 const cliPath = resolve(import.meta.dirname, "../../scripts/session-inspector.mjs");
 
+test("subagent prompt recording binds the current host turn and preserves multiline text", async () => {
+  let received: any;
+  const server = createServer(async (req, res) => {
+    let body = ""; for await (const chunk of req) body += chunk;
+    received = { path: req.url, body: JSON.parse(body) };
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ ok: true }));
+  });
+  await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
+  const address = server.address(); assert.ok(address && typeof address === "object");
+  const prompt = "檢查 src/main.ts\n保留 `pwd` 原文。";
+  try {
+    const result = await runCli(["record_subagent_prompt", JSON.stringify({
+      threadId: "child", kind: "spawn", prompt, sessionId: "wrong", turnId: "wrong"
+    })], { RUNNER_SERVER_URL: `http://127.0.0.1:${address.port}`, THREADEX_SESSION_ID: "owner",
+      THREADEX_TURN_ID: "turn", THREADEX_CONTINUITY_ONLY: "1", THREADEX_TODO_AGENT_ROLE: "default" });
+    assert.equal(result.code, 0, result.stderr);
+    assert.deepEqual(received, { path: "/api/subagent-prompts", body: {
+      threadId: "child", kind: "spawn", prompt, sessionId: "owner", turnId: "turn"
+    } });
+  } finally { server.closeAllConnections(); await new Promise<void>(done => server.close(() => done())); }
+});
+
 test("Manager connection failure reports its cause and exact escalation entrypoint", async () => {
   const server = createServer();
   await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
@@ -149,12 +172,15 @@ test("context-fork CLI loads source attachments via HTTP and preserves the sourc
   try {
     const result = await runCli(["create_task", '{"prompt":"Prepared handoff"}'], {
       RUNNER_SERVER_URL: `http://127.0.0.1:${address.port}`, THREADEX_CONTEXT_FORK_REQUEST: "1",
+      THREADEX_CHILD_MANAGED_MODE: "1", THREADEX_CHILD_EXECUTION_MODE: "loop",
       THREADEX_SESSION_ID: "source", THREADEX_TURN_ID: "turn-source", THREADEX_APPROVAL_POLICY: "granular"
     });
     assert.equal(result.code, 0, result.stderr);
     assert.equal(childBody.approvalPolicy, "granular");
     assert.equal(childBody.startImmediately, true);
     assert.equal(childBody.contextFork, true);
+    assert.equal(childBody.managedMode, true);
+    assert.equal(childBody.executionMode, "loop");
     assert.match(childBody.prompt, /Canonical user request/);
     assert.deepEqual(childBody.attachments, [{ name: "reference.png", type: "image/png", path: "/tmp/reference.png" }]);
   } finally { await new Promise<void>(done => server.close(() => done())); }
@@ -451,6 +477,7 @@ test("recover_current_session reads completed turns from the managed session wit
     const listed = await rpc(2, "tools/list");
     const listedResult = listed.result as { tools?: Array<{ name?: string }> };
     assert.deepEqual(listedResult.tools?.map((tool) => tool.name), [
+      "record_subagent_prompt",
       "recover_current_session",
       "get_session",
       "search_sessions"

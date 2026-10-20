@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { USER_INPUT_METHOD } from "../userInputRequest";
+import { managedModeTurnInstructions } from "../managedMode";
 import { inspectorCommand } from "./sessionInspectorCommand";
 import { withProviderHandoff } from "./sessionProviderThreads";
 import {
@@ -67,6 +68,83 @@ function context(overrides: Partial<ClaudeRunnerContext> = {}) {
 
 const init = { type: "system", subtype: "init", session_id: "claude-123", model: "claude-opus-5-5" };
 const success = (text: string) => ({ type: "result", subtype: "success", is_error: false, result: text, total_cost_usd: 0.01, usage: { input_tokens: 100, output_tokens: 20 } });
+
+test("Fable 5.1 reaches the Claude SDK unchanged for new and resumed turns", async () => {
+  for (const threadId of [null, "claude:claude-123"]) {
+    const seen: { options?: Record<string, unknown>; prompts: any[] } = { prompts: [] };
+    const { ctx, emitted } = context({ model: "claude-fable-5-1", reasoningEffort: "max", threadId });
+    await runClaudeTurn(ctx, fakeSdk(async function* () {
+      yield { ...init, model: "claude-fable-5-1" };
+      yield success("Done");
+    }, seen));
+    assert.equal(seen.options?.model, "claude-fable-5-1");
+    assert.equal(seen.options?.effort, "max");
+    assert.equal(seen.options?.resume, threadId ? "claude-123" : undefined);
+    assert.equal(emitted.find(entry => entry.event === "result")?.data.reply, "Done");
+    assert.equal(emitted.at(-1)?.event, "done");
+  }
+});
+
+test("Claude resume receives current Managed state after an enabled turn", async () => {
+  for (const enabled of [true, false]) {
+    const seen: { options?: any; prompts: any[] } = { prompts: [] };
+    const { ctx } = context({
+      threadId: enabled ? null : "claude:claude-123",
+      appendSystemPrompt: managedModeTurnInstructions(enabled, enabled ? "on" : "off")
+    });
+    await runClaudeTurn(ctx, fakeSdk(async function* () {
+      yield init;
+      yield success("Done");
+    }, seen));
+    assert.match(seen.options.systemPrompt.append, enabled ? /Managed mode: ON/ : /Managed mode: OFF/);
+    if (!enabled) {
+      assert.equal(seen.options.resume, "claude-123");
+      assert.match(seen.options.systemPrompt.append, /supersedes Managed mode policies/);
+    }
+  }
+});
+
+test("Claude native child startup gets a snapshot even without Managed mode", async () => {
+  const seen: { options?: any; prompts: any[] } = { prompts: [] };
+  const { ctx } = context();
+  await runClaudeTurn(ctx, fakeSdk(async function* () {
+    yield init;
+    const hook = seen.options.hooks.SubagentStart[0].hooks[0];
+    const result = await hook({ cwd: process.cwd() });
+    assert.equal(result.hookSpecificOutput.hookEventName, "SubagentStart");
+    assert.ok(result.hookSpecificOutput.additionalContext.includes(`pwd: ${process.cwd()}`));
+    assert.match(result.hookSpecificOutput.additionalContext, /Do not repeat/);
+    assert.ok(seen.options.hooks.PreToolUse, "existing approval hook is preserved");
+    yield success("Done");
+  }, seen));
+});
+
+test("Claude runner publishes native Agent and Task cards with delegated prompts and requested models", async () => {
+  const { ctx, emitted } = context();
+  await runClaudeTurn(ctx, fakeSdk(async function* () {
+    yield init;
+    for (const name of ["Agent", "Task"]) {
+      const id = `delegate-${name}`;
+      yield { type: "assistant", message: { id: `message-${name}`, content: [{
+        type: "tool_use", id, name,
+        input: { description: "Inspect the implementation", prompt: `Full ${name} brief\nKeep the second line.`, model: "sonnet", subagent_type: "general-purpose" }
+      }] } };
+      yield { type: "assistant", parent_tool_use_id: id, message: { id: `child-${name}`, content: [{ type: "text", text: "Internal child progress" }] } };
+      yield { type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, content: "Review completed" }] } };
+    }
+    yield success("Done");
+  }, { prompts: [] }));
+  for (const name of ["Agent", "Task"]) {
+    const cards = emitted.filter(entry => entry.event === "item" && entry.data.itemType === "subagent" && entry.data.id === `delegate-${name}`);
+    assert.ok(cards.some(entry => entry.data.eventType === "item.started"));
+    const completed = cards.find(entry => entry.data.eventType === "item.completed");
+    assert.ok(completed);
+    assert.equal(completed.data.prompt, `Full ${name} brief\nKeep the second line.`);
+    assert.equal(completed.data.model, "sonnet");
+    assert.equal(completed.data.agents[0].message, "Review completed");
+  }
+  assert.ok(!emitted.some(entry => entry.event === "item" && entry.data.text === "Internal child progress"));
+});
 
 test("read-only Claude planners can invoke their CLI command but cannot escalate other shell work", async () => {
   const { ctx, approvals } = context({ readOnly: true, permissionMode: "plan", approvedInspectorCommands: ["todo_set_plan"] });

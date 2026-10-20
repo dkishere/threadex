@@ -234,6 +234,8 @@ export function sessionTurnsToMessages(ctx, turns, title, existingMessages = [],
                 startupSnapshot: index === 0 ? existingUserMessage?.startupSnapshot : undefined,
                 developerInstructions,
                 forcePlan: existingUserMessage?.forcePlan === true || developerInstructionsIndicateForcePlan(developerInstructions),
+                managedMode: typeof turn.requestMetadata?.managedMode === "boolean"
+                    ? turn.requestMetadata.managedMode : existingUserMessage?.managedMode === true,
                 contextFork: existingUserMessage?.contextFork === true || inferredContextFork || promptMetadata.contextFork,
                 executionMode: turn.loopMode ? "loop" : hasGoalMode ? "goal" : existingUserMessage?.executionMode
             },
@@ -836,6 +838,7 @@ export function emptyComposerDraft(ctx, ) {
     return {
         input: "",
         forcePlanNextPrompt: false,
+        managedMode: false,
         executionMode: "default",
         forkNextPrompt: false
     };
@@ -857,6 +860,7 @@ export function normalizeComposerDraft(ctx, value) {
     return {
         input: typeof candidate.input === "string" ? candidate.input : "",
         forcePlanNextPrompt: candidate.forcePlanNextPrompt === true,
+        managedMode: candidate.managedMode === true,
         executionMode,
         forkNextPrompt: candidate.forkNextPrompt === true
     };
@@ -867,6 +871,7 @@ export function isEmptyComposerDraft(ctx, draft) {
     const {  } = ctx;
     return (draft.input.length === 0 &&
         draft.forcePlanNextPrompt === false &&
+        draft.managedMode !== true &&
         draft.executionMode === "default" &&
         draft.forkNextPrompt === false);
 

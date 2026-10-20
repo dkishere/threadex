@@ -9,6 +9,9 @@ function threadResult(input: {
   id: string;
   parentThreadId?: string | null;
   sessionId?: string;
+  model?: string;
+  reasoningEffort?: string;
+  forkedFromId?: string;
   turns?: unknown[];
 }) {
   return {
@@ -16,6 +19,9 @@ function threadResult(input: {
       id: input.id,
       parentThreadId: input.parentThreadId ?? null,
       sessionId: input.sessionId ?? "tree-1",
+      model: input.model,
+      reasoningEffort: input.reasoningEffort,
+      forkedFromId: input.forkedFromId,
       path: `/codex/sessions/${input.id}.jsonl`,
       turns: input.turns ?? []
     }
@@ -58,6 +64,8 @@ test("subagent transcript exposes delegated input and reasoning and merges only 
     threadReadResult: threadResult({
       id: "child-thread",
       parentThreadId: "root-thread",
+      model: "gpt-6-sol",
+      reasoningEffort: "high",
       turns: [{
         id: "child-turn",
         status: "completed",
@@ -122,6 +130,9 @@ test("subagent transcript exposes delegated input and reasoning and merges only 
 
   assert.equal(result.sessionId, "session-1");
   assert.equal(result.threadId, "child-thread");
+  assert.equal(result.model, "gpt-6-sol");
+  assert.equal(result.reasoningEffort, "high");
+  assert.equal(result.delegatedPrompt, "Inspect the server flow.");
   assert.equal(result.turns.length, 1);
   const items = result.turns[0].items;
   assert.deepEqual(items.map((item) => item.id), ["delegated-1", "reasoning-1", "answer-1", "command-1", "compact-1"]);
@@ -130,6 +141,24 @@ test("subagent transcript exposes delegated input and reasoning and merges only 
   assert.equal(items[1].itemType === "reasoning" ? items[1].text : null, "Checked ingestion.\nFound the dropped attribution.");
   assert.equal(items[2].itemType === "agent_message" ? items[2].text : null, "Persisted child answer.");
   assert.equal(items.every((item) => item.originThreadId === "child-thread"), true);
+});
+
+test("forked child history is not presented as its assigned prompt", () => {
+  const result = normalizeSubagentTranscript({
+    sessionId: "session-1",
+    threadId: "child-thread",
+    threadReadResult: threadResult({
+      id: "child-thread",
+      parentThreadId: "root-thread",
+      forkedFromId: "ancestor-turn",
+      turns: [{ id: "child-turn", items: [{
+        id: "inherited-user-message",
+        type: "userMessage",
+        content: [{ type: "text", text: "Old parent prompt" }]
+      }] }]
+    })
+  });
+  assert.equal(result.delegatedPrompt, undefined);
 });
 
 test("subagent transcript bounds item count and long message text", () => {

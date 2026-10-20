@@ -30,6 +30,19 @@ function alive(pid: number) {
 /** The server observes these workers; it does not own their lifetime. No account secrets go in jobs. */
 export class DiscussionJobs {
   constructor(readonly directory: string, private worker = fileURLToPath(new URL("./discussionWorker.ts", import.meta.url))) {}
+  runningSideChatSessionIds(): string[] {
+    if (!existsSync(this.directory)) return [];
+    const sessions = new Set<string>();
+    for (const session of readdirSync(this.directory, { withFileTypes: true })) {
+      if (!session.isDirectory()) continue;
+      for (const entry of readdirSync(resolve(this.directory, session.name), { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const job = readJobJson<DiscussionJob>(resolve(this.directory, session.name, entry.name, "job.json"));
+        if (job?.kind === "side-chat" && this.state(job).status === "running") sessions.add(job.sessionId);
+      }
+    }
+    return [...sessions];
+  }
   path(sessionId: string, id: string) {
     const hash = (value: string) => createHash("sha256").update(value).digest("hex");
     return resolve(this.directory, hash(sessionId), hash(id));

@@ -1,4 +1,5 @@
 import { DEFAULT_MODEL, MODEL_OPTIONS, isClaudeModel, modelProvider, normalizeModelId } from "../modelCatalog";
+import { resolveSubagentPromptTarget, subagentPromptRecord } from "./subagentPromptRecord";
 import { buildProviderHandoff, readProviderThreadScope, type ProviderThreadScope } from "./sessionProviderThreads";
 import { createClaudeAccountRouter } from "./claudeAccountRoutes";
 import { claudeQuotaRetryAt } from "./claudeAccounts";
@@ -27,7 +28,7 @@ import { GlobalAgentInstructions, createGlobalAgentInstructionsRouter } from "./
 import { RunnerProcessRegistry } from "./runnerProcessRegistry";
 import { clientLayoutInstructions } from "./clientLayoutInstructions";
 import { createTurnGrillHandler } from "./turnGrillRoute";
-import { createRoundtableRouter, RoundtableService, roundtableHostInstructions, roundtableHostPrompt } from "./roundtableService";
+import { createRoundtableRouter, prepareRoundtableFork, RoundtableService, roundtableHostInstructions, roundtableHostPrompt } from "./roundtableService";
 import { parseRoundtableActor, roundtableResponse, type RoundtableActor } from "../roundtable";
 import { SIDE_CHAT_MAX_ACTORS, sideChatActorSnapshot } from "../sideChatRoom";
 import { createWorkspaceSnapshotHandler } from "./workspaceSnapshotRoute";
@@ -202,6 +203,7 @@ type ChatRequest = {
   cwd?: string;
   contextFork?: boolean;
   forcePlan?: boolean;
+  managedMode?: boolean;
   lightweightTodo?: boolean;
   taskChild?: boolean;
   backgroundTask?: boolean;
@@ -300,6 +302,7 @@ type ForkSessionRequest = {
 };
 
 type CreateSessionTaskRequest = {
+  managedMode?: boolean;
   managerRequestId?: string;
   /** Stable identity for a queued-prompt fork when the workspace has no manager. */
   queueForkRequestId?: string;
@@ -507,6 +510,7 @@ type RunnerJob = {
   autoModelPromptFullVersion?: boolean;
   executionMode?: ExecutionMode;
   forcePlan?: boolean;
+  managedMode?: boolean;
   lightweightTodo?: boolean;
   todoPlanClarificationPending?: boolean;
   skills?: RequestedSkill[];
@@ -527,6 +531,7 @@ type RunnerJob = {
   contextParentSessionId?: string;
   contextForkRequest?: boolean;
   childExecutionMode?: ExecutionMode;
+  childManagedMode?: boolean;
   todoParentSessionId?: string;
   todoItemId?: string;
   developerInstructions?: string;
@@ -1005,6 +1010,7 @@ const workspaceManager = new WorkspaceManagerService(sessionStore, {
       ...target.request,
       title: input.title, prompt: input.prompt,
       startImmediately: true, attachments,
+      managedMode: input.turn.requestMetadata?.managedMode === true,
       executionMode: input.turn.requestMetadata?.executionMode === "loop"
         ? "loop" : normalizeExecutionMode(input.turn.requestMetadata?.executionMode),
       approvalPolicy: normalizeApprovalPolicy(input.turn.requestMetadata?.approvalPolicy
@@ -1129,6 +1135,7 @@ app.use("/api/settings/roundtable-actors", createRoundtableActorSettingsRouter(n
 app.use("/api/settings/global-instructions", createGlobalAgentInstructionsRouter(globalAgentInstructions));
 app.use("/api/quick-chat", createQuickChatRouter(resolve(dataDir, "quick-chat-sessions.json")));
 const discussionJobs = new DiscussionJobs(resolve(dataDir, "discussion-jobs"));
+sessionStore.runningSideChatSessionIds = () => discussionJobs.runningSideChatSessionIds();
 const roundtableService = new RoundtableService({
   jobs: discussionJobs,
   logDir: resolve(dataDir, "roundtable-logs"),
@@ -1142,6 +1149,11 @@ const roundtableService = new RoundtableService({
   settled: sessionId => schedulePendingTurnsForSession(sessionId, { immediate: true })
 });
 app.use("/api/roundtable", createRoundtableRouter(roundtableService, sessionStore, async body => {
+  if (typeof body.forkFromSessionId === "string") {
+    const parent = await getSessionForRequestedId(body.forkFromSessionId);
+    if (!parent) throw new Error("Fork source session not found.");
+    await prepareRoundtableFork(sessionStore, parent, body.sessionId);
+  }
   const session = await getOrCreateSession({
     sessionId: typeof body.sessionId === "string" ? body.sessionId : undefined,
     workspaceId: typeof body.workspaceId === "string" ? body.workspaceId : undefined,
@@ -2085,6 +2097,36 @@ app.get("/api/sessions/:sessionId/snapshot", async (req: Request<{ sessionId: st
   } catch (error) {
     res.status(500).json({ error: errorMessage(error) });
   }
+});
+
+app.post("/api/subagent-prompts", async (req: Request, res: Response) => {
+  try {
+    const session = typeof req.body.sessionId === "string" ? await getSessionForRequestedId(req.body.sessionId) : null;
+    const turn = typeof req.body.turnId === "string" ? await sessionStore.getSessionTurn(req.body.turnId) : null;
+    if (!session?.threadId || !turn || turn.sessionId !== session.id || turn.status !== "running") {
+      res.status(409).json({ error: "An active owning session turn is required." }); return;
+    }
+    let childThreadId: string;
+    let item: ReturnType<typeof subagentPromptRecord>;
+    try {
+      const items = req.body.taskName && !req.body.threadId
+        ? Object.values(await sessionStore.listSessionLiveItems(session.id)).flat() : [];
+      childThreadId = resolveSubagentPromptTarget(req.body, items);
+      item = subagentPromptRecord({ ...req.body, threadId: childThreadId });
+    } catch (error) { res.status(400).json({ error: errorMessage(error) }); return; }
+    const workspace = await sessionStore.getWorkspace(session.workspaceId);
+    if (!workspace) { res.status(404).json({ error: "Workspace not found." }); return; }
+    const readThread = (threadId: string) => runCodexAppServerRequest(workspace, "thread/read", { threadId, includeTurns: false });
+    const child = await readThread(childThreadId);
+    if (!await subagentThreadBelongsToRoot({ rootThreadId: session.threadId, requestedThreadId: childThreadId,
+      requestedThreadResult: child, readThread })) {
+      res.status(403).json({ error: "Child does not belong to this session." }); return;
+    }
+    const id = `${turn.id}:${item.id}`;
+    await sessionStore.recordSessionTurnEvent({ id, sessionId: session.id, turnId: turn.id, eventName: "item", payload: item });
+    await publishRunnerUpdateEvent({ id, sessionId: session.id, turnId: turn.id, event: "item", data: item });
+    res.json({ ok: true, threadId: childThreadId });
+  } catch (error) { res.status(500).json({ error: errorMessage(error) }); }
 });
 
 app.get("/api/sessions/:sessionId/subagents/:threadId/transcript", async (
@@ -5877,6 +5919,7 @@ app.post("/api/session-tasks", async (req: Request<object, object, CreateSession
           body: JSON.stringify({ sessionId: childSession.id, turnId, workspaceId: childSession.workspaceId,
             message: taskPrompt, approvalPolicy: req.body.approvalPolicy, backgroundTask: true,
             executionMode: req.body.executionMode,
+            managedMode: req.body.managedMode === true,
             ...(assignment && isAutoModel(assignment.selectedModel) ? {
               model: assignment.selectedModel, modelReasoningEffort: assignment.selectedEffort,
               autoModel: false, workspaceManagerModelSelection: true
@@ -5894,6 +5937,7 @@ app.post("/api/session-tasks", async (req: Request<object, object, CreateSession
         modelReasoningEffort: req.body.modelReasoningEffort,
         approvalPolicy: req.body.approvalPolicy,
         executionMode: req.body.executionMode,
+        managedMode: req.body.managedMode === true,
         skills: req.body.skills,
         developerInstructions: taskDeveloperInstructions,
         todoParentSessionId: req.body.todoItemId ? parentSessionId : undefined,
@@ -5917,6 +5961,7 @@ app.post("/api/session-tasks", async (req: Request<object, object, CreateSession
 });
 
 async function runCreatedSessionTask(input: {
+  managedMode?: boolean;
   sessionId: string;
   turnId: string;
   parentSession: SessionRecord;
@@ -5947,6 +5992,7 @@ async function runCreatedSessionTask(input: {
         modelReasoningEffort: input.modelReasoningEffort,
         approvalPolicy: input.approvalPolicy,
         executionMode: input.executionMode,
+        managedMode: input.managedMode === true,
         skills: input.skills,
         developerInstructions: input.developerInstructions,
         todoParentSessionId: input.todoParentSessionId,
@@ -6441,6 +6487,8 @@ app.post("/api/chat", async (req: Request<object, object, ChatRequest>, res: Res
       autoModelPromptFullVersion,
       executionMode: mainWorkspaceManager || chatRequest.contextFork === true ? "default" : normalizeExecutionMode(chatRequest.executionMode),
       forcePlan: forcePlanForTurn,
+      managedMode: chatRequest.managedMode === true && chatRequest.contextFork !== true && !mainWorkspaceManager && !collaboration && !roundtableSynthesisPrompt,
+      childManagedMode: chatRequest.contextFork === true && chatRequest.managedMode === true,
       lightweightTodo,
       todoPlanClarificationPending,
       skills: requestedSkills,
@@ -7928,6 +7976,7 @@ function buildPendingRequestMetadata(request: ChatRequest, attachments: SavedAtt
     clientLayout: request.clientLayout,
     contextFork: request.contextFork,
     forcePlan: request.forcePlan,
+    managedMode: request.managedMode === true,
     lightweightTodo: request.lightweightTodo,
     taskChild: request.taskChild,
     backgroundTask: request.backgroundTask,

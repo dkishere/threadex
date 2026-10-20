@@ -63,6 +63,7 @@ test("pending prompt metadata and order survive reload and claim exactly once", 
     pendingReason: "queued",
     requestMetadata: {
       executionMode: "goal",
+      managedMode: true,
       skills: [{ name: "release" }],
       attachments: [{ id: "attachment-1", name: "release.txt", path: "/uploads/queued-first/release.txt" }]
     }
@@ -87,6 +88,7 @@ test("pending prompt metadata and order survive reload and claim exactly once", 
       .filter(candidate => candidate.session.id === "session-queue");
     assert.deepEqual(pending.map(candidate => candidate.turn.id), ["queued-first", "queued-second"]);
     assert.equal(pending[0].turn.requestMetadata?.executionMode, "goal");
+    assert.equal(pending[0].turn.requestMetadata?.managedMode, true);
     assert.deepEqual(pending[0].turn.requestMetadata?.attachments, [
       { id: "attachment-1", name: "release.txt", path: "/uploads/queued-first/release.txt" }
     ]);
@@ -95,6 +97,7 @@ test("pending prompt metadata and order survive reload and claim exactly once", 
     });
     assert.equal(edited.requestMetadata?.message, "edited prompt");
     assert.equal(edited.requestMetadata?.executionMode, "goal");
+    assert.equal(edited.requestMetadata?.managedMode, true);
     assert.deepEqual(edited.requestMetadata?.attachments, pending[0].turn.requestMetadata?.attachments);
 
     const firstClaim = await store.claimPendingSessionTurn("queued-first", "session-queue");

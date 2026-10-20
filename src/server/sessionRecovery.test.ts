@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   buildSessionRecoveryContext,
   isRecoverableThreadResumeError,
+  isRejectedRemoteCompaction,
   recoveryPrompt,
   shouldForcePersistedRecovery
 } from "./sessionRecovery";
@@ -83,6 +84,28 @@ test("recognizes only thread-resume failures as recoverable", () => {
   assert.equal(isRecoverableThreadResumeError("No rollout found for thread id abc"), true);
   assert.equal(isRecoverableThreadResumeError("thread was not found"), true);
   assert.equal(isRecoverableThreadResumeError("refresh token was revoked"), false);
+});
+
+test("recognizes only rejected remote compaction as a fresh-thread fallback", () => {
+  assert.equal(isRejectedRemoteCompaction('Error running remote compact task: {"detail":"Bad Request"}'), true);
+  assert.equal(isRejectedRemoteCompaction("Error running remote compact task: workspace routing discovery unauthorized (401)"), false);
+  assert.equal(isRejectedRemoteCompaction("stream disconnected before completion"), false);
+});
+
+test("recovery keeps the newest turns within the agent input limit", () => {
+  const turns = Array.from({ length: 400 }, (_, index) => turn({
+    id: `turn-${index}`, userInput: `request ${index} ${"x".repeat(5_000)}`,
+    agentResponse: `result ${index} ${"y".repeat(index === 399 ? 90_000 : 5_000)}`,
+    created: new Date(Date.UTC(2026, 8, 4, 0, index)).toISOString()
+  }));
+  const recovery = buildSessionRecoveryContext({ session, currentTurnId: "current", turns });
+  const prompt = recoveryPrompt("go", recovery!);
+  assert.ok(prompt.length < 1_048_576, `recovery prompt is ${prompt.length} characters`);
+  assert.match(prompt, /request 399 /);
+  assert.match(prompt, /Threadex truncated \d+ more characters/);
+  assert.doesNotMatch(prompt, /request 0 /);
+  assert.match(prompt, /\[\d+ earlier saved turn\(s\) omitted .*sessionId local-original/);
+  assert.match(prompt, /\[End Threadex deterministic session recovery\]\n\nCurrent user request:\ngo$/);
 });
 
 test("first-provider recovery includes work completed ahead of a queued prompt and its user corrections", () => {

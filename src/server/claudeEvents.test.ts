@@ -137,11 +137,17 @@ test("TodoWrite maps to the shared todo list item", () => {
 
 test("subagent internals are hidden behind the Agent card", () => {
   const mapper = new ClaudeStreamMapper();
-  const started = items(mapper.handle({ type: "assistant", message: { id: "m7", content: [{ type: "tool_use", id: "tu_6", name: "Agent", input: { description: "Search code", prompt: "Find X", subagent_type: "Explore" } }] } }));
+  const started = items(mapper.handle({ type: "assistant", message: { id: "m7", content: [{ type: "tool_use", id: "tu_6", name: "Agent", input: { description: "Search code", prompt: "Find X", model: "haiku", effort: "low", subagent_type: "Explore" } }] } }));
   assert.equal(started[0]?.itemType, "subagent");
+  assert.equal(started[0]?.itemType === "subagent" && started[0].prompt, "Find X");
+  assert.equal(started[0]?.itemType === "subagent" && started[0].model, "haiku");
+  assert.equal(started[0]?.itemType === "subagent" && started[0].reasoningEffort, "low");
   assert.deepEqual(mapper.handle({ type: "assistant", parent_tool_use_id: "tu_6", message: { id: "sub", content: [{ type: "text", text: "inner" }] } }), []);
   const done = items(mapper.handle({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu_6", content: [{ type: "text", text: "Found X in a.ts" }] }] } }));
   assert.equal(done[0]?.itemType === "subagent" && done[0].agents[0]?.message, "Found X in a.ts");
+  assert.equal(done[0]?.itemType === "subagent" && done[0].prompt, "Find X");
+  assert.equal(done[0]?.itemType === "subagent" && done[0].model, "haiku");
+  assert.equal(done[0]?.itemType === "subagent" && done[0].reasoningEffort, "low");
   assert.equal(mapper.lastAgentText, "");
 });
 

@@ -8,6 +8,7 @@ import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { CONTEXT_FORK_USER_SUFFIX } from "../contextFork";
 import { AUTO_MODEL_ORDER } from "../modelCatalog";
+import { resolveManagedModePrompt } from "../managedMode";
 import { WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS } from "./workspaceManagerRouting";
 import { WORKSPACE_MANAGER_INSTRUCTIONS, workspaceManagerContext } from "./workspaceManager";
 import { MANAGER_REPLY_LANGUAGE_INSTRUCTIONS } from "./replyLanguage";
@@ -116,6 +117,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     sessionId: "session-1",
     turnId: "turn-1",
     message: "test callback burst",
+    managedMode: true,
     accountId: "account-1",
     accountAuthVersion: 1,
     fastMode: true,
@@ -144,6 +146,9 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 
   assert.equal(exitCode, 0, stderr);
   assert.equal(JSON.parse(readFileSync(turnParamsPath, "utf8")).serviceTierForTurn, "fast");
+  assert.match(JSON.parse(readFileSync(turnParamsPath, "utf8")).input[0].text, /\[Managed mode\]/);
+  assert.match(JSON.parse(readFileSync(turnParamsPath, "utf8")).settings.developer_instructions, /Current Threadex Managed mode: ON/);
+  assert.equal(JSON.parse(readFileSync(jobPath, "utf8")).message, "test callback burst");
   const entries = readFileSync(logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
   assert.equal(entries.some((entry) => entry.event === "runner.callback_error"), false);
   assert.equal(existsSync(pendingLogPath), false);
@@ -559,6 +564,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.match(turn.input[0].text, /operational metadata/);
   assert.equal(JSON.parse(readFileSync(jobPath, "utf8")).message, "請建立 todo plan，todo language 要跟返用戶 prompt");
   assert.match(turn.settings.developer_instructions, /original user's actual task request/);
+  assert.match(turn.settings.developer_instructions, /Current Threadex Managed mode: OFF/);
+  assert.match(turn.settings.developer_instructions, /Do not proactively spawn sub-agents/);
   assert.doesNotMatch(turn.settings.developer_instructions, /compact status headline/);
   assert.match(turn.settings.developer_instructions, /appended English force-plan suffix/);
   assert.match(turn.settings.developer_instructions, /session-inspector todo_request_clarification/);
@@ -992,6 +999,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     turnId: "turn-1",
     message: "開 child task",
     contextForkRequest: true,
+    childExecutionMode: "loop",
+    childManagedMode: true,
     approvalPolicy: "on-request",
     logPath,
     codexHome: resolve(root, "codex-home"),
@@ -1030,6 +1039,8 @@ syncBuiltinESMExports();
 
   const thread = JSON.parse(readFileSync(capturedThreadPath, "utf8"));
   assert.equal(thread.config.mcp_servers.session_inspector.enabled, false);
+  assert.equal(thread.inspectorEnv.THREADEX_CHILD_EXECUTION_MODE, "loop");
+  assert.equal(thread.inspectorEnv.THREADEX_CHILD_MANAGED_MODE, "1");
   assert.match(thread.developerInstructions, /Never wrap commentary in JSON/i);
   assert.match(thread.developerInstructions, /Context Fork\/New task is explicit delegation/i);
   const turn = JSON.parse(readFileSync(capturedTurnPath, "utf8"));
@@ -1238,6 +1249,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     sessionId: "session-1",
     turnId: "turn-1",
     message: "initial prompt",
+    managedMode: true,
     startupSnapshot: "[STARTUP]\npwd: /tmp/workspace\n[END STARTUP]",
     contextParentSessionId: "local_parent-1",
     executionMode: "goal",
@@ -1333,7 +1345,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.deepEqual(turn.input, [
     {
       type: "text",
-      text: "initial prompt",
+      text: resolveManagedModePrompt("initial prompt", AUTO_MODEL_ORDER[0], true),
       text_elements: []
     },
     { type: "skill", name: "test-skill", path: "/skills/test-skill/SKILL.md" }
@@ -2211,6 +2223,97 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     assert.match(turn.input[0].text, /Original objective and completed decisions/);
     assert.match(turn.input[0].text, /Current user request:\ngo$/);
     assert.equal(entries.find((entry) => entry.event === "result")?.data?.reply, "continued");
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("prompt runner continues in a fresh thread when remote compaction rejects a resumed thread", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "prompt-runner-compaction-recovery-"));
+  const fakeCodexPath = resolve(root, "fake-codex.mjs");
+  const jobPath = resolve(root, "job.json");
+  const logPath = resolve(root, "runner.ndjson");
+  const capturedTurnPath = resolve(root, "captured-turn.json");
+
+  // The rejected turn's late turn/completed carries no thread ID and lands while
+  // the replacement turn is still running; it must not settle that turn.
+  writeFileSync(fakeCodexPath, `#!/usr/bin/env node
+import { createInterface } from "node:readline";
+import { writeFileSync } from "node:fs";
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+let turns = 0;
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method === "initialize") send({ id: request.id, result: {} });
+  if (request.method === "thread/resume") send({ id: request.id, result: { thread: { id: "thread-old" } } });
+  if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "thread-fresh" } } });
+  if (request.method === "thread/goal/clear") send({ id: request.id, result: {} });
+  if (request.method === "turn/start") {
+    turns += 1;
+    if (turns === 1) {
+      send({ id: request.id, result: { turn: { id: "app-turn-old" } } });
+      const error = { message: 'Error running remote compact task: {"detail":"Bad Request"}' };
+      send({ method: "error", params: { error, willRetry: false, threadId: "thread-old", turnId: "app-turn-old" } });
+      setTimeout(() => send({ method: "turn/completed", params: { turn: { id: "app-turn-old", status: "failed", error } } }), 100);
+      return;
+    }
+    writeFileSync(process.env.CAPTURED_TURN_PATH, JSON.stringify(request.params));
+    send({ id: request.id, result: { turn: { id: "app-turn-fresh" } } });
+    setTimeout(() => {
+      send({ method: "item/completed", params: { threadId: "thread-fresh", item: { id: "answer", type: "agentMessage", text: "continued" } } });
+      send({ method: "turn/completed", params: { threadId: "thread-fresh", turn: { id: "app-turn-fresh", status: "completed" } } });
+    }, 400);
+  }
+});
+`, "utf8");
+  chmodSync(fakeCodexPath, 0o755);
+  writeFileSync(jobPath, JSON.stringify({
+    sessionId: "session-compaction",
+    turnId: "turn-compaction",
+    message: "go",
+    threadId: "thread-old",
+    recoveryContext: {
+      reason: "thread_unavailable",
+      sourceThreadId: "thread-old",
+      handoff: "[Threadex deterministic session recovery]\\nManager objectives and decisions"
+    },
+    providerHandoff: "[Threadex agent handoff]\\nIntervening turn",
+    // Workspace managers carry a Concurrent group without fork or saved worker context.
+    collaboration: { groupId: "collab-manager", fork: null, priorContext: "", instructions: "Concurrent manager group" },
+    logPath,
+    codexHome: resolve(root, "codex-home"),
+    cwd: projectRoot
+  }), "utf8");
+
+  try {
+    const child = spawn(process.execPath, ["--import", "tsx", runnerPath, jobPath], {
+      cwd: projectRoot,
+      env: {
+        ...process.env,
+        CODEX_PATH: fakeCodexPath,
+        CAPTURED_TURN_PATH: capturedTurnPath,
+        SESSION_INSPECTOR_MCP_MODE: "off"
+      },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const exitCode = await new Promise<number | null>((resolveExit) => child.once("exit", resolveExit));
+    assert.equal(exitCode, 0, stderr);
+
+    const entries = readFileSync(logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    const recovery = entries.find((entry) => entry.event === "context_recovery");
+    assert.equal(recovery?.data?.sourceThreadId, "thread-old");
+    assert.equal(recovery?.data?.threadId, "thread-fresh");
+    assert.ok(entries.some((entry) => entry.event === "session" && entry.data?.threadId === "thread-fresh"));
+    const turn = JSON.parse(readFileSync(capturedTurnPath, "utf8"));
+    assert.equal(turn.threadId, "thread-fresh");
+    assert.match(turn.input[0].text, /Manager objectives and decisions/);
+    assert.doesNotMatch(turn.input[0].text, /Intervening turn/);
+    assert.match(turn.input[0].text, /Current user request:\ngo$/);
+    assert.equal(entries.find((entry) => entry.event === "result")?.data?.reply, "continued");
+    assert.equal(entries.some((entry) => entry.event === "error"), false);
   } finally {
     rmSync(root, { force: true, recursive: true });
   }

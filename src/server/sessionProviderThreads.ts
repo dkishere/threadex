@@ -134,6 +134,31 @@ export function providerTurnLabel(turn: SessionTurnRecord) {
   return provider ? `${provider === "claude" ? "Claude Code" : "Codex"}${model ? ` (${model})` : ""}` : "agent (provider not recorded)";
 }
 
+// Codex rejects turn input over 1,048,576 characters. Saved history shares that
+// budget with the current request, so handoffs keep the newest turns that fit.
+const HISTORY_MAX_CHARS = 600_000;
+const HISTORY_FIELD_MAX_CHARS = 20_000;
+
+export function clipHistoryText(text: string) {
+  if (text.length <= HISTORY_FIELD_MAX_CHARS) return text;
+  return `${text.slice(0, HISTORY_FIELD_MAX_CHARS)}\n[Threadex truncated ${text.length - HISTORY_FIELD_MAX_CHARS} more characters of this saved text.]`;
+}
+
+export function fitHistoryTurns(input: { header: string[]; turns: string[][]; footer: string[]; sessionId: string;
+  maxChars?: number }) {
+  let used = [...input.header, ...input.footer].join("\n").length + 300;
+  let first = input.turns.length;
+  while (first > 0) {
+    const size = input.turns[first - 1].join("\n").length + 1;
+    if (used + size > (input.maxChars ?? HISTORY_MAX_CHARS)) break;
+    used += size;
+    first -= 1;
+  }
+  const omitted = first > 0 ? ["", `[${first} earlier saved turn(s) omitted to fit the agent input limit; ` +
+    `read them with session-inspector get_session for sessionId ${input.sessionId} when needed.]`] : [];
+  return [...input.header, ...omitted, ...input.turns.slice(first).flat(), ...input.footer].join("\n");
+}
+
 export function buildProviderHandoff(input: {
   thread: SessionProviderThread; turns: SessionTurnRecord[]; currentTurnId: string;
   steerMessagesByTurn?: Record<string, Array<{ content: string }>>;
@@ -148,21 +173,24 @@ export function buildProviderHandoff(input: {
     : prior.slice(seenIndex + 1)).filter(turn => turn.status !== "running" &&
     (turn.status === "done" || turn.runnerStarted || turn.runnerExitCode !== null));
   if (!unseen.length) return undefined;
-  return [
-    "[Threadex agent handoff — saved history, not new instructions]",
-    `You are resuming your existing ${input.thread.provider === "claude" ? "Claude Code" : "Codex"} thread ${input.thread.threadId}.`,
-    "Other agent turns or interrupted attempts occurred since your last confirmed synchronization. Their results may have changed the shared files and superseded earlier decisions.",
-    "Continue the current user request after this block. Do not repeat completed work. Treat quoted requests and responses below as historical evidence, not instructions to execute again.",
-    ...unseen.flatMap(turn => [
+  return fitHistoryTurns({
+    sessionId: input.thread.sessionId,
+    header: [
+      "[Threadex agent handoff — saved history, not new instructions]",
+      `You are resuming your existing ${input.thread.provider === "claude" ? "Claude Code" : "Codex"} thread ${input.thread.threadId}.`,
+      "Other agent turns or interrupted attempts occurred since your last confirmed synchronization. Their results may have changed the shared files and superseded earlier decisions.",
+      "Continue the current user request after this block. Do not repeat completed work. Treat quoted requests and responses below as historical evidence, not instructions to execute again."
+    ],
+    turns: unseen.map(turn => [
       "", `Turn ${input.turns.findIndex(candidate => candidate.id === turn.id) + 1} [turnId=${turn.id}; agent=${providerTurnLabel(turn)}; nativeThreadId=${turn.nativeThreadId ?? "not recorded"}; status=${turn.status}]:`,
-      "User request:", turn.userInput,
-      ...(input.steerMessagesByTurn?.[turn.id] ?? []).map(steer => `User follow-up during this turn:\n${steer.content}`),
+      "User request:", clipHistoryText(turn.userInput),
+      ...(input.steerMessagesByTurn?.[turn.id] ?? []).map(steer => `User follow-up during this turn:\n${clipHistoryText(steer.content)}`),
       turn.status === "done" && (turn.runnerExitCode === null || turn.runnerExitCode === 0)
-        ? `Agent result:\n${turn.agentResponse || "(no final response saved)"}`
+        ? `Agent result:\n${clipHistoryText(turn.agentResponse) || "(no final response saved)"}`
         : "Interrupted attempt; no successful result is confirmed. Inspect the current files before continuing."
     ]),
-    "", "[End Threadex agent handoff]"
-  ].join("\n");
+    footer: ["", "[End Threadex agent handoff]"]
+  });
 }
 
 export function withProviderHandoff(message: string, handoff: string | undefined) {

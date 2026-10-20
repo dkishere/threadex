@@ -4,7 +4,8 @@ import { RoundtableRunLog, interruptRoundtableAttempt } from "./roundtableRunLog
 import { Router } from "express";
 import { DEFAULT_MODEL, isClaudeModel } from "../modelCatalog";
 import { ROUNDTABLE_NEXT_ROUND_PROMPT, parseRoundtableActors, roundtableResponse, roundtableRunning, roundtableTopic, type RoundtableRound } from "../roundtable";
-import type { SessionStore } from "./sessionStore";
+import type { SessionRecord, SessionStore } from "./sessionStore";
+import { isThreadexSessionId } from "../codexReference";
 import { normalizeModelTokenUsage, type ModelTokenUsage } from "./modelTokenUsage";
 import { runRoundtableInference, type RoundtableActorTools, type RoundtableInference } from "./roundtableRunner";
 import { buildThreadexReference } from "../codexReference";
@@ -14,6 +15,21 @@ type Store = Pick<SessionStore, "getSession" | "getWorkspace" | "listSessionTurn
   | "getAccountAuth" | "getActiveAccount" | "resolveClaudeAccount" | "claimPendingSessionTurn"
   | "getSessionModelPreferences" | "getSessionTurn" | "listRoundtableRounds" | "getRoundtableRound" | "createRoundtableRound" | "saveRoundtableRound">;
 type Usage = { id: string; task: string; source: string; sessionId: string; workspaceId: string; accountId: string | null; model: string; usage: ModelTokenUsage | null };
+
+/** Freeze completed source context before starting actors; the stable child ID makes retries reusable. */
+export async function prepareRoundtableFork(store: Pick<SessionStore, "getSession" | "listSessionTurns" | "forkSessionAtTurn" | "upsertSession">,
+  parent: SessionRecord, sessionId: unknown) {
+  if (typeof sessionId !== "string" || !isThreadexSessionId(sessionId) || sessionId === parent.id) {
+    throw new Error("Round table fork requires a new session ID.");
+  }
+  const existing = await store.getSession(sessionId);
+  if (existing && existing.parentSessionId !== parent.id) throw new Error("Fork session belongs to another parent.");
+  if (existing) return;
+  const latest = (await store.listSessionTurns(parent.id)).filter(turn => turn.status === "done").at(-1);
+  if (latest) await store.forkSessionAtTurn({ id: sessionId, parentSessionId: parent.id, targetTurnId: latest.id });
+  else await store.upsertSession({ id: sessionId, threadId: null, workspaceId: parent.workspaceId,
+    cwd: parent.cwd, accountId: parent.accountId, parentSessionId: parent.id });
+}
 type Options = {
   jobs?: DiscussionJobs;
   store: Store;

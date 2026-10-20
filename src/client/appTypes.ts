@@ -68,6 +68,7 @@ export type ChatMessage = {
   startupSnapshot?: string;
   developerInstructions?: DeveloperInstructionRecord[];
   forcePlan?: boolean;
+  managedMode?: boolean;
   contextFork?: boolean;
   executionMode?: ExecutionMode;
 };

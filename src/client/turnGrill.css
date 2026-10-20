@@ -70,6 +70,7 @@
 .grill-compose-actions > div { display: flex; gap: 6px; flex-wrap: wrap; }
 .turn-grill .grill-button-primary { background: #4f46e5; color: #fff; border-color: #4f46e5; }
 .turn-grill .grill-button-primary:hover:not(:disabled) { background: #4338ca; color: #fff; border-color: #4338ca; }
+.turn-grill .grill-send-to-composer { min-height: 34px; padding: 8px 12px; font-size: 12px; }
 .turn-grill .grill-implement { min-height: 34px; padding: 8px 14px; background: #4f46e5; border-color: #4f46e5; color: #fff; font-size: 12px; font-weight: 650; box-shadow: 0 2px 5px #4f46e526; }
 .turn-grill .grill-implement:hover:not(:disabled) { background: #4338ca; border-color: #4338ca; color: #fff; }
 .turn-grill .grill-implement:disabled { box-shadow: none; }

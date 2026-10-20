@@ -92,6 +92,7 @@ for (const cachedInputTokens of [900, 0, undefined]) {
     }, [{
       id: "turn-usage",
       loopMode: true,
+      requestMetadata: { managedMode: cachedInputTokens === 900 },
       userInput: "Show the run details",
       agentResponse: "Done",
       model: "gpt-5.6-terra",
@@ -132,6 +133,8 @@ for (const cachedInputTokens of [900, 0, undefined]) {
       autoModelConfidence: 0.2,
       executionMode: "loop"
     });
+    assert.equal(prompt?.managedMode, cachedInputTokens === 900);
+    assert.equal(prompt?.content, "Show the run details");
   });
 }
 

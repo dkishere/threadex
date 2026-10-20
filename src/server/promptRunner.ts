@@ -1,6 +1,7 @@
 import { DEFAULT_MODEL, AUTO_MODEL_ORDER, isClaudeModel } from "../modelCatalog";
 import { isClaudeThreadId } from "./claudeEvents";
 import { approvedInspectorCommand, inspectorInstructions } from "./sessionInspectorCommand";
+import { SubagentPromptReminder } from "./subagentPromptRecord";
 import { withProviderHandoff, type ProviderThreadScope } from "./sessionProviderThreads";
 import { prepareClaudeHome } from "./claudeHome";
 import { claudePermissions, providerSwitchNote, runClaudeTurn, type ClaudeInputPart } from "./claudeRunner";
@@ -13,6 +14,7 @@ import { WORKSPACE_MANAGER_MODEL, WORKSPACE_MANAGER_EFFORT,
 import { recordLiveGitProvenance } from "./gitProvenance";
 import { buildThreadexTurnReference } from "../codexReference";
 import { USER_INPUT_METHOD, inputQuestions, inputResponse, asyncInputQuestions, asyncInputParams, asyncAnswerText } from "../userInputRequest";
+import { managedModeTurnInstructions, resolveManagedModePrompt } from "../managedMode";
 import { INTENT_APPROVAL_TOOL, intentRequest, intentTurnInstructions } from "../intentApproval";
 import { automationSteerItem, AUTOMATION_STEER_NOTICE, type SteerSource } from "./steerSource";
 import { LIGHTWEIGHT_TODO_INSTRUCTIONS } from "./lightweightTodo";
@@ -54,7 +56,7 @@ import {
   shouldGenerateCommentaryHeadline,
   stopCommentaryHeadlineWorker
 } from "./commentaryHeadline";
-import { CommentaryIssueInjector } from "./commentaryIssueInjection";
+import { CommentaryIssueInjector, ISSUE_CLOSURE_INSTRUCTIONS } from "./commentaryIssueInjection";
 import type { CommentaryIssueTracker } from "./commentaryHeadline";
 import {
   CONTEXT_FORK_USER_SUFFIX,
@@ -74,6 +76,7 @@ import { isCreditExhaustionError, isUsageLimitError } from "./usageLimit";
 import { isAccountLoginRequiredMessage } from "../codexAuth";
 import {
   isRecoverableThreadResumeError,
+  isRejectedRemoteCompaction,
   recoveryPrompt,
   type SessionRecoveryContext
 } from "./sessionRecovery";
@@ -105,6 +108,7 @@ type RunnerJob = {
   autoModelPromptFullVersion?: boolean;
   executionMode?: "default" | "plan" | "goal";
   forcePlan?: boolean;
+  managedMode?: boolean;
   lightweightTodo?: boolean;
   todoPlanClarificationPending?: boolean;
   skills?: RequestedSkill[];
@@ -124,6 +128,7 @@ type RunnerJob = {
   contextParentSessionId?: string;
   contextForkRequest?: boolean;
   childExecutionMode?: "default" | "plan" | "goal" | "loop";
+  childManagedMode?: boolean;
   todoParentSessionId?: string;
   todoItemId?: string;
   todoPlanAlreadyExists?: boolean;
@@ -165,6 +170,7 @@ type JsonRpcRequest = {
 };
 
 const THREADEX_DEVELOPER_INSTRUCTIONS = [
+  ISSUE_CLOSURE_INSTRUCTIONS,
   "Code-file edit tracking: before creating, editing, deleting, or renaming code files (including tests), use apply_patch or a native editing tool that records structured per-file changes and diffs in the session. Without the user's explicit prior permission for the specific alternative method and file scope, do not modify code using shell commands, Python/Node scripts, direct filesystem writes, redirection, sed -i, perl -i, formatter or linter write/autofix modes, codemods, or refactoring tools that lack structured edit tracking. A general request to implement, fix, refactor, format, or test code does not authorize an untracked editing method. Command logs, a later git diff, and passing tests do not replace structured edit tracking. If a tracked tool is unavailable or unsuitable, explain the exact method and files and obtain explicit permission before writing; never silently fall back. Permission covers only the approved method and scope and remains subject to sandbox and higher-priority restrictions.",
   "You are being called through the Threadex client. Use the built-in Threadex-config skill for Threadex-managed configuration. Write user-facing commentary and progress updates as plain natural-language prose only. Never wrap commentary in JSON or emit extracts, shortMsg, issues, solutions, type, short, or detail fields; Threadex handles status-card presentation separately.",
   "Threadex session ownership: a parent and its forks share history only through the fork point; later work belongs to its branch. A parent remains an active working session after creating a fork. Execute subsequent user requests in the receiving parent session; do not automatically forward them to an existing fork, create another task, or ask the user to continue there. Only an explicit user request to delegate or a current Context Fork/New task action authorizes that handoff. If another branch's post-fork work is needed, inspect its context and continue the work here; that dependency alone does not authorize delegation. Historical handoff instructions apply only to their original turn. Context Fork/New task is explicit delegation for the current turn only: follow the server-provided child-task contract.",
@@ -355,6 +361,7 @@ async function run() {
   const startedAt = Date.now();
   let generationFinishedAt: number | undefined;
   const itemCache = new Map<string, StreamItem>();
+  const subagentPromptReminder = new SubagentPromptReminder();
   const commandOutputCapturedChars = new Map<string, number>();
   const commandOutputCaptureStopped = new Set<string>();
   const commandOutputCaptureLimitChars = readPositiveInteger(
@@ -364,6 +371,9 @@ async function run() {
   let completeTurn: ((value: void) => void) | null = null;
   let failTurn: ((error: Error) => void) | null = null;
   let turnCompleted = Promise.resolve();
+  // Late notifications from a turn replaced by compaction recovery must not
+  // settle the replacement turn; some carry no thread ID to filter on.
+  const abandonedNativeTurnIds = new Set<string>();
   const resetTurnCompletion = () => {
     steeringFinished = false;
     appTurnId = null;
@@ -464,6 +474,12 @@ async function run() {
         }
         await emitEvent("item", activeCompaction?.id === streamItem.id && streamItem.itemType === "context_compaction" ? activeCompaction : streamItem);
         queueCommentaryHeadline(streamItem);
+        if (threadId && !job.workspaceManager) {
+          void subagentPromptReminder.observe(streamItem, threadId, async (text) => {
+            await appServer.rpc("thread/inject_items", { threadId,
+              items: [{ type: "message", role: "developer", content: [{ type: "input_text", text }] }] });
+          }).catch(error => appendInternalLog("runner.subagent_prompt_reminder_error", { message: errorMessage(error) }));
+        }
       }
     } else if (method === "turn/plan/updated") {
       if (notificationBelongsToRunnerThread(params, threadId)) {
@@ -560,11 +576,11 @@ async function run() {
         await emitEvent("item", streamItem);
       }
     } else if (method === "turn/completed") {
-      if (!notificationBelongsToRunnerThread(params, threadId)) {
+      const turn = readObject(params?.turn);
+      if (!notificationBelongsToRunnerThread(params, threadId) || abandonedNativeTurnIds.has(readString(turn?.id) ?? "")) {
         await emitEvent("codex", summarizeAppServerMessage(message));
         return;
       }
-      const turn = readObject(params?.turn);
       const error = readObject(turn?.error);
       const status = readString(turn?.status);
       completedCompactionAwaitingUsage = null;
@@ -580,7 +596,7 @@ async function run() {
         completeTurn?.();
       }
     } else if (method === "error") {
-      if (notificationBelongsToRunnerThread(params, threadId)) {
+      if (notificationBelongsToRunnerThread(params, threadId) && !abandonedNativeTurnIds.has(readString(params?.turnId) ?? "")) {
         const error = readObject(params?.error);
         if (params?.willRetry !== true) {
           failTurn?.(new Error(readString(error?.message) ?? "Codex app-server error."));
@@ -650,6 +666,8 @@ async function run() {
     let recoveryContextForTurn = !threadId || job.forceRecoveryOnResume === true
       ? job.recoveryContext ?? null
       : null;
+    let resumedExistingThread = false;
+    let compactionRecoveryAttempted = false;
     if (job.collaboration?.fork) {
       // Ephemeral IDs cannot be resumed after their app-server exits. Every explicit
       // continuation inherits the same native boundary and adds saved worker context.
@@ -683,6 +701,7 @@ async function run() {
           buildThreadResumeParams(threadId, job, threadDeveloperInstructions)
         );
         threadId = readThreadIdFromPayload(response) ?? threadId;
+        resumedExistingThread = true;
         if (recoveryContextForTurn) {
           await emitEvent("context_recovery", {
             sessionId: job.sessionId,
@@ -727,24 +746,27 @@ async function run() {
       throw new Error("Codex app-server did not return a thread id.");
     }
 
-    await emitEvent("session", {
-      sessionId: job.sessionId,
-      turnId: job.turnId,
-      threadId,
-      message: "Codex session ready"
-    });
-
-    if (job.executionMode === "goal") {
-      const goalObjective = preparedGoalObjective ?? prepareGoalObjective(job);
-      job.goalObjectiveFilePath = goalObjective.filePath;
-      await appServer.rpc("thread/goal/set", {
-        threadId,
-        objective: goalObjective.objective,
-        status: "active"
+    const prepareReadyThread = async (readyThreadId: string) => {
+      await emitEvent("session", {
+        sessionId: job.sessionId,
+        turnId: job.turnId,
+        threadId: readyThreadId,
+        message: "Codex session ready"
       });
-    } else if (!job.collaboration?.fork && (job.executionMode === "default" || job.executionMode === "plan")) {
-      await appServer.rpc("thread/goal/clear", { threadId });
-    }
+
+      if (job.executionMode === "goal") {
+        const goalObjective = preparedGoalObjective ?? prepareGoalObjective(job);
+        job.goalObjectiveFilePath = goalObjective.filePath;
+        await appServer.rpc("thread/goal/set", {
+          threadId: readyThreadId,
+          objective: goalObjective.objective,
+          status: "active"
+        });
+      } else if (!job.collaboration?.fork && (job.executionMode === "default" || job.executionMode === "plan")) {
+        await appServer.rpc("thread/goal/clear", { threadId: readyThreadId });
+      }
+    };
+    await prepareReadyThread(threadId);
 
     stopSteerControl = startSteerControlLoop(appServer, () => ({ threadId, appTurnId, finished: steeringFinished }));
     try {
@@ -784,7 +806,38 @@ async function run() {
         const nativeTurnId = readTurnIdFromPayload(turnStartResponse);
         appTurnId = nativeTurnId ?? appTurnId;
         await emitNativeTurnLink(nativeTurnId);
-        await turnCompleted;
+        try {
+          await turnCompleted;
+        } catch (error) {
+          // Pre-sampling compaction of a resumed thread can be rejected on every
+          // attempt. Continue once in a fresh thread from the saved session record.
+          const message = errorMessage(error);
+          if (phase !== 0 || !resumedExistingThread || compactionRecoveryAttempted || !job.recoveryContext || job.collaboration?.priorContext ||
+            finalResponse || !threadId || !isRejectedRemoteCompaction(message)) {
+            throw error;
+          }
+          compactionRecoveryAttempted = true;
+          const sourceThreadId = threadId;
+          if (appTurnId) abandonedNativeTurnIds.add(appTurnId);
+          stopCompactionHeartbeat();
+          activeCompaction = null;
+          const response = await appServer.rpc("thread/start", buildThreadStartParams(job, threadDeveloperInstructions));
+          const freshThreadId = readThreadIdFromPayload(response);
+          if (!freshThreadId) throw error;
+          threadId = freshThreadId;
+          recoveryContextForTurn = { ...job.recoveryContext, reason: "thread_compaction_failed", sourceThreadId };
+          await emitEvent("context_recovery", {
+            sessionId: job.sessionId,
+            turnId: job.turnId,
+            sourceThreadId,
+            threadId,
+            reason: message
+          }, { waitForCallback: true });
+          await prepareReadyThread(threadId);
+          phaseJob = { ...phaseJob, message: recoveryPrompt(job.message, recoveryContextForTurn) };
+          resetTurnCompletion();
+          continue;
+        }
 
         if (initialContextForkChildIds) {
           const childIds = await fetchContextForkChildIds();
@@ -1116,7 +1169,7 @@ async function runClaudeRunnerTurn() {
         message: command.message,
         buildInput: () => claudeInputFromRunnerInput([
           ...(command.developerInstructions ? [{ type: "text", text: `[Threadex developer note]\n${command.developerInstructions}` }] : []),
-          ...buildRunnerInput({ ...job, message: command.message, attachments: command.attachments ?? [], skills: command.skills ?? [] })
+          ...buildRunnerInput({ ...job, managedMode: false, message: command.message, attachments: command.attachments ?? [], skills: command.skills ?? [] })
         ], command.attachments ?? [])
       })),
       writeSteerResult
@@ -1856,6 +1909,7 @@ function startSteerControlLoop(
             expectedTurnId: appTurnId,
             input: buildRunnerInput({
               ...job,
+              managedMode: false,
               message: automation ? AUTOMATION_STEER_NOTICE : command.message,
               attachments: automation ? [] : command.attachments ?? [],
               skills: automation ? [] : command.skills ?? []
@@ -2046,6 +2100,7 @@ function buildSessionInspectorCliConfig(job: RunnerJob) {
   return {
     approvedCommands: [
       "recover_current_session", "get_session", "search_sessions",
+      ...(!job.workspaceManager && !isClaudeModel(job.model) ? ["record_subagent_prompt"] : []),
       ...(!planningTurnIsReadOnly(job) && !job.workspaceManager && !isClaudeModel(job.model) ? ["request_intent_approval"] : []),
       ...(job.workspaceManager || job.managerConcurrent ? WORKSPACE_MANAGER_TOOLS.map(tool => tool.name) : []),
       ...(job.lightweightTodo ? ["outcome_plan_get", "outcome_plan_set"] : []),
@@ -2066,6 +2121,7 @@ function buildSessionInspectorCliConfig(job: RunnerJob) {
       THREADEX_MODEL_REASONING_EFFORT: job.modelReasoningEffort ?? "",
       THREADEX_APPROVAL_POLICY: job.approvalPolicy ?? "",
       THREADEX_CHILD_EXECUTION_MODE: job.childExecutionMode ?? "default",
+      THREADEX_CHILD_MANAGED_MODE: job.childManagedMode ? "1" : "0",
       THREADEX_CHILD_SKILLS: JSON.stringify(job.skills ?? []),
       THREADEX_CONTEXT_FORK_REQUEST: job.contextForkRequest ? "1" : "0",
       THREADEX_CONTINUITY_ONLY: "0",
@@ -2154,7 +2210,8 @@ function runnerDeveloperInstructions(job: RunnerJob, includeStartupSnapshot = tr
       : undefined,
     sessionInspectorDeveloperInstructions(job),
     autoModelDeveloperInstructions(job),
-    serverContextDeveloperInstructions(job, includeStartupSnapshot)
+    serverContextDeveloperInstructions(job, includeStartupSnapshot),
+    !job.workspaceManager ? managedModeTurnInstructions(job.managedMode === true, job.turnId) : undefined
   ];
   if (job.executionMode === "plan") {
     instructions.push(
@@ -2284,7 +2341,8 @@ function buildRunnerInput(job: RunnerJob, appendForcePlanSuffix = false) {
     job.executionMode === "goal" && job.goalObjectiveFilePath && job.message.length > GOAL_OBJECTIVE_INLINE_LIMIT
       ? job.goalObjectiveFilePath
       : undefined;
-  const baseUserMessage = goalMessageFilePath ? buildLongGoalObjectiveUserRequest(goalMessageFilePath) : job.message;
+  const userRequest = goalMessageFilePath ? buildLongGoalObjectiveUserRequest(goalMessageFilePath) : job.message;
+  const baseUserMessage = resolveManagedModePrompt(userRequest, job.model ?? DEFAULT_MODEL, job.managedMode === true);
   const visibleMessage = attachments.length > 0 ? buildAttachmentPrompt(baseUserMessage, attachments) : baseUserMessage;
   // Keep operational contracts inside the model input. The stored turn and
   // client transcript retain job.message, so operational metadata stays hidden.

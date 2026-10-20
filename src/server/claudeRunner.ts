@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { buildSubagentStartupSnapshot } from "./subagentStartup";
 import { approvedInspectorCommand } from "./sessionInspectorCommand";
 import { normalizeModelEffort } from "../modelCatalog";
 import { readFileSync, statSync } from "node:fs";
@@ -271,7 +272,13 @@ export async function runClaudeTurn(ctx: ClaudeRunnerContext, sdkOverride?: SdkM
       const decision = await checkBoundary(input.tool_name ?? "", input.tool_input ?? {}, toolUseID ?? randomUUID(), options);
       return decision ? { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: decision.behavior,
         ...(decision.behavior === "deny" ? { permissionDecisionReason: decision.message } : {}) } } : {};
-    }] }] },
+    }] }], SubagentStart: [{ hooks: [async (input: { cwd?: string }) => ({
+      hookSpecificOutput: {
+        hookEventName: "SubagentStart",
+        additionalContext: await buildSubagentStartupSnapshot(input.cwd ?? "",
+          ctx.input.some(item => item.type === "text" && /[\u3400-\u9fff]/u.test(String(item.text))))
+      }
+    })] }] },
     model: ctx.model,
     ...(claudeEffort(ctx.reasoningEffort, ctx.model) ? { effort: claudeEffort(ctx.reasoningEffort, ctx.model) } : {}),
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),

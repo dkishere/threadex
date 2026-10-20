@@ -635,7 +635,7 @@ export class SessionSummarizer {
   async runCategoryTask(workspaceId: string, task: "category_classification" | "category_split" | "category_context_pool", prompt: string) {
     const workspace = await this.store.getWorkspace(workspaceId);
     if (!workspace) throw new Error("Category workspace no longer exists");
-    const model = "gpt-5.6-luna";
+    const model = DEFAULT_MODEL;
     const result = this.config.provider === "mock"
       ? { responseText: this.config.mockResponse ?? "{}", usage: null, accountId: null }
       : await this.runSummarizerLuna(prompt, workspace.codexHome, model, "categories");

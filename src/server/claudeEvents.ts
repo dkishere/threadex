@@ -379,6 +379,9 @@ function subagentItem(tool: ToolState, eventType: StreamItem["eventType"], statu
     receiverThreadIds: [],
     ...(readString(tool.input.prompt) ? { prompt: readString(tool.input.prompt) ?? undefined } : {}),
     ...(readString(tool.input.model) ? { model: readString(tool.input.model) ?? undefined } : {}),
+    ...(readString(tool.input.effort) || readString(tool.input.reasoning_effort)
+      ? { reasoningEffort: readString(tool.input.effort) ?? readString(tool.input.reasoning_effort) ?? undefined }
+      : {}),
     agents: [{
       id: tool.id,
       name: readString(tool.input.subagent_type) ?? "agent",

@@ -39,6 +39,7 @@ test("side-chat worker survives its submitting process, reconnects without dupli
   const storeId = `/private/tmp/discussion-store-${randomUUID()}`;
   const store = new SessionStore(storeId);
   const jobs = new DiscussionJobs(directory, worker);
+  store.runningSideChatSessionIds = () => jobs.runningSideChatSessionIds();
   const job: DiscussionJob = { id: "side_chat_request", sessionId: "host", kind: "side-chat", created: new Date().toISOString(),
     payload: { question: "Investigate", model: DEFAULT_MODEL, reasoningEffort: "low", serverUrl: "http://127.0.0.1:1",
       room: { actor: null, history: [], messageId: "side_chat_request" }, record: { roundId: "room", mode: "isolated_ephemeral_thread" } } };
@@ -49,10 +50,17 @@ test("side-chat worker survives its submitting process, reconnects without dupli
     await submitFromExitingServer(directory, job, storeId);
     await until(() => existsSync(resolve(path, "calls")));
     assert.equal(jobs.state(job).status, "running");
+    assert.deepEqual(jobs.runningSideChatSessionIds(), ["host"]);
+    assert.deepEqual(await store.listActiveSessionExecutionStatuses("default"), { host: "running" });
+    assert.deepEqual(await store.listActiveSessionExecutionStatuses("other-workspace"), {});
+    assert.deepEqual((await store.listWorkspaceMonitorSessions()).map(session => session.sessionId), ["host"]);
+    assert.equal(await store.getLatestRunningTurn("host"), null, "side chat does not occupy the host writer");
     assert.equal(new DiscussionJobs(directory, worker).start(job).id, job.id);
     writeFileSync(resolve(path, "release"), "");
     await until(() => jobs.state(job).status !== "running");
     assert.deepEqual(jobs.state(job), { status: "done" });
+    assert.deepEqual(await store.listActiveSessionExecutionStatuses(), {});
+    assert.deepEqual(await store.listWorkspaceMonitorSessions(), []);
     const saved = await store.listSessionSideChats("host");
     assert.equal(saved?.sideChats.length, 1);
     assert.equal(saved?.sideChats[0].answer, "Detached actor answer");
@@ -64,6 +72,7 @@ test("side-chat worker survives its submitting process, reconnects without dupli
     await until(() => existsSync(resolve(jobs.path(stopped.sessionId, stopped.id), "calls")));
     await jobs.stop(stopped);
     assert.equal(jobs.state(stopped).status, "stopped");
+    assert.deepEqual(jobs.runningSideChatSessionIds(), []);
     assert.equal((await store.listSessionSideChats("host"))?.sideChats.length, 1, "cancelled answers are not saved");
   } finally {
     if (existsSync(path)) { writeFileSync(resolve(path, "release"), ""); await jobs.stop(job); }

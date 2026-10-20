@@ -11,6 +11,10 @@ export function isAccountLoginRequiredMessage(value: string | null | undefined) 
   const accountAuthMismatch =
     message.includes("auth mismatch") ||
     (message.includes("saved auth belongs to") && (message.includes("account") || message.includes("user")));
+  // Turn runners start a fresh app-server and isolated runners retry once with a
+  // new process, so this rejection is not stale routing state: the account's
+  // workspace credentials are unusable until it signs in again.
+  const workspaceRoutingRejected = message.includes("workspace routing discovery unauthorized");
 
-  return refreshTokenRejected || expiredCodexToken || accountAuthMismatch;
+  return refreshTokenRejected || expiredCodexToken || accountAuthMismatch || workspaceRoutingRejected;
 }

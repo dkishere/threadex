@@ -291,7 +291,7 @@ export async function submit(ctx, event, modeOverride?: string) {
         const forcePlan = composerTodoPlanModeEnabled;
         const submissionMode = modeOverride ?? composerMode;
         if (ctx.roundtableEnabled && submissionMode !== "steer") {
-            await ctx.startRoundtable(message, attachments, turnSkills);
+            await ctx.startRoundtable(message, attachments, turnSkills, forkNextPrompt && Boolean(sessionIdRef.current));
             return;
         }
         if (ctx.concurrentSourceTurnId && submissionMode !== "steer") {
@@ -338,6 +338,7 @@ export async function startChatTurn(ctx, message, turnAttachments, turnExecution
         clearComposer = false;
         const preferences = saved.settings.modelPreferences;
         ctx = { ...ctx,
+            managedMode: saved.settings.managedMode === true,
             ...(preferences ? { currentModelPreferences: () => preferences, selectedModel: preferences.selectedModel } : {}),
             ...(saved.settings.approvalPolicy ? { approvalPolicy: saved.settings.approvalPolicy } : {})
         };
@@ -355,7 +356,7 @@ export async function startChatTurn(ctx, message, turnAttachments, turnExecution
             attachments: turnAttachments,
             ...(saved ? { createdAt: saved.createdAt, lastError: saved.lastError } : {}),
             settings: { executionMode: turnExecutionMode, skills: turnSkills, contextFork: contextForkRequest,
-                forcePlan, grillOrigin, modelPreferences: submittedModelPreferences, approvalPolicy,
+                forcePlan, managedMode: ctx.managedMode === true, grillOrigin, modelPreferences: submittedModelPreferences, approvalPolicy,
                 fastMode: submittedModelPreferences.fastMode === true }
         };
         // Even restoring the selected session can make a network request.
@@ -419,6 +420,7 @@ export async function startChatTurn(ctx, message, turnAttachments, turnExecution
             createdAt: new Date().toISOString(),
             attachments: turnAttachments,
             forcePlan,
+            managedMode: ctx.managedMode === true,
             contextFork: contextForkRequest,
             executionMode: displayExecutionMode
         };
@@ -444,6 +446,7 @@ export async function startChatTurn(ctx, message, turnAttachments, turnExecution
                 body: JSON.stringify({
                     message,
                     clientLayout: currentClientLayout(),
+                    managedMode: ctx.managedMode === true,
                     turnId,
                     grillOrigin,
                     model: selectedModel === AUTO_MODEL_VALUE ? DEFAULT_MODEL : selectedModel,

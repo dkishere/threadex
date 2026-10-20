@@ -58,6 +58,9 @@ test("parses transcript turns and drops malformed items defensively", () => {
   const payload = parseSubagentTranscriptPayload({
     sessionId: "session-1",
     threadId: "thread-1",
+    model: "gpt-6-sol",
+    reasoningEffort: "high",
+    delegatedPrompt: "Inspect the API flow",
     turns: [
       {
         id: "turn-1",
@@ -76,6 +79,9 @@ test("parses transcript turns and drops malformed items defensively", () => {
   });
 
   assert.equal(payload.turns.length, 1);
+  assert.equal(payload.model, "gpt-6-sol");
+  assert.equal(payload.reasoningEffort, "high");
+  assert.equal(payload.delegatedPrompt, "Inspect the API flow");
   assert.equal(payload.turns[0]?.items.length, 1);
   assert.equal(payload.turns[0]?.items[0]?.itemType, "agent_message");
 });

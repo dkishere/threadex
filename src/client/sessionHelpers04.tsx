@@ -260,6 +260,7 @@ export function toChatMessage(ctx, value) {
         attachments: Array.isArray(candidate.attachments) ? candidate.attachments.filter(isMessageAttachment) : undefined,
         developerInstructions: normalizeDeveloperInstructionRecords(candidate.developerInstructions),
         forcePlan: candidate.forcePlan === true,
+        managedMode: candidate.managedMode === true,
         contextFork: candidate.contextFork === true,
         executionMode: candidate.executionMode === "plan" || candidate.executionMode === "goal" || candidate.executionMode === "loop" || candidate.executionMode === "default"
             ? candidate.executionMode

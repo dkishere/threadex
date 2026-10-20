@@ -1577,6 +1577,7 @@ type TodoControlRow = {
 };
 
 export class SessionStore {
+  runningSideChatSessionIds: () => string[] = () => [];
   private connectionPromise: Promise<SessionDbConnection>;
   private queue = Promise.resolve();
   private connection: SessionDbConnection | null = null;
@@ -2210,6 +2211,8 @@ export class SessionStore {
   }
 
   async listActiveSessionExecutionStatuses(workspaceId?: string | null): Promise<Record<string, ActiveSessionExecutionStatus>> {
+    const sideChatSessions = (await Promise.all(this.runningSideChatSessionIds().map(id => this.getSession(id))))
+      .filter(session => session && (!workspaceId || session.workspaceId === workspaceId));
     return this.read(async (connection) => {
       const result = await connection.run(`SELECT activity.session_id
         FROM (${activeSessionDisplaySql}) activity JOIN sessions ON sessions.id = activity.session_id
@@ -2217,18 +2220,20 @@ export class SessionStore {
       workspaceId ? { workspaceId } : {});
       const rows = await result.getRowObjectsJS();
       return Object.fromEntries(
-        rows.flatMap((row) => {
+        [...sideChatSessions.map(session => [session!.id, "running"] as const), ...rows.flatMap((row) => {
           const sessionId = typeof row.session_id === "string" ? row.session_id : null;
           if (!sessionId) {
             return [];
           }
           return [[sessionId, "running"] as const];
-        })
+        })]
       );
     });
   }
 
   async listWorkspaceMonitorSessions(): Promise<WorkspaceMonitorSessionRecord[]> {
+    const sideChatSessions = (await Promise.all(this.runningSideChatSessionIds().map(id => this.getSession(id))))
+      .filter(session => session !== null);
     return this.read(async (connection) => {
       const result = await connection.run(`
         SELECT
@@ -2239,7 +2244,7 @@ export class SessionStore {
         INNER JOIN (${activeSessionDisplaySql}) AS running_turn ON running_turn.session_id = sessions.id
         ORDER BY sessions.updated DESC, sessions.id ASC
       `);
-      return (await result.getRowObjectsJS()).flatMap((row) => {
+      const monitored = (await result.getRowObjectsJS()).flatMap((row) => {
         const workspaceId = typeof row.workspace_id === "string" ? row.workspace_id : null;
         const sessionId = typeof row.session_id === "string" ? row.session_id : null;
         const sessionName = typeof row.session_name === "string" ? row.session_name : null;
@@ -2252,6 +2257,10 @@ export class SessionStore {
           sessionName
         }];
       });
+      const included = new Set(monitored.map(session => session.sessionId));
+      return [...monitored, ...sideChatSessions.filter(session => !included.has(session.id)).map(session => ({
+        workspaceId: session.workspaceId, sessionId: session.id, sessionName: session.title
+      }))];
     });
   }
 

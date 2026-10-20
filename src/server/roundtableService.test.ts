@@ -4,7 +4,7 @@ import test, { after } from "node:test";
 import { mkdtempSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { DEFAULT_MODEL, MODEL_CATALOG } from "../modelCatalog";
 import { newRoundtableActor, parseRoundtableActors, parseRoundtableSynthesis, roundtableIssueKind, type RoundtableRound } from "../roundtable";
-import { RoundtableService as Service, roundtableActorPrompt, roundtableHostInstructions, roundtableHostPrompt } from "./roundtableService";
+import { RoundtableService as Service, prepareRoundtableFork, roundtableActorPrompt, roundtableHostInstructions, roundtableHostPrompt } from "./roundtableService";
 import { SessionStore } from "./sessionStore";
 import type { RoundtableInference } from "./roundtableRunner";
 import { RoundtableRunLog } from "./roundtableRunLog";
@@ -17,6 +17,27 @@ class RoundtableService extends Service {
 
 const actors = [newRoundtableActor({ model: DEFAULT_MODEL, effort: "low" }), newRoundtableActor({ model: MODEL_CATALOG.claudeSonnet.id, effort: "high" })];
 const response = (responseText: string) => ({ responseText, usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } });
+
+for (const history of [false, true]) test(`round table forks context before creating its round, history=${history}`, async () => {
+  const store = await fixture();
+  const childId = `tx_${randomUUID()}`;
+  const service = new RoundtableService({ store, summarizerModel: () => DEFAULT_MODEL, run: async () => response("Answer") });
+  try {
+    if (history) await store.recordSessionTurn({ id: "before", sessionId: "host", userInput: "Keep this constraint", agentResponse: "Noted", tokenIn: 0, tokenOut: 0 });
+    const parent = (await store.getSession("host"))!;
+    await prepareRoundtableFork(store, parent, childId);
+    await prepareRoundtableFork(store, parent, childId);
+    assert.equal((await store.getSession(childId))?.parentSessionId, parent.id);
+    const copied = await store.listSessionTurns(childId);
+    assert.equal(copied.length, history ? 1 : 0);
+    if (history) assert.equal(copied[0].userInput, "Keep this constraint");
+    await service.create(childId, { turnId: "rt_fork", message: "Discuss in child", actors });
+    await service.idle("rt_fork");
+    assert.equal((await store.getRoundtableRound("rt_fork"))?.sessionId, childId);
+    assert.equal((await store.listSessionTurns("host")).length, history ? 1 : 0);
+    await assert.rejects(prepareRoundtableFork(store, parent, "host"), /new session ID/);
+  } finally { service.stopAll(); await service.idle("rt_fork"); await store.close(); }
+});
 
 for (const completedCount of [0, 1, 2]) test(`skip thinking actors settles with ${completedCount} completed answers`, async () => {
   const store = await fixture();

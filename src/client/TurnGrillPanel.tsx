@@ -20,8 +20,10 @@ export function useGrilledTurns() {
     pendingGrillSessions: new Set(grillSummaries.filter((item) => item.pending).map((item) => item.sessionId)) };
 }
 
-export function TurnGrillPanel({ sessionId, turnId, mainBusy, onImplement, actionExtras, onGrilled, copyText }: {
+export function TurnGrillPanel({ sessionId, turnId, mainBusy, composerDisabled, onSendToComposer, onImplement, actionExtras, onGrilled, copyText }: {
   sessionId: string; turnId: string; mainBusy: boolean;
+  composerDisabled?: boolean;
+  onSendToComposer: (prompt: string) => void;
   onImplement: (prompt: string, origin: { turnId: string; observedVersion: number }) => Promise<void>;
   actionExtras?: ReactNode;
   onGrilled?: (sessionId: string, turnId: string) => void;
@@ -328,11 +330,19 @@ export function TurnGrillPanel({ sessionId, turnId, mainBusy, onImplement, actio
           <button className="grill-button-primary" type="button" disabled={locked || !selectedCount || !!editing} onClick={() => void act("respond", prompt)}><Send size={13} aria-hidden="true" /> Ask thread</button>
           {canFollowUp && <button type="button" disabled={locked || !!editing || !!conflicts.length} onClick={() => void act("followup", prompt)}><Flame size={13} aria-hidden="true" /> Re-grill</button>}
         </div>
-        <button className="grill-implement" type="button" disabled={locked || mainBusy || !selectedCount || !!editing} onClick={async () => {
-          const observedVersion = grillContentVersion(reviewRef.current);
-          const saved = await flushChanges();
-          if (saved) { setBusy(true); setActivity("Main thread is working…"); try { await onImplement(grillHandoff(saved.issues, prompt, saved.rounds), { turnId, observedVersion }); setPrompt(""); } catch (err) { setError(String(err)); } finally { setBusy(false); } }
-        }}>Start work <ArrowUpRight size={14} aria-hidden="true" /></button>
+        <div>
+          <button className="grill-send-to-composer" type="button" disabled={locked || composerDisabled || !selectedCount || !!editing} onClick={async () => {
+            const saved = await flushChanges();
+            if (!saved) return;
+            try { onSendToComposer(grillHandoff(saved.issues, prompt, saved.rounds)); setPrompt(""); }
+            catch (err) { setError(String(err)); }
+          }}>Send to composer <ArrowUpRight size={14} aria-hidden="true" /></button>
+          <button className="grill-implement" type="button" disabled={locked || mainBusy || !selectedCount || !!editing} onClick={async () => {
+            const observedVersion = grillContentVersion(reviewRef.current);
+            const saved = await flushChanges();
+            if (saved) { setBusy(true); setActivity("Main thread is working…"); try { await onImplement(grillHandoff(saved.issues, prompt, saved.rounds), { turnId, observedVersion }); setPrompt(""); } catch (err) { setError(String(err)); } finally { setBusy(false); } }
+          }}>Start work <ArrowUpRight size={14} aria-hidden="true" /></button>
+        </div>
       </div>
     </div>}
 

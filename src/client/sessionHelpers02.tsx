@@ -367,9 +367,16 @@ export function SubagentEvent(ctx, { item, sessionId }) {
     const names = subagentNames(item);
     const threadIds = [...new Set((item.receiverThreadIds ?? []).filter(Boolean))];
     const displayName = item.label?.trim() || names.find(Boolean) || "Subagent";
-    const prompts = [...new Set(activityUpdates.map((update) => update.prompt?.trim()).filter(Boolean))];
-    const models = [...new Set(activityUpdates.map((update) => update.model?.trim()).filter(Boolean))];
-    const reasoningEfforts = [...new Set(activityUpdates.map((update) => update.reasoningEffort?.trim()).filter(Boolean))];
+    const loadedTranscripts = threadIds.flatMap((threadId) => transcripts[threadId]?.payload ? [transcripts[threadId].payload] : []);
+    const prompts = [...new Set([
+        ...activityUpdates.map((update) => update.prompt?.trim()),
+        ...loadedTranscripts.map((payload) => payload.delegatedPrompt?.trim())
+    ].filter(Boolean))];
+    const requestedModels = [...new Set(activityUpdates.map((update) => update.model?.trim()).filter(Boolean))];
+    const requestedEfforts = [...new Set(activityUpdates.map((update) => update.reasoningEffort?.trim()).filter(Boolean))];
+    const actualModels = [...new Set(loadedTranscripts.map((payload) => payload.model?.trim()).filter(Boolean))];
+    const actualEfforts = [...new Set(loadedTranscripts.map((payload) => payload.reasoningEffort?.trim()).filter(Boolean))];
+    const isLoadingDetails = threadIds.some((threadId) => !transcripts[threadId] || transcripts[threadId].status === "loading");
     const returnedMessages = [...new Set(activityUpdates.flatMap((update) => (update.agents ?? [])
         .map((agent) => agent.message?.trim())
         .filter(Boolean)))];
@@ -413,16 +420,26 @@ export function SubagentEvent(ctx, { item, sessionId }) {
             }));
         }
     }
-    const meta = models.length > 0 || reasoningEfforts.length > 0 || threadIds.length > 0
-        ? _jsxs("div", {
-            className: "subagent-event-meta",
-            children: [
-                ...models.map((model) => _jsxs("span", { children: ["Model: ", model] }, `model:${model}`)),
-                ...reasoningEfforts.map((effort) => _jsxs("span", { children: ["Reasoning: ", effort] }, `reasoning:${effort}`)),
-                ...threadIds.map((threadId) => _jsx("code", { children: threadId }, threadId))
-            ]
-        })
-        : null;
+    const meta = _jsxs("div", {
+        className: "subagent-event-meta",
+        children: [
+            ...(actualModels.length > 0
+                ? actualModels.map((model) => _jsxs("span", { children: ["Model: ", model] }, `actual-model:${model}`))
+                : requestedModels.length > 0
+                    ? requestedModels.map((model) => _jsxs("span", { children: [model === "inherit" ? "Model: inherited" : "Requested model: ", model === "inherit" ? "" : model] }, `requested-model:${model}`))
+                    : [_jsx("span", { children: canViewWork && isLoadingDetails ? "Model: loading…" : "Model: unknown" }, "model:unknown")]),
+            ...requestedModels.filter((model) => actualModels.length > 0 && !actualModels.includes(model))
+                .map((model) => _jsxs("span", { children: [model === "inherit" ? "Selection: inherited" : "Requested model: ", model === "inherit" ? "" : model] }, `requested-model:${model}`)),
+            ...(actualEfforts.length > 0
+                ? actualEfforts.map((effort) => _jsxs("span", { children: ["Effort: ", effort] }, `actual-effort:${effort}`))
+                : requestedEfforts.length > 0
+                    ? requestedEfforts.map((effort) => _jsxs("span", { children: ["Requested effort: ", effort] }, `requested-effort:${effort}`))
+                    : [_jsx("span", { children: canViewWork && isLoadingDetails ? "Effort: loading…" : "Effort: unknown" }, "effort:unknown")]),
+            ...requestedEfforts.filter((effort) => actualEfforts.length > 0 && !actualEfforts.includes(effort))
+                .map((effort) => _jsxs("span", { children: ["Requested effort: ", effort] }, `requested-effort:${effort}`)),
+            ...threadIds.map((threadId) => _jsx("code", { children: threadId }, threadId))
+        ]
+    });
     const details = [
         meta,
         ...prompts.map((prompt, index) => _jsxs("div", {
@@ -432,6 +449,13 @@ export function SubagentEvent(ctx, { item, sessionId }) {
                 _jsx(MarkdownContent, { children: prompt })
             ]
         }, `prompt:${index}`)),
+        prompts.length === 0 && _jsxs("div", {
+            className: "subagent-event-prompt",
+            children: [
+                _jsx("span", { children: "Delegated task" }),
+                _jsx("p", { children: canViewWork && isLoadingDetails ? "Loading child details…" : "Prompt not provided by runner." })
+            ]
+        }),
         returnedMessages.length > 0 && _jsxs("div", {
             className: "subagent-returned-content",
             children: [

@@ -27,6 +27,11 @@ test("recognizes rejected refresh-token errors as requiring login", () => {
     ),
     true
   );
+  assert.equal(
+    isAccountLoginRequiredMessage("Error running remote compact task: workspace routing discovery unauthorized (401)"),
+    true
+  );
+  assert.equal(isAccountLoginRequiredMessage("Error running remote compact task: {\"detail\":\"Bad Request\"}"), false);
   assert.equal(isAccountLoginRequiredMessage("temporary network error"), false);
 });
 

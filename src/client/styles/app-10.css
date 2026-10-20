@@ -14,6 +14,7 @@
 }
 
 .composer-fork-toggle[data-active="true"],
+.composer-managed-mode[data-active="true"],
 .composer-plan-prefix[data-active="true"],
 .composer-loop-mode[data-active="true"] {
   background: #27272a;
@@ -21,6 +22,7 @@
 }
 
 .composer-fork-toggle[data-active="true"]:hover,
+.composer-managed-mode[data-active="true"]:hover,
 .composer-plan-prefix[data-active="true"]:hover,
 .composer-loop-mode[data-active="true"]:hover {
   background: #3f3f46;

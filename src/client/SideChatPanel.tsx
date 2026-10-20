@@ -43,6 +43,7 @@ type SideChatPanelProps = {
   CompletedTurn: CompletedTurnComponent;
   annotation?: ResponseAnnotation | null;
   onClearAnnotation?: () => void;
+  onRunningChange?: (running: boolean) => void;
 };
 
 type MentionState = { start: number; end: number; query: string; index: number };
@@ -65,7 +66,7 @@ function saveRoster(sessionId: string, actors: RoundtableActor[]) {
   try { localStorage.setItem(rosterKey(sessionId), JSON.stringify(actors)); } catch { /* The in-memory roster still works. */ }
 }
 
-export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady, workspaceId, CompletedTurn, annotation, onClearAnnotation }: SideChatPanelProps) {
+export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady, workspaceId, CompletedTurn, annotation, onClearAnnotation, onRunningChange }: SideChatPanelProps) {
   const [messages, setMessages] = useState<SessionSideChat[]>([]);
   const [outgoing, setOutgoing] = useState<OutgoingSideChatReply[]>([]);
   const [input, setInput] = useState("");
@@ -86,6 +87,8 @@ export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady,
   const activeGear = gearProfiles[activeGearIndex] ?? gearProfiles[0];
   const actors = syncRoundtableDraftAvatars(roster, presets);
   const isSending = outgoing.some((reply) => reply.status === "pending");
+  useEffect(() => { onRunningChange?.(isSending); }, [isSending, onRunningChange]);
+  useEffect(() => () => onRunningChange?.(false), [onRunningChange]);
   const mentionOptions = mention ? actors.filter((actor) => actor.name.toLowerCase().includes(mention.query.toLowerCase())) : [];
   const rounds = buildSideChatRounds(messages, outgoing);
   const scrollKey = `${messages.length}:${messages.at(-1)?.id}:${outgoing.map(reply => `${reply.key}:${reply.status}`).join(",")}`;
@@ -139,7 +142,7 @@ export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady,
   }, [active]);
 
   useEffect(() => {
-    if (!active || !sessionReady) return;
+    if (!sessionReady) return;
     const controller = new AbortController();
     if (loadedSession.current !== sessionId) setIsLoading(true);
     let timer: number;
@@ -172,7 +175,7 @@ export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady,
     });
     refresh();
     return () => { controller.abort(); window.clearTimeout(timer); };
-  }, [active, sessionId, sessionReady]);
+  }, [sessionId, sessionReady]);
 
   useEffect(() => {
     const element = scrollRef.current;

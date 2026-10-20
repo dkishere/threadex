@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AUTO_MODEL_ORDER, MODEL_OPTIONS, defaultGearProfiles, normalizeModelId, supportsUltraEffort } from "./modelCatalog";
+import { AUTO_MODEL_ORDER, MODEL_OPTIONS, defaultGearProfiles, isClaudeModel, modelProvider, normalizeModelId, supportsUltraEffort } from "./modelCatalog";
 import { AUTO_MODEL_CHOICES } from "./autoModelCatalog";
 import { MODEL_OPTIONS as composerModels } from "./client/appConstants";
 import { modelOptionLabel, normalizeStoredModel } from "./client/sessionHelpers04";
@@ -10,7 +10,7 @@ import { normalizeEffortForModel } from "./client/sessionHelpers04";
 import { updateGearProfile } from "./client/sessionActions05";
 
 test("Claude gears and actors share provider effort choices and model-switch normalization", () => {
-  for (const model of ["opus", "sonnet", "haiku", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]) {
+  for (const model of ["opus", "sonnet", "haiku", "fable", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"]) {
     assert.deepEqual(modelEfforts(model), ["low", "medium", "high", "xhigh", "max"]);
     assert.equal(roundtableEfforts(model), modelEfforts(model));
     assert.equal(normalizeModelEffort(model, "minimal"), "low");
@@ -31,6 +31,20 @@ test("Claude gears and actors share provider effort choices and model-switch nor
   assert.deepEqual(modelEfforts("gpt-5.4"), ["minimal", "low", "medium", "high", "xhigh"]);
   assert.ok(modelEfforts("gpt-6-luna").includes("ultra"));
   assert.equal(normalizeModelEffort("gpt-5.4", "max"), "xhigh");
+});
+
+test("Fable 5.1 is selectable, survives stored preferences and routes to Claude", () => {
+  const model = "claude-fable-5-1";
+  assert.ok(composerModels.includes(model));
+  assert.equal(modelOptionLabel({}, model), "Fable 5.1");
+  for (const value of [model, "fable"]) {
+    assert.equal(normalizeModelId(value), model);
+    assert.equal(normalizeStoredModel({ AUTO_MODEL_VALUE: "auto", MODEL_OPTIONS }, value), model);
+    assert.equal(modelProvider(value), "claude");
+    assert.equal(isClaudeModel(value), true);
+  }
+  assert.ok(!(AUTO_MODEL_ORDER as readonly string[]).includes(model));
+  assert.equal(supportsUltraEffort(model), false);
 });
 
 test("composer, persisted gears and Auto share the catalog", () => {

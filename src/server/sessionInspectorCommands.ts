@@ -96,6 +96,13 @@ const todoPlanItemSchema: Record<string, unknown> = {
 };
 
 const tools: ToolSpec[] = [
+  {
+    name: "record_subagent_prompt",
+    description: "Save the exact plaintext prompt sent to a native child for its Threadex card. Call after native spawn or follow-up returns; this does not dispatch work.",
+    inputSchema: { type: "object", required: ["prompt", "kind"], anyOf: [{ required: ["threadId"] }, { required: ["taskName"] }], additionalProperties: false,
+      properties: { threadId: { type: "string" }, taskName: { type: "string", description: "Full task_name returned by native spawn, e.g. /root/check. Use this when spawn returns no UUID." }, prompt: { type: "string", minLength: 1, maxLength: 64000 },
+        kind: { type: "string", enum: ["spawn", "followup"] } } }
+  },
   INTENT_APPROVAL_TOOL,
   {
     name: "recover_current_session",
@@ -752,6 +759,7 @@ function baseToolsForAgent() {
   if (continuityOnly) {
     return tools.filter((tool) =>
       tool.name === "recover_current_session" ||
+      tool.name === "record_subagent_prompt" ||
       tool.name === "get_session" ||
       tool.name === "search_sessions"
     );
@@ -784,9 +792,12 @@ function isToolExposed(name: string) {
 
 
 export async function runCommand(name: string, args: Record<string, unknown>) {
-
   if (!name || !isToolExposed(name)) {
     throw new Error(`Command is not available to this ${todoAgentRole} agent: ${name ?? "unknown"}`);
+  }
+  if (name === "record_subagent_prompt") {
+    if (!managerSessionId || !managerTurnId) throw new Error("A Threadex runner turn is required.");
+    return postJson("/api/subagent-prompts", { ...args, sessionId: managerSessionId, turnId: managerTurnId });
   }
 
   if (name === "request_intent_approval") {
@@ -1167,6 +1178,7 @@ export async function runCommand(name: string, args: Record<string, unknown>) {
       parentSessionId: managerSessionId,
       sourceSessionId: managerSessionId,
       ...(managerContextForkRequest ? { contextFork: true } : {}),
+      ...(managerContextForkRequest ? { managedMode: process.env.THREADEX_CHILD_MANAGED_MODE === "1" } : {}),
       ...(attachmentForkRequestId ? { queueForkRequestId: attachmentForkRequestId } : {}),
       prompt: childPrompt,
       ...(attachments.length > 0 ? { attachments } : {}),

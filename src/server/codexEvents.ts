@@ -293,6 +293,11 @@ export function streamItemFromThreadItem(
       status: readString(threadItem.kind) ?? (eventType === "item.completed" ? "completed" : "inProgress"),
       ...(readString(threadItem.agentPath) ? { label: readString(threadItem.agentPath) ?? undefined } : {}),
       receiverThreadIds: agentThreadId ? [agentThreadId] : [],
+      ...(readString(threadItem.prompt) ? { prompt: readString(threadItem.prompt) ?? undefined } : {}),
+      ...(readString(threadItem.model) ? { model: readString(threadItem.model) ?? undefined } : {}),
+      ...(readString(threadItem.reasoningEffort)
+        ? { reasoningEffort: readString(threadItem.reasoningEffort) ?? undefined }
+        : {}),
       agents: agentThreadId
         ? [{ id: agentThreadId, name: readString(threadItem.agentPath) ?? undefined, status: readString(threadItem.kind) ?? "running" }]
         : []
