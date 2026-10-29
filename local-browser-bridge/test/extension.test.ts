@@ -1,6 +1,50 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
+
+test("selected element innerText survives compact context serialization with a 128 character limit", async () => {
+  const content = await readFile("extension/content.js", "utf8");
+  const captureSource = content.slice(content.indexOf("    function summarizeElementInnerText("), content.indexOf("    function pageValuesForUrl("));
+  const stored: unknown[] = [];
+  const capture = runInNewContext(`${captureSource}\ncaptureContext`, {
+    Intl,
+    location: { href: "https://example.com/" },
+    document: { title: "Selected element test" },
+    getSelection: () => null,
+    cssPath: () => "main > p",
+    pageValuesForUrl: () => null,
+    send: async (message: unknown) => { stored.push(message); return {}; },
+  });
+  const cases = [
+    { input: "", expected: "" },
+    { input: " \n\t ", expected: "" },
+    { input: " Hello\n\t world\u00a0! ", expected: "Hello world !" },
+    { input: "a".repeat(128), expected: "a".repeat(128) },
+    { input: "a".repeat(129), expected: "a".repeat(128) },
+    { input: "中".repeat(129), expected: "中".repeat(128) },
+    { input: "😀".repeat(129), expected: "😀".repeat(128) },
+    { input: "a".repeat(127) + "👩🏽‍💻", expected: "a".repeat(127) },
+    { input: "a".repeat(124) + "👩🏽‍💻!", expected: "a".repeat(124) + "👩🏽‍💻" },
+    { input: "a".repeat(127) + "e\u0301", expected: "a".repeat(127) },
+    { input: undefined, expected: "" },
+  ];
+  for (const { input, expected } of cases) {
+    const context = await capture({ tabId: 42, mappings: [] }, {
+      tagName: "P", id: "", className: "example", getAttribute: () => null,
+      innerText: input, textContent: "Hidden text must not leak into the summary", outerHTML: "<p>example</p>",
+    }, { key: "context-key" });
+    // Copy and Add to Threadex share this captured context; both serialize it as JSON.
+    const serialized = JSON.parse(JSON.stringify(context));
+    assert.equal(serialized.element.innerText, expected);
+    assert.ok(Array.from(serialized.element.innerText).length <= 128);
+    assert.equal(serialized.selector, "main > p");
+    assert.equal(serialized["extension-context-key"], "context-key");
+    assert.equal(serialized.element.className, "example");
+    const snapshot = (stored.at(-1) as { snapshot: { element: { innerText: string } } }).snapshot;
+    assert.equal(snapshot.element.innerText, expected);
+  }
+});
 
 test("manifest installs the automatic HTTP(S) page context content script", async () => {
   const manifest = JSON.parse(await readFile("extension/manifest.json", "utf8")) as { permissions?: string[]; content_scripts?: Array<{ matches?: string[]; js?: string[] }> };

@@ -1,0 +1,80 @@
+[
+  {
+    "id": "rollout-scope",
+    "source": "threadex://default/tx_eb362fd8-0300-4cc6-be24-930a916ff3e4/rt_ed36bb8b-6c41-44d8-869b-f74993cd8b90",
+    "description": "Original topic and verbatim excerpts from the two actor answers; unrelated migration details omitted.",
+    "topic": "ok, so cv e2e is here, we could move CV apis to unified hub-api, but keep in mind cv contain workers(so do hms) so they should still stay alone(for now)",
+    "responses": [
+      {
+        "actor": "AstraXH",
+        "text": "- **Agreed: consolidate the HTTP APIs, not the worker runtimes.** CV endpoints should join `hub-api`; CV and HMS workers should retain separate functions, triggers, scaling, permissions and rollback controls. Sharing business logic does not require sharing a runtime.\n\nI inspected the host history, current backend source and local Terraform read-only. No changes or tests were run; deployed AWS state was not verified."
+      },
+      {
+        "actor": "FableXH",
+        "text": "Agree with the direction, and it matches what the repo already documents: README/migration-plan/transition.md all say \"absorb the HTTP-facing part of CV into the unified API; CV asynchronous handlers stay separate\".\n\n## Suggested sequence (proposal only)\n\n3. Add a dev-env `ministack-replace-cv` combined path and env union, then run `CV_E2E_TARGET=baseline` vs `unified` for all four modes (`api`, `scoring`, `resolution`, `full`).\n4. Only then touch terraform: IAM additions on the HMS role, repoint the two CV gateway integrations, leave the 6-7 worker functions on the CV image pin (or hub-api image with handler override, per Option A).\n\n## Open questions\n\n- `greenhouse_ingest_handler` exists in code but isn't in terraform's `cv_data_real_handlers` map I read — is it deployed elsewhere or not yet wired? Worth confirming before claiming \"7 workers\"."
+      }
+    ],
+    "rubric": [
+      "Decision or summary is acceptable for this original direction-plus-constraint prompt; explain classification when reviewing results.",
+      "Never create a disagreement between the rollout sequence and AstraXH's verification scope.",
+      "Preserve agreement on separate worker runtimes and FableXH's rollout proposal without crediting AstraXH with that particular sequence.",
+      "Retain the unverified AWS state as scope and the ingestion deployment question as an open question, with their original attribution.",
+      "Do not turn FableXH's uncertainty about the worker count into a verified deployment fact."
+    ]
+  },
+  {
+    "id": "complementary",
+    "description": "Synthetic compatible qualifications to the same decision.",
+    "topic": "Choose the worker boundary for the API migration.",
+    "responses": [
+      { "actor": "Robin", "text": "Keep workers in separate deployments. Pin worker versions independently.\n\n## Verification scope\nRead source only; tests were not run." },
+      { "actor": "Willow", "text": "Keep workers in separate deployments. Preserve their existing triggers and permissions." }
+    ],
+    "rubric": [
+      "Use decision with one shared boundary position, supported by both actors.",
+      "Version pins and trigger/permission preservation are complementary details, not opposing positions.",
+      "Attribute verification scope to Robin alone."
+    ]
+  },
+  {
+    "id": "opposed",
+    "description": "Synthetic incompatible recommendations under the same conditions.",
+    "topic": "Given the current unverified deployed state, should we migrate today?",
+    "responses": [
+      { "actor": "Robin", "text": "Migrate today despite the unverified state; accept the risk.\n\n## Verification scope\nDeployed state was not verified." },
+      { "actor": "Willow", "text": "Do not migrate today. Wait until deployed state is verified.\n\n## Verification scope\nDeployed state was not verified." }
+    ],
+    "rubric": [
+      "Use decision with two positions on migration timing: proceed today versus wait.",
+      "Keep the shared scope note outside positions; it does not erase the substantive disagreement.",
+      "Do not discard Willow's condition about verification as merely a method note."
+    ]
+  },
+  {
+    "id": "questions-only",
+    "description": "Synthetic absence of a substantive recommendation.",
+    "topic": "Choose whether to migrate today.",
+    "responses": [
+      { "actor": "Robin", "text": "I cannot recommend an option. Which worker version is deployed?\n\n## Verification scope\nOnly local source was inspected." },
+      { "actor": "Willow", "text": "I have no position yet. Which worker version is deployed?\n\n## Verification scope\nTests were not run." }
+    ],
+    "rubric": [
+      "Use decision with an empty issues array, one shared open question, and separately attributed scope notes.",
+      "Do not manufacture a consensus to wait or invent opposing positions."
+    ]
+  },
+  {
+    "id": "research",
+    "description": "Synthetic conflicting findings in a research request.",
+    "topic": "Collect findings about rollout options; do not choose an option yet.",
+    "responses": [
+      { "actor": "Robin", "text": "A staged rollout may reduce exposure but requires extra deployment configuration.\n\n## Verification scope\nRead the design only." },
+      { "actor": "Willow", "text": "A staged rollout may increase operational risk because mixed versions can be incompatible.\n\n## Verification scope\nRuntime compatibility was not tested." }
+    ],
+    "rubric": [
+      "Use research/summary even though actors disagree about risk.",
+      "Keep both risk claims attributed, with verification scope in the overview or a closing section.",
+      "Do not add decision issues, scope or openQuestions fields to the summary schema."
+    ]
+  }
+]

@@ -51,6 +51,32 @@ test("an idle target starts a normal turn with the wake approval policy", async 
   }]);
 });
 
+test("a started wake returns once accepted without waiting for the turn stream to end", async () => {
+  let closeStream!: () => void;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode("event: session\ndata: {}\n\n"));
+      closeStream = () => controller.close();
+    }
+  });
+  const result = await Promise.race([
+    deliverProcessWake({
+      sessionId: "target",
+      turnId: "wait_subscription-1",
+      message: "finished",
+      workspaceId: "default",
+      loadBalanceInWorkspace: false
+    }, {
+      runningTurnId: async () => null,
+      steer: async () => { throw new Error("unexpected steer"); },
+      start: async () => new Response(body, { headers: { "Content-Type": "text/event-stream" } })
+    }),
+    new Promise(resolve => setTimeout(() => resolve("blocked on stream"), 1000))
+  ]);
+  closeStream();
+  assert.equal(result, "started");
+});
+
 test("a running target keeps the current turn and does not start another", async () => {
   assert.equal(await deliverProcessWake({
     sessionId: "target",

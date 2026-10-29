@@ -4,6 +4,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync, rmSync } from "node
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { AUTO_MODEL_CHOICES, isAutoEffort, type AutoCustomRules, type AutoModel } from "../autoModelCatalog";
+import { DECISION_BACKENDS, DEFAULT_DECISION_POLICIES, validDecisionPolicies, type ConfiguredDecisionBackend, type DecisionPolicies } from "../decisionSettings";
 
 /** Global server credential, never returned to clients or included in turn metadata. */
 export class AutoModelSettings {
@@ -27,8 +28,44 @@ export class AutoModelSettings {
     return {
       apiKeyConfigured: Boolean(this.apiKey()),
       selectorModel: "jev-latest",
+      backends: Object.fromEntries(DECISION_BACKENDS.map(id => [id, { apiKeyConfigured: Boolean(this.backendKey(id)), ...(id === "llm" ? { execution: "cli" } : {}) }])),
+      policies: this.policies(),
       ...this.customRules()
     };
+  }
+
+  backendKey(id: ConfiguredDecisionBackend): string | undefined {
+    // LLM simulation uses Codex/Claude login; legacy .llm keys are never loaded.
+    if (id === "llm") return undefined;
+    if (id === "jev") return this.apiKey();
+    try { return readFileSync(`${this.path}.${id}`, "utf8").trim() || undefined; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("Unable to read Decision settings.");
+      return process.env.OPENAI_API_KEY?.trim() || undefined;
+    }
+  }
+
+  saveBackendKey(id: ConfiguredDecisionBackend, key: string) {
+    if (id === "llm") throw new Error("LLM simulation uses Codex/Claude helper login, not an API key.");
+    this.writePrivateSetting(id === "jev" ? this.path : `${this.path}.${id}`, key.trim());
+    return this.status();
+  }
+
+  policies(): DecisionPolicies {
+    try {
+      const value: unknown = JSON.parse(readFileSync(`${this.path}.decision-policies.json`, "utf8"));
+      if (!validDecisionPolicies(value)) throw new Error("Invalid Decision settings.");
+      return value;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("Unable to read Decision settings.");
+      return structuredClone(DEFAULT_DECISION_POLICIES);
+    }
+  }
+
+  savePolicies(policies: DecisionPolicies) {
+    if (!validDecisionPolicies(policies)) throw new Error("Invalid Decision policies.");
+    this.writePrivateSetting(`${this.path}.decision-policies.json`, JSON.stringify(policies));
+    return this.status();
   }
 
   save(apiKey: string) {
@@ -94,6 +131,24 @@ export function createAutoModelSettingsRouter(settings: AutoModelSettings) {
     catch { res.status(500).json({ error: "Unable to read Auto model settings." }); }
   });
   router.put("/", (req, res) => {
+    if (Object.hasOwn(req.body ?? {}, "policies") || Object.hasOwn(req.body ?? {}, "backend")) {
+      const { policies, backend, apiKey } = req.body;
+      if (backend === "llm") {
+        res.status(400).json({ error: "LLM simulation uses Codex/Claude helper login and the helper model settings; no API key is needed." });
+        return;
+      }
+      if (policies !== undefined && !validDecisionPolicies(policies)
+        || backend !== undefined && (!DECISION_BACKENDS.includes(backend) || typeof apiKey !== "string" || apiKey.length > 512 || /\s/.test(apiKey.trim()))) {
+        res.status(400).json({ error: "Provide a valid backend key and purpose policies (unique backend order and thresholds from 0 to 1)." });
+        return;
+      }
+      try {
+        if (backend !== undefined) settings.saveBackendKey(backend, apiKey);
+        if (policies !== undefined) settings.savePolicies(policies);
+        res.json(settings.status());
+      } catch { res.status(500).json({ error: "Unable to save Decision settings." }); }
+      return;
+    }
     const hasApiKey = Object.hasOwn(req.body ?? {}, "apiKey");
     const hasCustomRules = Object.hasOwn(req.body ?? {}, "customRulesEnabled") || Object.hasOwn(req.body ?? {}, "customRules");
     const apiKey = req.body?.apiKey;

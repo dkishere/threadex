@@ -5,8 +5,10 @@ import { SubagentPromptReminder } from "./subagentPromptRecord";
 import { withProviderHandoff, type ProviderThreadScope } from "./sessionProviderThreads";
 import { prepareClaudeHome } from "./claudeHome";
 import { claudePermissions, providerSwitchNote, runClaudeTurn, type ClaudeInputPart } from "./claudeRunner";
+import { codexImageMcpConfig } from "./codexImageMcp";
 import type { CollaborationFork } from "../collaboration";
 import { WORKSPACE_MANAGER_TOOLS } from "./workspaceManagerTools";
+import { DOMAIN_ACTOR_TOOLS } from "./domainActorTools";
 import { MANAGER_CONCURRENT_INSTRUCTIONS, WORKSPACE_MANAGER_INSTRUCTIONS } from "./workspaceManager";
 import { MANAGER_REPLY_LANGUAGE_INSTRUCTIONS } from "./replyLanguage";
 import { WORKSPACE_MANAGER_MODEL, WORKSPACE_MANAGER_EFFORT,
@@ -42,11 +44,13 @@ import {
 } from "./codexConfig";
 import {
   fileChangesFromTurnDiff,
+  mergeTurnDiffChanges,
   streamItemFromThreadItem,
   streamItemFromPlanUpdate,
   summarizeAppServerMessage,
   truncateCommandOutput,
   type AppServerMessage,
+  type FileChange,
   type StreamItem
 } from "./codexEvents";
 import {
@@ -90,6 +94,12 @@ type RunnerJob = {
   sandboxEscapesApproved?: boolean;
   collaboration?: { groupId: string; fork: CollaborationFork | null; priorContext: string };
   workspaceManager?: boolean;
+  domainActor?: boolean;
+  domainActorCapability?: string;
+  /** Native split children hosted by this actor session; Claude registers them as SDK agents. No secrets. */
+  actorChildren?: Array<{ workItemId: string; name: string; description: string; prompt: string; model: string; effort: string }>;
+  /** Per-child actor capabilities by agent name; read from the runner environment, never persisted in the job. */
+  actorChildCapabilities?: Record<string, string>;
   managerConcurrent?: boolean;
   managerDelegatedTask?: boolean;
   managerLoopAlert?: boolean;
@@ -134,6 +144,7 @@ type RunnerJob = {
   todoPlanAlreadyExists?: boolean;
   goalObjectiveFilePath?: string;
   developerInstructions?: string;
+  actorContextInstructions?: string;
   globalAgentInstructions?: string;
   recoveryContext?: SessionRecoveryContext;
   forceRecoveryOnResume?: boolean;
@@ -174,6 +185,7 @@ const THREADEX_DEVELOPER_INSTRUCTIONS = [
   "Code-file edit tracking: before creating, editing, deleting, or renaming code files (including tests), use apply_patch or a native editing tool that records structured per-file changes and diffs in the session. Without the user's explicit prior permission for the specific alternative method and file scope, do not modify code using shell commands, Python/Node scripts, direct filesystem writes, redirection, sed -i, perl -i, formatter or linter write/autofix modes, codemods, or refactoring tools that lack structured edit tracking. A general request to implement, fix, refactor, format, or test code does not authorize an untracked editing method. Command logs, a later git diff, and passing tests do not replace structured edit tracking. If a tracked tool is unavailable or unsuitable, explain the exact method and files and obtain explicit permission before writing; never silently fall back. Permission covers only the approved method and scope and remains subject to sandbox and higher-priority restrictions.",
   "You are being called through the Threadex client. Use the built-in Threadex-config skill for Threadex-managed configuration. Write user-facing commentary and progress updates as plain natural-language prose only. Never wrap commentary in JSON or emit extracts, shortMsg, issues, solutions, type, short, or detail fields; Threadex handles status-card presentation separately.",
   "Threadex session ownership: a parent and its forks share history only through the fork point; later work belongs to its branch. A parent remains an active working session after creating a fork. Execute subsequent user requests in the receiving parent session; do not automatically forward them to an existing fork, create another task, or ask the user to continue there. Only an explicit user request to delegate or a current Context Fork/New task action authorizes that handoff. If another branch's post-fork work is needed, inspect its context and continue the work here; that dependency alone does not authorize delegation. Historical handoff instructions apply only to their original turn. Context Fork/New task is explicit delegation for the current turn only: follow the server-provided child-task contract.",
+  "Blocked by another task: when another running Threadex task blocks your work (for example it holds a file, process, branch or result you need), do not abandon the work or end with a blocked report. Identify the running task with session-inspector search_sessions status=running or get_session, subscribe to its end with session-inspector wait_for_task_end and a self-contained resume instruction, then end your turn unless independent work remains. You are woken when it completes, fails or is stopped; re-check for remaining blockers before continuing.",
   "Context preservation: when conversation state is compacted or summarized, preserve every material correction, decision, root cause, completed action, changed file or identifier, verification result, unresolved blocker, and next concrete goal. A substantive final response remains important even when later turns change topic; never omit it solely because it is not recent.",
   "Search safety: never run recursive file or text searches from a filesystem root, workspace root, or broad parent directory. Resolve the owning project first and search only explicit source, test, configuration, or documentation paths. Never broadly search Threadex runtime data such as runner logs, pending or quarantined logs, Codex homes, account homes, build output, dependencies, or generated data."
 ].join(" ");
@@ -263,6 +275,12 @@ if (!jobPath) {
 }
 
 const job = JSON.parse(readFileSync(jobPath, "utf8")) as RunnerJob;
+if (job.domainActor) {
+  job.domainActorCapability = process.env.THREADEX_ACTOR_CAPABILITY;
+  job.actorChildCapabilities = parseActorChildCapabilities(process.env.THREADEX_ACTOR_CHILD_CAPABILITIES);
+}
+// Agents launched by this runner receive capabilities only through explicit, per-provider channels.
+delete process.env.THREADEX_ACTOR_CHILD_CAPABILITIES;
 // Jobs saved before the roles were split used the supervisor flag for both.
 // Concurrent history/authority is retained; supervisor execution limits are not.
 if (job.workspaceManager && job.collaboration?.fork) {
@@ -361,6 +379,9 @@ async function run() {
   const startedAt = Date.now();
   let generationFinishedAt: number | undefined;
   const itemCache = new Map<string, StreamItem>();
+  // Latest net diff per native turn (main-thread phases and sub-agent turns),
+  // least recently updated first, so the merged Changes keep the newest snapshot of a shared path.
+  const turnDiffSnapshots = new Map<string, FileChange[]>();
   const subagentPromptReminder = new SubagentPromptReminder();
   const commandOutputCapturedChars = new Map<string, number>();
   const commandOutputCaptureStopped = new Set<string>();
@@ -424,7 +445,16 @@ async function run() {
         await emitNativeTurnLink(nativeTurnId);
       }
     } else if (method === "thread/tokenUsage/updated") {
-      if (notificationBelongsToRunnerThread(params, threadId)) {
+      if (!notificationBelongsToRunnerThread(params, threadId)) {
+        // A child thread's counter is separate; forwarding it as a codex event
+        // would be read as this turn's usage.
+        await emitEvent("subagent_usage", {
+          agentId: readString(params?.threadId),
+          source: "app_server",
+          tokenUsage: params?.tokenUsage ?? null
+        });
+        return;
+      } else {
         usage = readUsage(params?.tokenUsage, usage) ?? usage;
         const tokenUsage = readObject(params?.tokenUsage);
         const last = readObject(tokenUsage?.last);
@@ -491,31 +521,38 @@ async function run() {
         }
       }
     } else if (method === "turn/diff/updated") {
-      if (notificationBelongsToRunnerThread(params, threadId)) {
-        const nativeTurnId = readString(params?.turnId) ?? appTurnId ?? job.turnId;
-        const diff = readString(params?.diff) ?? "";
-        const lastEdit = [...itemCache.values()].reverse().find((item) =>
-          item.itemType === "file_change" && !item.authoritative &&
-          streamItemBelongsToRunnerThread(item, threadId) &&
-          (!item.originTurnId || item.originTurnId === nativeTurnId)
-        );
-        // A rejected patch can emit an empty diff without reverting prior edits.
-        if (!diff.trim() && lastEdit?.itemType === "file_change" && lastEdit.status === "failed") {
-          await emitEvent("codex", summarizeAppServerMessage(message));
-          return;
-        }
-        const streamItem: StreamItem = {
-          id: `turn-diff:${nativeTurnId}`,
-          eventType: "item.completed",
-          itemType: "file_change",
-          changes: fileChangesFromTurnDiff(diff),
-          status: "completed",
-          authoritative: true,
-          ...streamItemOrigin(params)
-        };
-        itemCache.set(streamItemCacheKey(params, streamItem.id), streamItem);
-        await emitEvent("item", streamItem);
+      // This runner's app-server only hosts this Threadex turn's threads: the main
+      // thread and the sub-agents it spawned. Each native turn's diff is net for
+      // its own edits only, so the turn's Changes merge every one of them.
+      const notificationThreadId = readString(params?.threadId) ?? threadId;
+      const nativeTurnId = readString(params?.turnId) ?? appTurnId ?? job.turnId;
+      const diff = readString(params?.diff) ?? "";
+      const lastEdit = [...itemCache.values()].reverse().find((item) =>
+        item.itemType === "file_change" && !item.authoritative &&
+        streamItemBelongsToRunnerThread(item, notificationThreadId) &&
+        (!item.originTurnId || item.originTurnId === nativeTurnId)
+      );
+      // A rejected patch can emit an empty diff without reverting prior edits.
+      if (!diff.trim() && lastEdit?.itemType === "file_change" && lastEdit.status === "failed") {
+        await emitEvent("codex", summarizeAppServerMessage(message));
+        return;
       }
+      turnDiffSnapshots.delete(nativeTurnId);
+      turnDiffSnapshots.set(nativeTurnId, fileChangesFromTurnDiff(diff));
+      const mainTurnId = appTurnId ?? nativeTurnId;
+      const streamItem: StreamItem = {
+        id: `turn-diff:${mainTurnId}`,
+        eventType: "item.completed",
+        itemType: "file_change",
+        changes: mergeTurnDiffChanges([...turnDiffSnapshots.values()]),
+        status: "completed",
+        authoritative: true,
+        turnDiffSources: [...turnDiffSnapshots.keys()],
+        ...(threadId ? { originThreadId: threadId } : {}),
+        originTurnId: mainTurnId
+      };
+      itemCache.set(streamItemCacheKey({ threadId: threadId ?? null }, streamItem.id), streamItem);
+      await emitEvent("item", streamItem);
     } else if (method === "item/agentMessage/delta") {
       const streamItem = updateCachedTextItem(itemCache, params, "agent_message", readString(params?.delta) ?? "");
       if (streamItem) {
@@ -657,12 +694,15 @@ async function run() {
 
     // Refresh persistent policy on every start/resume, including recovery of old
     // managers. Turn settings carry only changing context, not another policy copy.
-    const threadDeveloperInstructions = job.workspaceManager
+    // Global instructions and actor context ride here too: start, resume, fork and
+    // recovery all re-send them, and changed content replaces the old copy.
+    const threadDeveloperInstructions = [job.workspaceManager
       ? WORKSPACE_MANAGER_INSTRUCTIONS
       : [THREADEX_DEVELOPER_INSTRUCTIONS,
         job.managerConcurrent ? MANAGER_CONCURRENT_INSTRUCTIONS
           : job.managerDelegatedTask ? MANAGER_REPLY_LANGUAGE_INSTRUCTIONS : undefined]
-        .filter(Boolean).join("\n\n");
+        .filter(Boolean).join("\n\n"), persistentContextInstructions(job)]
+      .filter(Boolean).join("\n\n");
     let recoveryContextForTurn = !threadId || job.forceRecoveryOnResume === true
       ? job.recoveryContext ?? null
       : null;
@@ -1104,7 +1144,8 @@ async function runClaudeRunnerTurn() {
       ? { ...job, message: recoveryPrompt(job.message, recoveryContext) }
       : { ...job, message: withProviderHandoff(job.message, job.providerHandoff) };
     const forcePlanSuffix = turnJob.contextForkRequest !== true && turnJob.forcePlan === true && turnJob.todoPlanAlreadyExists !== true;
-    const turnInstructions = runnerDeveloperInstructions(turnJob, true);
+    // Claude's system prompt is rebuilt on every query, so it never accumulates in history.
+    const turnInstructions = runnerDeveloperInstructions(turnJob, true, true);
     await emitDeveloperInstructionsEvent("turn", 0, turnInstructions);
 
     const readOnly = planningTurnIsReadOnly(job) || defaultThreadOptions.sandbox === "read-only";
@@ -1134,12 +1175,22 @@ async function runClaudeRunnerTurn() {
       readOnly,
       sandboxMode: defaultThreadOptions.sandbox,
       protectedPaths: [job.claudeConfigDir, job.claudeAuthSourceDir].filter((path): path is string => Boolean(path)),
-      mcpServers: {},
+      mcpServers: codexImageMcpConfig({ cwd: job.cwd ?? defaultThreadOptions.cwd, readOnly, codexHome: job.codexHome }),
       allowedTools: [],
       approvedInspectorCommands: cli.approvedCommands,
       sandboxEscapesApproved: job.sandboxEscapesApproved === true,
+      ...(job.domainActor ? { actorCredentials: {
+        main: job.domainActorCapability || undefined,
+        children: Object.fromEntries((job.actorChildren ?? []).flatMap(child => job.actorChildCapabilities?.[child.name]
+          ? [[child.name, { workItemId: child.workItemId, capability: job.actorChildCapabilities[child.name] }]] : [])),
+        toolNames: DOMAIN_ACTOR_TOOLS.map(tool => tool.name)
+      } } : {}),
+      ...(job.actorChildren?.length ? { agents: Object.fromEntries(job.actorChildren.map(child => [child.name,
+        { description: child.description, prompt: child.prompt, model: child.model, effort: child.effort }])) } : {}),
       extraEnv: {
         ...cli.env,
+        // Claude actor credentials travel only through the PreToolUse hook, never in a sub-agent's environment.
+        ...(job.domainActor ? { THREADEX_ACTOR_CAPABILITY: "" } : {}),
         ...(job.claudeConfigDir ? { CLAUDE_CONFIG_DIR: job.claudeConfigDir } : {}),
         ...(!job.claudeAccountId ? { THREADEX_CLAUDE_DEFAULT_AUTH: "1" } : {}),
         THREADEX_MANAGED_RUNNER: "1",
@@ -1330,6 +1381,15 @@ function stopSleepInhibitor(child: ChildProcess | null) {
 function shouldInhibitSleep() {
   const value = (process.env.THREADEX_INHIBIT_SLEEP ?? "1").trim().toLowerCase();
   return value !== "0" && value !== "false" && value !== "off" && value !== "no";
+}
+
+function parseActorChildCapabilities(value: string | undefined): Record<string, string> | undefined {
+  if (!value) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === "string" && /^[a-f0-9]{64}$/.test(entry[1])));
+  } catch { return undefined; }
 }
 
 function readPositiveInteger(value: string | undefined, fallback: number) {
@@ -2103,6 +2163,7 @@ function buildSessionInspectorCliConfig(job: RunnerJob) {
       ...(!job.workspaceManager && !isClaudeModel(job.model) ? ["record_subagent_prompt"] : []),
       ...(!planningTurnIsReadOnly(job) && !job.workspaceManager && !isClaudeModel(job.model) ? ["request_intent_approval"] : []),
       ...(job.workspaceManager || job.managerConcurrent ? WORKSPACE_MANAGER_TOOLS.map(tool => tool.name) : []),
+      ...(job.domainActor ? DOMAIN_ACTOR_TOOLS.map(tool => tool.name) : []),
       ...(job.lightweightTodo ? ["outcome_plan_get", "outcome_plan_set"] : []),
       ...(job.autoModelEnabled ? ["upgrade_model"] : []),
       ...(job.contextForkRequest ? ["create_task"] : []),
@@ -2113,6 +2174,8 @@ function buildSessionInspectorCliConfig(job: RunnerJob) {
       THREADEX_SESSION_ID: job.sessionId,
       THREADEX_CONCURRENT_ID: job.collaboration?.groupId ?? "",
       THREADEX_WORKSPACE_MANAGER: job.workspaceManager || job.managerConcurrent ? "1" : "0",
+      THREADEX_DOMAIN_ACTOR: job.domainActor ? "1" : "0",
+      THREADEX_ACTOR_CAPABILITY: job.domainActorCapability ?? "",
       THREADEX_MANAGER_CONCURRENT: job.managerConcurrent ? "1" : "0",
       THREADEX_TURN_ID: job.turnId,
       THREADEX_THREAD_ID: job.threadId ?? "",
@@ -2201,13 +2264,21 @@ function todoPlanningRequested(job: RunnerJob) {
   return !job.lightweightTodo && job.todoPlanAlreadyExists !== true && (job.forcePlan === true || job.executionMode === "plan");
 }
 
-function runnerDeveloperInstructions(job: RunnerJob, includeStartupSnapshot = true) {
-  const instructions = [
-    !job.workspaceManager ? intentTurnInstructions(job.turnId) : undefined,
-    !job.workspaceManager ? inspectorInstructions : undefined,
+/** Global instructions and actor context: persistent, so Codex carries them at thread start/resume, not in each turn. */
+function persistentContextInstructions(job: RunnerJob) {
+  return [
     job.globalAgentInstructions?.trim()
       ? `User's global agent instructions (apply across Threadex workspaces):\n${job.globalAgentInstructions}`
       : undefined,
+    job.actorContextInstructions
+  ].filter(Boolean).join("\n\n");
+}
+
+function runnerDeveloperInstructions(job: RunnerJob, includeStartupSnapshot = true, includePersistentContext = false) {
+  const instructions = [
+    !job.workspaceManager ? intentTurnInstructions(job.turnId) : undefined,
+    !job.workspaceManager ? inspectorInstructions : undefined,
+    includePersistentContext ? persistentContextInstructions(job) || undefined : undefined,
     sessionInspectorDeveloperInstructions(job),
     autoModelDeveloperInstructions(job),
     serverContextDeveloperInstructions(job, includeStartupSnapshot),

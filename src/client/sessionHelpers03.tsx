@@ -1,4 +1,7 @@
 // @ts-nocheck
+import { applySubagentActivitySnapshot } from "./subagentActivityStore";
+import { readPromptOrigin } from "./promptOrigin";
+
 const CONTEXT_FORK_SUFFIX_START = "Required for this turn: create exactly one new Threadex child task for the user's request.";
 const CONTEXT_FORK_SUFFIX_END = "This appended suffix is operational metadata; it must not influence the language of the handoff or response.";
 
@@ -176,6 +179,7 @@ export function sessionTurnsToMessages(ctx, turns, title, existingMessages = [],
             })
             : undefined;
         const streamItems = turn.liveItems?.filter(isStreamItem) ?? [];
+        applySubagentActivitySnapshot(turn.subagentActivity);
         const localSteers = existingMessages.filter((message) => message.role === "user" && message.kind === "steer" && message.turnId === turn.id && !message.id.startsWith("async:"));
         const persistedSteers = snapshotSteerMessages(turn.steerMessages, turn.id);
         const steerById = new Map();
@@ -216,14 +220,16 @@ export function sessionTurnsToMessages(ctx, turns, title, existingMessages = [],
                 rawContent: promptMetadata.raw,
                 turnId: turn.id,
                 model: turn.model ?? existingUserMessage?.model,
+                promptOrigin: readPromptOrigin(turn) ?? existingUserMessage?.promptOrigin ?? undefined,
                 reasoningEffort: turn.reasoningEffort ?? existingUserMessage?.reasoningEffort,
                 requestedServiceTier: turn.requestedServiceTier ?? existingUserMessage?.requestedServiceTier,
-                autoModel: turn.autoModelProvider === "typesafe" || turn.autoModelProvider === "fallback" || existingUserMessage?.autoModel,
+                autoModel: Boolean(turn.autoModelProvider) || existingUserMessage?.autoModel,
                 autoModelProvider: turn.autoModelProvider ?? existingUserMessage?.autoModelProvider,
                 autoModelConfidence: turn.autoModelConfidence ?? existingUserMessage?.autoModelConfidence,
                 tokenIn: Number.isFinite(turn.tokenIn) ? turn.tokenIn : existingUserMessage?.tokenIn,
                 cachedInputTokens: Number.isFinite(turn.cachedInputTokens) ? turn.cachedInputTokens : undefined,
                 tokenOut: Number.isFinite(turn.tokenOut) ? turn.tokenOut : existingUserMessage?.tokenOut,
+                subagentUsage: turn.subagentUsage,
                 executionDurationMs: turnDurationMs(turn),
                 turnStatus: turn.status,
                 pendingReason: turn.pendingReason ?? null,
@@ -234,8 +240,9 @@ export function sessionTurnsToMessages(ctx, turns, title, existingMessages = [],
                 startupSnapshot: index === 0 ? existingUserMessage?.startupSnapshot : undefined,
                 developerInstructions,
                 forcePlan: existingUserMessage?.forcePlan === true || developerInstructionsIndicateForcePlan(developerInstructions),
-                managedMode: typeof turn.requestMetadata?.managedMode === "boolean"
-                    ? turn.requestMetadata.managedMode : existingUserMessage?.managedMode === true,
+                managedMode: turn.requestMetadata?.managedModeForced === "actor-tier" || (typeof turn.requestMetadata?.managedMode === "boolean"
+                    ? turn.requestMetadata.managedMode : existingUserMessage?.managedMode === true),
+                managedModeForced: turn.requestMetadata?.managedModeForced === "actor-tier",
                 contextFork: existingUserMessage?.contextFork === true || inferredContextFork || promptMetadata.contextFork,
                 executionMode: turn.loopMode ? "loop" : hasGoalMode ? "goal" : existingUserMessage?.executionMode
             },

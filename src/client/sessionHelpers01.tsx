@@ -289,7 +289,11 @@ export function streamItemsToSegments(ctx, items, rootThreadId) {
         if (item.itemType === "agent_message") {
             const itemKey = liveItemKey(item);
             const isChildOrigin = Boolean(item.originThreadId && item.originThreadId !== rootThreadId);
-            if (item.comment || isChildOrigin) {
+            // Root final answers stay plain text even after headline
+            // classification, matching the live view: the last one becomes the
+            // conclusion and any earlier one remains in the completed steps.
+            const isRootFinalAnswer = item.phase === "final_answer" && !isChildOrigin;
+            if ((item.comment && !isRootFinalAnswer) || isChildOrigin) {
                 segments = upsertLiveSegment(segments, item);
                 continue;
             }
@@ -742,6 +746,11 @@ function groupSubagentItems(items) {
             });
         }
 
+        if (item.tool === "send_message") {
+            // Recipient unknown in this runner: one standalone message, never merged by summary or name.
+            return [{ segmentId: id, aliases: [`message:${item.id}`], item: { ...item, receiverThreadIds: [], agents } }];
+        }
+
         const isListAgents = /list[_ -]?agents/i.test(item.tool ?? "");
         if (agents.length > 0 && (!item.label || isListAgents)) {
             return agents.flatMap((agent) => {
@@ -800,11 +809,13 @@ function groupSubagentItems(items) {
 
     return [...groupedRecords.values()].map((group) => {
         const activityUpdates = group.map(({ item }) => item);
-        const latestItem = activityUpdates.filter((item) => !["record_spawn_prompt", "record_followup_prompt"].includes(item.tool)).at(-1) ?? activityUpdates.at(-1);
-        const labels = activityUpdates.filter((item) => !["record_spawn_prompt", "record_followup_prompt"].includes(item.tool)).map((item) => item.label?.trim()).filter(Boolean);
+        // SendMessage items carry message text in label/prompt/agents; they join the card but never name or re-status it.
+        const workUpdates = activityUpdates.filter((item) => !["record_spawn_prompt", "record_followup_prompt", "send_message"].includes(item.tool));
+        const latestItem = workUpdates.at(-1) ?? activityUpdates.at(-1);
+        const labels = workUpdates.map((item) => item.label?.trim()).filter(Boolean);
         const receiverThreadIds = [...new Set(activityUpdates.flatMap((item) => item.receiverThreadIds ?? []))];
         const agentUpdates = new Map();
-        for (const item of activityUpdates) {
+        for (const item of workUpdates.length > 0 ? workUpdates : activityUpdates) {
             for (const agent of item.agents ?? []) {
                 const key = agent.id || agent.name || "agent";
                 const previous = agentUpdates.get(key);

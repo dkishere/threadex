@@ -4,7 +4,7 @@ import { AUTO_MODEL_ORDER, MODEL_OPTIONS, defaultGearProfiles, isClaudeModel, mo
 import { AUTO_MODEL_CHOICES } from "./autoModelCatalog";
 import { MODEL_OPTIONS as composerModels } from "./client/appConstants";
 import { modelOptionLabel, normalizeStoredModel } from "./client/sessionHelpers04";
-import { modelEfforts, normalizeModelEffort } from "./modelCatalog";
+import { modelEfforts, modelLabel, modelWorkTier, normalizeModelEffort } from "./modelCatalog";
 import { roundtableEfforts, parseRoundtableActors, newRoundtableActor } from "./roundtable";
 import { normalizeEffortForModel } from "./client/sessionHelpers04";
 import { updateGearProfile } from "./client/sessionActions05";
@@ -62,4 +62,18 @@ test("composer, persisted gears and Auto share the catalog", () => {
   assert.ok(defaultGearProfiles().every(gear => composerModels.includes(gear.model)));
   assert.equal(normalizeModelId("gpt-5.6-terra"), "gpt-6-luna");
   assert.equal(normalizeModelId("gpt-5.6-sol"), "gpt-6-sol");
+  assert.ok(MODEL_OPTIONS.includes("gpt-6.1-terra"));
+  assert.equal(normalizeModelId("gpt-6.1-terra"), "gpt-6.1-terra");
+  assert.equal(modelLabel("gpt-6.1-terra"), "6.1 Terra");
+  assert.equal(modelWorkTier("gpt-6.1-terra"), null, "Sonnet-class Terra is outside the Sol/Opus tier");
+  assert.equal(modelWorkTier("gpt-6.1-sol"), "sol");
+});
+
+test("crossesModelGroup flags only Claude Code <-> Codex switches", async () => {
+  const { crossesModelGroup } = await import("./modelCatalog");
+  assert.equal(crossesModelGroup("claude-opus-5-5", "gpt-6-sol"), true);
+  assert.equal(crossesModelGroup("gpt-6-sol", "claude-sonnet-5-5"), true);
+  assert.equal(crossesModelGroup("claude-opus-5-5", "claude-haiku-5-5"), false);
+  assert.equal(crossesModelGroup("gpt-6-sol", "gpt-5.4"), false);
+  assert.equal(crossesModelGroup(undefined, "gpt-6-sol"), false);
 });

@@ -1,3 +1,5 @@
+import type { RoundtableAttempt } from "./roundtable";
+
 export type GrillIssue = { id: string; md: string; responseMd: string; status: "open" | "resolved"; selected: boolean; dropped?: boolean; impact?: "blocking" | "non_blocking"; todoId?: string };
 export type GrillRound = { id: string; created: string; action: "start" | "respond" | "followup" | "save"; prompt: string; issues: GrillIssue[] };
 export type TurnGrill = {
@@ -8,6 +10,8 @@ export type TurnGrill = {
   workTurns?: Record<string, "pending" | "completed">;
   automatic?: boolean;
   request?: { action: "start" | "respond" | "followup"; prompt: string; issueId?: string };
+  /** Latest griller run: provider event count and last activity, as in round table attempts. */
+  activity?: RoundtableAttempt;
 };
 
 export type GrillSummary = { sessionId: string; turnId: string; revision: number; pending: boolean };

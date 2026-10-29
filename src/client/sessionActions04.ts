@@ -1,5 +1,6 @@
 // @ts-nocheck
 import { eventStore } from "./eventStore";
+import { applySubagentActivity } from "./subagentActivityStore";
 import { acknowledgeSubmissionEvent } from "./pendingSubmissions";
 export async function openLinkedSession(ctx, record) {
     const { activeWorkspace, switchSession, switchWorkspace } = ctx;
@@ -201,6 +202,10 @@ export function handleStreamEvent(ctx, event, target) {
     acknowledgeSubmissionEvent(event, target.turnId);
     if (event.type === "grill_ack") {
         eventStore.reportGrill(event.data.sessionId, event.data.turnId, event.data.grill);
+        return;
+    }
+    if (event.type === "subagent_activity") {
+        applySubagentActivity(event.data);
         return;
     }
     const { activeAccount, activeTurnIdRef, activeWorkspaceIdRef, appendAssistantMessage, applyDeveloperInstructionsToTurn, applyStreamItem, approvalDecisionLabel, approvalEventToLiveItem, capitalize, describeCodexEvent, finishStreamTarget, getCodexEventName, isAccountLoginRequiredMessage, isNoRolloutFoundMessage, isTargetVisible, loadAccounts, loadSessions, markTurnFinished, markTurnRunning, migrateLocalComposerDraft, migrateLocalQueuedPrompts, modelOptionLabel, openAccountLoginDialog, patchAssistantMessage, patchAssistantTurn, readNavigationTarget, removePendingApprovalItem, scheduleLoadSessions, sessionIdRef, setActiveAccount, setActiveTurnId, setMessages, setPendingApprovalItems, setPendingApprovalSessionIds, setResumeThreadId, setSessionAutoModel, setSessionId, setStatus, setThreadId, streamTargetsRef, threadIdRef, updateNavigationUrl, upsertLiveItem, upsertPendingApprovalItem } = ctx;

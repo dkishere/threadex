@@ -18,7 +18,7 @@ const ROUNDTABLE_RULES = [
 const ACTOR_TOOLS_RULE = [
   "The supplied context is deliberately brief. When it is not enough, look things up yourself: read the host session and its linked turns with the session_inspector tools, and use web search for current external facts.",
   "Your current working directory is a private scratch directory, deleted afterwards. Writing and running throwaway scripts there to verify a claim is verification, not implementation, and is allowed; never write anywhere else.",
-  "Say what you looked up or verified."
+  "End your answer with a short section headed \"Verification scope\": what you looked up or verified, and what you did not run or could not verify. Keep it separate from your positions."
 ].join(" ");
 const NO_TOOLS_RULE = "Use only the supplied conversation context; do not invoke tools.";
 const CLAUDE_ACTOR_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch"];
@@ -73,7 +73,8 @@ export async function runRoundtableInference(input: RoundtableInference) {
       inspectorCli: inspector,
       browserBridgeCli,
       githubReadCli,
-      appServerConfigArgs: ["-c", "tools.web_search=true", ...(browserBridgeCli ? ["-c", "tools.view_image=true"] : [])],
+      // view_image lets actors read attached images as well as Browser Bridge screenshots.
+      appServerConfigArgs: ["-c", "tools.web_search=true", "-c", "tools.view_image=true"],
       threadConfig: { tools: { web_search: true } }
     } : {}) });
   const abort = () => runner.stop();

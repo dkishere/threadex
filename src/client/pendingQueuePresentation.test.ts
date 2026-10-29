@@ -26,6 +26,17 @@ test("backend queued turns stay in queue order until each starts", () => {
   assert.deepEqual(afterStart.transcript.map(({ id }) => id), ["active:user", "active:assistant", "first:user", "first:assistant"]);
 });
 
+test("round table turns stay in transcript between stages and queue only behind another turn", () => {
+  const roundtable = [message("rt_a:user", "user", "rt_a", "todo", "queued"), message("rt_a:assistant", "assistant", "rt_a", "todo", "queued")];
+  const idle = partitionPendingQueueMessages(roundtable);
+  assert.equal(idle.queued.length, 0);
+  assert.deepEqual(idle.transcript.map(({ id }) => id), ["rt_a:user", "rt_a:assistant"]);
+
+  const behind = partitionPendingQueueMessages([message("active:user", "user", "active", "running"),
+    message("active:assistant", "assistant", "active", "running"), ...roundtable]);
+  assert.deepEqual(behind.queued.map(({ prompt }) => prompt.turnId), ["rt_a"]);
+});
+
 test("account waits stay in transcript instead of the ordinary prompt queue", () => {
   const messages = [message("limit:user", "user", "limit", "todo", "rate_limit"), message("limit:assistant", "assistant", "limit", "todo", "rate_limit")];
   const result = partitionPendingQueueMessages(messages);

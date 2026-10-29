@@ -1,0 +1,110 @@
+.actor-blocker-list { display: grid; gap: 8px; min-width: 0; }
+.actor-blocker-list-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; }
+.actor-blocker-list-header > strong { font-size: 13px; color: #0f172a; }
+.actor-blocker-list-header > span { color: #64748b; font-size: 12px; }
+.actor-blocker-card { display: grid; gap: 8px; min-width: 0; padding: 12px; border: 1px solid #fde68a; border-left: 3px solid #f59e0b; border-radius: 10px; background: #fffdf5; color: #0f172a; font-size: 13px; line-height: 1.5; }
+.actor-blocker-card[data-escalated] { border-color: #fecaca; border-left-color: #dc2626; background: #fff7f7; }
+.actor-blocker-card-header { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+.actor-blocker-status { display: inline-flex; align-items: center; gap: 4px; padding: 1px 7px; border-radius: 999px; background: #fef3c7; color: #92400e; font-size: 11px; font-weight: 650; white-space: nowrap; }
+.actor-blocker-status[data-status="escalated"] { background: #dc2626; color: #fff; }
+.actor-blocker-status > svg { width: 12px; height: 12px; flex: 0 0 auto; }
+.actor-blocker-kind { color: #64748b; font-size: 11px; font-weight: 600; }
+.actor-blocker-time { margin-left: auto; color: #64748b; font-size: 11px; }
+.actor-blocker-description { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.actor-blocker-meta { display: grid; gap: 2px; margin: 0; font-size: 12px; }
+.actor-blocker-meta > div { display: flex; gap: 6px; min-width: 0; }
+.actor-blocker-meta dt { flex: 0 0 auto; color: #64748b; font-weight: 600; }
+.actor-blocker-meta dd { margin: 0; min-width: 0; color: #334155; overflow-wrap: anywhere; }
+.actor-blocker-proposal { display: grid; gap: 4px; padding: 8px 10px; border: 1px solid #e2e8f0; border-radius: 8px; background: #fff; }
+.actor-blocker-proposal[data-pending] { border-color: #bfdbfe; background: #f8fbff; }
+.actor-blocker-proposal > header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; font-size: 12px; }
+.actor-blocker-proposal > header > span { color: #64748b; }
+.actor-blocker-proposal > p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.actor-blocker-proposal > small, .actor-blocker-no-proposal { margin: 0; color: #64748b; font-size: 12px; overflow-wrap: anywhere; }
+.actor-blocker-actions { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.actor-blocker-composer-actions { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.actor-blocker-composer-actions button { max-width: 100%; white-space: normal; text-align: left; }
+.actor-blocker-actions button, .actor-blocker-decision button { display: inline-flex; align-items: center; gap: 5px; }
+.actor-blocker-actions button > svg, .actor-blocker-decision button > svg { width: 14px; height: 14px; flex: 0 0 auto; }
+.actor-blocker-decision { display: grid; gap: 6px; flex: 1 1 220px; min-width: 0; }
+.actor-blocker-decision-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+.actor-blocker-reason { display: grid; gap: 4px; color: #475569; font-size: 12px; font-weight: 600; }
+.actor-blocker-reason textarea { box-sizing: border-box; width: 100%; max-width: 100%; resize: vertical; font: inherit; font-weight: 400; }
+.actor-blocker-reject { color: #b91c1c; }
+.actor-blocker-error { margin: 0; color: #b91c1c; font-size: 12px; overflow-wrap: anywhere; }
+.actor-blocker-card button:focus-visible, .task-blockers-trigger:focus-visible, .actor-list-badge[data-kind="blocker"]:focus-visible { outline: 2px solid #2563eb; outline-offset: 1px; }
+
+.task-blockers { position: relative; flex: 0 0 auto; }
+.task-blockers-trigger { display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px; border: 1px solid #fde68a; border-radius: 999px; background: #fffbeb; color: #92400e; font: inherit; font-size: 12px; font-weight: 650; white-space: nowrap; cursor: pointer; }
+.task-blockers-trigger[data-escalated] { border-color: #fca5a5; background: #fef2f2; color: #b91c1c; }
+.task-blockers-trigger > svg { width: 14px; height: 14px; flex: 0 0 auto; }
+.task-blockers-count { padding: 0 5px; border-radius: 10px; background: #fde68a; font-size: 10px; line-height: 16px; }
+.task-blockers-trigger[data-escalated] .task-blockers-count { background: #dc2626; color: #fff; }
+.task-blockers-panel { position: absolute; z-index: 120; top: calc(100% + 6px); right: 0; box-sizing: border-box; width: min(440px, calc(100vw - 16px)); max-height: min(560px, calc(100dvh - 120px)); overflow-y: auto; overscroll-behavior: contain; padding: 12px; border: 1px solid #e2e8f0; border-radius: 14px; background: #f8fafc; box-shadow: 0 16px 48px #0f172a24, 0 2px 8px #0f172a0a; text-align: left; }
+
+.project-blockers { margin: 0 0 12px; padding: 10px; border: 1px solid #fecaca; border-radius: 12px; background: #fffafa; }
+.actor-blockers-section { margin: 0 0 12px; }
+.task-blockers-panel:focus { outline: none; }
+
+/* Workspace (project) blockers: toolbar button and large table dialog. */
+.project-blockers-trigger { position: relative; color: #b91c1c; }
+.project-blockers-backdrop { z-index: 60; }
+.project-blockers-modal { display: grid; grid-template-rows: auto minmax(0, 1fr); }
+.project-blockers-modal .pending-waits-modal-header > svg { color: #dc2626; }
+.project-blockers-results { min-height: 200px; max-height: min(680px, calc(100dvh - 140px)); overflow: auto; overscroll-behavior: contain; }
+.project-blockers-table { width: 100%; min-width: 860px; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
+.project-blockers-table th, .project-blockers-table td { padding: 10px 12px; border-bottom: 1px solid #e2e8f0; text-align: left; vertical-align: top; color: #475569; overflow-wrap: anywhere; }
+.project-blockers-table th { position: sticky; top: 0; z-index: 1; background: #f8fafc; color: #64748b; font-size: 11px; font-weight: 700; text-transform: uppercase; }
+.project-blockers-table th:nth-child(1) { width: 30%; }
+.project-blockers-table th:nth-child(2) { width: 13%; }
+.project-blockers-table th:nth-child(3), .project-blockers-table th:nth-child(4) { width: 9%; }
+.project-blockers-table th:nth-child(5) { width: 13%; }
+.project-blockers-table th:nth-child(6) { width: 11%; }
+.project-blockers-table th:nth-child(7) { width: 15%; }
+.project-blockers-description > span { display: block; color: #0f172a; font-weight: 600; white-space: pre-wrap; }
+.project-blockers-description > small, .project-blockers-pending { display: block; margin-top: 4px; color: #64748b; font-size: 11px; }
+.project-blockers-pending { color: #1d4ed8; font-weight: 600; }
+.project-blockers-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.project-blockers-actions button { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.project-blockers-actions button > svg { width: 14px; height: 14px; }
+.project-blockers-detail > td { background: #f8fafc; }
+.project-blockers-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+/* Seen (acknowledged) blockers keep their entry point but drop the count and the alarm colour. */
+.project-blockers-trigger[data-seen] { color: #64748b; }
+.task-blockers-trigger[data-seen], .task-blockers-trigger[data-seen][data-escalated] { border-color: #e2e8f0; background: #f8fafc; color: #475569; }
+
+/* Stacked table (narrow actor column): each blocker is a labelled block instead of a wide scrolling table. */
+.project-blockers-table[data-stacked] { min-width: 0; table-layout: auto; }
+.project-blockers-table[data-stacked] thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+.project-blockers-table[data-stacked] tr, .project-blockers-table[data-stacked] td { display: block; }
+.project-blockers-table[data-stacked] tr { border-bottom: 1px solid #e2e8f0; }
+.project-blockers-table[data-stacked] tr:last-child { border-bottom: 0; }
+.project-blockers-table[data-stacked] td { padding: 4px 12px; border-bottom: 0; }
+.project-blockers-table[data-stacked] td:first-child { padding-top: 12px; }
+.project-blockers-table[data-stacked] td:last-child { padding-bottom: 12px; }
+.project-blockers-table[data-stacked] td[data-label]::before { content: attr(data-label) " · "; color: #94a3b8; font-size: 11px; font-weight: 700; text-transform: uppercase; }
+.project-blockers-table[data-stacked] .project-blockers-detail > td { padding: 8px; }
+
+/* Narrow screens: the dialog table stacks the same way. */
+@media (max-width: 640px) {
+  .project-blockers-backdrop { padding: 8px; }
+  .project-blockers-table { min-width: 0; table-layout: auto; }
+  .project-blockers-table thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  .project-blockers-table tr, .project-blockers-table td { display: block; }
+  .project-blockers-table tr { border-bottom: 1px solid #e2e8f0; }
+  .project-blockers-table td { padding: 4px 12px; border-bottom: 0; }
+  .project-blockers-table td:first-child { padding-top: 12px; }
+  .project-blockers-table td:last-child { padding-bottom: 12px; }
+  .project-blockers-table td[data-label]::before { content: attr(data-label) " · "; color: #94a3b8; font-size: 11px; font-weight: 700; text-transform: uppercase; }
+  .project-blockers-detail > td { padding: 8px; }
+}
+.task-blockers-trigger[data-compact] { gap: 3px; padding: 3px 6px; }
+.workspace-action-item[data-kind="blocker"]:hover { border-color: #fecaca; background: #fffdfd; }
+.workspace-action-item[data-kind="blocker"] > .workspace-action-icon, .workspace-action-icon[data-kind="blocker"] { background: #fef2f2; color: #b91c1c; }
+.workspace-action-item[data-kind="blocker"] .workspace-action-dot { background: #dc2626; }
+.workspace-action-modal .actor-blocker-card { margin: 0; }
+
+@media (max-width: 520px) {
+  .task-blockers-panel { position: fixed; top: 56px; right: 8px; left: 8px; width: auto; }
+  .actor-blocker-time { margin-left: 0; }
+}

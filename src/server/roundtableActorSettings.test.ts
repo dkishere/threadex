@@ -44,9 +44,9 @@ test("actor library survives reload and rejects stale writes without losing save
     assert.deepEqual(store.read(), { revision: 0, actors: [] });
     assert.equal(store.save([actor], 0).revision, 1);
     const reopened = new RoundtableActorSettings(path);
-    assert.deepEqual(reopened.read().actors, [actor]);
+    assert.deepEqual(reopened.read().actors, [{ ...actor, type: "consultant" }]);
     assert.throws(() => reopened.save([], 0), /Reload/);
-    assert.deepEqual(store.read().actors, [actor]);
+    assert.deepEqual(store.read().actors, [{ ...actor, type: "consultant" }]);
     assert.deepEqual(reopened.save([], 1), { revision: 2, actors: [] });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

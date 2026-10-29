@@ -17,6 +17,12 @@ test("side chat restores selected gear and edited model/effort from storage", ()
     preferences.gearProfiles[4] = { model: "claude-opus-5-5", effort: "max" };
     saveSideChatPreferences(preferences);
     assert.deepEqual(readSideChatPreferences(), preferences);
+    saveSideChatPreferences(preferences, "workspace/one");
+    const second = { gearProfiles: defaultGearProfiles(), activeGearIndex: 0 };
+    saveSideChatPreferences(second, "workspace-two");
+    assert.deepEqual(readSideChatPreferences("workspace/one"), preferences);
+    assert.deepEqual(readSideChatPreferences("workspace-two"), second);
+    assert.deepEqual(readSideChatPreferences(), preferences, "workspace changes preserve the legacy preference");
     values.set(SIDE_CHAT_PREFERENCES_KEY, JSON.stringify({ activeGearIndex: 99, gearProfiles: [{ model: "unknown" }] }));
     assert.deepEqual(readSideChatPreferences(), { gearProfiles: defaultGearProfiles(), activeGearIndex: 1 });
     values.set(SIDE_CHAT_PREFERENCES_KEY, "broken JSON");

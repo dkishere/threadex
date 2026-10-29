@@ -37,8 +37,11 @@ export async function loadWorkspaceSnapshot(ctx, options = {}) {
         // Both kinds of request still become stale when the user changes views.
         const requestId = preserveSelectedSession ? navigationRequestIdRef.current : ++navigationRequestIdRef.current;
         const expectedViewKey = options.viewKey ?? viewKeyRef.current;
-        const managerView = options.workspaceManagerView === true || navigationTarget?.view === "workspace-chat";
-        const snapshotUrl = options.includeActiveSession === false || preserveSelectedSession
+        const managerView = !navigationTarget?.groupChat && (options.workspaceManagerView === true || navigationTarget?.view === "workspace-chat");
+        // The actor room and an individual actor view are both sessionless;
+        // neither may restore the backend's active session.
+        const actorRoomView = (navigationTarget?.view === "workspace-chat" || navigationTarget?.view === "actor") && !navigationTarget.sessionId;
+        const snapshotUrl = actorRoomView || options.includeActiveSession === false || preserveSelectedSession
             ? "/api/workspace/snapshot?includeActiveSession=false"
             : `/api/workspace/snapshot${managerView ? "?view=workspace-chat" : ""}`;
         const previousWorkspaceId = activeWorkspaceIdRef.current;
@@ -159,7 +162,7 @@ export async function loadWorkspaceSnapshot(ctx, options = {}) {
                         }
                     }
                 }
-                else if (payload.activeSessionId) {
+                else if (!actorRoomView && payload.activeSessionId) {
                     // A sessionless history entry can outlive the blank composer
                     // that created it. Keep the backend's active session instead
                     // of turning the next submitted message into a new root task.
@@ -314,13 +317,34 @@ export async function handleDurableEvent(ctx, event) {
                 const item = approvalEventToLiveItem(approval, "pending");
                 setPendingApprovalItems((current) => upsertPendingApprovalItem(current, item));
                 setPendingApprovalSessionIds((current) => current.includes(approval.sessionId) ? current : [...current, approval.sessionId]);
+                // A runner that re-registers after a server restart makes the request answerable again.
+                const reviveItem = (entry) => entry?.itemType === "approval" && entry.approvalId === approval.approvalId && entry.status === "expired"
+                    ? { ...entry, eventType: "item.started", status: "pending", error: undefined }
+                    : entry;
+                setMessages((current) => sessionIdRef.current !== approval.sessionId ? current : current.map((message) => ({
+                    ...message,
+                    liveItems: message.liveItems?.map(reviveItem),
+                    segments: message.segments?.map((segment) => segment.type === "live" ? { ...segment, item: reviveItem(segment.item) } : segment)
+                })));
             }
             return;
         }
         if (event.type === "runner.approval.resolved") {
             const approval = event.payload;
-            if (approval?.approvalId)
+            if (approval?.approvalId) {
                 removePendingApprovalItem(approval.approvalId);
+                // Resolution must also reach transcript cards when the runner
+                // stream is disconnected or the decision came from another view.
+                const sourceSessionId = approval.sessionId ?? event.sessionId;
+                const resolveItem = (item) => item?.itemType === "approval" && item.approvalId === approval.approvalId
+                    ? { ...item, status: approval.expired ? "expired" : "resolved", decision: approval.decision, error: approval.error }
+                    : item;
+                setMessages((current) => sessionIdRef.current !== sourceSessionId ? current : current.map((message) => ({
+                    ...message,
+                    liveItems: message.liveItems?.map(resolveItem),
+                    segments: message.segments?.map((segment) => segment.type === "live" ? { ...segment, item: resolveItem(segment.item) } : segment)
+                })));
+            }
             return;
         }
         if (!event.sessionId)
@@ -337,7 +361,7 @@ export async function handleDurableEvent(ctx, event) {
             scheduleLoadSessions(0);
             return;
         }
-        if (event.type === "session.imported" || event.type === "session.task.created") {
+        if (event.type === "session.imported" || event.type === "session.archived" || event.type === "session.task.created") {
             scheduleLoadSessions(0);
             return;
         }

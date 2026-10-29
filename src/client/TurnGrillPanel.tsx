@@ -235,7 +235,7 @@ export function TurnGrillPanel({ sessionId, turnId, mainBusy, composerDisabled, 
     title={copyState === "copied" ? "Agent response copied" : copyState === "error" ? "Could not copy agent response" : "Copy last agent response"}
     aria-label={copyState === "copied" ? "Agent response copied" : copyState === "error" ? "Could not copy agent response" : "Copy last agent response"}
     onClick={(event) => void copyFinalResponse(event)}><Copy aria-hidden="true" /></button>{!review && !started && <button
-    className="message-action-icon" type="button" title="Grill with Luna Max; long turns use Sol Max" aria-label="Grill agent"
+    className="message-action-icon" type="button" title="Grill with Luna Max; long turns use Sol XHigh" aria-label="Grill agent"
     disabled={locked || mainBusy} onClick={() => void act("start")}><Flame aria-hidden="true" /></button>}</div>;
   if (!review && !started) return <>{actions}{error && <p role="alert">{error}</p>}</>;
 
@@ -269,6 +269,10 @@ export function TurnGrillPanel({ sessionId, turnId, mainBusy, composerDisabled, 
     </div>}
 
     {locked && <div className="grill-progress" role="status"><Loader2 className="spin" size={14} aria-hidden="true" />{loading ? "Loading review…" : activity}</div>}
+    {review?.activity && (review.status === "running" || review.status === "error") && <p className="grill-activity">
+      <a href={`${url}/attempts/${encodeURIComponent(review.activity.id)}/log`} target="_blank" rel="noreferrer">Activity log</a>
+      {` · ${review.activity.status} · ${review.activity.eventCount} events · Last activity: `}<time dateTime={review.activity.lastActivityAt}>{new Date(review.activity.lastActivityAt).toLocaleString()}</time>
+    </p>}
     {review?.status === "ready" && !issues.length && <div className="grill-empty"><Check size={18} aria-hidden="true" /><div><strong>No material gaps found</strong><p>This turn is ready to move forward.</p></div></div>}
 
     {!!issues.length && <>

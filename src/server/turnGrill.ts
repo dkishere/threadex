@@ -133,18 +133,25 @@ export function buildTurnGrillInspectorConfig(session: SessionRecord, serverUrl:
   };
 }
 
+/** The promoted long-turn tier already reads the workspace; max effort made those reviews take tens of minutes. */
+export function turnGrillEffort(longTurn: boolean) {
+  return longTurn ? "xhigh" as const : "max" as const;
+}
+
 export async function grillTurn(codexHome: string, prompt: string, session: SessionRecord, serverUrl: string, _totalTurns: number, turnId: string, longTurn: boolean,
-  options: { model?: string; claudeConfigDir?: string | null } = {}) {
+  options: { model?: string; claudeConfigDir?: string | null; onEvent?: (provider: "codex" | "claude", event: unknown) => void } = {}) {
   const model = options.model ?? turnGrillModel(longTurn);
   const cliConfig = buildTurnGrillInspectorConfig(session, serverUrl, turnId);
+  const reasoningEffort = turnGrillEffort(longTurn);
   if (isClaudeModel(model)) {
     const workspaceTools = longTurn ? CLAUDE_GRILL_WORKSPACE_TOOLS : [];
     const result = await runClaudeOneShot({
       model,
       prompt,
       systemPrompt: `${TURN_GRILL_INSTRUCTIONS}\n\n${TURN_GRILL_LANGUAGE_INSTRUCTIONS}`,
-      reasoningEffort: "max",
+      reasoningEffort,
       configDir: options.claudeConfigDir,
+      ...(options.onEvent ? { onEvent: (event: unknown) => options.onEvent!("claude", event) } : {}),
       ...(longTurn ? { cwd: session.cwd } : {}),
       builtinTools: workspaceTools,
       inspectorCli: cliConfig,
@@ -156,8 +163,9 @@ export async function grillTurn(codexHome: string, prompt: string, session: Sess
   const runner = new IsolatedLunaRunner({
     name: "turn-grill",
     model,
-    reasoningEffort: "max",
+    reasoningEffort,
     sourceHomeCandidates: [codexHome],
+    ...(options.onEvent ? { onEvent: (event: unknown) => options.onEvent!("codex", event) } : {}),
     allowMissingAuth: false,
     ...(longTurn ? { workspaceCwd: session.cwd, allowWorkspaceRead: true } : {}),
     baseInstructions: TURN_GRILL_INSTRUCTIONS,

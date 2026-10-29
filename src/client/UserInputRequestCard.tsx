@@ -16,9 +16,15 @@ export function UserInputRequestCard({ item, onDecisionSubmitted }: {
   const [submitted, setSubmitted] = useState(false);
   const [stale, setStale] = useState(false);
   const [error, setError] = useState("");
-  const resolved = item.status === "resolved" || submitted || stale;
+  const expired = item.status === "expired" && !submitted;
+  const resolved = item.status === "resolved" || submitted || stale || expired;
   const saved = inputResponse(item.decision, item.params);
-  const response = inputResponse({ answers: Object.fromEntries(questions.map((q) => [q.id, { answers: [values[q.id] ?? ""] }])) }, item.params);
+  const [picked, setPicked] = useState<Record<string, string[]>>({});
+  const isMulti = (q: (typeof questions)[number]) => q.multiSelect === true && !!q.options?.length;
+  const answersFor = (q: (typeof questions)[number]) => isMulti(q)
+    ? [...(q.options ?? []).filter((o) => picked[q.id]?.includes(o.label)).map((o) => o.label), ...(custom[q.id] && values[q.id]?.trim() ? [values[q.id]] : [])]
+    : [values[q.id] ?? ""];
+  const response = inputResponse({ answers: Object.fromEntries(questions.map((q) => [q.id, { answers: answersFor(q) }])) }, item.params);
   const blocking = (item.params as { isBlocking?: boolean })?.isBlocking !== false;
   async function submit() {
     if (busy || resolved || !response) return;
@@ -27,24 +33,34 @@ export function UserInputRequestCard({ item, onDecisionSubmitted }: {
       const res = await fetch(`/api/approvals/${encodeURIComponent(item.approvalId)}/decision`, {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ decision: response })
       });
-      if (res.status === 409) { setStale(true); throw new Error("This question is no longer waiting for an answer."); }
+      if (res.status === 409) { setStale(true); onDecisionSubmitted?.(item.approvalId); throw new Error("This question is no longer waiting for an answer."); }
       if (!res.ok) throw new Error("Could not send your answer. Please retry.");
       setSubmitted(true); onDecisionSubmitted?.(item.approvalId);
     } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
     finally { setBusy(false); }
   }
   return <section className="user-input-card" data-resolved={resolved} data-approval-id={item.approvalId} aria-label="Agent questions">
-    <header><MessageCircle size={17} /><strong>Your input</strong><span className="user-input-status">{resolved && (saved || submitted) && <Check size={12} />}{resolved ? saved || submitted ? "Answered" : "Closed" : blocking ? "Waiting for you" : "Agent is continuing"}</span></header>
+    <header><MessageCircle size={17} /><strong>Your input</strong><span className="user-input-status">{resolved && (saved || submitted) && <Check size={12} />}{resolved ? saved || submitted ? "Answered" : expired ? "Expired" : "Closed" : blocking ? "Waiting for you" : "Agent is continuing"}</span></header>
     {questions.map((q, index) => <fieldset key={q.id} disabled={busy || resolved}>
       <legend><small>{index + 1} · {q.header}</small><span>{q.question}</span></legend>
-      {resolved ? <div className="user-input-answer"><span className="user-input-answer-label">Your answer</span><p>{q.isSecret ? "••••••••" : saved?.answers[q.id]?.answers.join(", ") || (submitted ? values[q.id] : "No answer submitted")}</p></div> : <>
-        {q.options?.map((option, optionIndex) => <label className="user-input-option" key={optionIndex}>
+      {resolved ? <div className="user-input-answer"><span className="user-input-answer-label">Your answer</span><p>{q.isSecret ? "••••••••" : saved?.answers[q.id]?.answers.join(", ") || (submitted ? answersFor(q).join(", ") : "No answer submitted")}</p></div> : <>
+        {isMulti(q) && <p className="user-input-hint">Select all that apply</p>}
+        {q.options?.map((option, optionIndex) => isMulti(q)
+          ? <label className="user-input-option" key={optionIndex}>
+            <input type="checkbox" checked={!!picked[q.id]?.includes(option.label)}
+              onChange={(event) => setPicked((v) => ({ ...v, [q.id]: event.target.checked ? [...(v[q.id] ?? []), option.label] : (v[q.id] ?? []).filter((l) => l !== option.label) }))} />
+            <span><strong>{option.label}</strong><small>{option.description}</small></span>
+          </label>
+          : <label className="user-input-option" key={optionIndex}>
           <input type="radio" name={`${instanceId}-${q.id}`} checked={!custom[q.id] && values[q.id] === option.label}
             onChange={() => { setCustom((v) => ({ ...v, [q.id]: false })); setValues((v) => ({ ...v, [q.id]: option.label })); }} />
           <span><strong>{option.label}</strong><small>{option.description}</small></span>
         </label>)}
-        {q.isOther && !!q.options?.length && <label className="user-input-option"><input type="radio" name={`${instanceId}-${q.id}`} checked={!!custom[q.id]}
-          onChange={() => { setCustom((v) => ({ ...v, [q.id]: true })); setValues((v) => ({ ...v, [q.id]: "" })); }} /><span>Write my own answer</span></label>}
+        {q.isOther && !!q.options?.length && (isMulti(q)
+          ? <label className="user-input-option"><input type="checkbox" checked={!!custom[q.id]}
+            onChange={(event) => setCustom((v) => ({ ...v, [q.id]: event.target.checked }))} /><span>Write my own answer</span></label>
+          : <label className="user-input-option"><input type="radio" name={`${instanceId}-${q.id}`} checked={!!custom[q.id]}
+          onChange={() => { setCustom((v) => ({ ...v, [q.id]: true })); setValues((v) => ({ ...v, [q.id]: "" })); }} /><span>Write my own answer</span></label>)}
         {(!q.options?.length || custom[q.id]) && <input className="user-input-text" type={q.isSecret ? "password" : "text"} aria-label={`Answer: ${q.header}`} placeholder="Your answer…" value={values[q.id] ?? ""}
           onKeyDown={(event) => { if (event.key === "Enter" && !event.nativeEvent.isComposing) { event.preventDefault(); void submit(); } }}
           onChange={(event) => setValues((v) => ({ ...v, [q.id]: event.target.value }))} />}

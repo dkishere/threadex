@@ -24,8 +24,8 @@ test("manager history reads 50 visible turns at a time, pins live turns and surv
         ('manager_pending', 'manager', 'Wake-up', '', 'todo', 0, 0, '2026-01-02')`);
 
     const returnedPrompts: string[] = [];
-    const run = connection.run.bind(connection);
-    t.mock.method(connection, "run", async (...args: Parameters<SessionDbConnection["run"]>) => {
+    const run = connection.reader.run.bind(connection.reader);
+    t.mock.method(connection.reader, "run", async (...args: Parameters<SessionDbConnection["run"]>) => {
       const result = await run(...args);
       for (const row of await result.getRowObjectsJS()) if (typeof row.user_input === "string") returnedPrompts.push(row.user_input);
       return result;

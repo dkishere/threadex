@@ -1,10 +1,13 @@
 import type { RequestHandler } from "express";
 import { isClaudeModel } from "../modelCatalog";
-import { buildTurnGrillMidTurnInputs, buildTurnGrillPrompt, buildTurnGrillSessionContext, grillTurn, isLongTurnGrill, turnGrillModel } from "./turnGrill";
+import { buildTurnGrillMidTurnInputs, buildTurnGrillPrompt, buildTurnGrillSessionContext, grillTurn, isLongTurnGrill, turnGrillEffort, turnGrillModel } from "./turnGrill";
 import type { HelperModels } from "./helperModelSettings";
 import { detectConversationLanguage } from "./conversationLanguage";
 import { normalizeModelTokenUsage, type ModelTokenUsage } from "./modelTokenUsage";
 import { summarizeSessionFileChanges, type SessionStore } from "./sessionStore";
+import { resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { RoundtableRunLog } from "./roundtableRunLog";
 import { acknowledgeGrill, grillContentVersion, canFollowUpGrill, parseGrillIssues, type TurnGrill } from "../turnGrill";
 
 type GrillUsage = {
@@ -12,12 +15,36 @@ type GrillUsage = {
   sessionId: string; accountId: string | null; model: string; usage: ModelTokenUsage | null;
 };
 
-export function createTurnGrillHandler({ sessionStore, serverUrl, recordUsage, runGrill = grillTurn, helperModels }: {
+const ACTIVITY_CHECKPOINT_MS = 2000;
+
+// The server passes data/grill-logs; embedded handlers and tests keep journals in tmp.
+export function grillLogDir(logDir?: string) {
+  return resolve(logDir ?? resolve(tmpdir(), "threadex-grill-logs"));
+}
+
+/** Serves the latest griller run's activity journal, as round table attempts do. */
+export function createTurnGrillActivityLogHandler({ sessionStore, logDir }: { sessionStore: SessionStore; logDir?: string }): RequestHandler<{ sessionId: string; turnId: string; attemptId: string }> {
+  return async (req, res) => {
+    try {
+      const { sessionId, turnId, attemptId } = req.params;
+      const activity = /^[a-f0-9-]{36}$/.test(attemptId) ? (await sessionStore.getTurnGrill(sessionId, turnId))?.activity : undefined;
+      if (!activity || activity.id !== attemptId || activity.logPath !== resolve(grillLogDir(logDir), `${attemptId}.jsonl`)) {
+        res.status(404).json({ error: "Activity log not found for this review." }); return;
+      }
+      res.type("text/plain").sendFile(activity.logPath, (error) => {
+        if (error && !res.headersSent) res.status(404).json({ error: "Activity log is unavailable." });
+      });
+    } catch (error) { res.status(500).json({ error: error instanceof Error ? error.message : String(error) }); }
+  };
+}
+
+export function createTurnGrillHandler({ sessionStore, serverUrl, recordUsage, runGrill = grillTurn, helperModels, logDir }: {
   sessionStore: SessionStore;
   serverUrl: string;
   recordUsage: (usage: GrillUsage) => Promise<void>;
   runGrill?: typeof grillTurn;
   helperModels?: () => HelperModels;
+  logDir?: string;
 }): RequestHandler<{ sessionId: string; turnId: string }> {
   const activeTurnGrills = new Set<string>();
   return async (req, res) => {
@@ -30,6 +57,8 @@ export function createTurnGrillHandler({ sessionStore, serverUrl, recordUsage, r
     }
     if (ownsLock) activeTurnGrills.add(key);
     let running: TurnGrill | null = null;
+    let runLog: RoundtableRunLog | null = null;
+    let checkpoints = Promise.resolve();
     try {
       const [session, turn] = await Promise.all([
         sessionStore.getSession(sessionId), sessionStore.getSessionTurn(turnId)
@@ -42,7 +71,11 @@ export function createTurnGrillHandler({ sessionStore, serverUrl, recordUsage, r
       if (req.method === "GET") {
         // A lost process cannot leave a review permanently locked.
         if (saved?.status === "running" && !activeTurnGrills.has(key)) {
-          const recovered: TurnGrill = { ...saved, revision: saved.revision + 1, status: "error", error: "Review interrupted. Retry to continue from the saved discussion." };
+          const activity = saved.activity?.status === "running"
+            ? { ...saved.activity, status: "interrupted" as const, finishedAt: new Date().toISOString(), error: "Griller worker was lost." }
+            : saved.activity;
+          const recovered: TurnGrill = { ...saved, revision: saved.revision + 1, status: "error", error: "Review interrupted. Retry to continue from the saved discussion.",
+            ...(activity ? { activity } : {}) };
           await sessionStore.saveTurnGrill(sessionId, turnId, saved.revision, recovered);
           res.json({ grill: await sessionStore.getTurnGrill(sessionId, turnId) });
         } else res.json({ grill: saved });
@@ -139,7 +172,30 @@ export function createTurnGrillHandler({ sessionStore, serverUrl, recordUsage, r
       const claudeConfigDir = isClaudeModel(model)
         ? (await sessionStore.resolveClaudeAccount({ workspaceId: session.workspaceId, sessionId: session.id }))?.configDir ?? null
         : null;
-      const result = await runGrill(workspace.codexHome, prompt, session, serverUrl, sessionTurns.length, turn.id, longTurn, { model, claudeConfigDir });
+      // The griller has no deadline. Its journal and checkpointed event count
+      // show that a long review is still alive.
+      const log = runLog = new RoundtableRunLog(grillLogDir(logDir), { sessionId, turnId, model, effort: turnGrillEffort(longTurn) });
+      const checkpoint = () => {
+        const activity = { ...log.attempt };
+        checkpoints = checkpoints.then(async () => {
+          while (true) {
+            const current = await sessionStore.getTurnGrill(sessionId, turnId);
+            if (current?.status !== "running") return;
+            if (await sessionStore.saveTurnGrill(sessionId, turnId, current.revision, { ...current, revision: current.revision + 1, activity })) return;
+          }
+        }).catch((error) => console.warn(`Grill activity checkpoint failed for ${turnId}: ${error instanceof Error ? error.message : String(error)}`));
+      };
+      checkpoint();
+      let lastCheckpoint = Date.now();
+      const result = await runGrill(workspace.codexHome, prompt, session, serverUrl, sessionTurns.length, turn.id, longTurn, { model, claudeConfigDir,
+        onEvent: (provider, event) => {
+          log.providerEvent(provider, event);
+          if (Date.now() - lastCheckpoint < ACTIVITY_CHECKPOINT_MS) return;
+          lastCheckpoint = Date.now();
+          checkpoint();
+        } });
+      log.finish("done");
+      await checkpoints;
       await recordUsage({
         id: `background:turn_grill:${crypto.randomUUID()}`,
         task: "session_question", source: "app_server", workspaceId: workspace.id,
@@ -163,7 +219,7 @@ export function createTurnGrillHandler({ sessionStore, serverUrl, recordUsage, r
       if (action === "followup") merged.push(...returned.filter((issue) => !issues.some((old) => old.id === issue.id))
         .map((issue) => ({ ...issue, status: "open" as const, selected: true, dropped: false })));
       parseGrillIssues(merged);
-      let completed: TurnGrill = { ...next, revision: next.revision + 1, status: "ready", updated: new Date().toISOString(), issues: merged,
+      let completed: TurnGrill = { ...next, revision: next.revision + 1, status: "ready", updated: new Date().toISOString(), issues: merged, activity: { ...log.attempt },
         rounds: [...next.rounds, { id: crypto.randomUUID(), created: new Date().toISOString(), action, prompt: followup,
           issues: merged.map((issue) => action === "followup" && issues.some((old) => old.id === issue.id)
             && !requestedIssues.some((old) => old.id === issue.id && old.selected) ? { ...issue, selected: false } : issue) }] };
@@ -182,10 +238,13 @@ export function createTurnGrillHandler({ sessionStore, serverUrl, recordUsage, r
       res.json({ grill: completed });
     } catch (error) {
       if (running) {
+        if (runLog?.attempt.status === "running") runLog.finish("error", error instanceof Error ? error.message : String(error));
+        await checkpoints;
         while (true) {
           const current = (await sessionStore.getTurnGrill(sessionId, turnId))!;
           if (await sessionStore.saveTurnGrill(sessionId, turnId, current.revision, {
-            ...current, revision: current.revision + 1, status: "error", error: error instanceof Error ? error.message : String(error)
+            ...current, revision: current.revision + 1, status: "error", error: error instanceof Error ? error.message : String(error),
+            ...(runLog ? { activity: { ...runLog.attempt } } : {})
           })) break;
         }
       }

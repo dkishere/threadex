@@ -153,3 +153,57 @@ test("add, log in, select and report on a Claude account", async () => {
     assert.deepEqual(listing.body.accounts.map((account: ClaudeAccountRecord) => account.id), [id]);
   });
 });
+
+test("login and account switches clear limit waits; a usage refresh only schedules them", async () => {
+  const store = memoryStore();
+  const logins = new Map<string, ClaudeLogin>();
+  const available: string[] = [];
+  const cleared: Array<{ accountId: string; workspaceId?: string; sessionId?: string }> = [];
+  const router = createClaudeAccountRouter({
+    store,
+    dataDir: "/data",
+    onAccountAvailable: (account) => available.push(account.id),
+    onLimitWaitClear: (scope) => cleared.push(scope),
+    ops: {
+      readStatus: async (): Promise<ClaudeAuthStatus> => ({ loggedIn: true, authMethod: "claude.ai", email: "dk@example.com", organization: null, subscriptionType: "max", error: null }),
+      fetchUsage: async () => ({ quota: { fiveHour: { usedPercent: 12, resetsAt: 1 }, source: "usage" as const }, email: null, subscriptionType: null, organization: null }),
+      startLogin: (accountId, configDir) => {
+        const login = { id: `login-${accountId}`, accountId, configDir, output: "", loginUrl: null, exited: true, exitCode: 0, startedAt: Date.now() } as unknown as ClaudeLogin;
+        logins.set(login.id, login);
+        return login;
+      },
+      getLogin: (id) => logins.get(id) ?? null,
+      finishLogin: (id) => { logins.delete(id); },
+      sendLoginCode: () => undefined,
+      logout: async () => undefined
+    }
+  });
+
+  await withServer(router, async (base) => {
+    const first = await call(base, "/api/claude-accounts", { body: { name: "Personal" } });
+    const firstId = first.body.account.id as string;
+    assert.equal((await call(base, `/api/claude-accounts/login/${first.body.login.loginId}`)).body.complete, true);
+    assert.deepEqual(cleared, [{ accountId: firstId }], "a completed login releases that account's waits");
+    assert.deepEqual(available, [], "the login's usage refresh must not also schedule the same turns");
+
+    const second = await call(base, "/api/claude-accounts", { body: { name: "Work" } });
+    const secondId = second.body.account.id as string;
+    cleared.length = 0;
+
+    await call(base, `/api/claude-accounts/${firstId}/refresh`, { body: {} });
+    assert.deepEqual(cleared, [], "a usage refresh is not a manual switch");
+    assert.deepEqual(available, [firstId]);
+
+    await call(base, "/api/claude-accounts/select", { body: { accountId: firstId, scope: "workspace" } });
+    assert.deepEqual(cleared, [], "reselecting the effective account keeps waits");
+
+    await call(base, "/api/claude-accounts/select", { body: { accountId: secondId, scope: "session", sessionId: "s-1" } });
+    assert.deepEqual(cleared, [{ accountId: secondId, workspaceId: "ws-1", sessionId: "s-1" }]);
+
+    await call(base, "/api/claude-accounts/select", { body: { accountId: secondId, scope: "workspace", workspaceId: "ws-2" } });
+    assert.deepEqual(cleared.at(-1), { accountId: secondId, workspaceId: "ws-2" }, "a workspace switch stays inside that workspace");
+
+    assert.equal((await call(base, "/api/claude-accounts/select", { body: { accountId: secondId, scope: "session" } })).status, 400);
+    assert.equal(cleared.length, 2, "a rejected selection releases nothing");
+  });
+});

@@ -26,10 +26,14 @@ export type SessionDbResult = {
 export type SessionDbConnection = {
   readonly backend: "postgres";
   run(sql: string, params?: Record<string, SessionDbValue>): Promise<SessionDbResult>;
+  /** Same database through a separate pool, so autocommit reads need not wait behind serialised writes. */
+  readonly reader: Pick<SessionDbConnection, "backend" | "run">;
   checkpoint(): Promise<void>;
   close(): Promise<void>;
   /** Serialises schema DDL across processes; concurrent DDL fails with "tuple concurrently updated". */
   withSchemaLock<T>(operation: () => Promise<T>): Promise<T>;
+  /** Runs every statement on one pooled client; `run` alone may use a different client per call. */
+  withTransaction<T>(operation: (run: SessionDbConnection["run"]) => Promise<T>): Promise<T>;
   startDuckDbUi(assetUrl: string, uiPort: number): Promise<void>;
   stopDuckDbUi(): Promise<void>;
   tryLoadVss(): Promise<boolean>;
@@ -49,6 +53,9 @@ class RowResult implements SessionDbResult {
 export function postgresConnectionString(): string {
   return process.env.SESSION_DATABASE_URL ?? process.env.DATABASE_URL ?? defaultLocalPostgresUrl;
 }
+
+/** Hash-derived schemas this process opened; test processes drop them on exit (see testSchemaCleanup.ts). */
+export const generatedSchemasOpened = new Set<string>();
 
 export function postgresSchemaFromStoreId(storeId?: string | null): string | null {
   const explicit = process.env.SESSION_PG_SCHEMA?.trim();
@@ -73,26 +80,38 @@ export async function openPostgresSessionConnection(
   connectionString = postgresConnectionString(),
   schema = postgresSchemaFromStoreId()
 ): Promise<SessionDbConnection> {
-  const pool = new Pool({ connectionString });
-  const connection = new PostgresSessionConnection(pool, schema);
+  const connection = new PostgresSessionConnection(createPool(connectionString, 10), createPool(connectionString, 6), schema);
   await connection.withSchemaLock(() => connection.installCompatibilityFunctions());
   return connection;
 }
 
+function createPool(connectionString: string, max: number) {
+  // Bounded waits surface an unreachable database as an error instead of an indefinitely queued request.
+  const pool = new Pool({ connectionString, max, idleTimeoutMillis: 30_000, connectionTimeoutMillis: 15_000, keepAlive: true });
+  // An idle client dropped by the server (restart, OS sleep) emits here; unhandled, it would crash the process.
+  pool.on("error", (error) => console.warn(`PostgreSQL idle client error: ${error.message}`));
+  return pool;
+}
+
 class PostgresSessionConnection implements SessionDbConnection {
   readonly backend = "postgres" as const;
+  readonly reader: Pick<SessionDbConnection, "backend" | "run">;
 
   constructor(
     private readonly pool: pg.Pool,
+    private readonly readPool: pg.Pool,
     private readonly schema: string | null
-  ) {}
+  ) {
+    this.reader = { backend: "postgres", run: (sql, params) => this.runOn(this.readPool, sql, params) };
+  }
 
   async installCompatibilityFunctions() {
     if (this.schema) {
       await this.pool.query(`CREATE SCHEMA IF NOT EXISTS ${quoteIdentifier(this.schema)}`);
+      if (this.schema !== process.env.SESSION_PG_SCHEMA?.trim()) generatedSchemasOpened.add(this.schema);
     }
 
-    await this.withClient(async (client) => {
+    await this.withClient(this.pool, async (client) => {
       await client.query(`
         CREATE OR REPLACE FUNCTION contains(haystack text, needle text)
         RETURNS boolean
@@ -129,12 +148,16 @@ class PostgresSessionConnection implements SessionDbConnection {
   }
 
   async run(sql: string, params?: Record<string, SessionDbValue>) {
+    return this.runOn(this.pool, sql, params);
+  }
+
+  private async runOn(pool: pg.Pool, sql: string, params?: Record<string, SessionDbValue>) {
     const normalized = normalizePostgresSql(sql);
     if (normalized.noop) {
       return new RowResult([]);
     }
     const translated = translateNamedParams(normalized.sql, params ?? {});
-    return this.withClient(async (client) => {
+    return this.withClient(pool, async (client) => {
       const result = await client.query(translated.sql, translated.values);
       return new RowResult(result.rows as Record<string, unknown>[], result.rowCount ?? 0);
     });
@@ -145,7 +168,7 @@ class PostgresSessionConnection implements SessionDbConnection {
   }
 
   async close() {
-    await this.pool.end();
+    await Promise.all([this.pool.end(), this.readPool.end()]);
   }
 
   async withSchemaLock<T>(operation: () => Promise<T>): Promise<T> {
@@ -166,6 +189,25 @@ class PostgresSessionConnection implements SessionDbConnection {
     }
   }
 
+  async withTransaction<T>(operation: (run: SessionDbConnection["run"]) => Promise<T>): Promise<T> {
+    return this.withClient(this.pool, async (client) => {
+      const run = async (sql: string, params?: Record<string, SessionDbValue>) => {
+        const translated = translateNamedParams(normalizePostgresSql(sql).sql, params ?? {});
+        const result = await client.query(translated.sql, translated.values);
+        return new RowResult(result.rows as Record<string, unknown>[], result.rowCount ?? 0);
+      };
+      await client.query("BEGIN");
+      try {
+        const value = await operation(run);
+        await client.query("COMMIT");
+        return value;
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      }
+    });
+  }
+
   async startDuckDbUi() {
     console.warn("DuckDB admin UI is unavailable because Threadex now uses PostgreSQL.");
   }
@@ -178,8 +220,8 @@ class PostgresSessionConnection implements SessionDbConnection {
     return false;
   }
 
-  private async withClient<T>(operation: (client: pg.PoolClient) => Promise<T>): Promise<T> {
-    const client = await this.pool.connect();
+  private async withClient<T>(pool: pg.Pool, operation: (client: pg.PoolClient) => Promise<T>): Promise<T> {
+    const client = await pool.connect();
     try {
       if (this.schema) {
         await client.query(`SET search_path TO ${quoteIdentifier(this.schema)}`);

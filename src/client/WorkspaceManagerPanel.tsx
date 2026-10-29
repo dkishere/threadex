@@ -61,13 +61,6 @@ export function useWorkspaceManager(workspaceId: string | undefined) {
   return { state: state?.workspaceId === workspaceId ? state : null, refresh };
 }
 
-export function WorkspaceManagerToggle({ active, busy, onToggle }: { active: boolean; busy: boolean; onToggle: () => void }) {
-  return <button type="button" className="workspace-manager-toggle" role="switch" aria-checked={active}
-    aria-label="Workspace manager" title={active ? "Return to session" : "Open workspace manager"} disabled={busy} onClick={onToggle}>
-    {busy ? <Loader2 className="spin" /> : <MessageCircle />}<span>Manager</span>
-  </button>;
-}
-
 export function useWorkspaceManagerDashboard(workspaceId: string | undefined) {
   const [state, setState] = useState<{ workspaceId: string; snapshot: WorkspaceManagerSnapshot | null; error: string } | null>(null);
   useEffect(() => {
@@ -158,7 +151,7 @@ function taskActivityPresentation(task: WorkspaceManagerTask, now: number) {
   return { kind, description, Icon };
 }
 
-function TaskActivity({ task, now }: { task: WorkspaceManagerTask; now: number }) {
+export function TaskActivity({ task, now }: { task: WorkspaceManagerTask; now: number }) {
   const { kind, description, Icon } = taskActivityPresentation(task, now);
   return <span className="workspace-task-activity" data-kind={kind} role="img" aria-label={description} title={description}>
     <Icon aria-hidden="true" />

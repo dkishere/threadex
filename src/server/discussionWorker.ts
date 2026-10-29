@@ -6,6 +6,16 @@ import { SessionStore } from "./sessionStore";
 import { answerSessionQuestion, stopSessionQuestionRunners } from "./sessionQuestion";
 import { isClaudeModel } from "../modelCatalog";
 import { normalizeModelTokenUsage } from "./modelTokenUsage";
+import { DomainActorService } from "./domainActorService";
+import { DomainActorStore } from "./domainActorStore";
+import { actorModelHooks } from "./domainActorRunner";
+import { saveActorAttachments } from "./domainActorAttachments";
+import { SessionSummarizer } from "./sessionSummarizer";
+import { AutoModelSettings } from "./autoModelSettings";
+import { HelperModelSettings } from "./helperModelSettings";
+import { createDecisionService } from "./decision/service";
+import { DEFAULT_POLICY } from "./decision/policy";
+import { executeConsultation } from "./consultantService";
 
 const directory = resolve(process.argv[2]);
 const job = readJobJson<DiscussionJob>(resolve(directory, "job.json"))!;
@@ -38,7 +48,35 @@ try {
   await store.ready();
   if (existsSync(resolve(directory, "stop.json"))) cancel();
   controller.signal.throwIfAborted();
-  if (job.kind === "roundtable") {
+  if (job.kind === "consultant") {
+    const consultation = await executeConsultation({ job, store, signal: controller.signal,
+      save: result => writeJobJson(resolve(directory, "consultation.json"), result) });
+    writeJobJson(resolve(directory, "state.json"), { status: consultation.status === "done" ? "done" : consultation.status === "stopped" ? "stopped" : "error",
+      ...(consultation.error ? { error: consultation.error } : {}) });
+  } else if (job.kind === "actor-room") {
+    const dataDir = resolve(directory, "../../..");
+    const settings = new AutoModelSettings(resolve(dataDir, "typesafe-api-key"));
+    const helpers = new HelperModelSettings(resolve(dataDir, "helper-models.json"));
+    const summarizer = new SessionSummarizer(store, undefined, undefined, undefined, () => helpers.read());
+    const hooks = actorModelHooks(store, summarizer, job.payload.serverUrl);
+    const decide = createDecisionService(settings, store, input => summarizer.runDecisionJsonTask({ ...input,
+      signal: input.signal ? AbortSignal.any([input.signal, controller.signal]) : controller.signal }));
+    stop = async () => summarizer.close();
+    const service = new DomainActorService(new DomainActorStore(store), {
+      saveAttachments: (workspaceId, requestId, attachments) => saveActorAttachments(resolve(dataDir, "uploads"), workspaceId, requestId, attachments),
+      decide: input => { controller.signal.throwIfAborted(); return decide(input); },
+      policy: purpose => settings.policies()[purpose] ?? DEFAULT_POLICY,
+      ...hooks,
+      respond: input => hooks.respond({ ...input, signal: AbortSignal.any([input.signal, controller.signal]) }),
+      startTask: input => { controller.signal.throwIfAborted(); return hooks.startTask(input); },
+      maintain: input => { controller.signal.throwIfAborted(); return hooks.maintain(input); }
+    });
+    try {
+      if (job.payload.retry) await service.resumeRetry(job.payload.input.workspaceId, job.payload.retry.roundId, job.payload.retry.leaseOwner);
+      else await service.submit(job.payload.input, job.payload.taskBinding);
+      await service.settled();
+    } finally { summarizer.close(); }
+  } else if (job.kind === "roundtable") {
     const service = new RoundtableService({ store, logDir: job.payload.logDir, serverUrl: job.payload.serverUrl,
       summarizerModel: () => job.payload.summarizerModel, recordUsage: usage });
     stop = () => service.stop(job.payload.turnId);
@@ -82,7 +120,7 @@ try {
         workspaceId: session.workspaceId, accountId: isClaudeModel(result.model) ? null : accountId, model: result.model, usage: result.usage });
     } catch (error) { console.warn("Side-chat usage:", error); }
   }
-  writeJobJson(resolve(directory, "state.json"), { status: stopping ? "stopped" : "done" });
+  if (job.kind !== "consultant") writeJobJson(resolve(directory, "state.json"), { status: stopping ? "stopped" : "done" });
 } catch (error) {
   writeJobJson(resolve(directory, "state.json"), { status: stopping ? "stopped" : "error", error: error instanceof Error ? error.message : String(error) });
 } finally {

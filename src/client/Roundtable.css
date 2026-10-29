@@ -118,8 +118,11 @@
 .roundtable-group > ul { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
 .roundtable-topic { margin-bottom: 4px; color: #0f172a; overflow-wrap: anywhere; font-weight: 600; }
 .roundtable-topic p { margin: 0; }
-.roundtable-detail { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px; margin-top: 6px; }
-.roundtable-detail > .markdown-content { flex: 1 1 180px; min-width: 0; }
+.roundtable-view, .roundtable-detail { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px; }
+.roundtable-view > .markdown-content, .roundtable-detail > .markdown-content { flex: 1 1 180px; min-width: 0; }
+.roundtable-position .roundtable-detail { margin: 4px 0 0 10px; padding-left: 8px; border-left: 2px solid #e2e8f0; }
+.roundtable-group:is([data-kind=scope], [data-kind=questions]) { border-color: #94a3b8; color: #475569; }
+.roundtable-group:is([data-kind=scope], [data-kind=questions]) h4 { color: #475569; }
 .roundtable-positions { display: grid; gap: 6px; }
 .roundtable-group[data-kind=disagreement] .roundtable-positions { grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr)); }
 .roundtable-position { min-width: 0; }

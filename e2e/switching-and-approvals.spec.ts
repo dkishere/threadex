@@ -38,7 +38,7 @@ test("concurrent runners keep background and approval state while switch respons
     await expect(page.getByLabel("User prompts").getByText("Alpha mock runner prompt", { exact: true })).toBeVisible();
     await expect(page.getByText("Beta mock runner prompt", { exact: true })).toHaveCount(0);
     await expect(page.locator(".runtime-pill")).toHaveText("Working");
-    await expect(page.getByRole("heading", { name: "Approval required" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Approval required" })).toHaveCount(0);
 
     const alphaRow = page.locator(".session-row", { hasText: alpha.title });
     const betaRow = page.locator(".session-row", { hasText: beta.title });
@@ -48,9 +48,7 @@ test("concurrent runners keep background and approval state while switch respons
     const betaSwitchResponsePromise = page.waitForResponse(
       (response) => new URL(response.url()).pathname === "/api/sessions/switch" && response.request().method() === "POST"
     );
-    // The approval dialog intentionally remains open while a different session
-    // is selected. Dispatch the row's React click handler through the DOM so
-    // the persistent dialog does not absorb the pointer event.
+    // Pending actions must not open a dialog when the selected session changes.
     await betaRow.dispatchEvent("click");
     const betaSwitchPayload = await (await betaSwitchResponsePromise).json();
     expect(betaSwitchPayload.session.id).toBe(beta.id);
@@ -59,7 +57,7 @@ test("concurrent runners keep background and approval state while switch respons
     await expect(page.getByLabel("User prompts").getByText("Beta mock runner prompt", { exact: true })).toBeVisible();
     await expect(page.getByText("Alpha mock runner prompt", { exact: true })).toHaveCount(0);
     await expect(page.locator(".runtime-pill")).toHaveText("Working");
-    await expect(page.getByRole("heading", { name: "Approval required" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Approval required" })).toHaveCount(0);
     await expect(page.locator(".session-row", { hasText: alpha.title }).locator(".session-status-indicator")).toHaveAttribute(
       "data-status",
       "awaiting_approval"
@@ -89,7 +87,7 @@ test("concurrent runners keep background and approval state while switch respons
     await expect(page.getByText("Alpha mock runner prompt", { exact: true })).toHaveCount(0);
     await expect(page.getByText("Beta mock runner prompt", { exact: true })).toHaveCount(0);
     await expect(page.locator(".runtime-pill")).toHaveText("2 background");
-    await expect(page.getByRole("heading", { name: "Approval required" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Approval required" })).toHaveCount(0);
     await expect(page.locator(".session-row", { hasText: alpha.title }).locator(".session-status-indicator")).toHaveAttribute(
       "data-status",
       "awaiting_approval"

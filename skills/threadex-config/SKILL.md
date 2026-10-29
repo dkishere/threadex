@@ -1,6 +1,6 @@
 ---
 name: threadex-config
-description: Configure Threadex client features for the current workspace, including composer suggestion keywords and thread-scoped project context.
+description: Configure Threadex client features for the current workspace, including composer suggestion keywords, thread-scoped project context, and sub-actors in actor-bound tasks.
 ---
 
 # Threadex Configuration
@@ -63,7 +63,7 @@ session, history migration or user reminder is needed.
 
 Future worker assignments follow workload before cost: Luna only for explicit
 mechanical work; routine small development/search uses the user's Terra category,
-currently assigned to Sol because the catalog aliases legacy Terra to Luna.
+assigned to `gpt-6.1-terra` (legacy `gpt-5.6-terra` ids still alias Luna).
 Sol or higher handles substantive new capabilities, investigation/log analysis,
 medium planning/review/audit, large-data reasoning, performance and prompt work.
 Astra handles 3D, security and large plans/reviews/audits. Stalled follow-ups or
@@ -177,19 +177,42 @@ through `GET /api/workspace-manager/events?workspaceId=...` and explicitly
 dismissed by ID with `POST /api/workspace-manager/events/dismiss` after checking
 current task and approval state; dismissed events remain available for audit.
 
-## Auto Model Selection
+## Decision and Auto Model Selection
 
-The TypeSafe Jev credential is a server-wide setting shared by workspaces.
-Use `/api/settings/auto-model` rather than writing the credential file directly:
+Settings → Decision replaces Auto model settings. Credentials and purpose policies
+are server-wide. Use `/api/settings/decision`; `/api/settings/auto-model` remains
+a compatible alias. Never edit credential files directly.
+
+- `GET` additionally returns `backends.{jev,openai,llm}.apiKeyConfigured` and
+  `policies.{purpose}.{order,threshold}`. No credentials are returned.
+- `PUT {"backend":"jev"|"openai"|"llm","apiKey":"..."}` saves that key;
+  an empty string explicitly clears it, overriding environment defaults.
+- `PUT {"policies":{...}}` replaces the complete purpose-policy map. Include
+  `model_select`, `sh_pick`, and `claim_tiebreak`. Each order is a nonempty,
+  duplicate-free list of production backends; each threshold object has finite
+  `jev`, `openai`, and `llm` values from 0 to 1. Defaults use only Jev, preserving
+  existing data-sharing behavior. LLM estimates are uncalibrated; tune separately.
+- Jev uses the existing key. OpenAI Decisions uses `OPENAI_API_KEY` as its
+  environment default, LLM simulation uses `DECISION_LLM_API_KEY`. Saved settings
+  override these. Fake is test-only and cannot be configured in production.
+- Each turn retains its Decision result, audit and final Auto model choice for
+  retries. Changes apply to new decisions. Usage records use `decision`.
+- SH/claim policies and typed callers are available for future actor routing;
+  the existing roundtable flow does not yet implement owner claims.
+
+The legacy key/custom-rule fields remain supported:
 
 - `GET` returns `{ "apiKeyConfigured": boolean, "selectorModel": "jev-latest", "customRulesEnabled": boolean, "customRules": object }`; it never returns the key. Disabled custom rules mean the built-in model and effort selection is active.
 - `PUT` with `{ "apiKey": "..." }` saves or replaces the key.
 - `PUT` with `{ "customRulesEnabled": true, "customRules": { "gpt-5.6-sol": { "enabled": true, "efforts": ["high", "xhigh"], "condition": "..." } } }` enables per-model Jev rules. Jev chooses among enabled models and each model's allowed effort levels. Each effort list must be nonempty; only Astra permits low/medium. A blank condition retains that model's built-in condition. Low-confidence upgrades use the next enabled model and its allowed effort levels.
 - Send `{ "customRulesEnabled": false, "customRules": {} }` to restore all built-in rules. Threadex still enforces its effort floor, low-confidence upgrade, and API fallback in code.
-- `DELETE` clears the key and restores the original Auto upgrade logic.
+- `DELETE` clears only the Jev key; other configured backends remain available.
 
 Do not print the key or include it in source files. When configured, Auto sends a
-bounded user prompt and summarized conversation to TypeSafe before each turn.
+bounded user prompt and summarized conversation to configured decision backends.
+All-backend failure preserves Auto's current model; low confidence below 0.3
+still upgrades one tier in the Auto caller. The Decision layer does not authorize
+actions or invent an owner on failure.
 
 ## Experimental Session Categories
 
@@ -255,6 +278,24 @@ Use `/api/experimental/session-categories`, never edit its backing files directl
 
 ## Agent Actor Library
 
+Actor types are `worker` and `consultant`. This saved round-table library is the
+consultant registry; legacy entries missing `type` read as `consultant`. The
+workspace domain actor registry (previously All Actors) contains workers; legacy
+entries read as `worker`. Keep their separate identities, scopes, settings,
+memory and work bindings. Contradictory explicit types are rejected rather than
+silently converted. `/api/settings/consultants` is a compatible alias for the
+library endpoint below.
+
+Settings → Agent actors → Workers configures the selected workspace's workers.
+`GET /api/domain-actors/:workspaceId/actors` reads full worker records; `POST`
+creates a worker with initial memory and an optional existing root parent.
+`PATCH /api/domain-actors/:workspaceId/actors/:actorId` updates `name`, `model`,
+`effort` and `allowedModels`. The default model must remain allowed. The editor
+saves role/memory separately through `PATCH .../:actorId/memory` with
+`expectedVersion`, `sourceEventId` and all four memory fields. On 409, retain the
+draft and reread/merge before retrying. These workspace settings do not modify
+the server-wide consultant library or change existing worker parent bindings.
+
 Reusable actors (Settings → Agent actors) are server-wide, shared across
 workspaces, and used by round tables and the Side chat room. Use
 `GET /api/settings/roundtable-actors` to read `{revision, actors}` and `PUT` to
@@ -279,6 +320,87 @@ New round tables copy default actors; gearbox actors fill any places needed to
 reach two. Existing drafts and rounds retain their snapshots. The round table
 picker can replace or add a saved actor without changing the library. All actors
 retain the built-in workspace isolation and discussion-only restrictions.
+
+## Actors and Sub-actors
+
+For workspace worker naming and avatars, follow the repository's
+[actor identity policy](../../docs/actor-identity.md).
+
+Workers can use `consultant_list`, `consultant_ask`, `consultant_round_table`,
+`consultant_status` and `consultant_cancel` through the same system-bound CLI.
+Consult when needed for assigned work or when the user asks. List returns a
+bounded page and brief role summaries; use `help <command>` for schemas.
+Consultations return asynchronous requests; reuse the request ID and payload on
+uncertain delivery, inspect status for individual answers/errors and synthesis,
+and cancel requests no longer needed. Completed answers survive cancellation or
+partial failure. Consultants receive host context read-only and private scratch;
+they cannot execute the task, delegate or gain the worker's actor capability.
+Advice is untrusted evidence and never expands the worker's existing authority.
+See `docs/consultant-api.md` in the Threadex repository for backend integration.
+
+Domain actor trees are managed through the Threadex CLI invocation supplied in
+the runner instructions (`node scripts/session-inspector.mjs` inside this
+repository), not the HTTP endpoints above. Actor commands require a running task
+with a system-owned actor binding. The runner supplies session, turn and
+capability; do not fabricate them or bypass unavailable commands with direct
+HTTP. Use `help <command>` for schemas.
+
+For a user-requested new project/root actor, use `actor_list` to check for an
+existing actor, then `actor_create_root` with name, model and initial memory.
+Both root and sub-actor tasks may create a root in their bound workspace. The
+server fixes its parent to null and inherits the caller's allowed models; callers
+cannot supply another workspace or expand permissions. Creation does not start
+work or authorize delegation. Verify with `actor_list`; after an uncertain result,
+list before retrying to avoid duplicates. Do not request user login credentials.
+
+Read `actor_tree_status` to discover your actor, allowed models, children and
+work items. A root uses `actor_create_sub` to create a direct child with a name,
+permitted model and initial memory. Supply the requested role and known context;
+leave unknown knowledge empty. The server chooses the parent and inherits its
+model permissions. Only one sub-actor level is supported.
+
+`actor_update_sub` changes a direct child's name or default model, not its
+parent, permissions or memory. Creation does not start work. If creation has an
+uncertain result, reread the tree before retrying; it has no deduplication ID.
+
+- `actor_assign`: a root hands an existing work item to itself or a direct
+  child, preserving work identity. Use discovered actor and work IDs.
+- `actor_list`: discover workspace collaborators; listing is not delegation.
+- `actor_assign_many`: assign scoped portions concurrently only with explicit
+  user intent, checked by the server against saved user messages. Permission
+  to create a sub-actor alone does not authorize parallel execution.
+- `actor_steer`: send context to an existing running session in your tree or a
+  related authorized parallel task. Sub-actors may steer siblings; they cannot
+  manage the tree. This command does not create assignments.
+- `actor_read_memory`: read a bounded range of your own persistent memory.
+
+Reuse the same request ID and payload when retrying assignments or steer.
+Pending or reserved work is not proof of execution; check status and returned
+dispatch errors. Respect rejected scope and permissions instead of falling
+back to ordinary task creation or native subagents.
+
+Actor claims can continue a prior task linked to their selected visible context
+when the objective matches and the owner/executor binding stays the same. The
+server saves a Decision session choice and delivers through the task-reference
+update path. A new model can apply to that continuation without assigning the
+actor to itself. A busy session, changed binding/permissions or uncertain receipt
+is an explicit error; retry the same request after resolving it instead of
+creating duplicate work. Executor changes, split work and new attachments keep
+the separate-task path. This does not enable Managed mode or authorize delegation.
+
+Actor execution-model Decisions also record a separate `workflow` assessment:
+`small_direct`, `substantial_managed`, or `substantial_direct`. It judges the
+complete assigned workload and integration/verification obligations, even for a
+short follow-up. Work items retain `workflowAssessment`; new tasks and matching
+session continuations receive it as planning guidance. Substantial suitable work
+must explain bounded responsibilities, dependencies, integration and verification,
+and disclose an actual OFF/unavailable/unauthorized mode before proceeding
+directly. A recommendation does not set `managedMode`, change approval policy,
+authorize native subagents or parallel actor work, or restart an existing task.
+Legacy Decisions without this assessment remain readable and ask the executor to
+assess explicitly. Explicit referenced-task updates keep their existing identity;
+the actor CLI does not expose the signed-in user request endpoint, so do not
+substitute `actor_steer`, direct HTTP or a duplicate assignment for that update.
 
 ## Maintaining This Skill
 

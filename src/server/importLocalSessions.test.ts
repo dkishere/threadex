@@ -8,6 +8,73 @@ import { CONTEXT_FORK_USER_SUFFIX } from "../contextFork.js";
 import { openPostgresSessionConnection, postgresSchemaFromStoreId } from "./sessionDb.js";
 import { SessionStore } from "./sessionStore.js";
 
+for (const existingAlias of [false, true]) {
+  test(`old Manager transcripts retain their owner after thread rotation (alias: ${existingAlias})`, async () => {
+    const root = mkdtempSync(resolve(tmpdir(), "manager-historical-import-"));
+    const codexHome = resolve(root, "codex-home");
+    const sessionsDir = resolve(codexHome, "sessions", "2026", "09", "28");
+    const oldThread = "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb";
+    const newThread = "cccccccc-1111-4222-8333-dddddddddddd";
+    const transcriptPath = resolve(sessionsDir, `rollout-${oldThread}.jsonl`);
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(transcriptPath, [
+      { timestamp: "2026-09-28T10:00:00Z", type: "session_meta", payload: { id: oldThread, cwd: root } },
+      { timestamp: "2026-09-28T10:00:01Z", type: "event_msg", payload: { type: "task_started", turn_id: "native-old" } },
+      { timestamp: "2026-09-28T10:00:02Z", type: "event_msg", payload: { type: "user_message", message: "coordinate work" } },
+      { timestamp: "2026-09-28T10:00:03Z", type: "event_msg", payload: { type: "agent_message", phase: "final_answer", message: "Dispatched" } },
+      { timestamp: "2026-09-28T10:00:04Z", type: "event_msg", payload: { type: "task_complete", turn_id: "native-old" } }
+    ].map(record => JSON.stringify(record)).join("\n") + "\n");
+    const store = new SessionStore(resolve(root, "import.postgres"));
+    try {
+      await store.ready();
+      const manager = await store.ensureWorkspaceManager("default");
+      const recordOwnedTurn = async (sessionId: string, turnId: string, threadId: string) => {
+        await store.recordSessionTurn({ id: turnId, sessionId, userInput: "coordinate work",
+          agentResponse: "Dispatched", status: "running", tokenIn: 0, tokenOut: 0 });
+        await store.markSessionTurnRunning({ id: turnId, runnerPid: 2_000_000_000,
+          runnerLogPath: resolve(root, `${turnId}.ndjson`) });
+        await store.recordSessionProviderThread({ sessionId, turnId, threadId, provider: "codex",
+          nativeHome: codexHome, cwd: root, accountId: null, completed: true });
+        await store.updateSessionTurn({ id: turnId, agentResponse: "Dispatched", status: "done", tokenIn: 0, tokenOut: 0 });
+      };
+      await recordOwnedTurn(manager.sessionId, "managed-old", oldThread);
+      await recordOwnedTurn(manager.sessionId, "managed-new", newThread);
+      await store.upsertSession({ id: manager.sessionId, threadId: newThread });
+      if (existingAlias) {
+        await store.upsertSession({ id: `tx_${oldThread}`, threadId: oldThread, cwd: root, title: "Old imported copy" });
+        await store.recordSessionTurn({ id: "alias-unique", sessionId: `tx_${oldThread}`, userInput: "Keep this unique follow-up",
+          agentResponse: "Preserved", status: "done", tokenIn: 0, tokenOut: 0 });
+      }
+      // A different workspace's ownership must not make this import ambiguous.
+      await store.upsertWorkspace({ id: "other", name: "Other", cwd: root, codexHome: resolve(root, "other-home") });
+      await store.upsertSession({ id: "foreign", workspaceId: "other", cwd: root });
+      await recordOwnedTurn("foreign", "foreign-old", oldThread);
+
+      for (let retry = 0; retry < 2; retry++) {
+        const imported = await store.importLocalCodexSessionFile({ path: transcriptPath, codexHome, workspaceId: "default" });
+        assert.equal(imported.sessionId, manager.sessionId);
+        assert.equal(imported.turns, 0);
+        assert.equal((await store.listSessionTurns(manager.sessionId)).length, 2);
+        assert.equal((await store.getSession(manager.sessionId))?.threadId, newThread);
+      }
+      if (existingAlias) {
+        assert.deepEqual((await store.listSessionTurns(`tx_${oldThread}`)).map(turn => turn.id), ["alias-unique"]);
+      } else {
+        assert.equal(await store.getSession(`tx_${oldThread}`), null);
+        assert.equal((await store.listSessionsPage("default")).sessions.length, 0);
+      }
+      // Conflicting managed ownership must fail before any transcript is imported.
+      await store.upsertSession({ id: "conflicting", workspaceId: "default", cwd: root });
+      await recordOwnedTurn("conflicting", "conflicting-old", oldThread);
+      await assert.rejects(store.importLocalCodexSessionFile({ path: transcriptPath, codexHome, workspaceId: "default" }),
+        /multiple managed sessions/);
+      assert.equal(await store.getSessionTurn("native-old"), null);
+    } finally {
+      await store.close();
+    }
+  });
+}
+
 test("in-progress Codex app imports keep their newest activity timestamp", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "local-session-in-progress-test-"));
   const codexHome = resolve(root, "codex-home");

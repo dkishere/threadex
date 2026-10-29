@@ -284,7 +284,7 @@ async function ensureSchema(db) {
   await db.run(`
     UPDATE sessions
     SET title_source = 'initial'
-    WHERE title_source IS NULL OR title_source NOT IN ('initial', 'summarizer', 'user')
+    WHERE title_source IS NULL OR title_source NOT IN ('initial', 'summarizer', 'user', 'actor')
   `);
   await db.run(`
     CREATE TABLE IF NOT EXISTS workspaces (

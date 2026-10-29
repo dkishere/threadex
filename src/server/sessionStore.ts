@@ -1,5 +1,9 @@
 import { DEFAULT_MODEL, defaultGearProfiles, type ModelProvider } from "../modelCatalog";
 import type { LightweightTodo } from "../lightweightTodo";
+import { normalizeSubagentActivity, SUBAGENT_ACTIVITY_RETAINED_PER_AGENT, type SubagentActivityPayload } from "../eventProtocol";
+import type { DecisionAudit } from "./decision/policy";
+import { emptyActorRoom, type ActorRoom } from "../domainActors";
+import type { AutoModelSelection } from "./autoModelSelector";
 import { parseRoundtableConclusion, roundtableResponse, roundtableRunning, roundtableSynthesisMarkdown, type RoundtableRound } from "../roundtable";
 import { parseSideChatActorJson, type SideChatActor } from "../sideChatRoom";
 import type { CollaborationFork, CollaborationGroup } from "../collaboration";
@@ -9,6 +13,8 @@ import { acknowledgeGrill, grillAwaitingAck, type GrillSummary, type TurnGrill }
 import { openPostgresSessionConnection, postgresSchemaFromStoreId, type SessionDbConnection, type SessionDbValue } from "./sessionDb";
 import * as claudeAccountStore from "./claudeAccountStore";
 import { backfillProviderTurnHistory, ensureProviderThreadSchema, getProviderThread, recordProviderThread, threadProvider } from "./sessionProviderThreads";
+import * as sessionArchive from "./sessionArchiveStore";
+import { ensureSessionArchiveSchema, type NativeArchiveOutcome, type SessionArchiveReason } from "./sessionArchiveStore";
 import type { ClaudeAccountRecord, ClaudeAccountStatusUpdate, ClaudeQuotaSnapshot } from "./claudeAccountStore";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, statSync, type Stats } from "node:fs";
@@ -16,9 +22,10 @@ import { homedir } from "node:os";
 import { relative, resolve } from "node:path";
 import { PENDING_CODEX_SESSION_TITLE_PREFIX } from "./codexSessionTitles";
 import { stripTodoPlanOperationalSuffix } from "./todoInstructions";
-import { fileChangesFromTurnDiff, normalizeStructuredAgentComment } from "./codexEvents";
+import { fileChangesFromTurnDiff, mergeTurnDiffChanges, normalizeStructuredAgentComment, type FileChange } from "./codexEvents";
 import { changedFilePaths } from "./changedFilePaths";
-import { turnTokenUsageJoinSql } from "./turnTokenUsage";
+import { formatStoredUserInput } from "./attachmentUploads";
+import { turnSubagentTokenUsageJoinSql, turnTokenUsageJoinSql } from "./turnTokenUsage";
 import { canonicalSessionId, isThreadexSessionId, sessionIdAliases } from "../codexReference";
 import { stripContextForkOperationalSuffix } from "../contextFork";
 import { managerActivityPrompt, WORKSPACE_MANAGER_MODEL, WORKSPACE_MANAGER_EFFORT, WORKSPACE_MANAGER_VISIBLE_TURNS,
@@ -70,7 +77,8 @@ function workspacePendingTaskSql(alias: string) {
     AND NOT ((${alias}.pending_reason IS NULL OR ${alias}.pending_reason = 'queued')
       AND ${alias}.agent_response ~ '${legacyWatchdogStoppedResponseSql}')`;
 }
-export type SessionTitleSource = "initial" | "summarizer" | "user";
+/** "actor": decided when a domain actor claimed the task; only a user rename replaces it. */
+export type SessionTitleSource = "initial" | "summarizer" | "user" | "actor";
 
 // Display activity includes background discussion and Concurrent work; it does
 // not grant a runner writer or change the ordinary turn queue's ownership.
@@ -134,6 +142,8 @@ export type SessionRecord = {
   turnCount?: number;
   tokenCount?: number;
   modelTokenUsage?: SessionModelTokenUsage[];
+  /** Subagent usage across the session's turns; not included in tokenCount or modelTokenUsage. */
+  subagentTokenUsage?: SubagentTokenUsage;
   matchedTurn?: string | null;
 };
 
@@ -554,6 +564,8 @@ export type SessionTurnRecord = {
   usageSample: SessionTurnTokenUsageSampleRecord | null;
   /** Cached input accumulated over this turn, using the same samples as tokenIn. */
   cachedInputTokens?: number;
+  /** Usage of subagents started by this turn; excluded from tokenIn/tokenOut. */
+  subagentUsage?: SubagentTokenUsage;
   status: SessionTurnStatus;
   runnerPid: number | null;
   runnerStarted: string | null;
@@ -611,7 +623,7 @@ export type SessionTurnEventRecord = {
   created: string;
 };
 
-export type SessionAutoModelProvider = "typesafe" | "fallback";
+export type SessionAutoModelProvider = "typesafe" | "openai" | "llm" | "fake" | "fallback";
 
 export type SessionSideChatRecord = {
   id: string;
@@ -894,6 +906,8 @@ type ForkSessionInput = {
 };
 
 type RecordSessionTurnInput = {
+  /** Reject automatic continuations if another turn became active before insertion. */
+  requireIdleSession?: boolean;
   id?: string;
   sessionId: string;
   accountId?: string | null;
@@ -1018,11 +1032,21 @@ export type SessionTurnTokenUsageSampleRecord = {
 
 export type SessionTurnTokenUsageSampleInput = Omit<SessionTurnTokenUsageSampleRecord, "id" | "created" | "updated"> & {
   id?: string;
+  /** Child thread or Claude Agent call that produced the sample; absent for the turn's own agent. */
+  agentId?: string;
+};
+
+export type SubagentTokenUsage = {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  agentCount: number;
 };
 
 export type TokenUsageInput = {
   id: string;
-  usageType: "agent" | "summarizer" | "background" | "account";
+  usageType: "agent" | "subagent" | "summarizer" | "background" | "account" | "decision";
   source: string;
   workspaceId?: string | null;
   sessionId?: string | null;
@@ -1070,37 +1094,43 @@ type RecordCodexCommandCallInput = {
 const sessionLiveItemOutputTailBytes = 64 * 1024;
 const latestUsageSampleJoinSql = `
   ${turnTokenUsageJoinSql}
-  LEFT JOIN token_usage AS latest_usage
-    ON latest_usage.id = (
-      SELECT id
-      FROM token_usage
-      WHERE turn_id = session_turn.id
-        AND usage_type = 'agent'
-      ORDER BY
-        CASE WHEN primary_used_percent IS NOT NULL OR secondary_used_percent IS NOT NULL THEN 1 ELSE 0 END DESC,
-        source_timestamp DESC NULLS LAST,
-        source_index DESC NULLS LAST,
-        created DESC
-      LIMIT 1
-    )
-  LEFT JOIN token_usage AS latest_effort_usage
-    ON latest_effort_usage.id = (
-      SELECT id
-      FROM token_usage
-      WHERE turn_id = session_turn.id
-        AND usage_type = 'agent'
-        AND json_extract_string(metadata, '$.reasoningEffort') IS NOT NULL
-      ORDER BY
-        source_timestamp DESC NULLS LAST,
-        source_index DESC NULLS LAST,
-        created DESC
-      LIMIT 1
-    )
+  ${turnSubagentTokenUsageJoinSql}
+  -- LATERAL keeps these per-turn index lookups; "ON id = (subquery)" was planned as
+  -- two full token_usage scans plus hash joins (~3s for a 2k-turn session).
+  LEFT JOIN LATERAL (
+    SELECT *
+    FROM token_usage
+    WHERE turn_id = session_turn.id
+      AND usage_type = 'agent'
+    ORDER BY
+      CASE WHEN primary_used_percent IS NOT NULL OR secondary_used_percent IS NOT NULL THEN 1 ELSE 0 END DESC,
+      source_timestamp DESC NULLS LAST,
+      source_index DESC NULLS LAST,
+      created DESC
+    LIMIT 1
+  ) AS latest_usage ON TRUE
+  LEFT JOIN LATERAL (
+    SELECT *
+    FROM token_usage
+    WHERE turn_id = session_turn.id
+      AND usage_type = 'agent'
+      AND json_extract_string(metadata, '$.reasoningEffort') IS NOT NULL
+    ORDER BY
+      source_timestamp DESC NULLS LAST,
+      source_index DESC NULLS LAST,
+      created DESC
+    LIMIT 1
+  ) AS latest_effort_usage ON TRUE
 `;
 const latestUsageSampleSelectSql = `
   turn_usage_totals.input_tokens AS turn_usage_input_tokens,
   turn_usage_totals.cached_input_tokens AS turn_usage_cached_input_tokens,
   turn_usage_totals.output_tokens AS turn_usage_output_tokens,
+  turn_subagent_usage_totals.input_tokens AS subagent_usage_input_tokens,
+  turn_subagent_usage_totals.cached_input_tokens AS subagent_usage_cached_input_tokens,
+  turn_subagent_usage_totals.output_tokens AS subagent_usage_output_tokens,
+  turn_subagent_usage_totals.total_tokens AS subagent_usage_total_tokens,
+  turn_subagent_usage_totals.agent_count AS subagent_usage_agent_count,
   COALESCE(
     (
       SELECT model
@@ -1221,6 +1251,7 @@ type SessionRow = {
   turn_count?: unknown;
   token_count?: unknown;
   model_token_usage?: unknown;
+  subagent_token_usage?: unknown;
   matched_turn?: unknown;
 };
 
@@ -1268,6 +1299,11 @@ type SessionTurnRow = {
   turn_usage_input_tokens?: unknown;
   turn_usage_cached_input_tokens?: unknown;
   turn_usage_output_tokens?: unknown;
+  subagent_usage_input_tokens?: unknown;
+  subagent_usage_cached_input_tokens?: unknown;
+  subagent_usage_output_tokens?: unknown;
+  subagent_usage_total_tokens?: unknown;
+  subagent_usage_agent_count?: unknown;
   status?: unknown;
   runner_pid?: unknown;
   runner_started?: unknown;
@@ -1580,6 +1616,8 @@ export class SessionStore {
   runningSideChatSessionIds: () => string[] = () => [];
   private connectionPromise: Promise<SessionDbConnection>;
   private queue = Promise.resolve();
+  private readonly pendingReads = new Set<Promise<unknown>>();
+  private readonly actorRoomCache = new Map<string, { version: string; room: ActorRoom }>();
   private connection: SessionDbConnection | null = null;
   private duckDbUiStarted = false;
   private closed = false;
@@ -1604,6 +1642,210 @@ export class SessionStore {
       return (await result.getRowObjectsJS()).map(row =>
         (typeof row.state === "string" ? JSON.parse(row.state) : row.state) as CollaborationGroup);
     });
+  }
+
+  listSessionNativeThreads(sessionId: string) {
+    return this.read(connection => sessionArchive.listSessionNativeThreads(connection, sessionId));
+  }
+
+  listSessionArchiveCandidates(minIdleDays: number) {
+    return this.read(connection => sessionArchive.listSessionArchiveCandidates(connection, { minIdleDays, activeSessionSql: activeSessionDisplaySql }));
+  }
+
+  archiveSessionData(input: { sessionId: string; reason: SessionArchiveReason; nativeArchive: NativeArchiveOutcome[] }) {
+    return this.write(connection => sessionArchive.archiveSessionRows(connection, { ...input, activeSessionSql: activeSessionDisplaySql }));
+  }
+
+  readSessionArchive(sessionId: string) {
+    return this.read(connection => sessionArchive.readSessionArchive(connection, sessionId));
+  }
+
+  claimSessionArchiveRun(day: string) {
+    return this.write(connection => sessionArchive.claimSessionArchiveRun(connection, day));
+  }
+
+  finishSessionArchiveRun(day: string, result: unknown) {
+    return this.write(connection => sessionArchive.finishSessionArchiveRun(connection, day, result));
+  }
+
+  async getDomainActorRoom(workspaceId: string): Promise<ActorRoom> {
+    return this.read(async connection => (await this.readActorRoom(connection, workspaceId)) ?? emptyActorRoom(workspaceId));
+  }
+
+  /** The room is one multi-MB document polled several times a second. xmin changes with every committed
+   * row version, from any process, so it validates the cached copy without detoasting the document. */
+  private async readActorRoom(connection: SessionDbConnection, workspaceId: string): Promise<ActorRoom | null> {
+    const versionRows = await (await connection.run("SELECT xmin::text AS version FROM actor_room WHERE workspace_id = $workspaceId", { workspaceId })).getRowObjectsJS();
+    if (!versionRows[0]) return null;
+    const cached = this.actorRoomCache.get(workspaceId);
+    if (cached?.version === String(versionRows[0].version)) return structuredClone(cached.room);
+    const rows = await (await connection.run("SELECT xmin::text AS version, state FROM actor_room WHERE workspace_id = $workspaceId", { workspaceId })).getRowObjectsJS();
+    if (!rows[0]) return null;
+    const room = (typeof rows[0].state === "string" ? JSON.parse(rows[0].state) : rows[0].state) as ActorRoom;
+    this.actorRoomCache.set(workspaceId, { version: String(rows[0].version), room });
+    // Callers normalise and mutate rooms in place; the cached copy must stay pristine.
+    return structuredClone(room);
+  }
+
+  /** Store only a SHA256 verifier. The opaque bearer stays in the runner environment.
+   * A workItemId binds a native child of the host session turn instead of the session itself. */
+  async setDomainActorCapability(input: { workspaceId: string; sessionId: string; turnId: string; tokenHash: string; workItemId?: string }): Promise<void> {
+    if (!/^[a-f0-9]{64}$/.test(input.tokenHash)) throw new Error("Actor capability requires a SHA256 verifier.");
+    if (input.workItemId) {
+      const params = { workspaceId: input.workspaceId, sessionId: input.sessionId, turnId: input.turnId, workItemId: input.workItemId, tokenHash: input.tokenHash };
+      await this.write(async connection => {
+        const result = await connection.run(`INSERT INTO actor_child_capability (workspace_id, session_id, turn_id, work_item_id, token_hash)
+          SELECT s.workspace_id, s.id, t.id, $workItemId, $tokenHash FROM sessions s JOIN session_turn t ON t.session_id = s.id
+          WHERE s.workspace_id = $workspaceId AND s.id = $sessionId AND t.id = $turnId
+          ON CONFLICT (session_id, turn_id, work_item_id) DO UPDATE SET workspace_id = excluded.workspace_id,
+            token_hash = excluded.token_hash, updated = now()`, params);
+        if (result.rowCount !== 1) throw new Error("Actor capability task binding was not found.");
+      });
+      return;
+    }
+    await this.write(async connection => {
+      const result = await connection.run(`INSERT INTO actor_tool_capability (workspace_id, session_id, turn_id, token_hash)
+        SELECT s.workspace_id, s.id, t.id, $tokenHash FROM sessions s JOIN session_turn t ON t.session_id = s.id
+        WHERE s.workspace_id = $workspaceId AND s.id = $sessionId AND t.id = $turnId
+        ON CONFLICT (session_id, turn_id) DO UPDATE SET workspace_id = excluded.workspace_id,
+          token_hash = excluded.token_hash, updated = now()`, input);
+      if (result.rowCount !== 1) throw new Error("Actor capability task binding was not found.");
+    });
+  }
+
+  async getDomainActorCapability(input: { workspaceId: string; sessionId: string; turnId: string; workItemId?: string }): Promise<string | null> {
+    if (input.workItemId) {
+      const params = { workspaceId: input.workspaceId, sessionId: input.sessionId, turnId: input.turnId, workItemId: input.workItemId };
+      return this.read(async connection => {
+        const rows = await (await connection.run(`SELECT capability.token_hash FROM actor_child_capability capability
+          JOIN sessions s ON s.id = capability.session_id JOIN session_turn t ON t.id = capability.turn_id AND t.session_id = s.id
+          WHERE capability.workspace_id = $workspaceId AND s.workspace_id = $workspaceId AND capability.session_id = $sessionId
+            AND capability.turn_id = $turnId AND capability.work_item_id = $workItemId`, params)).getRowObjectsJS();
+        return rows[0] ? String(rows[0].token_hash) : null;
+      });
+    }
+    return this.read(async connection => {
+      const rows = await (await connection.run(`SELECT capability.token_hash FROM actor_tool_capability capability
+        JOIN sessions s ON s.id = capability.session_id JOIN session_turn t ON t.id = capability.turn_id AND t.session_id = s.id
+        WHERE capability.workspace_id = $workspaceId AND s.workspace_id = $workspaceId
+          AND capability.session_id = $sessionId AND capability.turn_id = $turnId`, input)).getRowObjectsJS();
+      return rows[0] ? String(rows[0].token_hash) : null;
+    });
+  }
+
+  async revokeDomainActorCapability(input: { workspaceId: string; sessionId: string; turnId: string }): Promise<void> {
+    await this.write(async connection => {
+      await connection.run(`DELETE FROM actor_tool_capability
+        WHERE workspace_id = $workspaceId AND session_id = $sessionId AND turn_id = $turnId`, input);
+    });
+  }
+
+  async captureActorCostBaseline(workspaceId: string): Promise<NonNullable<ActorRoom["costBaseline"]>> {
+    return this.read(async connection => ({ capturedAt: new Date().toISOString(),
+      usage: await (await connection.run(`SELECT model,
+        SUM(input_tokens) AS input_tokens, SUM(cached_input_tokens) AS cached_input_tokens,
+        SUM(output_tokens) AS output_tokens, SUM(reasoning_output_tokens) AS reasoning_output_tokens,
+        SUM(total_tokens) AS total_tokens, MAX(model_context_window) AS model_context_window
+        FROM token_usage usage WHERE usage.workspace_id = $workspaceId
+          OR (usage.workspace_id IS NULL AND EXISTS (SELECT 1 FROM sessions s WHERE s.id = usage.session_id AND s.workspace_id = $workspaceId))
+        GROUP BY model`, { workspaceId })).getRowObjectsJS()
+        .then(rows => rows.map(row => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, key === "model" || value === null ? value : Number(value)])))) }));
+  }
+
+  /** Largest context window observed for a model in any workspace; null when never reported. */
+  async getModelContextWindow(model: string): Promise<number | null> {
+    return this.read(async connection => {
+      const rows = await (await connection.run(`SELECT MAX(model_context_window) AS window FROM token_usage
+        WHERE model = $model AND model_context_window > 0`, { model })).getRowObjectsJS();
+      return nullableNumber(rows[0]?.window);
+    });
+  }
+
+  async getDomainActorRunningSessions(workspaceId: string): Promise<import("../domainActors").ActorRunningSession[]> {
+    return this.read(connection => this.actorRunningSessionsWithConnection(connection, workspaceId));
+  }
+  private async actorRunningSessionsWithConnection(connection: SessionDbConnection, workspaceId: string, includeLoops = false): Promise<import("../domainActors").ActorRunningSession[]> {
+      const rows = await (await connection.run(`SELECT execution->>'executorActorId' AS actor_id,
+        item->>'id' AS work_item_id, t.session_id, t.id AS turn_id, t.status
+        FROM actor_room room, jsonb_array_elements(room.state->'workItems') item,
+          jsonb_array_elements(jsonb_build_array(item) || COALESCE(item->'executionHistory', '[]'::JSONB)) execution,
+          session_turn t JOIN sessions s ON s.id = t.session_id
+        WHERE room.workspace_id = $workspaceId AND s.workspace_id = $workspaceId
+          AND t.session_id = execution->>'taskSessionId'
+          AND (t.status = 'running' OR (${workspacePendingTaskSql("t")})
+            ${includeLoops ? "OR EXISTS (SELECT 1 FROM loop_continuation c WHERE c.session_id = t.session_id AND c.pending = TRUE)" : ""})`, { workspaceId })).getRowObjectsJS();
+      // A manual follow-up counts as soon as it is queued; one entry per actor session, preferring the running turn.
+      const sessions = new Map<string, import("../domainActors").ActorRunningSession>();
+      for (const row of rows) {
+        const key = JSON.stringify([row.actor_id, row.work_item_id, row.session_id]);
+        const existing = sessions.get(key);
+        if (existing && (existing.status === "running" || row.status !== "running")) continue;
+        sessions.set(key, { actorId: String(row.actor_id), workItemId: String(row.work_item_id),
+          sessionId: String(row.session_id), turnId: String(row.turn_id), status: String(row.status) });
+      }
+      return [...sessions.values()];
+  }
+
+  /** One atomic workspace document keeps identities, reservations and events together. */
+  async changeDomainActorRoom<T>(workspaceId: string, change: (room: ActorRoom, runningSessions?: import("../domainActors").ActorRunningSession[]) => T,
+    options?: { actorLifecycleLock: true }): Promise<T> {
+    const mutate = async (connection: SessionDbConnection) => {
+      await connection.run(`INSERT INTO actor_room (workspace_id, state) VALUES ($workspaceId, $state::JSONB)
+        ON CONFLICT (workspace_id) DO NOTHING`, { workspaceId, state: JSON.stringify(emptyActorRoom(workspaceId)) });
+      if (options?.actorLifecycleLock) await connection.run("SELECT workspace_id FROM actor_room WHERE workspace_id = $workspaceId FOR UPDATE", { workspaceId });
+      const runningSessions = options?.actorLifecycleLock ? await this.actorRunningSessionsWithConnection(connection, workspaceId, true) : undefined;
+      for (let attempt = 0; attempt < 32; attempt++) {
+        const room = (await this.readActorRoom(connection, workspaceId))!;
+        // Every writer bumps revision, so it is the CAS token; comparing the whole multi-MB document cost seconds per write.
+        const previousRevision = Number(room.revision) || 0;
+        const before = JSON.stringify(room);
+        const result = change(room, runningSessions);
+        room.revision = previousRevision;
+        // A no-op change must not rewrite (and re-TOAST) the whole document.
+        if (JSON.stringify(room) === before) return result;
+        room.revision = previousRevision + 1;
+        const state = JSON.stringify(room);
+        const updated = await connection.run(`UPDATE actor_room SET state = $state::JSONB
+          WHERE workspace_id = $workspaceId AND COALESCE((state->>'revision')::BIGINT, 0) = $previousRevision
+          RETURNING xmin::text AS version`, { workspaceId, state, previousRevision });
+        if (updated.rowCount === 1) {
+          const [row] = await updated.getRowObjectsJS();
+          this.actorRoomCache.set(workspaceId, { version: String(row.version), room: JSON.parse(state) as ActorRoom });
+          return result;
+        }
+      }
+      throw new Error("Actor room changed concurrently; retry with the same request ID.");
+    };
+    return options?.actorLifecycleLock ? this.actorLifecycleTransaction(null, mutate) : this.write(mutate);
+  }
+
+  /** Admission and deletion lock the same document on a pinned PostgreSQL client. */
+  private actorLifecycleTransaction<T>(sessionId: string | null, operation: (connection: SessionDbConnection) => Promise<T>, turnId?: string): Promise<T> {
+    return this.write(connection => connection.withTransaction(async run => {
+      const pinned = Object.assign(Object.create(connection) as SessionDbConnection, { run });
+      const rows = sessionId || turnId ? await (await run(`SELECT s.id, s.workspace_id FROM sessions s
+        ${turnId ? "JOIN session_turn t ON t.session_id = s.id WHERE t.id = $turnId" : "WHERE s.id = $sessionId"}`,
+        turnId ? { turnId } : { sessionId })).getRowObjectsJS() : [];
+      if (rows[0]) await this.lockActorTurnAdmission(pinned, String(rows[0].workspace_id), String(rows[0].id));
+      return operation(pinned);
+    }));
+  }
+  private async lockActorTurnAdmission(connection: SessionDbConnection, workspaceId: string, sessionId: string) {
+    // Unbound sessions neither lock nor transfer the workspace's potentially multi-MB document.
+    const rows = await (await connection.run(`SELECT state FROM actor_room WHERE workspace_id = $workspaceId
+      AND EXISTS (SELECT 1 FROM jsonb_array_elements(state->'workItems') item
+        WHERE item->>'taskSessionId' = $sessionId
+          OR EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(item->'executionHistory', '[]'::JSONB)) execution
+            WHERE execution->>'taskSessionId' = $sessionId))
+      FOR UPDATE`, { workspaceId, sessionId })).getRowObjectsJS();
+    if (!rows[0]) return;
+    const room = (typeof rows[0].state === "string" ? JSON.parse(rows[0].state) : rows[0].state) as ActorRoom;
+    const active = new Set(room.actors.map(actor => actor.id));
+    for (const work of room.workItems) {
+      const executions = [work, ...work.executionHistory].filter(execution => execution.taskSessionId === sessionId);
+      if (executions.some(execution => !active.has(work.ownerActorId) || !active.has(execution.executorActorId)))
+        throw new Error("This task belongs to a deleted worker. Its history is available, but new execution is disabled.");
+    }
   }
 
   /** Optimistic CAS is atomic across API processes without relying on pooled transaction affinity. */
@@ -1677,6 +1919,7 @@ export class SessionStore {
     this.closed = true;
 
     await this.queue.catch(() => undefined);
+    await Promise.allSettled([...this.pendingReads]);
     const connection = await this.connectionPromise.catch(() => this.connection);
 
     if (connection) {
@@ -2067,6 +2310,22 @@ export class SessionStore {
                 GROUP BY COALESCE(NULLIF(agent_usage.model, ''), 'Unknown')
               ) AS session_model_usage
             ), '[]'::json) AS VARCHAR) AS model_token_usage,
+            (
+              SELECT CAST(json_build_object(
+                'inputTokens', CAST(sum(turn_subagent_usage_totals.input_tokens) AS BIGINT),
+                'cachedInputTokens', CAST(sum(turn_subagent_usage_totals.cached_input_tokens) AS BIGINT),
+                'outputTokens', CAST(sum(turn_subagent_usage_totals.output_tokens) AS BIGINT),
+                'totalTokens', CAST(sum(turn_subagent_usage_totals.total_tokens) AS BIGINT),
+                -- A subagent resumed in a later turn is still one agent.
+                'agentCount', (SELECT count(DISTINCT json_extract_string(subagent_usage.metadata, '$.agentId'))
+                  FROM token_usage AS subagent_usage
+                  WHERE subagent_usage.session_id = sessions.id AND subagent_usage.usage_type = 'subagent')
+              ) AS VARCHAR)
+              FROM session_turn
+              ${turnSubagentTokenUsageJoinSql}
+              WHERE session_turn.session_id = sessions.id
+              HAVING sum(turn_subagent_usage_totals.agent_count) > 0
+            ) AS subagent_token_usage,
             ${matchedTurnSql}
           FROM sessions
           WHERE workspace_id = $workspaceId
@@ -2163,7 +2422,7 @@ export class SessionStore {
       if (!session) {
         return;
       }
-      const source = input.source === "user" || input.source === "summarizer" ? input.source : "initial";
+      const source = input.source === "user" || input.source === "summarizer" || input.source === "actor" ? input.source : "initial";
       const canUpdateTitle = input.source !== "codex" && canUpdateSessionTitle(session.titleSource, source);
       await connection.run(
         `
@@ -2602,7 +2861,9 @@ export class SessionStore {
     return this.transaction(async connection => {
       await this.assertSessionExistsWithConnection(connection, round.sessionId);
       const inserted = await this.insertSessionTurnWithConnection(connection, {
-        id: round.turnId, sessionId: round.sessionId, userInput: round.prompt, agentResponse: roundtableResponse(round),
+        id: round.turnId, sessionId: round.sessionId, agentResponse: roundtableResponse(round),
+        // Inherited next-round files stay listed on their source turn.
+        userInput: round.attachments?.length && !round.continuation ? formatStoredUserInput(round.prompt, round.attachments) : round.prompt,
         tokenIn: 0, tokenOut: 0, status: "todo", pendingReason: "queued", requestMetadata: { roundtable: true }
       }, true);
       if (!inserted) {
@@ -4155,16 +4416,22 @@ export class SessionStore {
   }
 
   /** A fresh turn may choose a cheaper model; within-turn upgrades remain monotonic. */
-  async selectSessionAutoModel(input: { sessionId: string; model: string; effort: string }): Promise<SessionAutoModelConfig> {
+  async selectSessionAutoModel(input: { sessionId: string; model: string; effort: string; preserveUpgrades?: boolean }): Promise<SessionAutoModelConfig> {
     if (!isAutoModel(input.model) || !isAutoEffort(input.effort)) throw new Error("Invalid Auto model selection.");
     return this.write(async (connection) => {
       const current = await this.getSessionAutoModelWithConnection(connection, input.sessionId);
       if (!current.enabled) throw new Error("Auto model is not enabled for this session.");
+      // Retry replay must not undo a live upgrade, even if its event was not saved.
+      const modelOrder = Object.keys(AUTO_MODEL_CHOICES);
+      const effortOrder = Object.keys(AUTO_EFFORT_CHOICES);
+      const model = input.preserveUpgrades && modelOrder.indexOf(current.model) > modelOrder.indexOf(input.model) ? current.model : input.model;
+      const effort = input.preserveUpgrades && effortOrder.indexOf(current.effort) > effortOrder.indexOf(input.effort) ? current.effort : input.effort;
+      if (input.preserveUpgrades && model === current.model && effort === current.effort) return current;
       await connection.run(
         `UPDATE session_auto_model
          SET model = $model, effort = $effort, revision = revision + 1, updated = now()
          WHERE session_id = $sessionId AND enabled = true`,
-        input
+        { sessionId: input.sessionId, model, effort }
       );
       return this.getSessionAutoModelWithConnection(connection, input.sessionId);
     });
@@ -4904,6 +5171,8 @@ export class SessionStore {
           session_turn.pending_load_balance AS turn_pending_load_balance,
           CAST(session_turn.request_metadata AS VARCHAR) AS turn_request_metadata,
           CAST(session_turn.created AS VARCHAR) AS turn_created,
+          session_turn.provider AS turn_provider,
+          session_turn.native_thread_id AS turn_native_thread_id,
           sessions.id AS session_id,
           sessions.thread_id,
           sessions.workspace_id,
@@ -4957,7 +5226,9 @@ export class SessionStore {
           pending_reason: row.turn_pending_reason,
           pending_load_balance: row.turn_pending_load_balance,
           request_metadata: row.turn_request_metadata,
-          created: row.turn_created
+          created: row.turn_created,
+          provider: row.turn_provider,
+          native_thread_id: row.turn_native_thread_id
         }),
         session: toSessionRecord({
           id: row.session_id,
@@ -6613,6 +6884,11 @@ export class SessionStore {
   async recordSessionTurn(input: RecordSessionTurnInput): Promise<string> {
     return this.write(async (connection) => {
       const id = input.id ?? crypto.randomUUID();
+      if (input.requireIdleSession) {
+        const busy = await (await connection.run(`SELECT id FROM session_turn
+          WHERE session_id = $sessionId AND id <> $id AND status IN ('running', 'todo') LIMIT 1`, { sessionId: input.sessionId, id })).getRowObjectsJS();
+        if (busy.length) throw new Error("Existing session is running or queued; wait for it to finish before retrying this continuation.");
+      }
       await this.insertSessionTurnWithConnection(connection, { ...input, id });
       await this.syncSessionUpdatedWithLastTurn(connection, input.sessionId);
       await this.refreshSessionTurnFtsIndex(connection);
@@ -6698,7 +6974,11 @@ export class SessionStore {
       }
 
       try {
-        const result = await connection.run(
+        const result = await connection.withTransaction(async run => {
+          const pinned = Object.assign(Object.create(connection) as SessionDbConnection, { run });
+          const session = await this.getSessionWithConnection(pinned, sessionId);
+          if (session) await this.lockActorTurnAdmission(pinned, session.workspaceId, sessionId);
+          return run(
           `
             UPDATE session_turn AS pending_turn
             SET
@@ -6731,7 +7011,8 @@ export class SessionStore {
             RETURNING pending_turn.id
           `,
           { turnId, sessionId, runnerLogPath }
-        );
+          );
+        });
         if ((await result.getRowObjectsJS()).length > 0) {
           const turn = await this.getSessionTurnWithConnection(connection, turnId);
           return { disposition: "started", turn, runningTurn: turn };
@@ -6884,7 +7165,8 @@ export class SessionStore {
         skipped: true
       };
     }
-    if (!parsed.sessionId || isLocalMaintenanceSummarizerSession(parsed)) {
+    if (!parsed.sessionId || isLocalMaintenanceSummarizerSession(parsed)
+      || await this.read(connection => sessionArchive.isArchivedSessionIdentity(connection, parsed))) {
       return {
         path: parsed.path,
         sessionId: parsed.sessionId,
@@ -6903,7 +7185,7 @@ export class SessionStore {
       await connection.run("BEGIN TRANSACTION");
       try {
         if (parsed.threadId) {
-          const existingThreadSession = await this.getSessionByThreadIdWithConnection(
+          const existingThreadSession = await this.getImportedThreadOwnerWithConnection(
             connection,
             parsed.threadId,
             parsed.workspaceId
@@ -7023,6 +7305,7 @@ export class SessionStore {
         await connection.run("DELETE FROM session_description_embedding WHERE session_id IN (SELECT session_id FROM imported_session_ids)");
         await connection.run("DELETE FROM codex_command_call WHERE session_id IN (SELECT session_id FROM imported_session_ids)");
         await connection.run("DELETE FROM session_live_item WHERE session_id IN (SELECT session_id FROM imported_session_ids)");
+        await connection.run("DELETE FROM session_subagent_activity WHERE session_id IN (SELECT session_id FROM imported_session_ids)");
         await connection.run("DELETE FROM session_turn_event WHERE session_id IN (SELECT session_id FROM imported_session_ids)");
         await connection.run("DELETE FROM session_turn WHERE session_id IN (SELECT session_id FROM imported_session_ids)");
         await connection.run("DELETE FROM sessions WHERE id IN (SELECT session_id FROM imported_session_ids)");
@@ -7171,6 +7454,39 @@ export class SessionStore {
     });
   }
 
+  async getDecisionRecord(key: string): Promise<DecisionAudit | null> {
+    return this.read(async connection => {
+      const rows = await (await connection.run("SELECT document FROM decision_result WHERE id = $id", { id: key })).getRowObjectsJS();
+      return rows[0] ? JSON.parse(String(rows[0].document)) as DecisionAudit : null;
+    });
+  }
+
+  async getAutoModelSelection(turnId: string): Promise<AutoModelSelection | null> {
+    return this.read(async connection => {
+      const rows = await (await connection.run("SELECT event_name, CAST(payload AS VARCHAR) AS document FROM session_turn_event WHERE turn_id = $turnId AND event_name IN ('auto_model.selected', 'auto_model.upgraded') ORDER BY created ASC, id ASC", { turnId })).getRowObjectsJS();
+      const selected = rows.find(row => row.event_name === "auto_model.selected");
+      if (!selected) return null;
+      const selection = JSON.parse(String(selected.document)) as AutoModelSelection;
+      const modelOrder = Object.keys(AUTO_MODEL_CHOICES);
+      const effortOrder = Object.keys(AUTO_EFFORT_CHOICES);
+      for (const row of rows) {
+        if (row.event_name !== "auto_model.upgraded") continue;
+        const upgrade = JSON.parse(String(row.document)) as Record<string, unknown>;
+        if (isAutoModel(upgrade.model) && modelOrder.indexOf(upgrade.model) > modelOrder.indexOf(selection.model)) selection.model = upgrade.model;
+        if (isAutoEffort(upgrade.effort) && effortOrder.indexOf(upgrade.effort) > effortOrder.indexOf(selection.effort)) selection.effort = upgrade.effort;
+      }
+      return selection;
+    });
+  }
+
+  async saveDecisionRecord(key: string, audit: DecisionAudit): Promise<DecisionAudit> {
+    return this.write(async connection => {
+      await connection.run("INSERT INTO decision_result (id, document) VALUES ($id, $document) ON CONFLICT (id) DO NOTHING", { id: key, document: JSON.stringify(audit) });
+      const rows = await (await connection.run("SELECT document FROM decision_result WHERE id = $id", { id: key })).getRowObjectsJS();
+      return JSON.parse(String(rows[0].document)) as DecisionAudit;
+    });
+  }
+
   async recordTokenUsage(entries: TokenUsageInput[]): Promise<void> {
     if (entries.length === 0) {
       return;
@@ -7302,7 +7618,10 @@ export class SessionStore {
   }
 
   async updateSessionTurn(input: UpdateSessionTurnInput): Promise<boolean> {
-    return this.transaction(async (connection) => {
+    const active = input.status === "running" || input.status === "todo" && input.pendingReason !== "stopped";
+    const write = active ? <T>(operation: (connection: SessionDbConnection) => Promise<T>) => this.actorLifecycleTransaction(null, operation, input.id)
+      : this.transaction.bind(this);
+    return write(async (connection) => {
       const expectedStatusGuard = input.expectedStatus ? " AND status = $expectedStatus" : "";
       const expectedRunnerPidGuard = input.expectedRunnerPid === undefined
         ? ""
@@ -7417,7 +7736,9 @@ export class SessionStore {
     turn: SessionTurnRecord | null;
     queuedPrompt: string;
   }> {
-    return this.transaction(async connection => {
+    const write = input.staged ? <T>(operation: (connection: SessionDbConnection) => Promise<T>) => this.actorLifecycleTransaction(input.sessionId, operation)
+      : this.transaction.bind(this);
+    return write(async connection => {
       await connection.run("SELECT id FROM session_turn WHERE id = $turnId FOR UPDATE", { turnId: input.turnId });
       let turn = await this.getSessionTurnWithConnection(connection, input.turnId);
       const jobRows = await (await connection.run(`SELECT * FROM workspace_manager_queue_fork
@@ -7669,6 +7990,19 @@ export class SessionStore {
           queueEditPreviousEvent: turn.lastEventName })
       });
       return (await this.getSessionTurnWithConnection(connection, id))!;
+    });
+  }
+
+  /** A policy, not the requester, turned Managed mode on. Keep the requested
+   * managedMode untouched so retries re-evaluate against their final model. */
+  async setSessionTurnManagedModeForced(id: string, forced: boolean): Promise<void> {
+    await this.write(async (connection) => {
+      const turn = await this.getSessionTurnWithConnection(connection, id);
+      if (!turn || (turn.requestMetadata?.managedModeForced === "actor-tier") === forced) return;
+      const { managedModeForced: _previous, ...metadata } = turn.requestMetadata ?? {};
+      await connection.run("UPDATE session_turn SET request_metadata = $metadata WHERE id = $id", {
+        id, metadata: JSON.stringify(forced ? { ...metadata, managedModeForced: "actor-tier" } : metadata)
+      });
     });
   }
 
@@ -7949,6 +8283,123 @@ export class SessionStore {
   }
 
   /**
+   * Projects one normalized `subagent_activity` event. Returns false for a
+   * duplicate (session, agentId, seq). Keeps only the latest heartbeat and the
+   * latest SUBAGENT_ACTIVITY_RETAINED_PER_AGENT activity events per agent
+   * (started/finished are always kept); a `finished` event closes the agent's
+   * `subagent` live item unless a later runner item already superseded it.
+   */
+  async recordSubagentActivity(input: {
+    sessionId: string;
+    turnId: string;
+    eventId: string;
+    jsonlIndex?: number | null;
+    activity: SubagentActivityPayload;
+  }): Promise<boolean> {
+    const { activity } = input;
+    return this.write(async (connection) => {
+      const key = { sessionId: input.sessionId, agentId: activity.agentId };
+      const inserted = await connection.run(
+        `
+          INSERT INTO session_subagent_activity (session_id, agent_id, seq, turn_id, kind, at, payload, source_event_id)
+          VALUES ($sessionId, $agentId, $seq, $turnId, $kind, $at::TIMESTAMPTZ, $payload::JSON, $sourceEventId)
+          ON CONFLICT (session_id, agent_id, seq) DO NOTHING
+          RETURNING seq
+        `,
+        { ...key, seq: activity.seq, turnId: input.turnId, kind: activity.kind, at: activity.at,
+          payload: stringifyStoredJson(activity), sourceEventId: input.eventId }
+      );
+      if ((await inserted.getRowObjectsJS()).length === 0) return false;
+      if (activity.kind === "heartbeat") {
+        await connection.run(
+          `
+            DELETE FROM session_subagent_activity
+            WHERE session_id = $sessionId AND agent_id = $agentId AND kind = 'heartbeat'
+              AND seq < (SELECT max(seq) FROM session_subagent_activity
+                WHERE session_id = $sessionId AND agent_id = $agentId AND kind = 'heartbeat')
+          `,
+          key
+        );
+      } else if (activity.kind !== "started" && activity.kind !== "finished") {
+        await connection.run(
+          `
+            DELETE FROM session_subagent_activity
+            WHERE session_id = $sessionId AND agent_id = $agentId
+              AND seq IN (
+                SELECT seq FROM (
+                  SELECT seq, row_number() OVER (ORDER BY seq DESC) AS position
+                  FROM session_subagent_activity
+                  WHERE session_id = $sessionId AND agent_id = $agentId
+                    AND kind NOT IN ('heartbeat', 'started', 'finished')
+                ) AS ranked
+                WHERE position > $retained
+              )
+          `,
+          { ...key, retained: SUBAGENT_ACTIVITY_RETAINED_PER_AGENT }
+        );
+      }
+      if (activity.kind === "finished") {
+        await this.closeSubagentLiveItemWithConnection(connection, input);
+      }
+      return true;
+    });
+  }
+
+  private async closeSubagentLiveItemWithConnection(
+    connection: SessionDbConnection,
+    input: { sessionId: string; turnId: string; eventId: string; jsonlIndex?: number | null; activity: SubagentActivityPayload }
+  ): Promise<void> {
+    const result = await connection.run(
+      `
+        SELECT CAST(payload AS VARCHAR) AS payload_json
+        FROM session_live_item
+        WHERE turn_id = $turnId AND item_id = $agentId AND session_id = $sessionId AND item_type = 'subagent'
+      `,
+      { turnId: input.turnId, agentId: input.activity.agentId, sessionId: input.sessionId }
+    );
+    const row = (await result.getRowObjectsJS())[0] as { payload_json?: unknown } | undefined;
+    const item = parseJsonRecord(row?.payload_json);
+    if (!item || (item.status !== "inProgress" && item.status !== "running")) return;
+    const status = input.activity.status ?? "completed";
+    const agents = Array.isArray(item.agents) ? item.agents.map((agent) => {
+      const record = recordValue(agent);
+      return record && record.id === input.activity.agentId ? { ...record, status } : agent;
+    }) : item.agents;
+    await this.upsertSessionLiveItemWithConnection(connection, {
+      id: `${input.eventId}:subagent-finished`,
+      turnId: input.turnId,
+      sessionId: input.sessionId,
+      eventName: "item",
+      payload: { ...item, eventType: "item.completed", status, agents },
+      jsonlIndex: input.jsonlIndex ?? null
+    });
+  }
+
+  /** Retained subagent activity per turn, ascending by agent then seq. */
+  async listSessionSubagentActivity(sessionId: string, turnIds?: string[]): Promise<Record<string, SubagentActivityPayload[]>> {
+    return this.read(async (connection) => {
+      const result = await connection.run(
+        `
+          SELECT turn_id, CAST(payload AS VARCHAR) AS payload_json
+          FROM session_subagent_activity
+          WHERE session_id = $sessionId
+            ${turnIds ? "AND turn_id = ANY($turnIds::VARCHAR[])" : ""}
+          ORDER BY agent_id ASC, seq ASC
+        `,
+        { sessionId, ...(turnIds ? { turnIds } : {}) }
+      );
+      const byTurn: Record<string, SubagentActivityPayload[]> = {};
+      for (const row of await result.getRowObjectsJS() as Array<{ turn_id?: unknown; payload_json?: unknown }>) {
+        const turnId = stringValue(row.turn_id);
+        const activity = normalizeSubagentActivity(parseJsonObject(row.payload_json));
+        if (!turnId || !activity) continue;
+        (byTurn[turnId] ??= []).push(activity);
+      }
+      return byTurn;
+    });
+  }
+
+  /**
    * A managed Codex process has a native transcript turn id that differs from
    * the Threadex turn id. Persist their relationship when the Stop hook runs
    * so later local imports can identify the managed turn exactly instead of
@@ -8140,8 +8591,9 @@ export class SessionStore {
       return;
     }
     await this.recordTokenUsage(samples.map((sample) => ({
-      id: `agent:sample:${sample.id ?? `${sample.turnId}:${sample.source}:${sample.sourceIndex ?? sample.sourceTimestamp ?? crypto.randomUUID()}`}`,
-      usageType: "agent",
+      id: `${sample.agentId ? "subagent" : "agent"}:sample:${sample.id ?? `${sample.turnId}:${sample.source}:${sample.sourceIndex ?? sample.sourceTimestamp ?? crypto.randomUUID()}`}`,
+      usageType: sample.agentId ? "subagent" : "agent",
+      ...(sample.agentId ? { metadata: { agentId: sample.agentId } } : {}),
       source: sample.source,
       sessionId: sample.sessionId,
       turnId: sample.turnId,
@@ -8425,11 +8877,11 @@ export class SessionStore {
               ELSE $keywordWeights::JSON
             END,
             title = CASE
-              WHEN title_source IS DISTINCT FROM 'user' AND $title IS NOT NULL THEN $title
+              WHEN COALESCE(title_source, 'initial') NOT IN ('user', 'actor') AND $title IS NOT NULL THEN $title
               ELSE title
             END,
             title_source = CASE
-              WHEN title_source IS DISTINCT FROM 'user' AND $title IS NOT NULL THEN 'summarizer'
+              WHEN COALESCE(title_source, 'initial') NOT IN ('user', 'actor') AND $title IS NOT NULL THEN 'summarizer'
               ELSE title_source
             END
           WHERE id = $sessionId
@@ -8721,6 +9173,7 @@ export class SessionStore {
       )
     `);
     await ensureProviderThreadSchema(connection);
+    await ensureSessionArchiveSchema(connection);
     await connection.run(`
       CREATE TABLE IF NOT EXISTS workspaces (
         id VARCHAR PRIMARY KEY,
@@ -8738,6 +9191,9 @@ export class SessionStore {
         updated TIMESTAMPTZ NOT NULL DEFAULT current_timestamp
       )
     `);
+    await connection.run(`CREATE TABLE IF NOT EXISTS actor_room (
+      workspace_id VARCHAR PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE, state JSONB NOT NULL
+    )`);
     await connection.run(`CREATE TABLE IF NOT EXISTS workspace_manager (
       workspace_id VARCHAR PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
       session_id VARCHAR NOT NULL UNIQUE REFERENCES sessions(id) ON DELETE CASCADE,
@@ -8987,6 +9443,21 @@ export class SessionStore {
         created TIMESTAMPTZ NOT NULL DEFAULT current_timestamp
       )
     `);
+    await connection.run(`CREATE TABLE IF NOT EXISTS actor_tool_capability (
+      workspace_id VARCHAR NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      session_id VARCHAR NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      turn_id VARCHAR NOT NULL REFERENCES session_turn(id) ON DELETE CASCADE,
+      token_hash VARCHAR NOT NULL CHECK (token_hash ~ '^[a-f0-9]{64}$'),
+      updated TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (session_id, turn_id)
+    )`);
+    await connection.run(`CREATE TABLE IF NOT EXISTS actor_child_capability (
+      workspace_id VARCHAR NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      session_id VARCHAR NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      turn_id VARCHAR NOT NULL REFERENCES session_turn(id) ON DELETE CASCADE,
+      work_item_id VARCHAR NOT NULL,
+      token_hash VARCHAR NOT NULL CHECK (token_hash ~ '^[a-f0-9]{64}$'),
+      updated TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (session_id, turn_id, work_item_id)
+    )`);
     await connection.run("CREATE INDEX IF NOT EXISTS sessions_workspace_updated_idx ON sessions(workspace_id, updated DESC, created DESC, id)");
     await connection.run("CREATE INDEX IF NOT EXISTS sessions_thread_workspace_updated_idx ON sessions(thread_id, workspace_id, updated DESC, created DESC)");
     await connection.run("CREATE INDEX IF NOT EXISTS session_turn_session_created_idx ON session_turn(session_id, created ASC, id ASC)");
@@ -9061,6 +9532,9 @@ export class SessionStore {
     await connection.run(`CREATE TABLE IF NOT EXISTS session_turn_grill (
       session_id VARCHAR NOT NULL, turn_id VARCHAR NOT NULL, revision BIGINT NOT NULL,
       document VARCHAR NOT NULL, PRIMARY KEY (session_id, turn_id)
+    )`);
+    await connection.run(`CREATE TABLE IF NOT EXISTS decision_result (
+      id VARCHAR PRIMARY KEY, document VARCHAR NOT NULL
     )`);
     await connection.run(`CREATE TABLE IF NOT EXISTS session_roundtable_round (
       turn_id VARCHAR PRIMARY KEY, session_id VARCHAR NOT NULL, revision BIGINT NOT NULL, document VARCHAR NOT NULL
@@ -9176,13 +9650,15 @@ export class SessionStore {
     await connection.run(`
       UPDATE sessions
       SET title_source = 'initial'
-      WHERE title_source IS NULL OR title_source NOT IN ('initial', 'summarizer', 'user')
+      WHERE title_source IS NULL OR title_source NOT IN ('initial', 'summarizer', 'user', 'actor')
     `);
     await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS account_id VARCHAR");
     // open() upgrades both fresh and existing stores before ready()/enqueue()
     // release readers or writers. PostgreSQL supplies [] for pre-existing rows.
     await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS changed_files TEXT[] NOT NULL DEFAULT '{}'::TEXT[]");
     await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS native_thread_id VARCHAR");
+    await connection.run(`CREATE INDEX IF NOT EXISTS session_turn_managed_native_thread_idx
+      ON session_turn(native_thread_id, session_id) WHERE runner_log_path IS NOT NULL`);
     await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS provider VARCHAR");
     await connection.run("ALTER TABLE session_turn ADD COLUMN IF NOT EXISTS native_updated_at TIMESTAMPTZ");
     await connection.run(`CREATE TABLE IF NOT EXISTS session_turn_reference (
@@ -9279,7 +9755,26 @@ export class SessionStore {
     await connection.run("CREATE INDEX IF NOT EXISTS session_live_item_session_idx ON session_live_item(session_id)");
     await connection.run("CREATE INDEX IF NOT EXISTS session_live_item_turn_idx ON session_live_item(turn_id)");
     await connection.run("CREATE INDEX IF NOT EXISTS session_live_item_session_order_idx ON session_live_item(session_id, created ASC, item_id ASC)");
+    // Legacy 'item' events are normally absent; without this the backfill seq-scans every event on each startup.
+    await connection.run("CREATE INDEX IF NOT EXISTS session_turn_event_legacy_item_idx ON session_turn_event(id) WHERE event_name = 'item'");
     await this.backfillSessionLiveItems(connection);
+    // Projection of runner `subagent_activity` events (raw copies stay in
+    // session_turn_event). Bounded per agent; (session, agent, seq) dedupes replays.
+    await connection.run(`
+      CREATE TABLE IF NOT EXISTS session_subagent_activity (
+        session_id VARCHAR NOT NULL,
+        agent_id VARCHAR NOT NULL,
+        seq BIGINT NOT NULL,
+        turn_id VARCHAR NOT NULL,
+        kind VARCHAR NOT NULL,
+        at TIMESTAMPTZ NOT NULL,
+        payload JSON NOT NULL,
+        source_event_id VARCHAR,
+        created TIMESTAMPTZ NOT NULL DEFAULT current_timestamp,
+        PRIMARY KEY (session_id, agent_id, seq)
+      )
+    `);
+    await connection.run("CREATE INDEX IF NOT EXISTS session_subagent_activity_turn_idx ON session_subagent_activity(session_id, turn_id)");
     await connection.run(`
       CREATE TABLE IF NOT EXISTS local_session_file (
         path VARCHAR PRIMARY KEY,
@@ -9960,6 +10455,29 @@ export class SessionStore {
     );
   }
 
+  private async getImportedThreadOwnerWithConnection(
+    connection: SessionDbConnection,
+    threadId: string,
+    workspaceId: string
+  ): Promise<SessionRecord | null> {
+    // Provider bindings describe the current resumable thread and are replaced
+    // on rotation. Runner turn history retains ownership of older transcripts.
+    // Prefer that evidence over an imported alias, even if the alias was resumed.
+    const owners = (await (await connection.run(`
+      SELECT DISTINCT t.session_id
+      FROM session_turn t JOIN sessions s ON s.id = t.session_id
+      WHERE t.native_thread_id = $threadId AND t.runner_log_path IS NOT NULL
+        AND s.workspace_id = $workspaceId
+      LIMIT 2`, { threadId, workspaceId })).getRowObjectsJS());
+    if (owners.length > 1) {
+      throw new Error(`Native thread ${threadId} belongs to multiple managed sessions; import stopped.`);
+    }
+    if (owners.length === 1) {
+      return this.getSessionWithConnection(connection, String(owners[0].session_id));
+    }
+    return this.getSessionByThreadIdWithConnection(connection, threadId, workspaceId);
+  }
+
   private async getSessionByThreadIdWithConnection(
     connection: SessionDbConnection,
     threadId: string,
@@ -10002,8 +10520,17 @@ export class SessionStore {
   private async insertSessionTurnWithConnection(
     connection: SessionDbConnection,
     input: RecordSessionTurnInput & { id: string },
-    ignoreConflicts = false
+    ignoreConflicts = false,
+    actorAdmissionChecked = false
   ): Promise<boolean> {
+    if (!actorAdmissionChecked && (input.status === "running" || input.status === "todo" && input.pendingReason !== "stopped")) {
+      return connection.withTransaction(async run => {
+        const pinned = Object.assign(Object.create(connection) as SessionDbConnection, { run });
+        const session = await this.getSessionWithConnection(pinned, input.sessionId);
+        if (session) await this.lockActorTurnAdmission(pinned, session.workspaceId, input.sessionId);
+        return this.insertSessionTurnWithConnection(pinned, input, ignoreConflicts, true);
+      });
+    }
     if (input.status === "todo") {
       const forkRows = await (await connection.run(`SELECT status FROM workspace_manager_queue_fork
         WHERE turn_id = $turnId FOR UPDATE`, { turnId: input.id })).getRowObjectsJS();
@@ -10363,7 +10890,8 @@ export class SessionStore {
         WHERE session_id = $sessionId
           ${turnFilter}
           ${fileChangesOnly ? "AND item_type = 'file_change'" : ""}
-        ORDER BY created ASC, item_id ASC
+        -- Qualified: the VARCHAR "created" alias would force a text sort instead of the (session_id, created, item_id) index order.
+        ORDER BY session_live_item.created ASC, item_id ASC
       `,
       queryParams
     );
@@ -10434,7 +10962,65 @@ export class SessionStore {
         sortEventId: eventId
       });
     }
+    await this.mergeNativeTurnDiffsWithConnection(connection, sessionId, itemsByTurn);
     return itemsByTurn;
+  }
+
+  /**
+   * A Threadex turn's Changes cover every native turn that edited for it: the
+   * main thread's phases and each sub-agent thread. Older runners stored, and
+   * history synthesis picked, a single native turn's net diff (the main thread's,
+   * or whichever thread diffed last), hiding other sub-agents' edits. Merge the
+   * latest net diff of each editing native turn the authoritative item does not
+   * cover yet, on read only; stored history is left unchanged.
+   */
+  private async mergeNativeTurnDiffsWithConnection(
+    connection: SessionDbConnection,
+    sessionId: string,
+    itemsByTurn: Record<string, unknown[]>
+  ) {
+    for (const [turnId, items] of Object.entries(itemsByTurn)) {
+      let baseIndex = items.length - 1;
+      while (baseIndex >= 0 && !isAuthoritativeFileChangeItem(items[baseIndex])) baseIndex -= 1;
+      const base = recordValue(items[baseIndex]);
+      if (!base) continue;
+      const sources = Array.isArray(base.turnDiffSources)
+        ? base.turnDiffSources.filter((source): source is string => typeof source === "string")
+        : [];
+      const baseId = stringValue(base.id);
+      const fallbackSource = nonEmptyString(base.originTurnId) ?? (baseId.startsWith("turn-diff:") ? baseId.slice("turn-diff:".length) : null);
+      const covered = new Set(sources.length > 0 ? sources : fallbackSource ? [fallbackSource] : []);
+      const editsByNativeTurn = new Map<string, Record<string, unknown>[]>();
+      for (const value of items) {
+        const item = recordValue(value);
+        const nativeTurnId = nonEmptyString(item?.originTurnId);
+        if (!item || item.itemType !== "file_change" || item.authoritative === true || !nativeTurnId || covered.has(nativeTurnId)) continue;
+        editsByNativeTurn.set(nativeTurnId, [...(editsByNativeTurn.get(nativeTurnId) ?? []), item]);
+      }
+      if (editsByNativeTurn.size === 0) continue;
+
+      const snapshots: Array<{ created: number; changes: FileChange[] }> = [
+        { created: Date.parse(stringValue(base.sortCreated)) || 0, changes: base.changes as FileChange[] }
+      ];
+      for (const [nativeTurnId, edits] of editsByNativeTurn) {
+        const [row] = await this.listLatestTurnDiffsWithConnection(connection, sessionId, turnId, undefined, [], nativeTurnId);
+        if (row && stringValue(row.native_turn_id) === nativeTurnId) {
+          snapshots.push({ created: Date.parse(stringValue(row.created)) || 0, changes: fileChangesFromTurnDiff(stringValue(row.diff)) });
+          continue;
+        }
+        // Without a recorded net diff, that native turn's applied edits are the best record.
+        for (const edit of edits) {
+          if (edit.status === "failed" || edit.status === "declined" || !Array.isArray(edit.changes)) continue;
+          snapshots.push({ created: Date.parse(stringValue(edit.sortCreated)) || 0, changes: edit.changes as FileChange[] });
+        }
+      }
+      snapshots.sort((left, right) => left.created - right.created);
+      items[baseIndex] = {
+        ...base,
+        changes: mergeTurnDiffChanges(snapshots.map((snapshot) => snapshot.changes)),
+        turnDiffSources: [...covered, ...editsByNativeTurn.keys()]
+      };
+    }
   }
 
   private async listLatestTurnDiffsWithConnection(
@@ -10442,7 +11028,8 @@ export class SessionStore {
     sessionId: string,
     turnId?: string | string[],
     before?: { created: string; id: string },
-    authoritativeTurnIds: string[] = []
+    authoritativeTurnIds: string[] = [],
+    nativeTurnId?: string
   ): Promise<Record<string, unknown>[]> {
     // Use the existing session/turn/created index to search backward, stopping
     // at the latest diff for each turn. Historical cumulative diffs can total
@@ -10463,6 +11050,7 @@ export class SessionStore {
             AND event_name = 'codex'
             ${before ? "AND (created, id) < ($beforeCreated::TIMESTAMPTZ, $beforeId)" : ""}
             AND contains(CAST(payload AS VARCHAR), 'turn/diff/updated')
+            ${nativeTurnId ? "AND contains(CAST(payload AS VARCHAR), $nativeTurnId)" : ""}
           ORDER BY created DESC, id DESC LIMIT 1
         ) AS diff_event
       )
@@ -10473,6 +11061,7 @@ export class SessionStore {
       sessionId,
       ...(Array.isArray(turnId) ? { turnIds: turnId } : turnId ? { turnId } : {}),
       ...(authoritativeTurnIds.length ? { authoritativeTurnIds } : {}),
+      ...(nativeTurnId ? { nativeTurnId } : {}),
       ...(before ? { beforeCreated: before.created, beforeId: before.id } : {})
     });
     return (await result.getRowObjectsJS()).flatMap((row) => {
@@ -10623,7 +11212,7 @@ export class SessionStore {
       const turnId = stringValue((row as { turn_id?: unknown }).turn_id);
       const payload = parseJsonObject((row as { payload_json?: unknown }).payload_json);
       const provider = (payload as Record<string, unknown> | null)?.provider;
-      if (turnId && (provider === "typesafe" || provider === "fallback")) {
+      if (turnId && (provider === "typesafe" || provider === "openai" || provider === "llm" || provider === "fake" || provider === "fallback")) {
         const confidence = (payload as Record<string, unknown>).confidence;
         providers[turnId] = { provider, ...(typeof confidence === "number" ? { confidence } : {}) };
       }
@@ -11790,8 +12379,19 @@ export class SessionStore {
     return (await result.getRowObjectsJS()).length > 0;
   }
 
+  /** Reads run concurrently on the read pool; one slow query no longer stalls every API and the event poll. */
   private async read<T>(operation: (connection: SessionDbConnection) => Promise<T>): Promise<T> {
-    return this.enqueue(operation);
+    if (this.closed) {
+      throw new Error("SessionStore is closed.");
+    }
+    const pending = this.connectionPromise.then(connection =>
+      operation(Object.assign(Object.create(connection) as SessionDbConnection, { run: connection.reader.run })));
+    this.pendingReads.add(pending);
+    try {
+      return await pending;
+    } finally {
+      this.pendingReads.delete(pending);
+    }
   }
 
   private async write<T>(operation: (connection: SessionDbConnection) => Promise<T>): Promise<T> {
@@ -12684,6 +13284,10 @@ function toSessionRecord(row: SessionRow): SessionRecord {
   if (row.model_token_usage !== undefined) {
     session.modelTokenUsage = parseSessionModelTokenUsage(row.model_token_usage);
   }
+  const subagentTokenUsage = parseSubagentTokenUsage(row.subagent_token_usage);
+  if (subagentTokenUsage) {
+    session.subagentTokenUsage = subagentTokenUsage;
+  }
   if (row.matched_turn !== undefined) {
     session.matchedTurn = nullableString(row.matched_turn);
   }
@@ -12691,17 +13295,17 @@ function toSessionRecord(row: SessionRow): SessionRecord {
 }
 
 function sessionTitleSourceValue(value: unknown): SessionTitleSource {
-  return value === "user" || value === "summarizer" ? value : "initial";
+  return value === "user" || value === "summarizer" || value === "actor" ? value : "initial";
 }
 
 function canUpdateSessionTitle(currentSource: SessionTitleSource, nextSource: SessionTitleSource) {
   if (nextSource === "user") {
     return true;
   }
-  if (currentSource === "user") {
+  if (currentSource === "user" || currentSource === "actor") {
     return false;
   }
-  return nextSource === "summarizer";
+  return nextSource === "summarizer" || nextSource === "actor";
 }
 
 function toWorkspaceRecord(row: WorkspaceRow): WorkspaceRecord {
@@ -12756,6 +13360,14 @@ function toSessionTurnRecord(row: SessionTurnRow): SessionTurnRecord {
     tokenIn: nullableNumber(row.turn_usage_input_tokens) ?? numberValue(row.token_in),
     cachedInputTokens: nullableNumber(row.turn_usage_cached_input_tokens) ?? undefined,
     tokenOut: nullableNumber(row.turn_usage_output_tokens) ?? numberValue(row.token_out),
+    // sum() yields HUGEINT, which arrives as a string.
+    ...((nullableNumber(row.subagent_usage_agent_count) ?? 0) > 0 ? { subagentUsage: {
+      inputTokens: nullableNumber(row.subagent_usage_input_tokens) ?? 0,
+      cachedInputTokens: nullableNumber(row.subagent_usage_cached_input_tokens) ?? 0,
+      outputTokens: nullableNumber(row.subagent_usage_output_tokens) ?? 0,
+      totalTokens: nullableNumber(row.subagent_usage_total_tokens) ?? 0,
+      agentCount: nullableNumber(row.subagent_usage_agent_count) ?? 0
+    } } : {}),
     usageSample: toSessionTurnTokenUsageSampleRecord(row),
     status,
     runnerPid: status === "running" ? nullableNumber(row.runner_pid) : null,
@@ -13326,6 +13938,22 @@ function parseSessionModelTokenUsage(value: unknown): SessionModelTokenUsage[] {
   });
 }
 
+function parseSubagentTokenUsage(value: unknown): SubagentTokenUsage | undefined {
+  const parsed = parseJsonObject(value);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return undefined;
+  }
+  const record = parsed as Record<string, unknown>;
+  const agentCount = numberValue(record.agentCount);
+  return agentCount > 0 ? {
+    inputTokens: numberValue(record.inputTokens),
+    cachedInputTokens: numberValue(record.cachedInputTokens),
+    outputTokens: numberValue(record.outputTokens),
+    totalTokens: numberValue(record.totalTokens),
+    agentCount
+  } : undefined;
+}
+
 function parseSessionModelProfiles(value: unknown): SessionModelProfile[] | undefined {
   const parsed = parseJsonObject(value);
   if (!Array.isArray(parsed)) {
@@ -13669,6 +14297,9 @@ function sessionLiveItemFromRow(row: Record<string, unknown>): unknown | null {
       changes: Array.isArray(changes) ? changes : [],
       status: stringValue(row.status),
       ...(isPlainObject(storedPayload) && storedPayload.authoritative === true ? { authoritative: true } : {}),
+      ...(isPlainObject(storedPayload) && storedPayload.authoritative === true && Array.isArray(storedPayload.turnDiffSources)
+        ? { turnDiffSources: storedPayload.turnDiffSources.filter((source): source is string => typeof source === "string") }
+        : {}),
       ...origin
     };
   }
@@ -13740,7 +14371,8 @@ function approvalLiveItemFromRow(row: Record<string, unknown>): unknown | null {
     approvalId,
     method,
     params: record.params ?? null,
-    status: resolved ? "resolved" : "pending",
+    // Expiry is durable so reloads match the live expired card.
+    status: resolved ? record.expired === true ? "expired" : "resolved" : "pending",
     ...(resolved && row.answer_submitted_at ? { answerSubmittedAt: stringValue(row.answer_submitted_at) } : {}),
     ...(resolved ? { decision: record.decision, error: record.error } : {})
   };

@@ -8,8 +8,13 @@ export type RoundtableAttempt = {
   eventCount: number; lastEvent: string; error?: string;
 };
 export type RoundtableAnswer = { actor: RoundtableActor; status: "waiting" | "running" | "done" | "error" | "skipped"; text: string; error: string | null; attempts?: RoundtableAttempt[] };
+/** Saved upload actors read from its absolute path. */
+export type RoundtableAttachment = { name: string; mimeType: string; size: number; path: string };
+export type RoundtableSkill = { name: string; path: string };
 export type RoundtableRound = {
   turnId: string; sessionId: string; revision: number; prompt: string; created: string;
+  /** Prompt inputs; a "Next round" inherits its source round's inputs. */
+  attachments?: RoundtableAttachment[]; skills?: RoundtableSkill[];
   status: "queued" | "context" | "actors" | "host" | "done" | "error" | "stopped";
   context: string | null; summarizerModel: string; answers: RoundtableAnswer[];
   contextAttempts?: RoundtableAttempt[];
@@ -18,8 +23,11 @@ export type RoundtableRound = {
   hostModel: string; hostEffort: string;
   summary: string; synthesis?: RoundtableConclusion | null; error: string | null; tokenIn: number; tokenOut: number;
 };
-/** Host output: each issue lists distinct positions and the actors (by name) who hold them. */
-export type RoundtableSynthesis = { template?: "decision"; taskType?: "decision"; issues: { topic: string; positions: { view: string; actors: string[]; details?: { actors: string[]; detail: string }[] }[] }[] };
+type RoundtableNote = { actors: string[]; text: string };
+/** Issues contain positions; questions and verification scope never count as votes. */
+export type RoundtableSynthesis = { template?: "decision"; taskType?: "decision";
+  issues: { topic: string; positions: { view: string; actors: string[]; details?: { actors: string[]; detail: string }[] }[] }[];
+  openQuestions?: RoundtableNote[]; scope?: RoundtableNote[] };
 export type RoundtableSummary = {
   template: "summary"; taskType: "code_review" | "research" | "summary";
   overview: string; sections: { title: string; items: { text: string; actors: string[] }[] }[];
@@ -34,14 +42,56 @@ export function roundtableIssueKind(issue: RoundtableSynthesis["issues"][number]
   return actorCount > 0 && new Set(issue.positions[0]?.actors).size === actorCount ? "consensus" : "partial";
 }
 
+function parseRoundtableNotes(raw: unknown, known: Set<string>): RoundtableNote[] | null {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) return null;
+  const notes: RoundtableNote[] = [];
+  for (const note of raw) {
+    if (typeof note?.text !== "string" || !note.text.trim() || !Array.isArray(note.actors) || !note.actors.length
+      || note.actors.some((name: unknown) => typeof name !== "string" || !known.has(name))) return null;
+    const names = [...new Set<string>(note.actors)];
+    const sameText = notes.find(entry => entry.text === note.text.trim());
+    if (sameText) sameText.actors.push(...names.filter(name => !sameText.actors.includes(name)));
+    else notes.push({ actors: names, text: note.text.trim() });
+  }
+  return notes;
+}
+
+/**
+ * Hosts occasionally close an array with `}` or an object with `]`. Swap only
+ * such mismatched closers; truncated or otherwise malformed output stays
+ * unparsed, and the repaired value still passes the full schema checks.
+ */
+function parseHostJson(text: string): unknown {
+  const body = (text.match(/```(?:json)?\s*([\s\S]*?)```/)?.[1] ?? text).trim();
+  try { return JSON.parse(body); } catch { /* try a closer repair */ }
+  const stack: string[] = [];
+  let repaired = "", inString = false, escaped = false;
+  for (const char of body) {
+    if (inString) {
+      inString = !(char === '"' && !escaped);
+      escaped = !escaped && char === "\\";
+    } else if (char === '"') inString = true;
+    else if (char === "{" || char === "[") stack.push(char === "{" ? "}" : "]");
+    else if (char === "}" || char === "]") {
+      const expected = stack.pop();
+      if (!expected) return undefined;
+      repaired += expected;
+      continue;
+    }
+    repaired += char;
+  }
+  if (inString || stack.length || repaired === body) return undefined;
+  try { return JSON.parse(repaired); } catch { return undefined; }
+}
+
 export function parseRoundtableSynthesis(text: string, actorNames: string[]): RoundtableSynthesis | null {
-  const body = text.match(/```(?:json)?\s*([\s\S]*?)```/)?.[1] ?? text;
-  let raw: unknown;
-  try { raw = JSON.parse(body.trim()); } catch { return null; }
+  const raw = parseHostJson(text);
+  if (raw === undefined) return null;
   const known = new Set(actorNames);
   if (!known.size || known.size !== actorNames.length) return null;
   const issuesRaw = (raw as { issues?: unknown } | null)?.issues;
-  if (!Array.isArray(issuesRaw) || !issuesRaw.length) return null;
+  if (!Array.isArray(issuesRaw)) return null;
   const issues: RoundtableSynthesis["issues"] = [];
   for (const issue of issuesRaw) {
     if (typeof issue?.topic !== "string" || !issue.topic.trim() || !Array.isArray(issue.positions) || !issue.positions.length) return null;
@@ -77,14 +127,17 @@ export function parseRoundtableSynthesis(text: string, actorNames: string[]): Ro
     }
     issues.push({ topic: issue.topic.trim(), positions });
   }
-  return { issues };
+  const notesRaw = raw as { scope?: unknown; openQuestions?: unknown };
+  const scope = parseRoundtableNotes(notesRaw.scope, known);
+  const openQuestions = parseRoundtableNotes(notesRaw.openQuestions, known);
+  if (!scope || !openQuestions || !issues.length && !scope.length && !openQuestions.length) return null;
+  return { issues, ...(openQuestions.length ? { openQuestions } : {}), ...(scope.length ? { scope } : {}) };
 }
 
 /** The host classifies the task before choosing a template. Legacy issues-only output is a decision. */
 export function parseRoundtableConclusion(text: string, actorNames: string[]): RoundtableConclusion | null {
-  const body = text.match(/```(?:json)?\s*([\s\S]*?)```/)?.[1] ?? text;
-  let raw;
-  try { raw = JSON.parse(body.trim()); } catch { return null; }
+  // Validated field by field below.
+  const raw = parseHostJson(text) as any;
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   if (raw.template === undefined || raw.template === "decision") {
     if (raw.template === "decision" ? raw.taskType !== "decision" : raw.taskType !== undefined) return null;
@@ -93,7 +146,8 @@ export function parseRoundtableConclusion(text: string, actorNames: string[]): R
     return decision && (raw.template === "decision" ? { ...decision, taskType: "decision", template: "decision" } : decision);
   }
   if (raw.template !== "summary" || !["code_review", "research", "summary"].includes(raw.taskType)
-    || typeof raw.overview !== "string" || !raw.overview.trim() || !Array.isArray(raw.sections) || raw.issues !== undefined) return null;
+    || typeof raw.overview !== "string" || !raw.overview.trim() || !Array.isArray(raw.sections)
+    || raw.issues !== undefined || raw.scope !== undefined || raw.openQuestions !== undefined) return null;
   const known = new Set(actorNames);
   if (!known.size || known.size !== actorNames.length) return null;
   const sections: RoundtableSummary["sections"] = [];
@@ -116,7 +170,7 @@ export function roundtableSynthesisMarkdown(synthesis: RoundtableConclusion, act
     `**${section.title}**\n\n${section.items.map(item => `- ${item.text.replace(/\n/g, "\n  ")} — ${item.actors.join(", ")}`).join("\n")}`
   )].join("\n\n");
   const sections: [RoundtableIssueKind, string][] = [["consensus", "Consensus"], ["disagreement", "Disagreements"], ["partial", "Other points"]];
-  return sections.flatMap(([kind, title]) => {
+  const groups = sections.flatMap(([kind, title]) => {
     const issues = synthesis.issues.filter(issue => roundtableIssueKind(issue, actorCount) === kind);
     if (!issues.length) return [];
     const lines = issues.map(issue => [`- **${issue.topic}**`, ...issue.positions.flatMap(position => [
@@ -124,7 +178,11 @@ export function roundtableSynthesisMarkdown(synthesis: RoundtableConclusion, act
       ...(position.details ?? []).map(item => `    - ${item.actors.join(", ")}: ${item.detail}`)
     ])].join("\n"));
     return [`**${title}**\n\n${lines.join("\n")}`];
-  }).join("\n\n");
+  });
+  for (const [title, notes] of [["Open questions", synthesis.openQuestions], ["Verification scope", synthesis.scope]] as const) {
+    if (notes?.length) groups.push(`**${title}**\n\n${notes.map(note => `- ${note.actors.join(", ")}: ${note.text.replace(/\n/g, "\n  ")}`).join("\n")}`);
+  }
+  return groups.join("\n\n");
 }
 export const ROUNDTABLE_NEXT_ROUND_PROMPT = "Next round: actors, continue the discussion.";
 /** The discussion topic, carried through chained next rounds. */
@@ -136,6 +194,8 @@ export const roundtableStatus = (round: RoundtableRound) => ({
 })[round.status];
 
 export const roundtableEfforts: (model: string) => readonly string[] = modelEfforts;
+/** Give synthesis at least medium effort to reconcile all actors' responses. */
+export const roundtableHostEffort = (effort: string) => ["minimal", "low"].includes(effort) ? "medium" : effort;
 
 export function newRoundtableActor(profile?: { model: string; effort?: string }): RoundtableActor {
   const names = ["Robin", "Willow", "Maple", "Cedar", "Otter", "Finch", "Aspen", "Lark"];

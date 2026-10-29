@@ -1,8 +1,16 @@
 // @ts-nocheck
+import { domainActorIdentity } from "./domainActorIdentity";
+import { BotAvatar } from "./BotAvatar";
+import { ActorAvatar } from "./ActorAvatar";
+import { useCurrentDomainActors } from "./CurrentDomainActorsContext";
+import { SubagentActivityHeadline, SubagentActivityPanel, useSubagentActivityPresentation } from "./SubagentActivity";
+import { SendMessageList } from "./SendMessageCards";
+import { collectSendMessages, isSendMessageItem } from "./sendMessageView";
 import { UserInputRequestCard } from "./UserInputRequestCard";
 import { IntentApprovalCard } from "./IntentApprovalCard";
 import { INTENT_APPROVAL_METHOD } from "../intentApproval";
 import { USER_INPUT_METHOD } from "../userInputRequest";
+import { useRef } from "react";
 export function ServerPrefixPanel(ctx, { block }) {
     const { ChevronRight, FileText, ListChecks, TerminalSquare, _jsx, _jsxs } = ctx;
     const Icon = block.kind === "startup" ? TerminalSquare : block.kind === "todo" ? ListChecks : FileText;
@@ -360,27 +368,52 @@ export function StatusUpdateIndicator(ctx, { text, spinning = true, completedIco
 
 export function SubagentEvent(ctx, { item, sessionId }) {
     const { ChevronRight, MarkdownContent, SubagentTranscript, UserPlus, _jsx, _jsxs, fetchSubagentTranscript, formatSubagentStatus, subagentNames, subagentStatusTone, useEffect, useRef, useState } = ctx;
+    const currentActors = useCurrentDomainActors();
     const [transcripts, setTranscripts] = useState({});
     const requestedThreadIdsRef = useRef(new Set());
     const requestScopeRef = useRef("");
-    const activityUpdates = item.activityUpdates?.length ? item.activityUpdates : [item];
+    const allUpdates = item.activityUpdates?.length ? item.activityUpdates : [item];
+    // SendMessage calls render as message cards, not as delegated work: keep them out of prompts, results and models.
+    const activityUpdates = allUpdates.filter((update) => !isSendMessageItem(update));
     const names = subagentNames(item);
     const threadIds = [...new Set((item.receiverThreadIds ?? []).filter(Boolean))];
     const displayName = item.label?.trim() || names.find(Boolean) || "Subagent";
     const loadedTranscripts = threadIds.flatMap((threadId) => transcripts[threadId]?.payload ? [transcripts[threadId].payload] : []);
-    const prompts = [...new Set([
+    const allPrompts = [...new Set([
         ...activityUpdates.map((update) => update.prompt?.trim()),
         ...loadedTranscripts.map((payload) => payload.delegatedPrompt?.trim())
     ].filter(Boolean))];
+    // Actor context: a Claude actor child's definition prompt, or a Codex child's verbatim actor brief.
+    const actorContexts = [...new Set([
+        ...activityUpdates.map((update) => update.actorContext?.trim()),
+        ...allPrompts.filter(isActorAssignmentBrief)
+    ].filter(Boolean))];
+    const prompts = allPrompts.filter((prompt) => !isActorAssignmentBrief(prompt));
     const requestedModels = [...new Set(activityUpdates.map((update) => update.model?.trim()).filter(Boolean))];
     const requestedEfforts = [...new Set(activityUpdates.map((update) => update.reasoningEffort?.trim()).filter(Boolean))];
-    const actualModels = [...new Set(loadedTranscripts.map((payload) => payload.model?.trim()).filter(Boolean))];
-    const actualEfforts = [...new Set(loadedTranscripts.map((payload) => payload.reasoningEffort?.trim()).filter(Boolean))];
+    // Actual values: recorded on the card (system-fixed or observed by the runner) or read from the child transcript.
+    const actualModels = [...new Set([
+        ...activityUpdates.map((update) => update.actualModel?.trim()),
+        ...loadedTranscripts.map((payload) => payload.model?.trim())
+    ].filter(Boolean))];
+    const actualEfforts = [...new Set([
+        ...activityUpdates.map((update) => update.actualReasoningEffort?.trim()),
+        ...loadedTranscripts.map((payload) => payload.reasoningEffort?.trim())
+    ].filter(Boolean))];
     const isLoadingDetails = threadIds.some((threadId) => !transcripts[threadId] || transcripts[threadId].status === "loading");
     const returnedMessages = [...new Set(activityUpdates.flatMap((update) => (update.agents ?? [])
         .map((agent) => agent.message?.trim())
         .filter(Boolean)))];
     const canViewWork = Boolean(sessionId && threadIds.length > 0);
+    // Claude sub-agents report progress as `subagent_activity`, keyed by the Agent tool_use id (the card id).
+    const activityAgentIds = [...new Set([item.id, ...activityUpdates.map((update) => update.id), ...(item.agents ?? []).map((agent) => agent.id)].filter(Boolean))];
+    const activity = useSubagentActivityPresentation(activityAgentIds);
+    const itemTone = subagentStatusTone(item.status);
+    // A terminal card status wins; otherwise activity can finish, end or flag a running card.
+    const activityLabel = itemTone === "running" ? activity?.presentation.label : undefined;
+    const activityTone = activity?.presentation.tone;
+    const cardTone = itemTone !== "running" ? itemTone
+        : activityTone === "done" || activityTone === "error" ? activityTone : itemTone;
     requestScopeRef.current = sessionId ?? "";
     useEffect(() => {
         requestedThreadIdsRef.current = new Set();
@@ -420,6 +453,17 @@ export function SubagentEvent(ctx, { item, sessionId }) {
             }));
         }
     }
+    // A Codex actor child's brief exists only in its transcript: read it up front so the collapsed header shows the actor.
+    const awaitsActorIdentity = canViewWork && awaitsActorBrief(displayName, actorContexts);
+    useEffect(() => {
+        if (awaitsActorIdentity) threadIds.forEach((threadId) => void loadTranscript(threadId));
+    }, [awaitsActorIdentity, sessionId, threadIds.join("\n")]);
+    const unknownReason = "The runner recorded no requested or actual value for this subagent, and no child transcript reports one.";
+    const sendMessages = collectSendMessages(allUpdates, activity?.view.events ?? []);
+    // A message with no spawn card to join (or an old record without one) stands alone.
+    if (activityUpdates.length === 0 && sendMessages.length > 0) {
+        return _jsx(SendMessageList, { views: sendMessages, Markdown: MarkdownContent });
+    }
     const meta = _jsxs("div", {
         className: "subagent-event-meta",
         children: [
@@ -427,14 +471,14 @@ export function SubagentEvent(ctx, { item, sessionId }) {
                 ? actualModels.map((model) => _jsxs("span", { children: ["Model: ", model] }, `actual-model:${model}`))
                 : requestedModels.length > 0
                     ? requestedModels.map((model) => _jsxs("span", { children: [model === "inherit" ? "Model: inherited" : "Requested model: ", model === "inherit" ? "" : model] }, `requested-model:${model}`))
-                    : [_jsx("span", { children: canViewWork && isLoadingDetails ? "Model: loading…" : "Model: unknown" }, "model:unknown")]),
+                    : [_jsx("span", { title: unknownReason, children: canViewWork && isLoadingDetails ? "Model: loading…" : "Model: not reported" }, "model:unknown")]),
             ...requestedModels.filter((model) => actualModels.length > 0 && !actualModels.includes(model))
                 .map((model) => _jsxs("span", { children: [model === "inherit" ? "Selection: inherited" : "Requested model: ", model === "inherit" ? "" : model] }, `requested-model:${model}`)),
             ...(actualEfforts.length > 0
                 ? actualEfforts.map((effort) => _jsxs("span", { children: ["Effort: ", effort] }, `actual-effort:${effort}`))
                 : requestedEfforts.length > 0
                     ? requestedEfforts.map((effort) => _jsxs("span", { children: ["Requested effort: ", effort] }, `requested-effort:${effort}`))
-                    : [_jsx("span", { children: canViewWork && isLoadingDetails ? "Effort: loading…" : "Effort: unknown" }, "effort:unknown")]),
+                    : [_jsx("span", { title: unknownReason, children: canViewWork && isLoadingDetails ? "Effort: loading…" : "Effort: not reported" }, "effort:unknown")]),
             ...requestedEfforts.filter((effort) => actualEfforts.length > 0 && !actualEfforts.includes(effort))
                 .map((effort) => _jsxs("span", { children: ["Requested effort: ", effort] }, `requested-effort:${effort}`)),
             ...threadIds.map((threadId) => _jsx("code", { children: threadId }, threadId))
@@ -442,6 +486,24 @@ export function SubagentEvent(ctx, { item, sessionId }) {
     });
     const details = [
         meta,
+        activity && _jsx(SubagentActivityPanel, { view: activity.view, presentation: activity.presentation }, "activity"),
+        sendMessages.length > 0 && _jsx(SendMessageList, { views: sendMessages, ownAgentIds: activityAgentIds, ownName: displayName, Markdown: MarkdownContent }, "send-messages"),
+        ...actorContexts.map((context, index) => {
+            const actor = actorContextIdentity(context);
+            return _jsxs("details", {
+                className: "subagent-actor-context",
+                children: [
+                    _jsxs("summary", {
+                        title: actor?.id,
+                        children: [
+                            _jsx("span", { children: "Actor context" }),
+                            _jsx("strong", { children: actor ? actor.label : "Domain actor" })
+                        ]
+                    }),
+                    _jsx("pre", { children: context })
+                ]
+            }, `actor-context:${index}`);
+        }),
         ...prompts.map((prompt, index) => _jsxs("div", {
             className: "subagent-event-prompt",
             children: [
@@ -449,7 +511,7 @@ export function SubagentEvent(ctx, { item, sessionId }) {
                 _jsx(MarkdownContent, { children: prompt })
             ]
         }, `prompt:${index}`)),
-        prompts.length === 0 && _jsxs("div", {
+        prompts.length === 0 && actorContexts.length === 0 && _jsxs("div", {
             className: "subagent-event-prompt",
             children: [
                 _jsx("span", { children: "Delegated task" }),
@@ -471,9 +533,14 @@ export function SubagentEvent(ctx, { item, sessionId }) {
             threadId
         }, threadId)) : [])
     ].filter(Boolean);
+    // Native actor children are named by their internal path (/root/actor_…); show the actor from its brief instead.
+    const headerActor = actorContexts.map(actorContextIdentity).find(Boolean);
+    const currentActor = headerActor && currentActors?.actors.find((actor) => actor.id === headerActor.id);
+    const headerName = currentActor?.name ?? (headerActor ? headerActor.label : readableAgentName(displayName));
     return _jsxs("details", {
         className: "subagent-event",
-        "data-status": subagentStatusTone(item.status),
+        "data-status": cardTone,
+        ...(cardTone === "running" && activityTone ? { "data-activity": activityTone } : {}),
         onToggle: (event) => {
             if (event.target !== event.currentTarget) return;
             if (event.currentTarget.open && canViewWork) {
@@ -485,15 +552,41 @@ export function SubagentEvent(ctx, { item, sessionId }) {
                 className: "subagent-event-header",
                 children: [
                     _jsx(ChevronRight, { className: "command-chevron", "aria-hidden": "true" }),
-                    _jsx(UserPlus, { "aria-hidden": "true" }),
-                    _jsx("strong", { children: displayName }),
-                    _jsx("span", { className: "subagent-event-status", children: formatSubagentStatus(item.status) })
+                    headerActor
+                        ? _jsx("span", { className: "subagent-event-avatar", "aria-hidden": "true", children: currentActor?.avatar ? _jsx(ActorAvatar, { actor: currentActor, decorative: true }) : _jsx(BotAvatar, { seed: headerActor.id, character: headerActor.character }) })
+                        : _jsx(UserPlus, { "aria-hidden": "true" }),
+                    _jsx("strong", { title: headerActor ? `${headerName} (${displayName})` : displayName, children: headerName }),
+                    cardTone === "running" && activity && _jsx(SubagentActivityHeadline, { presentation: activity.presentation }),
+                    _jsx("span", { className: "subagent-event-status", title: activity?.presentation.liveness, children: activityLabel ?? formatSubagentStatus(item.status) })
                 ]
             }),
             _jsx("div", { className: "subagent-event-body", children: details })
         ]
     });
 
+}
+
+/** A Codex actor child's spawn message starts with the system's assignment marker and carries its actor brief. */
+function isActorAssignmentBrief(prompt) {
+    return /^\[threadex-actor-assignment:[a-z0-9_]+\]/.test(prompt);
+}
+
+/** Actor briefs open with "You are domain actor NAME (ID), ..."; shown as the UI character with the saved name. */
+export function actorContextIdentity(context) {
+    const match = context.match(/You are domain actor (.+?) \(([^()\s]+)\)/);
+    if (!match) return null;
+    const identity = domainActorIdentity({ name: match[1] });
+    return { id: match[2], character: identity.role ? identity.name : undefined, label: identity.role ? `${identity.name} · ${identity.role}` : identity.name };
+}
+
+/** A native actor child (named actor_<allocation>_<work>) whose actor brief has not been read yet. */
+export function awaitsActorBrief(name, actorContexts) {
+    return actorContexts.length === 0 && /^actor_[a-z0-9_]+$/.test(readableAgentName(name));
+}
+
+/** Internal native agent paths (/root/actor_a2_9fd316) read as their last segment when no actor is known. */
+function readableAgentName(name) {
+    return /^\/root\/.+/.test(name) ? name.split("/").filter(Boolean).pop() : name;
 }
 
 export function SubagentTranscript(ctx, { anchorPrefix, onRetry, state, threadId, sessionId, workspaceId }) {
@@ -590,6 +683,8 @@ export function ApprovalEvent(ctx, { item, onDecisionSubmitted, compact = false 
     const { FileEditIcon, TerminalSquare, _jsx, _jsxs, approvalAvailableDecisions, approvalDecisionLabel, readRecord, readStringField, summarizeCommand, useState } = ctx;
     const [submittingDecision, setSubmittingDecision] = useState(null);
     const [isStale, setIsStale] = useState(false);
+    const [decisionError, setDecisionError] = useState("");
+    const decisionInFlight = useRef(false);
     const params = readRecord(item.params);
     const isCommandApproval = item.method === "item/commandExecution/requestApproval";
     const title = isCommandApproval ? "Command approval" : "File approval";
@@ -606,10 +701,14 @@ export function ApprovalEvent(ctx, { item, onDecisionSubmitted, compact = false 
     const declineDecision = availableDecisions.find((decision) => decision.key === "decline");
     const cancelDecision = availableDecisions.find((decision) => decision.key === "cancel");
     const resolved = item.status === "resolved";
+    const [expiredLocally, setExpiredLocally] = useState(false);
+    const expired = !resolved && (item.status === "expired" || expiredLocally);
     async function decide(action) {
-        if (resolved || submittingDecision === action.key) {
+        if (resolved || expired || decisionInFlight.current) {
             return;
         }
+        decisionInFlight.current = true;
+        setDecisionError("");
         setSubmittingDecision(action.key);
         try {
             const response = await fetch(`/api/approvals/${encodeURIComponent(item.approvalId)}/decision`, {
@@ -620,28 +719,32 @@ export function ApprovalEvent(ctx, { item, onDecisionSubmitted, compact = false 
             if (!response.ok) {
                 const payload = (await response.json().catch(() => null));
                 if ((response.status === 404 || response.status === 409) && payload?.stale) {
-                    setIsStale(true);
+                    // The server no longer waits for this request; keep it readable but inert.
+                    setExpiredLocally(true);
                     onDecisionSubmitted?.(item.approvalId);
                     return;
                 }
                 throw new Error(`API returned ${response.status}`);
             }
+            setIsStale(true);
             onDecisionSubmitted?.(item.approvalId);
         }
         catch {
+            setDecisionError("Could not submit the decision. Please retry.");
             // Keep the approval actionable if the request fails or the stream is stale.
         }
         finally {
+            decisionInFlight.current = false;
             setSubmittingDecision(null);
         }
     }
-    if (isStale) {
+    if (isStale && !resolved && !expired) {
         return null;
     }
     if (resolved && !item.error) {
         return (_jsx("section", { className: "approval-card approval-record", "data-status": item.status, children: _jsxs("div", { className: "approval-header", children: [isCommandApproval ? _jsx(TerminalSquare, { "aria-hidden": "true" }) : _jsx(FileEditIcon, { "aria-hidden": "true" }), _jsx("span", { children: title }), command && _jsx("code", { children: summarizeCommand(command) }), _jsx("strong", { children: approvalDecisionLabel(item.decision) })] }) }));
     }
-    return (_jsxs("section", { className: `approval-card${compact ? " approval-card-compact" : ""}`, "data-status": item.status, children: [!compact && (_jsxs("div", { className: "approval-header", children: [isCommandApproval ? _jsx(TerminalSquare, { "aria-hidden": "true" }) : _jsx(FileEditIcon, { "aria-hidden": "true" }), _jsx("span", { children: title }), _jsx("strong", { children: resolved ? approvalDecisionLabel(item.decision) : "Waiting" })] })), reason && _jsx("p", { children: reason }), networkHost && (_jsxs("p", { children: ["Network: ", _jsx("code", { children: networkProtocol ? `${networkProtocol}://${networkHost}` : networkHost })] })), command && _jsx("pre", { className: "approval-command", children: command }), cwd && _jsx("code", { className: "approval-meta", children: cwd }), grantRoot && _jsx("code", { className: "approval-meta", children: grantRoot }), !resolved && (_jsxs("div", { className: "approval-actions", children: [acceptDecision && (_jsx("button", { type: "button", "data-action": "approve", onClick: () => void decide(acceptDecision), disabled: submittingDecision === acceptDecision.key, children: "Approve" })), acceptForSessionDecision && (_jsx("button", { type: "button", "data-action": "approve", onClick: () => void decide(acceptForSessionDecision), disabled: submittingDecision === acceptForSessionDecision.key, children: "Approve session" })), declineDecision && (_jsx("button", { type: "button", onClick: () => void decide(declineDecision), disabled: submittingDecision === declineDecision.key, children: "Decline" })), cancelDecision && (_jsx("button", { type: "button", onClick: () => void decide(cancelDecision), disabled: submittingDecision === cancelDecision.key, children: "Cancel" }))] })), item.error && _jsx("small", { className: "approval-error", children: item.error })] }));
+    return (_jsxs("section", { className: `approval-card${compact ? " approval-card-compact" : ""}`, "data-status": expired ? "expired" : item.status, "aria-disabled": expired || undefined, children: [!compact && (_jsxs("div", { className: "approval-header", children: [isCommandApproval ? _jsx(TerminalSquare, { "aria-hidden": "true" }) : _jsx(FileEditIcon, { "aria-hidden": "true" }), _jsx("span", { children: title }), _jsx("strong", { children: resolved ? approvalDecisionLabel(item.decision) : expired ? "Expired" : "Waiting" })] })), expired && _jsx("p", { className: "approval-expired-note", children: "This request expired before it was answered and can no longer be approved or declined." }), reason && _jsx("p", { children: reason }), networkHost && (_jsxs("p", { children: ["Network: ", _jsx("code", { children: networkProtocol ? `${networkProtocol}://${networkHost}` : networkHost })] })), command && _jsx("pre", { className: "approval-command", children: command }), cwd && _jsx("code", { className: "approval-meta", children: cwd }), grantRoot && _jsx("code", { className: "approval-meta", children: grantRoot }), !resolved && !expired && (_jsxs("div", { className: "approval-actions", children: [acceptDecision && (_jsx("button", { type: "button", "data-action": "approve", onClick: () => void decide(acceptDecision), disabled: submittingDecision !== null, children: "Approve" })), acceptForSessionDecision && (_jsx("button", { type: "button", "data-action": "approve", onClick: () => void decide(acceptForSessionDecision), disabled: submittingDecision !== null, children: "Approve session" })), declineDecision && (_jsx("button", { type: "button", onClick: () => void decide(declineDecision), disabled: submittingDecision !== null, children: "Decline" })), cancelDecision && (_jsx("button", { type: "button", onClick: () => void decide(cancelDecision), disabled: submittingDecision !== null, children: "Cancel" }))] })), !expired && (decisionError || item.error) && _jsx("small", { role: "alert", className: "approval-error", children: decisionError || item.error })] }));
 
 }
 

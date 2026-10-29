@@ -276,6 +276,20 @@
             }
         }
     }
+    function summarizeElementInnerText(element) {
+        const text = ("innerText" in element && typeof element.innerText === "string" ? element.innerText : "").replace(/\s+/gu, " ").trim();
+        let summary = "";
+        let length = 0;
+        // Count Unicode code points, retaining whole graphemes (including emoji sequences).
+        for (const { segment } of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text)) {
+            const size = Array.from(segment).length;
+            if (length + size > 128)
+                break;
+            summary += segment;
+            length += size;
+        }
+        return summary.trimEnd();
+    }
     async function captureContext(config, element, screenshot) {
         const capturedAt = new Date().toISOString();
         const selector = cssPath(element);
@@ -284,7 +298,8 @@
             id: element.id || null,
             className: typeof element.className === "string" ? element.className : null,
             role: element.getAttribute("role"),
-            ariaLabel: element.getAttribute("aria-label")
+            ariaLabel: element.getAttribute("aria-label"),
+            innerText: summarizeElementInnerText(element)
         };
         const pageValues = pageValuesForUrl(location.href, config.mappings);
         const contextKey = screenshot?.key ?? `${contextKeyPrefix}${config.tabId}:${crypto.randomUUID()}`;

@@ -564,8 +564,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.match(turn.input[0].text, /operational metadata/);
   assert.equal(JSON.parse(readFileSync(jobPath, "utf8")).message, "請建立 todo plan，todo language 要跟返用戶 prompt");
   assert.match(turn.settings.developer_instructions, /original user's actual task request/);
-  assert.match(turn.settings.developer_instructions, /Current Threadex Managed mode: OFF/);
-  assert.match(turn.settings.developer_instructions, /Do not proactively spawn sub-agents/);
+  assert.doesNotMatch(turn.settings.developer_instructions, /Managed mode/);
   assert.doesNotMatch(turn.settings.developer_instructions, /compact status headline/);
   assert.match(turn.settings.developer_instructions, /appended English force-plan suffix/);
   assert.match(turn.settings.developer_instructions, /session-inspector todo_request_clarification/);
@@ -1671,6 +1670,79 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.ok(resultIndex > fileChangeIndex);
 });
 
+test("prompt runner accumulates main and sub-agent turn diffs into one turn Changes item", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "prompt-runner-subagent-diffs-"));
+  const fakeCodexPath = resolve(root, "fake-codex.mjs");
+  const jobPath = resolve(root, "job.json");
+  const logPath = resolve(root, "runner.ndjson");
+  const diff = (...files: Array<[string, string[]]>) => files.map(([path, added]) =>
+    `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1,${added.length + 1} @@\n old\n${added.map((line) => `+${line}`).join("\n")}`
+  ).join("\n");
+
+  writeFileSync(fakeCodexPath, `#!/usr/bin/env node
+import { createInterface } from "node:readline";
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+const diff = ${JSON.stringify({
+    main: diff(["src/main.ts", ["a"]]),
+    childA: diff(["src/shared.ts", ["a1"]], ["src/child-a.ts", ["a"]]),
+    childB: diff(["src/shared.ts", ["a1", "b1", "b2"]]),
+    childBLate: diff(["src/shared.ts", ["a1", "b1", "b2"]], ["src/late.ts", ["x", "y"]])
+  })};
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method === "initialize") send({ id: request.id, result: {} });
+  if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "root-thread" } } });
+  if (request.method === "thread/goal/clear") send({ id: request.id, result: {} });
+  if (request.method === "turn/start") {
+    send({ id: request.id, result: { turn: { id: "root-turn" } } });
+    send({ method: "turn/started", params: { threadId: "root-thread", turn: { id: "root-turn", status: "inProgress", items: [] } } });
+    for (const child of ["child-a", "child-b"]) {
+      send({ method: "thread/started", params: { thread: { id: child + "-thread", parentThreadId: "root-thread" } } });
+      send({ method: "turn/started", params: { threadId: child + "-thread", turn: { id: child + "-turn", rootTurnId: "root-turn", status: "inProgress", items: [] } } });
+    }
+    send({ method: "turn/diff/updated", params: { threadId: "root-thread", turnId: "root-turn", diff: diff.main } });
+    send({ method: "turn/diff/updated", params: { threadId: "child-a-thread", turnId: "child-a-turn", diff: diff.childA } });
+    send({ method: "turn/diff/updated", params: { threadId: "child-b-thread", turnId: "child-b-turn", diff: diff.childB } });
+    send({ method: "item/completed", params: { threadId: "root-thread", turnId: "root-turn",
+      item: { id: "root-answer", type: "agentMessage", text: "root final" } } });
+    // A sub-agent still working after the main answer keeps accumulating.
+    send({ method: "turn/diff/updated", params: { threadId: "child-b-thread", turnId: "child-b-turn", diff: diff.childBLate } });
+    send({ method: "turn/completed", params: { threadId: "root-thread", turn: { id: "root-turn", status: "completed", items: [
+      { id: "root-answer", type: "agentMessage", text: "root final" }
+    ] } } });
+  }
+});
+`, "utf8");
+  chmodSync(fakeCodexPath, 0o755);
+  writeFileSync(jobPath, JSON.stringify({
+    sessionId: "session-1", turnId: "manager-turn", message: "delegate edits",
+    logPath, codexHome: resolve(root, "codex-home"), cwd: projectRoot
+  }), "utf8");
+
+  const child = spawn(process.execPath, ["--import", "tsx", runnerPath, jobPath], {
+    cwd: projectRoot,
+    env: { ...process.env, CODEX_PATH: fakeCodexPath, SESSION_INSPECTOR_MCP_MODE: "off" },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const exitCode = await new Promise<number | null>((resolveExit) => child.once("exit", resolveExit));
+  assert.equal(exitCode, 0, stderr);
+
+  const authoritative = readFileSync(logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line))
+    .filter((entry) => entry.event === "item" && entry.data?.authoritative === true)
+    .map((entry) => entry.data);
+  assert.equal(authoritative.length, 4);
+  assert.ok(authoritative.every((item) => item.id === "turn-diff:root-turn" && item.originThreadId === "root-thread"));
+  const final = authoritative.at(-1);
+  assert.deepEqual(final.turnDiffSources, ["root-turn", "child-a-turn", "child-b-turn"]);
+  // src/shared.ts is edited by both sub-agents and counted once, from the latest snapshot.
+  assert.deepEqual(final.changes.map((change: { path: string }) => change.path),
+    ["src/main.ts", "src/shared.ts", "src/child-a.ts", "src/late.ts"]);
+  assert.match(final.changes[1].diff, /\+b2/);
+});
+
 test("prompt runner attributes multiplexed child items without mutating root turn state", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "prompt-runner-child-attribution-"));
   const fakeCodexPath = resolve(root, "fake-codex.mjs");
@@ -2428,11 +2500,14 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   const worktreeReviewGuidance = /THREADEX_WORKTREE_(?:REVIEW|REASON)|HOW TO SKIP|Threadex automatically installs Git pre-commit\/pre-push hooks/;
   assert.doesNotMatch(turn.settings.developer_instructions, worktreeReviewGuidance);
   assert.doesNotMatch(thread.developerInstructions, worktreeReviewGuidance);
+  // Global instructions travel with thread start/resume only, never as a per-turn copy.
+  assert.match(thread.developerInstructions, /Preserve the user's preferred language/, `${variant} thread scope`);
+  assert.doesNotMatch(turn.settings.developer_instructions, /Preserve the user's preferred language/, `${variant} turn scope`);
   assert.equal(thread.developerInstructions.includes(MANAGER_REPLY_LANGUAGE_INSTRUCTIONS), workspaceManagerRole || managerDelegatedTask);
   if (managerDelegatedTask) assert.equal(thread.threadId, variant === "worker-resume" ? "thread-old" : undefined);
   if (workspaceManagerRole) {
     assert.equal(thread.threadId, ["manager-resume", "manager-event"].includes(variant) ? "thread-old" : undefined);
-    assert.equal(thread.developerInstructions, WORKSPACE_MANAGER_INSTRUCTIONS, `${variant} must install the current policy at thread scope`);
+    assert.equal(thread.developerInstructions, `${WORKSPACE_MANAGER_INSTRUCTIONS}\n\nUser's global agent instructions (apply across Threadex workspaces):\nPreserve the user's preferred language.`, `${variant} must install the current policy at thread scope`);
     assert.match(thread.developerInstructions, /Threadex commands use the CLI/);
     assert.match(thread.developerInstructions, /sandbox_permissions=require_escalated/);
     assert.match(thread.developerInstructions, /Do not use npm run/);
@@ -2441,7 +2516,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     assert.ok(!turn.settings.developer_instructions.includes(WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS));
     assert.match(turn.settings.developer_instructions, /worker-turn-1/);
     assert.match(turn.settings.developer_instructions, /2026-09-28T12:00:00Z/);
-    assert.match(turn.settings.developer_instructions, /Preserve the user's preferred language/);
+    assert.doesNotMatch(turn.settings.developer_instructions, /Preserve the user's preferred language/);
     assert.doesNotMatch(turn.settings.developer_instructions, /Historical task description|Previous request|Previous response|Full request from dashboard|Full commentary/);
     assert.equal(thread.inspectorEnv.THREADEX_WORKSPACE_MANAGER, "1");
     assert.equal(thread.inspectorEnv.THREADEX_CONTINUITY_ONLY, "0");

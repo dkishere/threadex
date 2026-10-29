@@ -323,6 +323,40 @@ shell's validated contract and comment cards, so older exports using that shell
 can receive feedback controls without rebuilding. Unsupported shells keep the
 ordinary preview behavior.
 
+Claude Code turns with workspace write access receive the turn-local
+`codex_image` MCP server. Call `mcp__codex_image__generate_image` with
+`{"prompt":"A green cube on a white background"}`. It runs
+`@agentclientprotocol/codex-acp@2.2.2` over ACP v1, using Codex's native image
+generation tool. The default launcher is `npx --yes` with that pinned package;
+the first call needs npm registry access. Set `THREADEX_CODEX_ACP_PATH` on the
+Threadex server to an installed `codex-acp` executable to avoid runtime downloads.
+No global Claude MCP settings are written. Restart the server after changing
+environment settings; injection applies on the next Claude turn.
+
+The bridge copies only the existing Codex login into a temporary agent home,
+uses read-only mode, disables shell/apps/delegation, and refuses extra ACP
+permissions and client filesystem/terminal requests. It does not start a login
+flow. A missing login, unavailable image capability, or response without inline
+image data returns a tool error. `THREADEX_IMAGE_MODEL` optionally selects a
+Codex model with image generation access. The MCP server is omitted from
+read-only/planning turns. Each generation gets a fresh ACP connection and
+session; a failed request is never automatically replayed.
+
+Successful calls return PNG image content (up to four images, 5 MB each) plus
+temporary local PNG paths. Copy those files into the project to keep them.
+The temporary authentication home is removed after the operation. Calls time
+out after 180 seconds (`THREADEX_IMAGE_TIMEOUT_MS`, bounded to 1–600 seconds);
+MCP cancellation or disconnect cancels the ACP session and closes its owned
+processes. The existing `npm run acp` feedback adapter below is separate and
+continues to accept text only.
+
+Run `node --import tsx scripts/probe-codex-image-mcp.ts` for an opt-in live
+Claude → MCP → Codex ACP generation check. It uses both existing logins and
+generates one image; it fails unless Claude discovers the tool, calls it, and
+receives image content and a file path. Refresh an expired Claude login before
+running it. The unit suite uses protocol fixtures and does not replace this
+live check.
+
 `npm run acp` exposes newline-delimited JSON-RPC over stdio for external ACP
 clients. Set `RUNNER_SERVER_URL` to the Threadex server URL (otherwise it uses
 `PORT`, default 8787). Supported methods are `initialize`, `session/new`,

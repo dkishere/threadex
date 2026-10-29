@@ -335,6 +335,7 @@ export function updateNavigationUrl(ctx, target, mode) {
     const { navigationTargetRef, navigationUrl } = ctx;
         navigationTargetRef.current = target;
         const nextUrl = navigationUrl(target);
+        if (nextUrl === `${window.location.pathname}${window.location.search}${window.location.hash}`) return;
         if (mode === "push") {
             window.history.pushState(null, "", nextUrl);
         }

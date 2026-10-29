@@ -205,6 +205,28 @@ test("workspace account removals survive a store restart", async () => {
   }
 });
 
+test("a turn's inter-actor promptOrigin survives a store restart", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "session-prompt-origin-restart-test-"));
+  const dbPath = resolve(root, "threadex.postgres");
+  const promptOrigin = { kind: "inter-actor", trigger: "handoff", sourceActorId: "root", sourceActorName: "Root Actor", sourceSessionId: "parent-session", sourceRoundId: "round-1" };
+  let store = new SessionStore(dbPath);
+  await store.ready();
+  await store.upsertSession({ id: "origin-session", workspaceId: "default" });
+  await store.recordSessionTurn({ id: "origin-turn", sessionId: "origin-session", userInput: "Build the UI", agentResponse: "", tokenIn: 0, tokenOut: 0,
+    status: "todo", pendingReason: "queued", requestMetadata: { backgroundTask: true, promptOrigin } });
+  await store.close();
+
+  store = new SessionStore(dbPath);
+  try {
+    await store.ready();
+    assert.deepEqual((await store.getSessionTurn("origin-turn"))?.requestMetadata?.promptOrigin, promptOrigin);
+    const listed = (await store.listSessionTurns("origin-session")).find(turn => turn.id === "origin-turn");
+    assert.deepEqual(listed?.requestMetadata?.promptOrigin, promptOrigin);
+  } finally {
+    await store.close();
+  }
+});
+
 test("workspace load-balance selections survive a store restart", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "session-workspace-load-balance-restart-test-"));
   const dbPath = resolve(root, "threadex.postgres");
@@ -830,6 +852,61 @@ test("authoritative turn diff supersedes partial file-change activity for histor
     });
     const reverted = await store.inspectSession({ sessionId: "session-1", view: "turn_summary" });
     assert.deepEqual(reverted?.turns[0]?.fileChanges, []);
+  } finally {
+    await store.close();
+  }
+});
+
+test("turn Changes accumulate every sub-agent's net diff on read without rewriting history", async () => {
+  const store = await createStore();
+  const diff = (path: string, added: string[]) =>
+    `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1,${added.length + 1} @@\n old\n${added.map((line) => `+${line}`).join("\n")}`;
+  const nativeDiff = async (id: string, turnId: string, threadId: string, nativeTurnId: string, text: string) =>
+    store.recordSessionTurnEvent({ id, turnId, sessionId: "session-1", eventName: "codex",
+      payload: { method: "turn/diff/updated", params: { threadId, turnId: nativeTurnId, diff: text } } });
+  const edit = async (id: string, turnId: string, threadId: string, nativeTurnId: string, path: string, status = "completed") =>
+    store.recordSessionTurnEvent({ id, turnId, sessionId: "session-1", eventName: "item",
+      payload: { id, itemType: "file_change", eventType: "item.completed", status, originThreadId: threadId, originTurnId: nativeTurnId,
+        changes: [{ path, kind: "update", diff: "@@ -1 +1 @@\n-old\n+new" }] } });
+  try {
+    // Only sub-agents edited; history used to keep just whichever thread diffed last.
+    await edit("a-edit", "turn-1", "child-a", "child-a-turn", "/abs/shared.ts");
+    await nativeDiff("a-diff", "turn-1", "child-a", "child-a-turn", `${diff("shared.ts", ["a"])}\n${diff("a.ts", ["a"])}`);
+    await edit("b-edit", "turn-1", "child-b", "child-b-turn", "/abs/shared.ts");
+    await nativeDiff("b-diff", "turn-1", "child-b", "child-b-turn", `${diff("shared.ts", ["a", "b"])}\n${diff("b.ts", ["b"])}`);
+    // A sub-agent whose only edit failed and that never published a diff adds nothing.
+    await edit("c-edit", "turn-1", "child-c", "child-c-turn", "/abs/denied.ts", "failed");
+    // A sub-agent without any recorded net diff falls back to its applied edits.
+    await edit("d-edit", "turn-1", "child-d", "child-d-turn", "d.ts");
+
+    const summary = await store.inspectSession({ sessionId: "session-1", view: "turn_summary" });
+    assert.deepEqual(summary?.turns[0]?.fileChanges.map((change) => [change.path, change.additions, change.deletions]),
+      [["a.ts", 1, 0], ["b.ts", 1, 0], ["d.ts", 1, 1], ["shared.ts", 2, 0]]);
+    const authoritative = ((await store.listSessionLiveItems("session-1"))["turn-1"] as Array<Record<string, unknown>>)
+      .filter((item) => item.authoritative === true);
+    assert.equal(authoritative.length, 1);
+    assert.equal(authoritative[0].id, "turn-diff:child-b-turn");
+    assert.deepEqual(authoritative[0].turnDiffSources, ["child-b-turn", "child-a-turn", "child-c-turn", "child-d-turn"]);
+
+    for (const id of ["turn-2", "turn-3"]) await store.recordSessionTurn({ id, sessionId: "session-1", userInput: "test",
+      agentResponse: "", tokenIn: 0, tokenOut: 0, status: "done" });
+    // An older runner stored only the main thread's net diff; sub-agent diffs merge in on read.
+    await nativeDiff("main-diff", "turn-2", "main", "main-turn", diff("main.ts", ["m"]));
+    await store.recordSessionTurnEvent({ id: "main-stored", turnId: "turn-2", sessionId: "session-1", eventName: "item",
+      payload: { id: "turn-diff:main-turn", itemType: "file_change", eventType: "item.completed", status: "completed",
+        authoritative: true, originThreadId: "main", originTurnId: "main-turn", changes: [{ path: "main.ts", kind: "update", diff: diff("main.ts", ["m"]) }] } });
+    await edit("e-edit", "turn-2", "child-e", "child-e-turn", "/abs/e.ts");
+    await nativeDiff("e-diff", "turn-2", "child-e", "child-e-turn", diff("e.ts", ["e"]));
+    // Current runners already merge sub-agents; their item is used as stored.
+    await edit("f-edit", "turn-3", "child-f", "child-f-turn", "/abs/f.ts");
+    await store.recordSessionTurnEvent({ id: "merged-stored", turnId: "turn-3", sessionId: "session-1", eventName: "item",
+      payload: { id: "turn-diff:root-turn", itemType: "file_change", eventType: "item.completed", status: "completed",
+        authoritative: true, turnDiffSources: ["root-turn", "child-f-turn"], changes: [{ path: "f.ts", kind: "update", diff: diff("f.ts", ["f"]) }] } });
+
+    const turns = (await store.inspectSession({ sessionId: "session-1", view: "turn_summary" }))?.turns ?? [];
+    const pathsByTurn = Object.fromEntries(turns.map((turn) => [turn.id, turn.fileChanges.map((change) => change.path)]));
+    assert.deepEqual(pathsByTurn["turn-2"], ["e.ts", "main.ts"]);
+    assert.deepEqual(pathsByTurn["turn-3"], ["f.ts"]);
   } finally {
     await store.close();
   }
@@ -1904,6 +1981,36 @@ test("session summary refresh does not move old sessions above newer activity", 
     assert.deepEqual(page.sessions.map((session) => session.id), ["new-session", "old-session"]);
   } finally {
     await store.close();
+  }
+});
+
+test("actor claim titles survive migration and summaries until a user renames the session", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "session-actor-title-test-"));
+  const path = resolve(root, "threadex.postgres");
+  const summarize = (store: SessionStore, sourceHash: string) => store.upsertSessionSummary({ sessionId: "actor-session",
+    sourceHash, sourceTurnCount: 1, sourceUpdated: new Date().toISOString(), summarizerModel: "test-model", title: "Summarizer rename", keywordWeights: { actor: 1 } });
+  const store = new SessionStore(path);
+  await store.ready();
+  try {
+    await store.upsertSession({ id: "actor-session", workspaceId: "default", title: "Actor claim 標題", titleSource: "actor" }, { createOnly: true });
+    await summarize(store, "first");
+    const summarized = await store.getSession("actor-session");
+    assert.deepEqual([summarized?.title, summarized?.titleSource, summarized?.keywordWeights], ["Actor claim 標題", "actor", { actor: 1 }]);
+  } finally {
+    await store.close();
+  }
+  // Startup normalization must keep the actor source instead of resetting it to initial.
+  const reopened = new SessionStore(path);
+  await reopened.ready();
+  try {
+    await summarize(reopened, "second");
+    const migrated = await reopened.getSession("actor-session");
+    assert.deepEqual([migrated?.title, migrated?.titleSource], ["Actor claim 標題", "actor"]);
+    await reopened.upsertSession({ id: "actor-session", workspaceId: "default", title: "User rename" });
+    const renamed = await reopened.getSession("actor-session");
+    assert.deepEqual([renamed?.title, renamed?.titleSource], ["User rename", "user"]);
+  } finally {
+    await reopened.close();
   }
 });
 

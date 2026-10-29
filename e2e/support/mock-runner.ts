@@ -23,7 +23,7 @@ export async function postJson(request: APIRequestContext, path: string, body: u
 
 export async function checkedJson(response: APIResponse) {
   if (!response.ok()) {
-    throw new Error(`${response.request().method()} ${response.url()} returned ${response.status()}: ${await response.text()}`);
+    throw new Error(`${response.url()} returned ${response.status()}: ${await response.text()}`);
   }
   return response.json();
 }

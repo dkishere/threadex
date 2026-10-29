@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { buildSubagentStartupSnapshot } from "./subagentStartup";
-import { approvedInspectorCommand } from "./sessionInspectorCommand";
+import { approvedInspectorCommand, inspectorAliases, inspectorArgv, inspectorScript } from "./sessionInspectorCommand";
 import { normalizeModelEffort } from "../modelCatalog";
 import { readFileSync, statSync } from "node:fs";
 import { USER_INPUT_METHOD } from "../userInputRequest";
@@ -14,6 +14,7 @@ import {
   type ClaudeUsage
 } from "./claudeEvents";
 import type { StreamItem } from "./codexEvents";
+import { REPLY_LANGUAGE_INSTRUCTIONS } from "./replyLanguage";
 
 /**
  * Runs one Threadex turn on Claude through the Claude Agent SDK.
@@ -105,7 +106,80 @@ export type ClaudeRunnerContext = {
   /** Threadex Claude account used for this turn, if any (for limit and login reporting). */
   accountLabel?: string | null;
   reportAccountEvent?: (kind: "rate_limit" | "auth_failed", info: Record<string, unknown>) => Promise<void>;
+  /** How long the stream may stay open after the final result before the runner closes it. */
+  resultGraceMs?: number;
+  backgroundWaitMaxMs?: number;
+  backgroundHeartbeatMs?: number;
+  /** A running subagent quiet for this long gets a heartbeat event. */
+  subagentHeartbeatMs?: number;
+  /** Heartbeats stop this long after a subagent's last real sign of life, so a hung one cannot keep the runner looking busy. */
+  subagentStallMs?: number;
+  /** Actor tool credentials. The PreToolUse hook injects the calling agent's own credential into
+   * session-inspector actor calls, so none is present in the model-visible environment. */
+  actorCredentials?: ActorToolCredentials;
+  /** Native split children as SDK agent definitions keyed by agent name (subagent_type). */
+  agents?: Record<string, { description: string; prompt: string; model: string; effort?: string }>;
 };
+
+export type ActorToolCredentials = {
+  /** The session's own actor: the main thread and its non-actor helpers. */
+  main?: string;
+  /** Native split children by agent name; each acts only as its own actor work item. */
+  children: Record<string, { workItemId: string; capability: string }>;
+  toolNames: string[];
+};
+
+const quoteArg = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+
+/** Rewrites a tool call so actor identity follows the calling agent: session-inspector
+ * actor commands receive that agent's credential, and an actor child's Agent call keeps
+ * its system-fixed model, foreground run and working directory. Returns null when unchanged. */
+export function actorCredentialedInput(credentials: ActorToolCredentials | undefined, agentNames: readonly string[], tool: string,
+  args: Record<string, unknown>, agent: { agentId?: string; agentType?: string }): { updatedInput: Record<string, unknown> } | { deny: string } | null {
+  if ((tool === "Agent" || tool === "Task") && typeof args.subagent_type === "string" && agentNames.includes(args.subagent_type)) {
+    if (agent.agentId) return { deny: "Only the split host session starts actor sub-agents." };
+    const { model: _model, effort: _effort, isolation: _isolation, name: _name, ...rest } = args;
+    return { updatedInput: { ...rest, run_in_background: false } };
+  }
+  // SendMessage output is not a sub-agent result; rework reruns the actor agent so its outcome is recorded.
+  if (tool === "SendMessage" && typeof args.to === "string" && agentNames.includes(args.to))
+    return { deny: "Actor sub-agent rework must start the same subagent_type again with the Agent tool, including its previous result and the changes needed." };
+  if (!credentials || tool !== "Bash") return null;
+  const argv = inspectorArgv(args.command);
+  if (!argv || argv[0] !== process.execPath || argv[1] !== inspectorScript || argv.length > 4) return null;
+  const name = inspectorAliases[argv[2]] ?? argv[2];
+  if (!credentials.toolNames.includes(name)) return null;
+  let input: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(argv[3] ?? "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    input = parsed as Record<string, unknown>;
+  } catch { return null; }
+  const { _actorCredential: _credential, _actorWorkItem: _workItem, ...clean } = input;
+  const child = agent.agentId && agent.agentType ? credentials.children[agent.agentType] : undefined;
+  const credentialed = child ? { ...clean, _actorCredential: child.capability, _actorWorkItem: child.workItemId }
+    : credentials.main ? { ...clean, _actorCredential: credentials.main } : clean;
+  return { updatedInput: { ...args, command: [process.execPath, inspectorScript, argv[2], JSON.stringify(credentialed)].map(quoteArg).join(" ") } };
+}
+
+// Prompt suggestions arrive a few seconds after the final result; anything
+// still holding the CLI open well after that would only keep the turn running.
+const RESULT_GRACE_MS = 30_000;
+// Background tasks (async subagents, background shells) live in the CLI process, so the
+// turn stays open while they run; the cap keeps a never-ending task (a dev server) bounded.
+const BACKGROUND_WAIT_MAX_MS = Number(process.env.THREADEX_CLAUDE_BACKGROUND_WAIT_MS ?? 60 * 60_000);
+// Log movement while waiting so the stale-runner watchdog does not abandon a quiet test run.
+const BACKGROUND_HEARTBEAT_MS = 60_000;
+const SUBAGENT_HEARTBEAT_MS = 30_000;
+const SUBAGENT_STALL_MS = Number(process.env.THREADEX_SUBAGENT_STALL_MS ?? 10 * 60_000);
+
+/** Live non-ambient background task ids from a background_tasks_changed level message, else null. */
+export function backgroundTaskIds(message: unknown): string[] | null {
+  const record = message as { type?: unknown; subtype?: unknown; tasks?: unknown } | null;
+  if (record?.type !== "system" || record.subtype !== "background_tasks_changed" || !Array.isArray(record.tasks)) return null;
+  return record.tasks.flatMap((task: { task_id?: unknown; ambient?: unknown }) =>
+    typeof task?.task_id === "string" && task.ambient !== true ? [task.task_id] : []);
+}
 
 export type SdkModule = {
   query: (input: { prompt: AsyncIterable<unknown>; options: Record<string, unknown> }) => AsyncIterable<unknown> & {
@@ -167,6 +241,14 @@ export function providerSwitchNote(previousProvider: string) {
   return `[Threadex note: this session previously ran on ${previousProvider}. That agent's native context is not available in this turn. If the request depends on earlier turns, run session-inspector recover_current_session first and treat recovered turns as historical records.]`;
 }
 
+// Every Claude query (new, resume, recovery retry, actor and managed turns)
+// rebuilds its system prompt here, so the reply-language rule is added once per query.
+export function claudeSystemPromptAppend(appendSystemPrompt: string) {
+  return appendSystemPrompt.includes(REPLY_LANGUAGE_INSTRUCTIONS)
+    ? appendSystemPrompt
+    : [appendSystemPrompt, REPLY_LANGUAGE_INSTRUCTIONS].filter(Boolean).join("\n\n");
+}
+
 export async function runClaudeTurn(ctx: ClaudeRunnerContext, sdkOverride?: SdkModule): Promise<void> {
   const startedAt = Date.now();
   const sdk = sdkOverride ?? await loadSdk();
@@ -178,6 +260,16 @@ export async function runClaudeTurn(ctx: ClaudeRunnerContext, sdkOverride?: SdkM
   });
   const boundaryDecisions = new Map<string, PermissionResult>();
   let escapesApproved = ctx.sandboxEscapesApproved === true;
+  // A quiet subagent may only be waiting on the user; its heartbeats say so instead of looking hung.
+  const pendingWaits = new Map<string, "approval" | "input">();
+  const currentWait = () => [...pendingWaits.values()].includes("approval") ? "approval" as const : pendingWaits.size ? "input" as const : undefined;
+  let beatSubagents: (quietMs: number) => void = () => undefined;
+  const whileWaiting = async <T,>(kind: "approval" | "input", run: () => Promise<T>): Promise<T> => {
+    const id = randomUUID();
+    pendingWaits.set(id, kind);
+    beatSubagents(0);
+    try { return await run(); } finally { pendingWaits.delete(id); }
+  };
   const checkBoundary = async (tool: string, args: Record<string, unknown>, toolUseID: string, options: CanUseToolOptions = {}): Promise<PermissionResult | null> => {
     const reason = boundary(tool, args);
     if (!reason) return null;
@@ -189,8 +281,8 @@ export async function runClaudeTurn(ctx: ClaudeRunnerContext, sdkOverride?: SdkM
     const saved = boundaryDecisions.get(key);
     if (saved) return saved;
     const request = approvalRequestFor(ctx, tool, args, toolUseID, { ...options, decisionReason: `${reason} Approval grants this action outside the sandbox boundary.` });
-    const decision = await ctx.requestApproval({ approvalId: randomUUID(), requestId: toolUseID, method: request.method,
-      params: escape ? { ...request.params, sandboxEscape: true } : request.params, isCanceled: () => Boolean(options.signal?.aborted) });
+    const decision = await whileWaiting("approval", () => ctx.requestApproval({ approvalId: randomUUID(), requestId: toolUseID, method: request.method,
+      params: escape ? { ...request.params, sandboxEscape: true } : request.params, isCanceled: () => Boolean(options.signal?.aborted) }));
     // One session approval covers every later escape; the server persists it for later turns (sandbox.escape_grant).
     if (escape && decision === "acceptForSession") escapesApproved = true;
     const result: PermissionResult = decision === "accept" || decision === "acceptForSession"
@@ -204,13 +296,25 @@ export async function runClaudeTurn(ctx: ClaudeRunnerContext, sdkOverride?: SdkM
     ? [{ type: "text" as const, text: providerSwitchNote("Codex") }, ...ctx.input]
     : ctx.input;
 
-  const mapper = new ClaudeStreamMapper();
+  // Agent calls to these definitions run with the definition's model, effort and system prompt, so their cards show those.
+  const mapper = new ClaudeStreamMapper(Object.fromEntries(Object.entries(ctx.agents ?? {}).map(([name, agent]) => {
+    const effort = claudeEffort(agent.effort, agent.model);
+    return [name, { model: agent.model, ...(effort ? { effort } : {}), prompt: agent.prompt }];
+  })));
   const inbox = new AsyncQueue<unknown>();
   let sessionId = resumeSessionId ?? "";
   let threadId: string | null = resumeSessionId ? ctx.threadId : null;
-  let pushed = 0;
+  // Prompts the CLI has not yet answered with a result. A steer the CLI folds
+  // into the running turn is answered by that turn's result, so counting
+  // results against sends would wait forever for a result that never comes.
+  const unanswered = new Set<string>();
   let results = 0;
   let finished = false;
+  let graceTimer: ReturnType<typeof setTimeout> | undefined;
+  let closedAfterResult = false;
+  let stopReading = () => {};
+  // Ends the read loop even if a closed query never settles its pending read.
+  const stopped = new Promise<void>((resolve) => { stopReading = resolve; });
   let failure: string | null = null;
   let rateLimitMessage: string | null = null;
   let limitReached = false;
@@ -220,13 +324,14 @@ export async function runClaudeTurn(ctx: ClaudeRunnerContext, sdkOverride?: SdkM
   let costUsd = 0;
 
   const push = (parts: ClaudeInputPart[]) => {
-    pushed += 1;
-    inbox.push(buildClaudeUserMessage(parts, sessionId));
+    const uuid = randomUUID();
+    unanswered.add(uuid);
+    inbox.push({ ...buildClaudeUserMessage(parts, sessionId), uuid });
   };
 
   const canUseTool = async (toolName: string, toolInput: Record<string, unknown>, options: CanUseToolOptions = {}): Promise<PermissionResult> => {
     const toolUseId = options.toolUseID ?? randomUUID();
-    if (toolName === "AskUserQuestion") return askUserQuestion(ctx, toolInput, toolUseId, options);
+    if (toolName === "AskUserQuestion") return whileWaiting("input", () => askUserQuestion(ctx, toolInput, toolUseId, options));
     if (isInspector(toolName, toolInput)) return { behavior: "allow", updatedInput: toolInput };
     const boundaryDecision = await checkBoundary(toolName, toolInput, toolUseId, options);
     if (boundaryDecision) return boundaryDecision;
@@ -244,13 +349,13 @@ export async function runClaudeTurn(ctx: ClaudeRunnerContext, sdkOverride?: SdkM
     if (ctx.autoApproveAll) return { behavior: "allow", updatedInput: toolInput };
 
     const request = approvalRequestFor(ctx, toolName, toolInput, toolUseId, options);
-    const decision = await ctx.requestApproval({
+    const decision = await whileWaiting("approval", () => ctx.requestApproval({
       approvalId: randomUUID(),
       requestId: toolUseId,
       method: request.method,
       params: request.params,
       isCanceled: () => Boolean(options.signal?.aborted)
-    });
+    }));
     if (decision === "accept") return { behavior: "allow", updatedInput: toolInput };
     if (decision === "acceptForSession" || (decision && typeof decision === "object")) {
       // Keep "approve session" in memory for this Claude session only; never write settings files.
@@ -268,10 +373,16 @@ export async function runClaudeTurn(ctx: ClaudeRunnerContext, sdkOverride?: SdkM
     cwd: ctx.cwd,
     ...claudeSandboxOptions(sandboxMode, ctx.cwd, ctx.protectedPaths,
       Boolean(ctx.approvedInspectorCommands?.length) || (!ctx.autoApproveAll && sandboxMode === "workspace-write")),
-    hooks: { PreToolUse: [{ hooks: [async (input: { tool_name?: string; tool_input?: Record<string, unknown> }, toolUseID?: string, options: CanUseToolOptions = {}) => {
-      const decision = await checkBoundary(input.tool_name ?? "", input.tool_input ?? {}, toolUseID ?? randomUUID(), options);
-      return decision ? { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: decision.behavior,
-        ...(decision.behavior === "deny" ? { permissionDecisionReason: decision.message } : {}) } } : {};
+    hooks: { PreToolUse: [{ hooks: [async (input: { tool_name?: string; tool_input?: Record<string, unknown>; agent_id?: string; agent_type?: string }, toolUseID?: string, options: CanUseToolOptions = {}) => {
+      const actor = actorCredentialedInput(ctx.actorCredentials, Object.keys(ctx.agents ?? {}), input.tool_name ?? "", input.tool_input ?? {},
+        { agentId: input.agent_id, agentType: input.agent_type });
+      if (actor && "deny" in actor) return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: actor.deny } };
+      const toolInput = actor?.updatedInput ?? input.tool_input ?? {};
+      const decision = await checkBoundary(input.tool_name ?? "", toolInput, toolUseID ?? randomUUID(), options);
+      if (decision) return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: decision.behavior,
+        ...(decision.behavior === "deny" ? { permissionDecisionReason: decision.message } : actor ? { updatedInput: toolInput } : {}) } };
+      // Credentialed inspector calls and actor-agent launches are already within policy.
+      return actor ? { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: toolInput } } : {};
     }] }], SubagentStart: [{ hooks: [async (input: { cwd?: string }) => ({
       hookSpecificOutput: {
         hookEventName: "SubagentStart",
@@ -288,9 +399,12 @@ export async function runClaudeTurn(ctx: ClaudeRunnerContext, sdkOverride?: SdkM
     promptSuggestions: true,
     permissionMode: ctx.permissionMode,
     canUseTool,
-    systemPrompt: { type: "preset", preset: "claude_code", append: ctx.appendSystemPrompt },
+    systemPrompt: { type: "preset", preset: "claude_code", append: claudeSystemPromptAppend(ctx.appendSystemPrompt) },
     settingSources: ["user", "project", "local"],
     ...(Object.keys(ctx.mcpServers).length ? { mcpServers: ctx.mcpServers } : {}),
+    ...(ctx.agents && Object.keys(ctx.agents).length ? { agents: Object.fromEntries(Object.entries(ctx.agents).map(([name, agent]) => [name, {
+      description: agent.description, prompt: agent.prompt, model: agent.model,
+      ...(claudeEffort(agent.effort, agent.model) ? { effort: claudeEffort(agent.effort, agent.model) } : {}) }])) } : {}),
     ...(ctx.allowedTools.length ? { allowedTools: ctx.allowedTools } : {}),
     env: claudeEnvironment(process.env, ctx.extraEnv),
     ...(process.env.THREADEX_CLAUDE_PATH ? { pathToClaudeCodeExecutable: process.env.THREADEX_CLAUDE_PATH } : {}),
@@ -298,11 +412,61 @@ export async function runClaudeTurn(ctx: ClaudeRunnerContext, sdkOverride?: SdkM
   };
 
   const query = sdk.query({ prompt: inbox, options });
+  let backgroundTasks = new Set<string>();
+  let backgroundWaitTimer: ReturnType<typeof setTimeout> | undefined;
+  let backgroundHeartbeat: ReturnType<typeof setInterval> | undefined;
+  let backgroundIdleTimer: ReturnType<typeof setTimeout> | undefined;
+  const clearBackgroundWait = () => {
+    clearTimeout(backgroundWaitTimer);
+    clearInterval(backgroundHeartbeat);
+    clearTimeout(backgroundIdleTimer);
+    backgroundWaitTimer = backgroundHeartbeat = backgroundIdleTimer = undefined;
+  };
+  const finishTurn = () => {
+    if (finished) return;
+    clearBackgroundWait();
+    finished = true;
+    inbox.close();
+    const graceMs = ctx.resultGraceMs ?? RESULT_GRACE_MS;
+    graceTimer = setTimeout(() => {
+      ctx.appendInternalLog("claude.closed_after_result", { graceMs, backgroundTasks: backgroundTasks.size,
+        message: "Claude stream stayed open after the final result; closing it so the turn can finish." });
+      closedAfterResult = true;
+      try { query.close?.(); } catch (error) {
+        ctx.appendInternalLog("claude.close_error", { message: error instanceof Error ? error.message : String(error) });
+      }
+      stopReading();
+    }, graceMs);
+  };
+  // Keep the CLI, and the background work it owns, alive until that work settles.
+  const awaitBackground = () => {
+    clearTimeout(backgroundIdleTimer);
+    backgroundIdleTimer = undefined;
+    if (backgroundWaitTimer) return;
+    const maxMs = ctx.backgroundWaitMaxMs ?? BACKGROUND_WAIT_MAX_MS;
+    const waitStartedAt = Date.now();
+    ctx.appendInternalLog("claude.awaiting_background_tasks", { tasks: [...backgroundTasks], maxMs });
+    backgroundHeartbeat = setInterval(() => ctx.appendInternalLog("claude.background_tasks_heartbeat",
+      { tasks: [...backgroundTasks], elapsedMs: Date.now() - waitStartedAt }), ctx.backgroundHeartbeatMs ?? BACKGROUND_HEARTBEAT_MS);
+    backgroundWaitTimer = setTimeout(() => {
+      ctx.appendInternalLog("claude.background_wait_expired", { tasks: [...backgroundTasks], maxMs });
+      finishTurn();
+    }, maxMs);
+  };
   const onSigterm = () => {
     try { query.close?.(); } catch { /* exiting */ }
     process.exit(143);
   };
   process.once("SIGTERM", onSigterm);
+
+  const subagentQuietMs = ctx.subagentHeartbeatMs ?? SUBAGENT_HEARTBEAT_MS;
+  beatSubagents = (quietMs) => {
+    for (const output of mapper.heartbeats({ quietMs, stallMs: ctx.subagentStallMs ?? SUBAGENT_STALL_MS,
+      processAlive: !closedAfterResult, waiting: currentWait() })) {
+      if (output.kind === "subagent_activity") void ctx.emitEvent("subagent_activity", output.payload);
+    }
+  };
+  const subagentBeatTimer = setInterval(() => beatSubagents(subagentQuietMs), Math.max(10, Math.min(15_000, subagentQuietMs / 2)));
 
   const processedSteers = new Set<string>();
   const steerTimer = setInterval(() => {
@@ -324,7 +488,7 @@ export async function runClaudeTurn(ctx: ClaudeRunnerContext, sdkOverride?: SdkM
   }, 200);
 
   try {
-    for await (const message of query) {
+    for await (const message of readUntil(query, stopped)) {
       logSdkMessage(ctx, message);
       for (const output of mapper.handle(message)) {
         if (output.kind === "session") {
@@ -347,6 +511,10 @@ export async function runClaudeTurn(ctx: ClaudeRunnerContext, sdkOverride?: SdkM
         } else if (output.kind === "item") {
           nativeActivity = true;
           await ctx.emitEvent("item", output.item);
+        } else if (output.kind === "subagent_activity") {
+          await ctx.emitEvent("subagent_activity", output.payload);
+        } else if (output.kind === "subagent_usage") {
+          await ctx.emitEvent("subagent_usage", { agentId: output.agentId, source: "claude", tokenUsage: output.tokenUsage });
         } else if (output.kind === "rate_limit") {
           if (output.status === "rejected") {
             limitReached = true;
@@ -377,10 +545,29 @@ export async function runClaudeTurn(ctx: ClaudeRunnerContext, sdkOverride?: SdkM
           }
           costUsd += output.costUsd ?? 0;
           if (!output.ok) failure = failure ?? rateLimitMessage ?? output.errors.join("\n");
-          if (results >= pushed) {
-            finished = true;
-            inbox.close();
+          const answered = output.userMessageUuids.filter((uuid) => unanswered.has(uuid));
+          // Results without uuids (older CLIs, error results) answer the oldest send.
+          for (const uuid of answered.length ? answered : [...unanswered].slice(0, 1)) unanswered.delete(uuid);
+          // An empty CLI queue means no send is waiting for another turn: any
+          // send still unanswered was folded into this one without a uuid echo.
+          const clearedByEmptyQueue = output.queuedTurnCount === 0 ? unanswered.size : 0;
+          if (clearedByEmptyQueue) unanswered.clear();
+          ctx.appendInternalLog("claude.result", { subtype: output.subtype, answered: answered.length,
+            unanswered: unanswered.size, clearedByEmptyQueue, queuedTurnCount: output.queuedTurnCount });
+          if (unanswered.size === 0 && !finished) {
+            if (backgroundTasks.size) awaitBackground();
+            else finishTurn();
           }
+        }
+      }
+      const liveTasks = backgroundTaskIds(message);
+      if (liveTasks) {
+        backgroundTasks = new Set(liveTasks);
+        // The CLI answers the completion notification with another result; finish without
+        // one only if it stays idle for the grace period.
+        if (!backgroundTasks.size && backgroundWaitTimer) {
+          clearBackgroundWait();
+          backgroundIdleTimer = setTimeout(finishTurn, ctx.resultGraceMs ?? RESULT_GRACE_MS);
         }
       }
       // A rejected request need not be followed by a result: with streaming
@@ -396,10 +583,14 @@ export async function runClaudeTurn(ctx: ClaudeRunnerContext, sdkOverride?: SdkM
       }
     }
   } catch (error) {
-    failure = failure ?? (error instanceof Error ? error.message : String(error));
+    // Closing a lingering stream after the final result is not a turn failure.
+    if (!closedAfterResult) failure = failure ?? (error instanceof Error ? error.message : String(error));
   } finally {
     finished = true;
+    clearTimeout(graceTimer);
+    clearBackgroundWait();
     clearInterval(steerTimer);
+    clearInterval(subagentBeatTimer);
     inbox.close();
     process.removeListener("SIGTERM", onSigterm);
   }
@@ -479,6 +670,7 @@ async function askUserQuestion(
       header: typeof question.header === "string" ? question.header : `Question ${index + 1}`,
       question: typeof question.question === "string" ? question.question : "",
       isOther: true,
+      ...(question.multiSelect === true ? { multiSelect: true } : {}),
       options: (Array.isArray(question.options) ? question.options : []).flatMap((option) => {
         const record = option && typeof option === "object" ? option as Record<string, unknown> : null;
         return typeof record?.label === "string"
@@ -571,6 +763,21 @@ export async function loadSdk(): Promise<SdkModule> {
     return await import(specifier) as SdkModule;
   } catch (error) {
     throw new Error(`Claude models need ${SDK_PACKAGE}. Run "npm install ${SDK_PACKAGE}" in Threadex and restart the server. (${error instanceof Error ? error.message : String(error)})`);
+  }
+}
+
+async function* readUntil<T>(source: AsyncIterable<T>, stopped: Promise<void>): AsyncGenerator<T> {
+  const iterator = source[Symbol.asyncIterator]();
+  const stop = stopped.then(() => ({ done: true, value: undefined }) as IteratorResult<T>);
+  try {
+    while (true) {
+      const next = await Promise.race([iterator.next(), stop]);
+      if (next.done) return;
+      yield next.value;
+    }
+  } finally {
+    // Not awaited: a stopped query may never settle its pending read.
+    void Promise.resolve(iterator.return?.()).catch(() => undefined);
   }
 }
 

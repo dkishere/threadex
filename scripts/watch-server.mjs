@@ -27,6 +27,11 @@ let restartPending = false;
 let shuttingDown = false;
 let buildChild = null;
 let rebuildRequested = false;
+const minCrashRestartDelayMs = 1_000;
+const maxCrashRestartDelayMs = 30_000;
+const stableRunMs = 60_000;
+let crashRestartDelayMs = minCrashRestartDelayMs / 2;
+let crashRestartTimer = null;
 
 mkdirSync(supervisorDir, { recursive: true });
 writeFileSync(supervisorPidPath, `${process.pid}\n`, "utf8");
@@ -70,6 +75,11 @@ function startServer() {
   }
   delete env.ENABLE_DUCKDB_UI;
 
+  if (crashRestartTimer) {
+    clearTimeout(crashRestartTimer);
+    crashRestartTimer = null;
+  }
+  const startedAt = Date.now();
   child = spawn(process.execPath, [tsxCli, serverEntry], {
     cwd: rootDir,
     env,
@@ -96,7 +106,14 @@ function startServer() {
       return;
     }
 
-    console.error(`Server exited (${signal ?? code}). Waiting for a source change before retrying.`);
+    // A crash otherwise leaves the UI offline until someone edits a source file.
+    crashRestartDelayMs = Date.now() - startedAt > stableRunMs ? minCrashRestartDelayMs
+      : Math.min(crashRestartDelayMs * 2, maxCrashRestartDelayMs);
+    console.error(`Server exited (${signal ?? code}). Restarting in ${crashRestartDelayMs}ms.`);
+    crashRestartTimer = setTimeout(() => {
+      crashRestartTimer = null;
+      if (!child && !restarting && !buildChild) startServer();
+    }, crashRestartDelayMs);
   });
 }
 
@@ -196,7 +213,7 @@ function scheduleRestart(reason) {
 
 function readSourceSnapshot() {
   return readdirSync(serverDir)
-    .filter((filename) => extname(filename) === ".ts")
+    .filter((filename) => extname(filename) === ".ts" && !filename.endsWith(".test.ts"))
     .sort()
     .map((filename) => {
       const stats = statSync(resolve(serverDir, filename), { bigint: true });

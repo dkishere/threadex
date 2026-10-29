@@ -1,5 +1,6 @@
 import { Plus, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { ActorMentionAvatar } from "./ActorMentionAvatar";
 import type { ComposerSuggestion } from "./appTypes";
 
 function normalizeKeywords(value: unknown): string[] {
@@ -23,27 +24,38 @@ export async function loadComposerSuggestionKeywords(workspaceId?: string | null
   return normalizeKeywords(payload.keywords);
 }
 
-export function ComposerSuggestionMenu({ suggestions, activeIndex, onSelect, loading }: {
+export function composerSuggestionOptionId(menuId: string, index: number) {
+  return `${menuId}-option-${index}`;
+}
+
+export function ComposerSuggestionMenu({ suggestions, activeIndex, onSelect, loading, id, emptyText }: {
   suggestions: ComposerSuggestion[];
   activeIndex: number;
   onSelect: (suggestion: ComposerSuggestion) => void;
   loading?: boolean;
+  /** Enables option ids for the editor's aria-activedescendant. */
+  id?: string;
+  /** Shown instead of the default empty text, for example why actors cannot be mentioned. */
+  emptyText?: string | null;
 }) {
-  return <div className="slash-suggestions composer-suggestions" role="listbox" aria-label="Composer suggestions">
+  return <div id={id} className="slash-suggestions composer-suggestions" role="listbox" aria-label="Composer suggestions">
     {suggestions.map((suggestion, index) => <button
       type="button"
       role="option"
+      id={id ? composerSuggestionOptionId(id, index) : undefined}
       aria-selected={index === activeIndex}
       data-active={index === activeIndex}
       onMouseDown={(event) => event.preventDefault()}
       onClick={() => onSelect(suggestion)}
-      key={`${suggestion.kind}:${suggestion.name}:${suggestion.kind === "path" || suggestion.kind === "skill" ? suggestion.path : ""}`}
+      key={`${suggestion.kind}:${suggestion.name}:${suggestion.kind === "path" || suggestion.kind === "skill" ? suggestion.path : suggestion.kind === "actor" ? suggestion.actor.id : ""}`}
     >
-      <span className="slash-suggestion-name">/{suggestion.name}</span>
+      {suggestion.kind === "actor"
+        ? <span className="slash-suggestion-name slash-suggestion-actor"><ActorMentionAvatar actor={suggestion.actor} />@{suggestion.name}</span>
+        : <span className="slash-suggestion-name">/{suggestion.name}</span>}
       <span className="slash-suggestion-description">{suggestion.description}</span>
-      <small>{suggestion.kind === "mode" || suggestion.kind === "todo" ? "Mode" : suggestion.scope}</small>
+      <small>{suggestion.kind === "mode" || suggestion.kind === "todo" ? "Mode" : suggestion.kind === "actor" ? "Worker" : suggestion.scope}</small>
     </button>)}
-    {suggestions.length === 0 && <span className="slash-suggestions-empty">{loading ? "Loading suggestions…" : "No matching suggestions"}</span>}
+    {suggestions.length === 0 && <span className="slash-suggestions-empty" role={emptyText ? "status" : undefined}>{emptyText ?? (loading ? "Loading suggestions…" : "No matching suggestions")}</span>}
   </div>;
 }
 

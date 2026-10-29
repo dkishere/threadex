@@ -107,6 +107,8 @@ test("quote popover interactions preserve the annotation when selection collapse
   assert.deepEqual(updates, []);
   captureResponseQuoteSelection(ctx, { target: { closest: () => null } });
   assert.deepEqual(updates, [null]);
+  captureResponseQuoteSelection(ctx, { target: { closest: (selector: string) => selector === ".actor-room-messages" ? {} : null } });
+  assert.deepEqual(updates, [null, null], "actor selection clears the session popup and is handled by the actor composer");
 });
 
 test("manager reconciliation pins the finished turn and rejects a late response after switching to raw view", async t => {

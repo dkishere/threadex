@@ -21,3 +21,13 @@ test("custom options require isOther and malformed questions fail closed", () =>
   assert.deepEqual(inputQuestions({ questions: [q, q] }), []);
   assert.deepEqual(inputQuestions({ questions: [{ ...q, options: ["wrong"] }] }), []);
 });
+test("multiSelect questions accept several unique known options; single-select still takes one", () => {
+  const options = [{ label: "A", description: "" }, { label: "B", description: "" }];
+  const multi = { questions: [{ id: "m", header: "H", question: "Q", multiSelect: true, options }] };
+  assert.deepEqual(inputResponse({ answers: { m: { answers: ["A", "B"] } } }, multi), { answers: { m: { answers: ["A", "B"] } } });
+  assert.equal(inputResponse({ answers: { m: { answers: [] } } }, multi), null);
+  assert.equal(inputResponse({ answers: { m: { answers: ["A", "A"] } } }, multi), null);
+  assert.equal(inputResponse({ answers: { m: { answers: ["A", "Z"] } } }, multi), null);
+  assert.deepEqual(inputResponse({ answers: { m: { answers: ["A", "Z"] } } }, { questions: [{ ...multi.questions[0], isOther: true }] }), { answers: { m: { answers: ["A", "Z"] } } });
+  assert.equal(inputResponse({ answers: { m: { answers: ["A", "B"] } } }, { questions: [{ ...multi.questions[0], multiSelect: false }] }), null);
+});

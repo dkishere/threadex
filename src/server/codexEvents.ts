@@ -1,4 +1,5 @@
 import { asyncInputQuestions, type AsyncInputQuestion } from "../userInputRequest";
+import type { SendMessageRecord } from "../eventProtocol";
 
 type AppServerThreadItem = Record<string, unknown> & {
   id?: unknown;
@@ -106,6 +107,8 @@ export type StreamItem = {
       status: string;
       /** Final net diff for the turn, rather than an individual edit action. */
       authoritative?: boolean;
+      /** Native turn ids (main thread phases and sub-agent turns) whose net diffs this authoritative item merges. */
+      turnDiffSources?: string[];
     }
   | {
       id: string;
@@ -137,8 +140,16 @@ export type StreamItem = {
       senderThreadId?: string;
       receiverThreadIds: string[];
       prompt?: string;
+      /** Requested by the calling agent; may be absent when the child inherits or the system fixes it. */
       model?: string;
       reasoningEffort?: string;
+      /** What the child actually runs with: system-fixed by its agent definition or observed from its responses. */
+      actualModel?: string;
+      actualReasoningEffort?: string;
+      /** Claude actor child: the system prompt (actor identity, memory and assigned brief) its definition gives it. */
+      actorContext?: string;
+      /** Claude SendMessage (`tool: "send_message"`): the structured message; see docs/claude-send-message-events.md. */
+      sendMessage?: SendMessageRecord;
       agents: Array<{ id: string; name?: string; status: string; message?: string }>;
     }
   | {
@@ -620,6 +631,20 @@ export function fileChangesFromTurnDiff(value: unknown): FileChange[] {
       ...(kind === "move" && newPath && newPath !== path ? { movePath: newPath } : {})
     }];
   });
+}
+
+/**
+ * Merge the net diffs of every native turn that worked for one Threadex turn
+ * (main-thread phases and sub-agent threads), oldest snapshot first. Each
+ * native diff is net only for its own edits, so a path changed by several of
+ * them keeps the most recent snapshot instead of being counted twice.
+ */
+export function mergeTurnDiffChanges(snapshots: FileChange[][]): FileChange[] {
+  const byPath = new Map<string, FileChange>();
+  for (const changes of snapshots) {
+    for (const change of changes) byPath.set(change.path, change);
+  }
+  return [...byPath.values()];
 }
 
 function pathsFromDiffGitHeader(line: string | undefined) {

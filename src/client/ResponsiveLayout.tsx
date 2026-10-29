@@ -88,7 +88,7 @@ export function ResponsiveLayout({ children }: { children: ReactNode }) {
           {runningSessionCount > 0 && <span className="layout-menu-count" aria-hidden="true">{menuCount}</span>}
         </button>
         {!compact && <button className="layout-left-toggle" aria-label="Toggle sessions panel" aria-expanded={leftOpen} onClick={() => { setLeftOpen(!leftOpen); setMenuOpen(false); }} title="Sessions">{leftOpen ? <PanelLeftClose /> : <PanelLeft />}</button>}
-        <button aria-label="Toggle middle panel" aria-expanded={middleOpen} onClick={() => setMiddleOpen(!middleOpen)} title="Sessions / Turns / Plan / Side chat">{middleOpen ? <PanelRightClose /> : <PanelRightOpen />}</button>
+        <button className="layout-middle-toggle" aria-label="Toggle middle panel" aria-expanded={middleOpen} onClick={() => setMiddleOpen(!middleOpen)} title="Sessions / Turns / Plan / Side chat">{middleOpen ? <PanelRightClose /> : <PanelRightOpen />}</button>
         <TaskNotifications runningCount={runningSessionCount} />
       </div>
       {menuOpen && <button className="layout-backdrop" aria-label="Close navigation" onClick={() => { setMenuOpen(false); controls.current?.querySelector<HTMLButtonElement>(".layout-menu-toggle")?.focus(); }} />}

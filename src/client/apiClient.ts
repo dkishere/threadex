@@ -1,12 +1,12 @@
 export class ApiError extends Error {
-  constructor(message: string, readonly status: number) {
+  constructor(message: string, readonly status: number, readonly code?: string) {
     super(message);
     this.name = "ApiError";
   }
 }
 
 type ApiOptions = {
-  method?: "GET" | "POST" | "PUT" | "DELETE";
+  method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
   body?: unknown;
   signal?: AbortSignal;
   fresh?: boolean;
@@ -33,7 +33,7 @@ async function request<T>(url: string, options: ApiOptions): Promise<T> {
   const body = await response.json().catch(() => null);
   if (!response.ok) {
     throw new ApiError(typeof body?.error === "string" && body.error.trim()
-      ? body.error : `API returned ${response.status}`, response.status);
+      ? body.error : `API returned ${response.status}`, response.status, typeof body?.code === "string" ? body.code : undefined);
   }
   if (body === null) throw new Error("The server returned an incomplete JSON response.");
   return body as T;

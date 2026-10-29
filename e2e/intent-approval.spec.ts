@@ -6,6 +6,7 @@ import { scenarioSessions } from "./support/scenarios";
 import { SessionStore } from "../src/server/sessionStore";
 
 for (const width of [1280, 390]) test(`intention approval narrows scope, requires a user cookie and waits for runner acknowledgement at ${width}px`, async ({ page, request }, testInfo) => {
+  test.setTimeout(90000);
   await page.setViewportSize({ width, height: 900 });
   const sessionId = width === 1280 ? scenarioSessions.switchAlpha.id : scenarioSessions.switchBeta.id, turnId = `intent-e2e-${width}`;
   // Seed a genuinely running fixture; runner.started cannot promote a queued turn.
@@ -43,9 +44,18 @@ for (const width of [1280, 390]) test(`intention approval narrows scope, require
   expect(overwrite.status()).toBe(400);
   await selectSession(request, sessionId);
   await page.goto(`/?workspaceId=default&sessionId=${sessionId}`);
+  const openApproval = async () => {
+    const trigger = page.getByRole("button", { name: /^Default actions/ });
+    if (!await trigger.isVisible()) await page.getByRole("button", { name: /^Toggle workspace menu/ }).click();
+    await trigger.click();
+    await page.getByRole("dialog", { name: "Default actions", exact: true }).getByRole("button", { name: /Deploy this version to staging/ }).click();
+  };
+  await expect(page.locator("dialog[open]")).toHaveCount(0);
+  await openApproval();
   const modal = page.getByRole("dialog", { name: "Approval required" });
   await expect(modal.getByText(intent.title)).toBeVisible();
   await page.reload();
+  await openApproval();
   await expect(modal.getByText(intent.scope)).toBeVisible();
   await modal.getByRole("checkbox", { name: "Build version abc" }).uncheck();
   await modal.getByRole("checkbox", { name: "Deploy version abc" }).uncheck();
@@ -65,7 +75,8 @@ for (const width of [1280, 390]) test(`intention approval narrows scope, require
   expect(await postJson(request, `/api/intent-approvals/${approvalId}/result`, {})).toEqual({ pending: true });
   mkdirSync(resolve(e2eDataDir, "runner-control-results"), { recursive: true });
   writeFileSync(resolve(e2eDataDir, "runner-control-results", `${command!.id}.json`), JSON.stringify({ ok: true, commandId: command!.id, appTurnId: "native-test-turn" }));
-  await expect(modal).toHaveCount(0);
+  await expect(modal.getByRole("status")).toContainText("no longer pending");
+  await modal.getByRole("button", { name: "Close request" }).click();
   const result = await postJson(request, `/api/intent-approvals/${approvalId}/result`, {});
   expect(result).toEqual({ decision: { outcome: "approved", actions: ["Deploy version abc"], constraints: "Only after 6pm" }, grantId: approvalId });
   await page.reload();

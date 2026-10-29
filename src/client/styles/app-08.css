@@ -1358,6 +1358,14 @@ body[data-file-drag-active="true"]::after {
   cursor: text;
 }
 
+.composer-ended-notice {
+  margin: 0;
+  padding: 12px 16px;
+  border-top: 1px solid #e2e8f0;
+  color: #64748b;
+  font-size: 13px;
+}
+
 .composer-submission-error {
   margin: 0 0 8px;
   color: var(--danger, #e57373);

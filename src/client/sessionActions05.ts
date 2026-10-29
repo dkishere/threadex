@@ -817,8 +817,9 @@ export function handleEditorKeyDown(ctx, event) {
             const selectedSuggestion = composerSuggestionIndex >= 0
                 ? visibleComposerSuggestions[composerSuggestionIndex]
                 : null;
+            // Space never picks a worker: an @ option is preselected so Enter can choose it.
             if (selectedSuggestion && !event.nativeEvent.isComposing &&
-                ((event.key === "Enter" && !event.shiftKey) || event.key === " ")) {
+                ((event.key === "Enter" && !event.shiftKey) || (event.key === " " && selectedSuggestion.kind !== "actor"))) {
                 event.preventDefault();
                 selectComposerSuggestion(selectedSuggestion);
                 return;

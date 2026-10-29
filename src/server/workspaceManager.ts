@@ -788,6 +788,7 @@ export class WorkspaceManagerService {
             ...(contextFork ? { contextFork: true } : {}),
             model: model ?? preferences.selectedModel, modelReasoningEffort: preferences.selectedEffort,
             ...(model ? { autoModel: false, workspaceManagerModelSelection: true } : {}),
+            promptOrigin: { kind: "inter-actor", trigger: "manager", sourceSessionId: actorSessionId },
             approvalPolicy: await this.store.resolveApprovalPolicy(target.id) });
           res.json({ ...await this.dispatchResult(result, sessionId, turnId),
             ...(contextFork ? { contextForkHandoff: true, childSessionId: null } : {}) }); return;
@@ -811,6 +812,7 @@ export class WorkspaceManagerService {
           const result = await this.deps.post("/api/pending-turns", { sessionId, turnId, message,
             workspaceId: manager.workspaceId, backgroundTask: true, autoModel: false,
             model: strongerModel, modelReasoningEffort: effort,
+            promptOrigin: { kind: "inter-actor", trigger: "manager", sourceSessionId: actorSessionId },
             approvalPolicy: await this.store.resolveApprovalPolicy(target.id) });
           await this.store.setSessionModelPreferences(sessionId, { selectedModel: strongerModel, selectedEffort: effort });
           res.json({ ...await this.dispatchResult(result, sessionId, turnId), previousModel: currentModel,

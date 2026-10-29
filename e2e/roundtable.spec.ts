@@ -25,11 +25,14 @@ test("legacy selected actors use the saved preset avatar after loading and reope
   const toggle = page.getByRole("button", { name: "Round table mode", exact: true });
   await expect(toggle).toHaveAttribute("aria-pressed", "false");
   await toggle.click();
-  const image = page.getByRole("dialog", { name: "Round table settings" }).getByRole("img", { name: "AstraXH avatar" });
+  const dialog = page.getByRole("dialog", { name: "Round table settings" });
+  await dialog.getByText("Customise selected actors", { exact: true }).click();
+  const image = dialog.getByRole("img", { name: "AstraXH avatar" });
   await expect(image).toHaveAttribute("src", avatar);
   await page.reload();
   await expect(toggle).toHaveAttribute("aria-pressed", "false");
   await toggle.click();
+  await dialog.getByText("Customise selected actors", { exact: true }).click();
   await expect(image).toHaveAttribute("src", avatar);
 });
 
@@ -79,8 +82,12 @@ test("saved actors can be edited in Settings, selected as defaults and reused in
   await dialog.getByRole("button", { name: "Select actors", exact: true }).click();
   await dialog.getByRole("checkbox", { name: "Builder", exact: true }).check();
   await expect(dialog.locator(".roundtable-actor-tile")).toHaveCount(3);
-  await dialog.getByRole("checkbox", { name: removedName, exact: true }).uncheck();
-  await page.keyboard.press("Escape");
+  // A temporary actor disappears from the options when removed; check that outcome directly.
+  await dialog.getByRole("checkbox", { name: removedName, exact: true }).click();
+  await expect(dialog.getByRole("checkbox", { name: removedName, exact: true })).toHaveCount(0);
+  await expect(dialog.locator(".roundtable-actor-tile")).toHaveCount(2);
+  // The removed checkbox no longer owns keyboard focus; close the picker explicitly.
+  await dialog.getByRole("button", { name: "Select actors", exact: true }).click();
   await dialog.getByRole("button", { name: "Edit actor 2", exact: true }).click();
   await expect(dialog.getByLabel("Actor 2 system prompt")).toHaveValue("Consider feasibility");
   await dialog.getByRole("button", { name: "Select actors", exact: true }).click();
@@ -208,8 +215,11 @@ test("composer round table highlights the input and requires re-enabling for eac
     { topic: "[Rollout](https://example.com/rollout)", positions: [{ view: "Stage the migration. See [plan](https://example.com/plan)", actors: [firstActor, secondActor],
       details: [{ actors: [firstActor], detail: "Start with [a pilot](https://example.com/pilot)" }] }] },
     { topic: "Monitoring", positions: [{ view: "Monitor errors", actors: [secondActor, firstActor] }] },
-    { topic: "Cost", positions: [{ view: "Cost is secondary", actors: [secondActor] }, { view: "Compare cloud costs first", actors: [firstActor] }] },
-    { topic: "Follow-up", positions: [{ view: "Review [the earlier decision](threadex://default/example#1)", actors: [secondActor] }] }] };
+    { topic: "Timing", positions: [{ view: "Migrate now", actors: [secondActor] }, { view: "Defer migration", actors: [firstActor] }] },
+    { topic: "Follow-up", positions: [{ view: "Review [the earlier decision](threadex://default/example#1)", actors: [secondActor],
+      details: [{ actors: [secondActor], detail: "Confirm the worker version pins." }] }] }],
+    openQuestions: [{ actors: [firstActor, secondActor], text: "Where is the ingestion worker deployed?" }],
+    scope: [{ actors: [secondActor], text: "Read-only inspection; deployed state was not verified." }] };
   rounds[0].revision++;
   const card = page.getByRole("region", { name: "Round table synthesis" });
   await card.getByRole("button", { name: "Context", exact: true }).click();
@@ -224,18 +234,31 @@ test("composer round table highlights the input and requires re-enabling for eac
   const consensus = card.getByRole("region", { name: "Consensus" });
   await expect(consensus.getByRole("link", { name: "Rollout", exact: true })).toHaveAttribute("href", "https://example.com/rollout");
   await expect(consensus.getByRole("link", { name: "plan", exact: true })).toHaveAttribute("href", "https://example.com/plan");
-  await expect(consensus.locator(".roundtable-issue").first().locator(".roundtable-position > .markdown-content")).toHaveCount(0);
+  // The shared view stays visible once, with every supporter, even when an actor adds a detail below it.
+  const rollout = consensus.locator(".roundtable-issue").first();
+  await expect(rollout.locator(".roundtable-view")).toHaveText(`${firstActor}${secondActor}：Stage the migration. See plan`);
+  await expect(rollout.locator(".roundtable-view .roundtable-supporter")).toHaveText([firstActor, secondActor]);
+  await expect(rollout.locator(".roundtable-detail")).toHaveText(`${firstActor}：Start with a pilot`);
   await expect(consensus).toContainText("Monitor errors");
-  await expect(consensus.locator(".roundtable-issue").first().locator(".roundtable-detail .roundtable-supporter")).toHaveText([firstActor, secondActor]);
-  await expect(consensus.locator(".roundtable-detail").nth(1)).toContainText("Stage the migration");
   await expect(consensus.getByRole("link", { name: "a pilot" })).toHaveAttribute("href", "https://example.com/pilot");
-  await expect(consensus.locator(".roundtable-issue").first().locator(".roundtable-supporter")).toHaveText([firstActor, secondActor]);
   await expect(consensus.locator(".roundtable-issue").nth(1).locator(".roundtable-supporter")).toHaveText([firstActor, secondActor]);
-  await expect(consensus.locator(".roundtable-issue").nth(1).locator(".roundtable-detail")).toHaveText(`${firstActor}${secondActor}：Monitor errors`);
+  await expect(consensus.locator(".roundtable-issue").nth(1).locator(".roundtable-view")).toHaveText(`${firstActor}${secondActor}：Monitor errors`);
+  await expect(consensus.locator(".roundtable-issue").nth(1).locator(".roundtable-detail")).toHaveCount(0);
   const disagreements = card.getByRole("region", { name: "Disagreements" });
   await expect(disagreements.locator(".roundtable-position")).toHaveCount(2);
   await expect(disagreements.locator(".roundtable-supporter")).toHaveText([firstActor, secondActor]);
+  await expect(disagreements.locator(".roundtable-view")).toHaveText([`${firstActor}：Defer migration`, `${secondActor}：Migrate now`]);
+  const questions = card.getByRole("region", { name: "Open questions", exact: true });
+  await expect(questions).toContainText("Where is the ingestion worker deployed?");
+  await expect(questions.locator('[aria-label="Raised by"]')).toHaveCount(1);
+  await expect(questions.locator('[aria-label="Supported by"]')).toHaveCount(0);
+  const scope = card.getByRole("region", { name: "Verification scope", exact: true });
+  await expect(scope.locator(".roundtable-detail")).toHaveText(`${secondActor}：Read-only inspection; deployed state was not verified.`);
+  await expect(scope.locator(".roundtable-supporter")).toHaveText([secondActor]);
+  await expect(scope.locator('[aria-label="Reported by"]')).toHaveCount(1);
   const other = card.getByRole("region", { name: "Other points" });
+  await expect(other.locator(".roundtable-view")).toContainText("Review the earlier decision");
+  await expect(other.locator(".roundtable-detail")).toContainText("Confirm the worker version pins.");
   await expect(other).toContainText(`No position recorded: ${firstActor}`);
   await expect(other.getByRole("link", { name: "the earlier decision" })).toHaveAttribute("href", "?threadId=example&workspaceId=default&turnNumbers=1");
   await expect(page.locator(".messages-pane > .messages")).not.toContainText("Host conclusion: stage the migration");
@@ -294,6 +317,7 @@ test("composer round table highlights the input and requires re-enabling for eac
   await expect(summaryCard).not.toContainText("No position recorded");
   await expect(summaryCard.getByRole("region", { name: "Consensus", exact: true })).toHaveCount(0);
   await expect(summaryCard.getByRole("region", { name: "Disagreements", exact: true })).toHaveCount(0);
+  await expect(summaryCard.getByRole("region", { name: "Verification scope", exact: true })).toHaveCount(0);
   await expect(summaryCard.getByRole("button", { name: "Next round", exact: true })).toBeEnabled();
   await expect.poll(() => summaryCard.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
   await summaryCard.screenshot({ path: "/private/tmp/threadex-roundtable-summary-mobile.png" });

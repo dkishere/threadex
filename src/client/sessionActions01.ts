@@ -202,6 +202,8 @@ export function captureResponseQuoteSelection(ctx, event) {
         // The document capture listener runs before the popover's mouseup handler.
         // Focusing its textarea can collapse the selection without dismissing it.
         if (event.target?.closest?.(".response-quote-popover")) return;
+        // Actor conversations own their selection popup and composer draft.
+        if (event.target?.closest?.(".actor-room-messages")) { setResponseQuotePopover(null); return; }
         const selection = window.getSelection();
         if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
             setResponseQuotePopover(null);

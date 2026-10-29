@@ -18,6 +18,9 @@ import {
   type ClaudeLogin
 } from "./claudeAccounts";
 
+/** Rate-limited Claude turns to release: those whose effective account is now `accountId`. */
+export type ClaudeLimitWaitClearScope = { accountId: string; workspaceId?: string; sessionId?: string };
+
 export type ClaudeAccountStoreApi = {
   listClaudeAccounts(): Promise<ClaudeAccountRecord[]>;
   getClaudeAccount(id: string): Promise<ClaudeAccountRecord | null>;
@@ -59,8 +62,14 @@ export function createClaudeAccountRouter(input: {
   store: ClaudeAccountStoreApi;
   dataDir: string;
   ops?: Partial<ClaudeAccountOps>;
-  /** Called after an account's limit clears or login succeeds, to retry waiting turns. */
+  /** Called after a usage refresh finds an account's limit windows, to retry waiting turns. */
   onAccountAvailable?: (account: ClaudeAccountRecord) => void;
+  /**
+   * Called after a login succeeds or the effective Claude account changes, to
+   * release rate-limit waits now served by `accountId` without waiting for the
+   * old reset time. Replaces onAccountAvailable for a completed login.
+   */
+  onLimitWaitClear?: (scope: ClaudeLimitWaitClearScope) => void;
 }) {
   const { store } = input;
   const ops: ClaudeAccountOps = { ...defaultOps, ...input.ops };
@@ -95,7 +104,7 @@ export function createClaudeAccountRouter(input: {
     });
   }
 
-  async function refreshUsage(account: ClaudeAccountRecord) {
+  async function refreshUsage(account: ClaudeAccountRecord, notifyAvailable = true) {
     try {
       const usage = await ops.fetchUsage(account.configDir);
       if (usage.email || usage.subscriptionType || usage.organization) {
@@ -109,7 +118,7 @@ export function createClaudeAccountRouter(input: {
       // Fresh windows supersede the last run-time limit; without them keep it.
       const hasWindows = Boolean(usage.quota.fiveHour || usage.quota.weekly);
       const updated = await store.mergeClaudeAccountQuota(account.id, hasWindows ? { ...usage.quota, status: "allowed", limitResetsAt: null } : usage.quota, null);
-      if (updated && hasWindows) input.onAccountAvailable?.(updated);
+      if (updated && hasWindows && notifyAvailable) input.onAccountAvailable?.(updated);
       return updated;
     } catch (error) {
       return store.mergeClaudeAccountQuota(account.id, {}, errorMessage(error));
@@ -151,11 +160,22 @@ export function createClaudeAccountRouter(input: {
     if (accountId && !(await store.getClaudeAccount(accountId))) {
       return void res.status(404).json({ error: `Claude account not found: ${accountId}` });
     }
+    if (scope === "session" && !sessionId) {
+      return void res.status(400).json({ error: "sessionId is required for a session selection." });
+    }
+    const effectiveFor = { workspaceId, sessionId: scope === "session" ? sessionId : null };
+    const previous = await store.resolveClaudeAccount(effectiveFor);
     if (scope === "session") {
-      if (!sessionId) return void res.status(400).json({ error: "sessionId is required for a session selection." });
-      await store.setSessionClaudeAccount(sessionId, accountId);
+      await store.setSessionClaudeAccount(sessionId!, accountId);
     } else {
       await store.setWorkspaceClaudeAccount(workspaceId, accountId);
+    }
+    const next = await store.resolveClaudeAccount(effectiveFor);
+    // Only a real switch releases waits; reselecting the same account keeps them.
+    if (next && next.id !== previous?.id) {
+      input.onLimitWaitClear?.(scope === "session"
+        ? { accountId: next.id, workspaceId, sessionId: sessionId! }
+        : { accountId: next.id, workspaceId });
     }
     res.json(await listing(workspaceId, sessionId));
   }));
@@ -190,8 +210,13 @@ export function createClaudeAccountRouter(input: {
     if (status.loggedIn) {
       ops.finishLogin(login.id);
       const updated = await applyStatus(account, status);
-      const withUsage = updated ? await refreshUsage(updated) : null;
-      if (updated) input.onAccountAvailable?.(withUsage ?? updated);
+      // A completed login releases this account's waits through one path, so
+      // the usage refresh must not also schedule them.
+      const withUsage = updated ? await refreshUsage(updated, !input.onLimitWaitClear) : null;
+      if (updated) {
+        if (input.onLimitWaitClear) input.onLimitWaitClear({ accountId: updated.id });
+        else input.onAccountAvailable?.(withUsage ?? updated);
+      }
       return void res.json({ complete: true, account: withUsage ?? updated, ...loginPayload(login) });
     }
     res.json({ complete: false, account, ...loginPayload(login) });

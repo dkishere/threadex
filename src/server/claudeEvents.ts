@@ -1,3 +1,10 @@
+import {
+  clipSendMessageText,
+  SEND_MESSAGE_RESULT_MAX_CHARS,
+  SEND_MESSAGE_TEXT_MAX_CHARS,
+  type SendMessageRecord,
+  type SubagentActivityPayload
+} from "../eventProtocol";
 import { structureAgentComment, truncateCommandOutput, type FileChange, type StreamItem } from "./codexEvents";
 
 /**
@@ -48,10 +55,37 @@ export type ClaudeMapperOutput =
       sessionId: string | null;
       durationMs: number | null;
       numTurns: number | null;
+      // Client uuids of the prompts this turn consumed, including steers the
+      // CLI folded into the running turn between tool rounds.
+      userMessageUuids: string[];
+      queuedTurnCount: number | null;
     }
   | { kind: "rate_limit"; status: string; resetsAt: string | null; info: Record<string, unknown> }
   | { kind: "api_error"; error: string; text: string }
-  | { kind: "prompt_suggestion"; suggestion: string };
+  | { kind: "prompt_suggestion"; suggestion: string }
+  | { kind: "subagent_usage"; agentId: string; tokenUsage: { last: SubagentTokenCounts; total: SubagentTokenCounts } }
+  | { kind: "subagent_activity"; payload: SubagentActivityPayload };
+
+/** Child agents keep reporting progress about every few seconds; the card needs far fewer rows. */
+const SUBAGENT_PROGRESS_MIN_MS = 5_000;
+/** Dedupe window for repeated assistant frames of one API response. */
+const SUBAGENT_SEEN_MAX = 2_000;
+
+type SubagentState = {
+  seq: number;
+  startedAt: number;
+  lastActivityAt: number;
+  lastEmitAt: number;
+  lastProgressAt: number;
+  progressSignature: string;
+  taskId?: string;
+  /** Survives the Agent tool_result: a background agent's result is only its launch receipt. */
+  background: boolean;
+  finished: boolean;
+};
+
+/** Codex-shaped counts so subagent samples share the Codex usage parser. */
+type SubagentTokenCounts = { inputTokens: number; cachedInputTokens: number; outputTokens: number; totalTokens: number };
 
 type TextKind = "text" | "thinking";
 
@@ -59,7 +93,14 @@ type ToolState = {
   id: string;
   name: string;
   input: Record<string, unknown>;
+  /** Agent/Task only: the model and effort the child actually runs with, when known. */
+  actual?: { model?: string; effort?: string };
+  /** Agent/Task only: the system prompt its agent definition gives the child (an actor's identity and memory). */
+  actorContext?: string;
 };
+
+/** SDK agent definitions whose model, effort and system prompt the system fixes, keyed by subagent_type. */
+export type ClaudeAgentDefinitions = Record<string, { model: string; effort?: string; prompt?: string }>;
 
 const EDIT_TOOLS = new Set(["Edit", "MultiEdit", "Write", "NotebookEdit"]);
 const SILENT_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode", "EnterPlanMode"]);
@@ -82,7 +123,23 @@ export class ClaudeStreamMapper {
   private readonly declinedTools = new Set<string>();
   private sessionAnnounced = false;
   private readonly pendingTextIds = new Set<string>();
+  /** Latest usage per API message id, grouped by the Agent call that ran it. */
+  private readonly subagentMessageUsage = new Map<string, Map<string, ClaudeUsage>>();
   lastAgentText = "";
+  private readonly subagents = new Map<string, SubagentState>();
+  private readonly seenChildBlocks = new Set<string>();
+  /** Names and runtime agent ids a SendMessage may address, mapped to the Agent/Task tool_use id. */
+  private readonly agentAliases = new Map<string, string>();
+  /** Main-session SendMessage calls by tool_use id. */
+  private readonly sendMessages = new Map<string, SendMessageRecord>();
+  /** Sub-agent SendMessage calls still awaiting their result, by tool_use id. */
+  private readonly childSends = new Map<string, SendMessageRecord>();
+  /** Test seam for the clock. */
+  now = () => Date.now();
+
+  /** `agents` are this run's SDK agent definitions; the runner strips model and effort from
+   * Agent calls to them, so the definition, not the call input, is what the child runs with. */
+  constructor(private readonly agents: ClaudeAgentDefinitions = {}) {}
 
   /** Tool calls the user declined render as declined rather than failed. */
   markDeclined(toolUseId: string) {
@@ -93,8 +150,14 @@ export class ClaudeStreamMapper {
     const record = readObject(message);
     if (!record) return [];
     const type = readString(record.type);
-    // Subagent internals stay inside their Agent/Task card in this first version.
-    if (readString(record.parent_tool_use_id)) return [];
+    // Subagent frames never become main-thread items: their usage and a bounded,
+    // deduplicated activity feed are reported against the Agent/Task tool_use id.
+    const parentToolUseId = readString(record.parent_tool_use_id);
+    if (parentToolUseId) {
+      this.touchAgent(parentToolUseId);
+      if (type === "user") return this.handleSubagentUser(parentToolUseId, record);
+      return type === "assistant" ? this.handleSubagentAssistant(parentToolUseId, record) : [];
+    }
 
     if (type === "system") return this.handleSystem(record);
     if (type === "stream_event") return this.handleStreamEvent(record);
@@ -133,6 +196,9 @@ export class ClaudeStreamMapper {
       const toolUseId = readString(record.tool_use_id);
       if (toolUseId) this.markDeclined(toolUseId);
       return [];
+    }
+    if (subtype === "task_started" || subtype === "task_progress" || subtype === "task_notification") {
+      return this.handleTask(subtype, record);
     }
     if (subtype === "compact_boundary") {
       const metadata = readObject(record.compact_metadata);
@@ -221,12 +287,260 @@ export class ClaudeStreamMapper {
         const name = readString(block.name);
         if (!id || !name) continue;
         const tool: ToolState = { id, name, input: readObject(block.input) ?? {} };
+        const definition = (name === "Agent" || name === "Task") ? this.agents[readString(tool.input.subagent_type) ?? ""] : undefined;
+        if (definition) {
+          tool.actual = { model: definition.model, ...(definition.effort ? { effort: definition.effort } : {}) };
+          if (definition.prompt?.trim()) tool.actorContext = definition.prompt;
+        }
         this.tools.set(id, tool);
+        this.agentState(id);
+        if (name === "Agent" || name === "Task") {
+          const agentName = readString(tool.input.name)?.trim();
+          if (agentName) this.agentAliases.set(agentName, id);
+        }
+        if (name === "SendMessage") {
+          if (this.sendMessages.has(id)) continue;
+          const record = this.sendMessageRecord(id, tool.input, { kind: "main" });
+          this.sendMessages.set(id, record);
+          outputs.push({ kind: "item", item: sendMessageItem(record, "item.started") });
+          continue;
+        }
         const item = toolStartItem(tool);
         if (item) outputs.push({ kind: "item", item });
       }
     }
     return outputs;
+  }
+
+  /** State for a running Agent/Task call, created on first sign of life; null for any other tool id. */
+  private agentState(agentId: string): SubagentState | null {
+    const existing = this.subagents.get(agentId);
+    if (existing) return existing;
+    const name = this.tools.get(agentId)?.name;
+    if (name !== "Agent" && name !== "Task") return null;
+    const now = this.now();
+    const state: SubagentState = { seq: 0, startedAt: now, lastActivityAt: now, lastEmitAt: 0, lastProgressAt: 0, progressSignature: "", background: false, finished: false };
+    this.subagents.set(agentId, state);
+    return state;
+  }
+
+  private touchAgent(agentId: string) {
+    const state = this.agentState(agentId);
+    if (state && !state.finished) state.lastActivityAt = this.now();
+  }
+
+  private activity(agentId: string, kind: SubagentActivityPayload["kind"], extra: Partial<SubagentActivityPayload> = {}): ClaudeMapperOutput[] {
+    const state = this.agentState(agentId);
+    if (!state) return [];
+    const now = this.now();
+    state.seq += 1;
+    state.lastEmitAt = now;
+    const payload: SubagentActivityPayload = {
+      agentId, source: "claude", kind, at: new Date(now).toISOString(), seq: state.seq,
+      ...(state.taskId ? { taskId: state.taskId } : {}),
+      elapsedMs: Math.max(0, now - state.startedAt),
+      lastActivityAt: new Date(state.lastActivityAt).toISOString(),
+      ...extra
+    };
+    return [{ kind: "subagent_activity", payload }];
+  }
+
+  private childContentActivity(agentId: string, messageId: string | null, message: Record<string, unknown> | null): ClaudeMapperOutput[] {
+    const content = Array.isArray(message?.content) ? message.content : [];
+    const outputs: ClaudeMapperOutput[] = [];
+    content.forEach((rawBlock, index) => {
+      const block = readObject(rawBlock);
+      const type = readString(block?.type);
+      if (!block || (type !== "text" && type !== "tool_use")) return;
+      // One API response arrives as several frames that repeat earlier blocks.
+      const key = `${agentId}:${type === "tool_use" ? readString(block.id) ?? `${messageId}:${index}` : `${messageId}:${index}`}`;
+      if (this.seenChildBlocks.has(key)) return;
+      if (type === "text") {
+        const text = readString(block.text)?.trim();
+        if (!text) return;
+        this.rememberChildBlock(key);
+        outputs.push(...this.activity(agentId, "message", { text: text.slice(0, 2000) }));
+      } else {
+        this.rememberChildBlock(key);
+        const toolUseId = readString(block.id);
+        if (readString(block.name) === "SendMessage" && toolUseId && !this.childSends.has(toolUseId)) {
+          this.childSends.set(toolUseId, this.sendMessageRecord(toolUseId, readObject(block.input) ?? {}, { kind: "subagent", agentId }));
+        }
+        outputs.push(...this.activity(agentId, "tool", { toolName: readString(block.name) ?? undefined }));
+      }
+    });
+    return outputs;
+  }
+
+  private sendMessageRecord(toolUseId: string, input: Record<string, unknown>, sender: SendMessageRecord["sender"]): SendMessageRecord {
+    const to = readString(input.to)?.trim() || readString(input.recipient)?.trim() || "unknown";
+    const summary = readString(input.summary)?.trim();
+    const raw = readString(input.message) ?? (input.message !== undefined ? JSON.stringify(input.message) : "");
+    const clipped = clipSendMessageText(raw, SEND_MESSAGE_TEXT_MAX_CHARS);
+    const recipientAgentId = this.agentAliases.get(to) ?? (this.tools.has(to) ? to : undefined);
+    return {
+      toolUseId, sender, to,
+      ...(recipientAgentId ? { recipientAgentId } : {}),
+      ...(summary ? { summary: summary.slice(0, 500) } : {}),
+      message: clipped.text,
+      ...(clipped.omitted > 0 ? { messageTruncated: true as const, omittedMessageChars: clipped.omitted } : {}),
+      status: "pending",
+      at: new Date(this.now()).toISOString()
+    };
+  }
+
+  /** Settles a SendMessage from its tool_result; a JSON `success: false` result counts as failed. */
+  private settleSendMessage(record: SendMessageRecord, output: string, failed: boolean): SendMessageRecord {
+    const parsed = parseJsonObject(output);
+    const resumed = readString(parsed?.resumedAgentId);
+    const recipientAgentId = record.recipientAgentId ?? (resumed ? this.agentAliases.get(resumed) : undefined);
+    const resultSummary = output.trim() ? clipSendMessageText(output.trim(), SEND_MESSAGE_RESULT_MAX_CHARS).text : "";
+    return {
+      ...record,
+      ...(recipientAgentId ? { recipientAgentId } : {}),
+      status: failed || parsed?.success === false ? "failed" : "sent",
+      ...(resultSummary ? { resultSummary } : {}),
+      completedAt: new Date(this.now()).toISOString()
+    };
+  }
+
+  private handleSubagentUser(agentId: string, record: Record<string, unknown>): ClaudeMapperOutput[] {
+    const content = Array.isArray(readObject(record.message)?.content) ? readObject(record.message)!.content as unknown[] : [];
+    const outputs: ClaudeMapperOutput[] = [];
+    for (const rawBlock of content) {
+      const block = readObject(rawBlock);
+      const toolUseId = readString(block?.tool_use_id);
+      const pending = toolUseId ? this.childSends.get(toolUseId) : undefined;
+      if (readString(block?.type) !== "tool_result" || !toolUseId || !pending) continue;
+      this.childSends.delete(toolUseId);
+      const sendMessage = this.settleSendMessage(pending, toolResultText(block?.content), block?.is_error === true);
+      outputs.push(...this.activity(agentId, "send_message", { sendMessage }));
+    }
+    return outputs;
+  }
+
+  /** A sub-agent that ends before its SendMessage result arrives still reports the message, as pending. */
+  private flushChildSends(agentId: string): ClaudeMapperOutput[] {
+    const outputs: ClaudeMapperOutput[] = [];
+    for (const [toolUseId, pending] of this.childSends) {
+      if (pending.sender.kind !== "subagent" || pending.sender.agentId !== agentId) continue;
+      this.childSends.delete(toolUseId);
+      outputs.push(...this.activity(agentId, "send_message", { sendMessage: pending }));
+    }
+    return outputs;
+  }
+
+  private rememberChildBlock(key: string) {
+    this.seenChildBlocks.add(key);
+    if (this.seenChildBlocks.size > SUBAGENT_SEEN_MAX) {
+      const oldest = this.seenChildBlocks.values().next().value;
+      if (oldest !== undefined) this.seenChildBlocks.delete(oldest);
+    }
+  }
+
+  private handleTask(subtype: string, record: Record<string, unknown>): ClaudeMapperOutput[] {
+    const agentId = readString(record.tool_use_id);
+    if (!agentId) return [];
+    const state = this.agentState(agentId);
+    if (!state) return [];
+    const taskId = readString(record.task_id) ?? undefined;
+    if (taskId) state.taskId = taskId;
+    const description = readString(record.description) ?? undefined;
+    if (subtype === "task_started") {
+      if (record.is_backgrounded === true) state.background = true;
+      if (state.seq > 0 || state.finished) return [];
+      return this.activity(agentId, "started", { ...(description ? { description: description.slice(0, 500) } : {}) });
+    }
+    if (state.finished) return [];
+    state.lastActivityAt = this.now();
+    if (subtype === "task_progress") {
+      state.background = true;
+      const usage = readObject(record.usage);
+      const toolUses = readNumber(usage?.tool_uses);
+      const totalTokens = readNumber(usage?.total_tokens);
+      const toolName = readString(record.last_tool_name) ?? undefined;
+      const signature = `${toolUses ?? ""}|${toolName ?? ""}|${description ?? ""}`;
+      const now = this.now();
+      if (signature === state.progressSignature || now - state.lastProgressAt < SUBAGENT_PROGRESS_MIN_MS) return [];
+      state.progressSignature = signature;
+      state.lastProgressAt = now;
+      return this.activity(agentId, "progress", {
+        ...(description ? { description: description.slice(0, 500) } : {}),
+        ...(toolName ? { toolName } : {}),
+        ...(readString(record.summary) ? { text: (readString(record.summary) ?? "").slice(0, 2000) } : {}),
+        ...(toolUses !== null ? { toolUses } : {}),
+        ...(totalTokens !== null ? { totalTokens } : {})
+      });
+    }
+    // task_notification: the background task ended for good.
+    const rawStatus = readString(record.status);
+    const status = rawStatus === "failed" || rawStatus === "stopped" ? rawStatus : "completed";
+    return this.finishAgent(agentId, status, readString(record.summary) ?? undefined);
+  }
+
+  private finishAgent(agentId: string, status: "completed" | "failed" | "stopped", summary?: string): ClaudeMapperOutput[] {
+    const state = this.agentState(agentId);
+    const tool = this.tools.get(agentId);
+    if (!state || !tool || state.finished) return [];
+    const flushed = this.flushChildSends(agentId);
+    state.finished = true;
+    return [
+      ...flushed,
+      ...this.activity(agentId, "finished", { status, ...(summary ? { text: summary.slice(0, 2000) } : {}) }),
+      // The launch receipt completed the card once; close it for real so a live stream stops showing it as running.
+      { kind: "item", item: subagentItem(tool, "item.completed", status, summary) }
+    ];
+  }
+
+  /**
+   * Liveness beat for every running Agent/Task that has been quiet for `quietMs`.
+   * Beats stop once an agent shows no real sign of life for `stallMs`, so a hung agent does not
+   * keep the runner log moving forever; one last beat marks the point where it went quiet.
+   */
+  heartbeats(options: { quietMs: number; stallMs: number; processAlive: boolean; waiting?: "approval" | "input" }): ClaudeMapperOutput[] {
+    const now = this.now();
+    const outputs: ClaudeMapperOutput[] = [];
+    for (const [agentId, state] of this.subagents) {
+      if (state.finished || now - state.lastEmitAt < options.quietMs) continue;
+      const stalled = now - state.lastActivityAt >= options.stallMs;
+      if (stalled && state.lastEmitAt > state.lastActivityAt + options.stallMs) continue;
+      outputs.push(...this.activity(agentId, options.waiting ? "waiting" : "heartbeat", {
+        processAlive: options.processAlive,
+        ...(options.waiting ? { waiting: options.waiting } : {})
+      }));
+    }
+    return outputs;
+  }
+
+  private handleSubagentAssistant(agentId: string, record: Record<string, unknown>): ClaudeMapperOutput[] {
+    const message = readObject(record.message);
+    const messageId = readString(message?.id);
+    const usage = readUsage(message?.usage);
+    // The child's own API responses name the model it really runs on; refresh its card once it changes.
+    // Synthetic messages (e.g. "<synthetic>") are not API responses and name no real model.
+    const observedModel = readString(message?.model)?.startsWith("<") ? undefined : readString(message?.model);
+    const tool = this.tools.get(agentId);
+    const outputs: ClaudeMapperOutput[] = [];
+    // Once the task ended, a late frame must not reopen the finished card.
+    if (observedModel && tool && tool.actual?.model !== observedModel) {
+      tool.actual = { ...tool.actual, model: observedModel };
+      if (!this.subagents.get(agentId)?.finished) outputs.push({ kind: "item", item: subagentItem(tool, "item.updated", "inProgress") });
+    }
+    outputs.push(...this.childContentActivity(agentId, messageId, message));
+    if (!messageId || !usage) return outputs;
+    // One API response arrives as several frames (one per content block) that repeat its usage.
+    const messages = mapFor(this.subagentMessageUsage, agentId);
+    const previous = messages.get(messageId);
+    if (previous && JSON.stringify(previous) === JSON.stringify(usage)) return outputs;
+    messages.set(messageId, usage);
+    const total: ClaudeUsage = { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 };
+    for (const value of messages.values()) {
+      total.inputTokens += value.inputTokens;
+      total.outputTokens += value.outputTokens;
+      total.cacheReadInputTokens += value.cacheReadInputTokens;
+      total.cacheCreationInputTokens += value.cacheCreationInputTokens;
+    }
+    return [...outputs, { kind: "subagent_usage", agentId, tokenUsage: { last: subagentTokenCounts(usage), total: subagentTokenCounts(total) } }];
   }
 
   private handleUser(record: Record<string, unknown>): ClaudeMapperOutput[] {
@@ -239,6 +553,16 @@ export class ClaudeStreamMapper {
       const toolUseId = readString(block?.tool_use_id);
       const tool = toolUseId ? this.tools.get(toolUseId) : undefined;
       if (!tool) continue;
+      const sent = this.sendMessages.get(tool.id);
+      if (sent) {
+        if (sent.status !== "pending") continue;
+        const declined = this.declinedTools.has(tool.id);
+        const settled = this.settleSendMessage(sent, toolResultText(block?.content), declined || block?.is_error === true);
+        this.sendMessages.set(tool.id, settled);
+        outputs.push({ kind: "item", item: sendMessageItem(settled, "item.completed", declined) });
+        continue;
+      }
+      if (tool.name === "Agent" || tool.name === "Task") this.learnAgentId(tool.id, toolResultText(block?.content), readObject(record.tool_use_result));
       const item = toolCompletedItem(tool, {
         output: toolResultText(block?.content),
         isError: block?.is_error === true,
@@ -246,8 +570,31 @@ export class ClaudeStreamMapper {
         detail: readObject(record.tool_use_result)
       });
       if (item) outputs.push({ kind: "item", item });
+      outputs.push(...this.endForegroundAgent(tool.id, record, toolResultText(block?.content), block?.is_error === true));
     }
     return outputs;
+  }
+
+  /** The runtime agent id a later SendMessage addresses ("agentId: …" in the launch receipt or result). */
+  private learnAgentId(toolUseId: string, output: string, detail: Record<string, unknown> | null) {
+    const agentId = readString(detail?.agentId) ?? /\bagentId:\s*([A-Za-z0-9_-]+)/.exec(output)?.[1];
+    if (agentId) this.agentAliases.set(agentId, toolUseId);
+  }
+
+  /** A foreground Agent call ends with its tool_result; a background launch's result is only a receipt. */
+  private endForegroundAgent(agentId: string, record: Record<string, unknown>, output: string, isError: boolean): ClaudeMapperOutput[] {
+    const state = this.subagents.get(agentId);
+    if (!state || state.finished) return [];
+    const detail = readObject(record.tool_use_result);
+    const asyncLaunch = state.background || /async agent launched/i.test(output) ||
+      readString(detail?.status) === "async_launched" || detail?.isAsync === true;
+    if (asyncLaunch) {
+      state.background = true;
+      return [];
+    }
+    const flushed = this.flushChildSends(agentId);
+    state.finished = true;
+    return [...flushed, ...this.activity(agentId, "finished", { status: isError ? "failed" : "completed" })];
   }
 
   private handleResult(record: Record<string, unknown>): ClaudeMapperOutput {
@@ -268,7 +615,11 @@ export class ClaudeStreamMapper {
       costUsd: readNumber(record.total_cost_usd),
       sessionId: readString(record.session_id),
       durationMs: readNumber(record.duration_ms),
-      numTurns: readNumber(record.num_turns)
+      numTurns: readNumber(record.num_turns),
+      userMessageUuids: Array.isArray(record.user_message_uuids)
+        ? record.user_message_uuids.flatMap((value) => typeof value === "string" ? [value] : [])
+        : readString(record.user_message_uuid) ? [readString(record.user_message_uuid) as string] : [],
+      queuedTurnCount: readNumber(record.queued_turn_count)
     };
   }
 
@@ -382,6 +733,10 @@ function subagentItem(tool: ToolState, eventType: StreamItem["eventType"], statu
     ...(readString(tool.input.effort) || readString(tool.input.reasoning_effort)
       ? { reasoningEffort: readString(tool.input.effort) ?? readString(tool.input.reasoning_effort) ?? undefined }
       : {}),
+    ...(tool.actual?.model ? { actualModel: tool.actual.model } : {}),
+    ...(tool.actual?.effort ? { actualReasoningEffort: tool.actual.effort } : {}),
+    // Every emission carries it: a later card event replaces the earlier one.
+    ...(tool.actorContext ? { actorContext: tool.actorContext } : {}),
     agents: [{
       id: tool.id,
       name: readString(tool.input.subagent_type) ?? "agent",
@@ -389,6 +744,38 @@ function subagentItem(tool: ToolState, eventType: StreamItem["eventType"], statu
       ...(output?.trim() ? { message: clip(output.trim(), 4000) } : {})
     }]
   };
+}
+
+/** Main-session SendMessage card: a `subagent` item addressed to the recipient's Agent card when known. */
+function sendMessageItem(record: SendMessageRecord, eventType: StreamItem["eventType"], declined = false): StreamItem {
+  const status = declined ? "declined" : record.status === "pending" ? "inProgress" : record.status === "sent" ? "completed" : "failed";
+  return {
+    id: record.toolUseId,
+    eventType,
+    itemType: "subagent",
+    tool: "send_message",
+    status,
+    ...(record.summary ? { label: record.summary } : {}),
+    receiverThreadIds: record.recipientAgentId ? [record.recipientAgentId] : [],
+    prompt: record.message,
+    sendMessage: record,
+    agents: [{
+      id: record.recipientAgentId ?? record.to,
+      name: record.to,
+      status: status === "inProgress" ? "running" : status,
+      ...(record.resultSummary ? { message: record.resultSummary } : {})
+    }]
+  };
+}
+
+function parseJsonObject(text: string): Record<string, unknown> | null {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("{")) return null;
+  try {
+    return readObject(JSON.parse(trimmed));
+  } catch {
+    return null;
+  }
 }
 
 function fileChangesFromTool(tool: ToolState, detail: Record<string, unknown> | null): FileChange[] {
@@ -490,6 +877,13 @@ function readUsage(value: unknown): ClaudeUsage | null {
     cacheReadInputTokens: readNumber(usage.cache_read_input_tokens) ?? 0,
     cacheCreationInputTokens: readNumber(usage.cache_creation_input_tokens) ?? 0
   };
+}
+
+/** Same input convention as the turn's own Claude tokenIn: cache reads and writes are input. */
+function subagentTokenCounts(usage: ClaudeUsage): SubagentTokenCounts {
+  const inputTokens = usage.inputTokens + usage.cacheReadInputTokens + usage.cacheCreationInputTokens;
+  return { inputTokens, cachedInputTokens: usage.cacheReadInputTokens, outputTokens: usage.outputTokens,
+    totalTokens: inputTokens + usage.outputTokens };
 }
 
 function textItemId(messageId: string, kind: TextKind, ordinal: number) {

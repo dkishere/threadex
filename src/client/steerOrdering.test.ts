@@ -73,6 +73,29 @@ test("a later commentary item replaces its streamed plain text in place", () => 
   assert.deepEqual(segments.map((segment: any) => segment.id), ["live:note", "live:cmd"]);
 });
 
+test("restored root final answers stay as text so earlier answers survive reload", () => {
+  const liveCtx = {
+    liveItemKey: (item: any) => item.id,
+    liveItemForDisplay: (item: any) => item,
+    isDisplayableLiveItem: (item: any) => !(item.itemType === "agent_message" && item.phase === "final_answer")
+  };
+  const report = "| Service | Uncovered |\n| --- | --- |\n| UM | 14 |\n| CP | 12 |";
+  const segments = streamItemsToSegments({
+    liveItemKey: (item: any) => item.id,
+    appendTextSegment: (segments: any[], id: string, text: string) => [...segments, { id: `${id}:0`, sourceId: id, type: "text", text }],
+    normalizeMessageSegments: (segments: any[]) => segments,
+    upsertLiveSegment: (segments: any[], item: any) => upsertLiveSegment(liveCtx, segments, item)
+  }, [
+    { id: "child", itemType: "agent_message", eventType: "item.completed", phase: "final_answer", originThreadId: "child-thread", text: "Child report", comment: { detail: "Child report" } },
+    { id: "report", itemType: "agent_message", eventType: "item.completed", phase: "final_answer", originThreadId: "root-thread", text: report, comment: { detail: report } },
+    { id: "closure", itemType: "agent_message", eventType: "item.completed", phase: "final_answer", originThreadId: "root-thread", text: "The audit is complete.", comment: { detail: "The audit is complete." } }
+  ], "root-thread");
+  assert.deepEqual(segments.map((segment: any) => [segment.id, segment.text]), [
+    ["agent:report:0", report],
+    ["agent:closure:0", "The audit is complete."]
+  ]);
+});
+
 test("replacing streamed text with commentary also removes it from the reply text", () => {
   const liveCtx = { liveItemKey: (item: any) => item.id, liveItemForDisplay: (item: any) => item, isDisplayableLiveItem: () => true };
   const message = applyLiveItemToMessage({

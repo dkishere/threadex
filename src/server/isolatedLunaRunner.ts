@@ -36,6 +36,8 @@ export type IsolatedLunaRunnerOptions = {
   reasoningEffort: AgentCliReasoningEffort | "minimal";
   /** Omit for jobs that must be allowed to finish without a wall-clock limit. */
   timeoutMs?: number;
+  /** Measure silence between inbound events, with no total duration limit. */
+  idleTimeout?: boolean;
   /** Inbound activity and process lifecycle; excludes outbound auth/configuration. */
   onEvent?: (event: unknown) => void;
   sourceHomeCandidates: Array<string | null | undefined>;
@@ -62,7 +64,9 @@ export type IsolatedLunaRunnerOptions = {
 };
 
 export type IsolatedLunaRunOptions = {
+  onEvent?: (event: unknown) => void;
   model?: string;
+  outputSchema?: Record<string, unknown>;
   reasoningEffort?: AgentCliReasoningEffort | "minimal";
 };
 
@@ -97,6 +101,8 @@ export class IsolatedLunaRunner {
   private runInProgress = false;
   private stopped = false;
   private eventError: Error | null = null;
+  private runOnEvent: ((event: unknown) => void) | undefined;
+  private activityTimeouts = new Set<() => void>();
 
   constructor(private readonly options: IsolatedLunaRunnerOptions) {}
 
@@ -109,6 +115,7 @@ export class IsolatedLunaRunner {
       throw new Error(`${this.options.name} app-server received overlapping turns.`);
     }
     this.runInProgress = true;
+    this.runOnEvent = options.onEvent;
     try {
       try {
         return await this.runExclusive(input, options);
@@ -127,6 +134,7 @@ export class IsolatedLunaRunner {
         }
       }
     } finally {
+      this.runOnEvent = undefined;
       this.runInProgress = false;
     }
   }
@@ -150,6 +158,10 @@ export class IsolatedLunaRunner {
     const completion = new Promise<IsolatedLunaRunnerResult>((resolveTurn, rejectTurn) => {
       this.activeTurn = { threadId, responseText: "", usage: null, resolve: resolveTurn, reject: rejectTurn };
     });
+    // stop() can reject the turn while turn/start is still awaiting its ACK.
+    // The later await must still reject, but the RPC failure must not leave an
+    // unobserved rejected completion behind.
+    void completion.catch(() => {});
     let turnStarted = false;
 
     try {
@@ -161,14 +173,14 @@ export class IsolatedLunaRunner {
         summary: "none",
         // An empty list removes the execution environment; scratch jobs keep the default local one for shell.
         ...(this.options.scratchWrite || this.hasCliApprovals ? {} : { environments: [] }),
-        ...(this.options.outputSchema ? { outputSchema: this.options.outputSchema } : {}),
+        ...((options.outputSchema ?? this.options.outputSchema) ? { outputSchema: options.outputSchema ?? this.options.outputSchema } : {}),
         sandboxPolicy: this.options.scratchWrite && this.ephemeralWorkspace
           ? { type: "workspaceWrite", writableRoots: [this.ephemeralWorkspace], networkAccess: this.options.networkAccess === true, excludeTmpdirEnvVar: true, excludeSlashTmp: true }
           : { type: "readOnly", networkAccess: false },
         approvalPolicy: this.hasCliApprovals ? "on-request" : "never"
       });
       turnStarted = true;
-      return await withTimeout(completion, this.options.timeoutMs, `${this.options.name} turn timed out.`);
+      return await withTimeout(completion, this.options.timeoutMs, `${this.options.name} turn timed out.`, this.options.idleTimeout ? this.activityTimeouts : undefined);
     } finally {
       this.activeTurn = null;
       if (this.options.freshThreadPerRun && this.threadId === threadId) {
@@ -265,7 +277,7 @@ export class IsolatedLunaRunner {
       }
     });
 
-    this.options.onEvent?.({ method: "process.started", pid: child.pid });
+    this.emitEvent({ method: "process.started", pid: child.pid });
     await this.rpc("initialize", {
       clientInfo: { name: "threadex-isolated", title: "Threadex Isolated Agent", version: "0.1.0" },
       capabilities: { experimentalApi: true }
@@ -316,7 +328,7 @@ export class IsolatedLunaRunner {
       this.pending.set(id, { resolve: resolveRpc, reject: rejectRpc });
       this.send({ id, method, params });
     });
-    return withTimeout(request, this.options.timeoutMs, `${this.options.name} app-server ${method} timed out.`);
+    return withTimeout(request, this.options.timeoutMs, `${this.options.name} app-server ${method} timed out.`, this.options.idleTimeout ? this.activityTimeouts : undefined);
   }
 
   private notify(method: string, params: unknown) {
@@ -346,6 +358,7 @@ export class IsolatedLunaRunner {
     }
     const id = typeof message.id === "number" ? message.id : null;
     if (id !== null && this.pending.has(id)) {
+      if (!this.emitEvent({ method: "rpc.response", id })) return;
       const request = this.pending.get(id);
       this.pending.delete(id);
       if (!request) return;
@@ -355,6 +368,7 @@ export class IsolatedLunaRunner {
       return;
     }
     if (id !== null && typeof message.method === "string") {
+      if (!this.emitEvent(message)) return;
       if (["item/commandExecution/requestApproval", "execCommandApproval"].includes(message.method) && this.hasCliApprovals) {
         const command = readObject(message.params)?.command;
         const approved = this.approveInspector(command) || Boolean(this.options.browserBridgeCli &&
@@ -367,11 +381,12 @@ export class IsolatedLunaRunner {
       this.send({ id, error: { code: -32601, message: "Tools are disabled for isolated Luna runners." } });
       return;
     }
-    if (typeof message.method !== "string" || !this.activeTurn) return;
+    if (typeof message.method !== "string") return;
     const params = readObject(message.params);
     const notificationThreadId = readString(params?.threadId) ?? readString(readObject(params?.thread)?.id);
-    if (notificationThreadId && notificationThreadId !== this.activeTurn.threadId) return;
+    if (this.activeTurn && notificationThreadId && notificationThreadId !== this.activeTurn.threadId) return;
     if (!this.emitEvent(message)) return;
+    if (!this.activeTurn) return;
 
     if (message.method === "item/completed") {
       const item = readObject(params?.item);
@@ -406,7 +421,12 @@ export class IsolatedLunaRunner {
   }
 
   private emitEvent(event: unknown) {
-    try { this.options.onEvent?.(event); return true; }
+    try {
+      for (const reset of this.activityTimeouts) reset();
+      this.options.onEvent?.(event);
+      this.runOnEvent?.(event);
+      return true;
+    }
     catch (error) {
       this.eventError = error instanceof Error ? error : new Error(String(error));
       this.fail(this.eventError); return false;
@@ -557,24 +577,24 @@ function finalAgentMessageFromTurn(turn: Record<string, unknown> | null) {
   return "";
 }
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number | undefined, message: string) {
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number | undefined, message: string, activity?: Set<() => void>) {
   if (!Number.isFinite(timeoutMs) || !timeoutMs || timeoutMs <= 0) {
     return promise;
   }
   let timer: NodeJS.Timeout | null = null;
+  let reset: () => void;
   return new Promise<T>((resolvePromise, rejectPromise) => {
-    timer = setTimeout(() => rejectPromise(new Error(message)), timeoutMs);
-    timer.unref();
-    promise.then(
-      (value) => {
-        if (timer) clearTimeout(timer);
-        resolvePromise(value);
-      },
-      (error) => {
-        if (timer) clearTimeout(timer);
-        rejectPromise(error);
-      }
-    );
+    reset = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => rejectPromise(new Error(message)), timeoutMs);
+      timer.unref();
+    };
+    activity?.add(reset);
+    reset();
+    promise.then(resolvePromise, rejectPromise);
+  }).finally(() => {
+    if (timer) clearTimeout(timer);
+    activity?.delete(reset);
   });
 }
 import { inspectorApprovalGate, inspectorInstructions, type InspectorCliConfig } from "./sessionInspectorCommand";

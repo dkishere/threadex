@@ -4,8 +4,10 @@ import { USER_INPUT_METHOD } from "../userInputRequest";
 import { managedModeTurnInstructions } from "../managedMode";
 import { inspectorCommand } from "./sessionInspectorCommand";
 import { withProviderHandoff } from "./sessionProviderThreads";
+import { REPLY_LANGUAGE_INSTRUCTIONS } from "./replyLanguage";
 import {
   buildClaudeUserMessage,
+  claudeSystemPromptAppend,
   claudeEffort,
   claudeEnvironment,
   claudePermissionFallback,
@@ -90,16 +92,16 @@ test("Claude resume receives current Managed state after an enabled turn", async
     const seen: { options?: any; prompts: any[] } = { prompts: [] };
     const { ctx } = context({
       threadId: enabled ? null : "claude:claude-123",
-      appendSystemPrompt: managedModeTurnInstructions(enabled, enabled ? "on" : "off")
+      appendSystemPrompt: managedModeTurnInstructions(enabled, enabled ? "on" : "off") ?? "base prompt"
     });
     await runClaudeTurn(ctx, fakeSdk(async function* () {
       yield init;
       yield success("Done");
     }, seen));
-    assert.match(seen.options.systemPrompt.append, enabled ? /Managed mode: ON/ : /Managed mode: OFF/);
-    if (!enabled) {
+    if (enabled) assert.match(seen.options.systemPrompt.append, /Managed mode: ON/);
+    else {
       assert.equal(seen.options.resume, "claude-123");
-      assert.match(seen.options.systemPrompt.append, /supersedes Managed mode policies/);
+      assert.doesNotMatch(seen.options.systemPrompt.append, /Managed mode/);
     }
   }
 });
@@ -218,6 +220,37 @@ test("auto approvals cannot bypass the workspace through file tools or unsandbox
   assert.equal(seen.options!.sandbox.failIfUnavailable, true);
 });
 
+test("native split children run as fixed actor agents and every actor call carries its caller's own credential", async () => {
+  const seen: { options?: Record<string, any>; prompts: any[] } = { prompts: [] };
+  const credentials = { main: "a".repeat(64), toolNames: ["actor_read_memory"], children: { actor_ui_123456: { workItemId: "ui-work", capability: "b".repeat(64) } } };
+  const agents = { actor_ui_123456: { description: "Domain actor UI", prompt: "You are domain actor UI", model: "claude-sonnet-5-5", effort: "high" } };
+  const call = (input: object) => `${inspectorCommand} actor_read_memory '${JSON.stringify(input)}'`;
+  const injected = (output: any) => JSON.parse(output.hookSpecificOutput.updatedInput.command.match(/actor_read_memory' '(.*)'$/)[1]);
+  await runClaudeTurn(context({ actorCredentials: credentials, agents, approvedInspectorCommands: ["actor_read_memory"] }).ctx,
+    fakeSdk(async function* () {
+      yield init;
+      const hook = seen.options!.hooks.PreToolUse[0].hooks[0];
+      const main = await hook({ tool_name: "Bash", tool_input: { command: call({ field: "rolePrompt", _actorCredential: "forged" }) } });
+      assert.equal(main.hookSpecificOutput.permissionDecision, "allow");
+      assert.deepEqual(injected(main), { field: "rolePrompt", _actorCredential: "a".repeat(64) }, "a forged credential is replaced");
+      const child = await hook({ tool_name: "Bash", agent_id: "agent-1", agent_type: "actor_ui_123456", tool_input: { command: call({ field: "rolePrompt" }) } });
+      assert.deepEqual(injected(child), { field: "rolePrompt", _actorCredential: "b".repeat(64), _actorWorkItem: "ui-work" });
+      const helper = await hook({ tool_name: "Bash", agent_id: "agent-2", agent_type: "general-purpose", tool_input: { command: call({ field: "rolePrompt" }) } });
+      assert.deepEqual(injected(helper), { field: "rolePrompt", _actorCredential: "a".repeat(64) }, "non-actor helpers keep the session actor");
+      const spawn = await hook({ tool_name: "Agent", tool_input: { subagent_type: "actor_ui_123456", prompt: "Build the form", description: "UI", model: "opus", effort: "max", isolation: "worktree", run_in_background: true, name: "ui" } });
+      assert.deepEqual(spawn.hookSpecificOutput.updatedInput, { subagent_type: "actor_ui_123456", prompt: "Build the form", description: "UI", run_in_background: false });
+      const rework = await hook({ tool_name: "SendMessage", tool_input: { to: "actor_ui_123456", message: "Fix the label" } });
+      assert.equal(rework.hookSpecificOutput.permissionDecision, "deny");
+      assert.match(rework.hookSpecificOutput.permissionDecisionReason, /start the same subagent_type again/);
+      assert.deepEqual(await hook({ tool_name: "SendMessage", tool_input: { to: "helper", message: "hi" } }), {}, "messages to non-actor helpers are untouched");
+      const nested = await hook({ tool_name: "Agent", agent_id: "agent-1", agent_type: "actor_ui_123456", tool_input: { subagent_type: "actor_ui_123456", prompt: "again" } });
+      assert.equal(nested.hookSpecificOutput.permissionDecision, "deny");
+      assert.deepEqual(await hook({ tool_name: "Bash", tool_input: { command: "ls" } }), {}, "ordinary tools are untouched");
+      yield success("ok");
+    }, seen));
+  assert.deepEqual(seen.options!.agents, { actor_ui_123456: { description: "Domain actor UI", prompt: "You are domain actor UI", model: "claude-sonnet-5-5", effort: "high" } });
+});
+
 test("boundary escalation asks once for the exact action and respects a denial", async () => {
   const seen: { options?: Record<string, any>; prompts: any[] } = { prompts: [] };
   const calls: any[] = [];
@@ -312,7 +345,7 @@ test("a turn streams items, routes Bash approval and publishes the result", asyn
   assert.equal(seen.options?.model, "claude-opus-5-5");
   assert.equal(seen.options?.effort, "high");
   assert.equal(seen.options?.resume, undefined);
-  assert.deepEqual(seen.options?.systemPrompt, { type: "preset", preset: "claude_code", append: "Threadex rules" });
+  assert.deepEqual(seen.options?.systemPrompt, { type: "preset", preset: "claude_code", append: `Threadex rules\n\n${REPLY_LANGUAGE_INSTRUCTIONS}` });
   assert.equal(approvals[0].method, "item/commandExecution/requestApproval");
   assert.equal(approvals[0].params.command, "npm test");
   assert.equal(approvals[0].params.cwd, "/repo");
@@ -400,6 +433,37 @@ test("missing Claude native session falls back once with full saved history; aut
   }
 });
 
+test("every Claude query carries the reply-language rule exactly once", async () => {
+  const count = (append: unknown) => String(append).split(REPLY_LANGUAGE_INSTRUCTIONS).length - 1;
+  // New and resumed turns.
+  for (const threadId of [null, "claude:claude-123"]) {
+    const seen: { options?: any; prompts: any[] } = { prompts: [] };
+    const { ctx } = context({ threadId, input: [{ type: "text", text: "幫我修呢個 bug" }] });
+    await runClaudeTurn(ctx, fakeSdk(async function* () { yield init; yield success("搞掂"); }, seen));
+    assert.equal(seen.options.resume, threadId ? "claude-123" : undefined);
+    assert.equal(seen.options.systemPrompt.preset, "claude_code");
+    assert.equal(count(seen.options.systemPrompt.append), 1, `threadId=${threadId}`);
+    assert.match(seen.options.systemPrompt.append, /^Threadex rules/);
+  }
+  // A missing native session retries without resume; the rule is not stacked.
+  const queries: any[] = [];
+  const sdk: SdkModule = { query: ({ prompt, options }) => (async function* () {
+    for await (const _input of prompt) {
+      queries.push(options);
+      if (options.resume) throw new Error("No conversation found with session ID: original");
+      yield init;
+      yield success("recovered");
+    }
+  })() };
+  const { ctx } = context({ threadId: "claude:original", recoveryInput: [{ type: "text", text: "history" }] });
+  await runClaudeTurn(ctx, sdk);
+  assert.equal(queries.length, 2);
+  for (const options of queries) assert.equal(count((options.systemPrompt as any).append), 1);
+  // Caller-supplied copies and empty prompts stay single.
+  assert.equal(claudeSystemPromptAppend(`base\n\n${REPLY_LANGUAGE_INSTRUCTIONS}`), `base\n\n${REPLY_LANGUAGE_INSTRUCTIONS}`);
+  assert.equal(claudeSystemPromptAppend(""), REPLY_LANGUAGE_INSTRUCTIONS);
+});
+
 test("declined edits deny the tool and plan-mode turns refuse mutation", async () => {
   const outcomes: any[] = [];
   const sdk = fakeSdk(async function* (_user, _turn, canUseTool) {
@@ -474,6 +538,155 @@ test("steer commands join the running Claude session", async () => {
   assert.equal(emitted.find((entry) => entry.event === "result")?.data.reply, "Docs updated.");
 });
 
+test("a steer folded into the running turn ends the turn at its single result", async () => {
+  let pending: ClaudeSteerCommand[] = [];
+  const prompts: any[] = [];
+  const sdk: SdkModule = {
+    query: ({ prompt }) => Object.assign((async function* () {
+      const inbox = prompt[Symbol.asyncIterator]();
+      prompts.push((await inbox.next()).value);
+      yield init;
+      pending = [{ id: "steer-1", message: "cc only", buildInput: () => [{ type: "text", text: "cc only" }] }];
+      // The CLI takes the queued steer between tool rounds; no second result follows.
+      prompts.push((await inbox.next()).value);
+      yield { type: "assistant", message: { id: "m-final", content: [{ type: "text", text: "Claude Code only." }] } };
+      yield { ...success("Claude Code only."), user_message_uuids: prompts.map((user) => user.uuid), queued_turn_count: 0 };
+      yield { type: "prompt_suggestion", suggestion: "Run the tests", uuid: "s1", session_id: "claude-123" };
+      // Like the CLI, keep waiting for input until the runner closes the inbox.
+      if (!(await inbox.next()).done) throw new Error("unexpected extra prompt");
+    })(), { close() {} })
+  };
+  const { ctx, emitted, steerResults } = context({ pendingSteerCommands: () => pending });
+  await runClaudeTurn(ctx, sdk);
+  assert.equal(prompts.length, 2);
+  assert.ok(prompts.every((user) => typeof user.uuid === "string"));
+  assert.deepEqual(steerResults.map((result) => result.ok), [true]);
+  const result = emitted.find((entry) => entry.event === "result");
+  assert.equal(result?.data.reply, "Claude Code only.");
+  assert.equal(result?.data.promptSuggestion, "Run the tests");
+  assert.equal(emitted.at(-1)?.event, "done");
+});
+
+test("an empty CLI queue ends the turn when the result echoes no uuids", async () => {
+  let pending: ClaudeSteerCommand[] = [];
+  let prompts = 0;
+  const logs: Array<{ event: string; data: any }> = [];
+  const sdk: SdkModule = {
+    query: ({ prompt }) => Object.assign((async function* () {
+      const inbox = prompt[Symbol.asyncIterator]();
+      await inbox.next();
+      prompts += 1;
+      yield init;
+      pending = [{ id: "steer-1", message: "cc only", buildInput: () => [{ type: "text", text: "cc only" }] }];
+      await inbox.next();
+      prompts += 1;
+      yield { ...success("Folded."), queued_turn_count: 0 };
+      if (!(await inbox.next()).done) throw new Error("unexpected extra prompt");
+    })(), { close() {} })
+  };
+  const { ctx, emitted } = context({ pendingSteerCommands: () => pending,
+    appendInternalLog: (event, data) => { logs.push({ event, data }); } });
+  await runClaudeTurn(ctx, sdk);
+  assert.equal(prompts, 2);
+  assert.equal(emitted.find((entry) => entry.event === "result")?.data.reply, "Folded.");
+  assert.equal(emitted.at(-1)?.event, "done");
+  assert.equal(logs.find((entry) => entry.event === "claude.result")?.data.clearedByEmptyQueue, 1);
+  assert.equal(logs.some((entry) => entry.event === "claude.closed_after_result"), false);
+});
+
+test("a stream left open after the final result is closed after the grace period", async () => {
+  let closed = false;
+  const logs: string[] = [];
+  const sdk: SdkModule = {
+    query: ({ prompt }) => Object.assign((async function* () {
+      const user: any = (await prompt[Symbol.asyncIterator]().next()).value;
+      yield init;
+      yield { ...success("Done."), user_message_uuids: [user.uuid] };
+      yield { type: "prompt_suggestion", suggestion: "Next", uuid: "s1", session_id: "claude-123" };
+      // Background work holding the CLI open; close() never settles this read.
+      await new Promise(() => undefined);
+    })(), { close() { closed = true; } })
+  };
+  const { ctx, emitted } = context({ resultGraceMs: 20, appendInternalLog: (event) => { logs.push(event); } });
+  await runClaudeTurn(ctx, sdk);
+  assert.equal(closed, true);
+  assert.ok(logs.includes("claude.closed_after_result"));
+  assert.equal(emitted.some((entry) => entry.event === "error"), false);
+  assert.equal(emitted.find((entry) => entry.event === "result")?.data.promptSuggestion, "Next");
+  assert.equal(emitted.at(-1)?.event, "done");
+});
+
+const backgroundTasks = (...ids: string[]) => ({ type: "system", subtype: "background_tasks_changed",
+  tasks: ids.map((task_id) => ({ task_id, task_type: "local_agent", description: task_id })), uuid: "b", session_id: "claude-123" });
+
+test("live background tasks keep the CLI open until their completion is answered", async () => {
+  let closed = false;
+  let inboxOpenAtCompletion = false;
+  let inboxDone = false;
+  const logs: string[] = [];
+  const sdk: SdkModule = {
+    query: ({ prompt }) => Object.assign((async function* () {
+      const inbox = prompt[Symbol.asyncIterator]();
+      const user: any = (await inbox.next()).value;
+      void inbox.next().then((next) => { inboxDone = Boolean(next.done); });
+      yield init;
+      yield backgroundTasks("worker-1", "worker-2");
+      yield { ...success("Workers are running in the background."), user_message_uuids: [user.uuid] };
+      // Longer than the result grace: the old runner closed the CLI here and killed the workers.
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      inboxOpenAtCompletion = !inboxDone;
+      yield { ...backgroundTasks("worker-1", "worker-2"), tasks: [{ task_id: "watch", task_type: "monitor", description: "w", ambient: true }] };
+      yield success("Both workers finished.");
+    })(), { close() { closed = true; } })
+  };
+  const { ctx, emitted } = context({ resultGraceMs: 20, backgroundHeartbeatMs: 10, appendInternalLog: (event) => { logs.push(event); } });
+  await runClaudeTurn(ctx, sdk);
+  assert.equal(inboxOpenAtCompletion, true);
+  assert.equal(closed, false);
+  assert.ok(logs.includes("claude.awaiting_background_tasks"));
+  assert.ok(logs.includes("claude.background_tasks_heartbeat"));
+  assert.equal(logs.includes("claude.closed_after_result"), false);
+  assert.match(emitted.find((entry) => entry.event === "result")?.data.reply ?? "", /Both workers finished/);
+  assert.equal(emitted.at(-1)?.event, "done");
+});
+
+test("the turn finishes after the grace period when emptied background tasks get no reply", async () => {
+  const logs: string[] = [];
+  const sdk: SdkModule = {
+    query: ({ prompt }) => Object.assign((async function* () {
+      const user: any = (await prompt[Symbol.asyncIterator]().next()).value;
+      yield init;
+      yield backgroundTasks("shell-1");
+      yield { ...success("Started."), user_message_uuids: [user.uuid] };
+      yield backgroundTasks();
+      await new Promise(() => undefined);
+    })(), { close() {} })
+  };
+  const { ctx, emitted } = context({ resultGraceMs: 20, appendInternalLog: (event) => { logs.push(event); } });
+  await runClaudeTurn(ctx, sdk);
+  assert.ok(logs.includes("claude.closed_after_result"));
+  assert.equal(emitted.at(-1)?.event, "done");
+});
+
+test("background tasks that outlive the wait cap are closed with the CLI", async () => {
+  let closed = false;
+  const logs: string[] = [];
+  const sdk: SdkModule = {
+    query: ({ prompt }) => Object.assign((async function* () {
+      const user: any = (await prompt[Symbol.asyncIterator]().next()).value;
+      yield init;
+      yield backgroundTasks("dev-server");
+      yield { ...success("Server started."), user_message_uuids: [user.uuid] };
+      await new Promise(() => undefined);
+    })(), { close() { closed = true; } })
+  };
+  const { ctx, emitted } = context({ resultGraceMs: 20, backgroundWaitMaxMs: 40, appendInternalLog: (event) => { logs.push(event); } });
+  await runClaudeTurn(ctx, sdk);
+  assert.equal(closed, true);
+  assert.ok(logs.indexOf("claude.background_wait_expired") < logs.indexOf("claude.closed_after_result"));
+  assert.equal(emitted.at(-1)?.event, "done");
+});
+
 for (const limitMessage of [
   { type: "rate_limit_event", rate_limit_info: { status: "rejected" } },
   { type: "assistant", error: "rate_limit", message: { content: [{ type: "text", text: "Limit reached" }] } }
@@ -530,5 +743,38 @@ test("plan limits become a pending turn and update the Claude account", async ()
   assert.match(pending?.data.message, /Claude plan limit reached for Work; it resets at 2026-10-13T15:00:00Z/);
   assert.equal(emitted.some((entry) => entry.event === "error"), false);
   assert.deepEqual(reports.map((report) => [report.kind, report.info.status]), [["rate_limit", "rejected"]]);
+  assert.equal(emitted.at(-1)?.event, "done");
+});
+
+test("a quiet running subagent emits heartbeats while the turn waits, then stops once it stalls", async () => {
+  const sdk: SdkModule = {
+    query: ({ prompt }) => Object.assign((async function* () {
+      const user: any = (await prompt[Symbol.asyncIterator]().next()).value;
+      yield init;
+      yield { type: "assistant", message: { id: "m1", content: [{ type: "tool_use", id: "toolu_agent", name: "Agent", input: { description: "d", subagent_type: "general-purpose", prompt: "p" } }] } };
+      yield { type: "assistant", parent_tool_use_id: "toolu_agent", message: { id: "c1", content: [{ type: "text", text: "working" }] } };
+      yield { type: "system", subtype: "task_progress", task_id: "a1", tool_use_id: "toolu_agent", description: "d", usage: { total_tokens: 1, tool_uses: 1, duration_ms: 1 } };
+      yield backgroundTasks("a1");
+      yield { ...success("Started."), user_message_uuids: [user.uuid] };
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      yield { type: "system", subtype: "task_notification", task_id: "a1", tool_use_id: "toolu_agent", status: "completed", summary: "done" };
+      yield backgroundTasks();
+      yield success("Finished.");
+    })(), { close() {} })
+  };
+  const { ctx, emitted } = context({ resultGraceMs: 20, subagentHeartbeatMs: 20, subagentStallMs: 150 });
+  await runClaudeTurn(ctx, sdk);
+  const activity = emitted.filter((entry) => entry.event === "subagent_activity").map((entry) => entry.data as any);
+  const kinds = activity.map((entry) => entry.kind);
+  assert.ok(kinds.includes("message"));
+  assert.ok(kinds.includes("progress"));
+  const beats = activity.filter((entry) => entry.kind === "heartbeat");
+  assert.ok(beats.length >= 2, `expected heartbeats, got ${kinds.join()}`);
+  assert.ok(beats.length < 12, "heartbeats must stop after the stall window");
+  assert.equal(beats.every((entry) => entry.agentId === "toolu_agent" && entry.processAlive === true), true);
+  assert.equal(kinds.at(-1), "finished");
+  const seqs = activity.map((entry) => entry.seq);
+  assert.deepEqual([...seqs].sort((a, b) => a - b), seqs.slice().sort((a, b) => a - b));
+  assert.equal(new Set(seqs).size, seqs.length);
   assert.equal(emitted.at(-1)?.event, "done");
 });

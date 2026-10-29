@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
@@ -46,7 +46,7 @@ test("injects all built-in skills into every workspace codex home", () => {
   const root = mkdtempSync(resolve(tmpdir(), "session-builtins-test-"));
   const sourceRoot = resolve(root, "source-skills");
   const workspaceHomes = [resolve(root, "workspace-one"), resolve(root, "workspace-two")];
-  for (const [name, description] of [["session-inspector", "session"], ["browser-bridge", "browser"], ["threadex-config", "config"], ["threadex-author", "provenance"]]) {
+  for (const [name, description] of [["session-inspector", "session"], ["browser-bridge", "browser"], ["threadex-config", "config"], ["threadex-author", "provenance"], ["threadex-concurrent", "concurrent"], ["threadex-pr-review", "review"]]) {
     const sourceSkill = resolve(sourceRoot, name);
     mkdirSync(sourceSkill, { recursive: true });
     writeFileSync(resolve(sourceSkill, "SKILL.md"), `---\nname: ${name}\ndescription: ${description}\n---\n`, "utf8");
@@ -61,11 +61,16 @@ test("injects all built-in skills into every workspace codex home", () => {
     updated: ""
   }));
 
+  mkdirSync(resolve(workspaceHomes[0], "skills"), { recursive: true });
+  symlinkSync(resolve(sourceRoot, "threadex-actors"), resolve(workspaceHomes[0], "skills", "threadex-actors"), "dir");
+  mkdirSync(resolve(workspaceHomes[1], "skills", "threadex-actors"), { recursive: true });
   const destinations = injectBuiltinSkillsForWorkspaces(workspaces, sourceRoot);
+  assert.throws(() => lstatSync(resolve(workspaceHomes[0], "skills", "threadex-actors")), { code: "ENOENT" });
+  assert.equal(lstatSync(resolve(workspaceHomes[1], "skills", "threadex-actors")).isDirectory(), true);
 
-  assert.equal(destinations.length, workspaceHomes.length * 4);
+  assert.equal(destinations.length, workspaceHomes.length * 6);
   for (const codexHome of workspaceHomes) {
-    for (const name of ["session-inspector", "browser-bridge", "threadex-config", "threadex-author"]) {
+    for (const name of ["session-inspector", "browser-bridge", "threadex-config", "threadex-author", "threadex-concurrent", "threadex-pr-review"]) {
       assert.equal(lstatSync(resolve(codexHome, "skills", name)).isSymbolicLink(), true);
       assert.equal(resolve(codexHome, "skills", readlinkSync(resolve(codexHome, "skills", name))), resolve(sourceRoot, name));
       assert.equal(readFileSync(resolve(codexHome, "skills", name, "SKILL.md"), "utf8").includes(`name: ${name}`), true);

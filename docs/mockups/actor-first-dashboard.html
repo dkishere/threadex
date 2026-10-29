@@ -1,0 +1,569 @@
+<!doctype html>
+<html lang="zh-Hant-HK">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Concept · Actor-first Manager dashboard</title>
+<!--
+  CONCEPT MOCKUP — static HTML, not the implemented interface.
+  Data is illustrative. Field names map to existing types:
+  ActorSummaryEntry (counts.open, counts.attention, running, unreadConclusions),
+  DomainActor.memory.roleSummary, ActorWorkItem.status, WorkspaceManagerTask
+  (runningSince, turnNumber, updatedFiles, currentTurnLines, sessionLines,
+  runningModel, contextPercent, requestPrompt, queuedPrompts, comments, sessionLoopEnabled).
+-->
+<style>
+  :root {
+    --bg: #f5f6fa; --panel: #fff; --line: #e6e8ef; --line-soft: #eef0f5;
+    --ink: #0f172a; --ink-2: #334155; --muted: #64748b; --faint: #94a3b8;
+    --accent: #2563eb; --accent-soft: #eff4ff;
+    --attn: #b45309; --attn-soft: #fff7ea; --attn-line: #fde3b5;
+    --ok: #047857; --ok-soft: #ecfdf5; --stop: #dc2626;
+    --radius: 14px; --shadow: 0 1px 2px rgb(15 23 42 / .04), 0 4px 16px rgb(15 23 42 / .04);
+    --font: ui-sans-serif, -apple-system, "SF Pro Text", Inter, "PingFang HK", "Noto Sans HK", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #e9ebf1; color: var(--ink); font: 13px/1.45 var(--font); -webkit-font-smoothing: antialiased; }
+  svg.i { width: 15px; height: 15px; flex: none; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  button { font: inherit; color: inherit; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+
+  /* ---------- Mockup chrome (not part of the product) ---------- */
+  .mock-bar { position: sticky; top: 0; z-index: 50; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; padding: 10px 20px; background: #111827; color: #e5e7eb; font-size: 12px; }
+  .mock-bar strong { color: #fbbf24; letter-spacing: .02em; }
+  .mock-bar fieldset { display: flex; gap: 4px; margin: 0; padding: 0; border: 0; align-items: center; }
+  .mock-bar legend { float: left; margin-right: 6px; color: #9ca3af; }
+  .mock-bar button { padding: 4px 10px; border: 1px solid #374151; border-radius: 999px; background: transparent; color: #d1d5db; cursor: pointer; }
+  .mock-bar button[aria-pressed="true"] { background: #f9fafb; color: #111827; border-color: #f9fafb; }
+  .stage { display: grid; justify-items: center; padding: 24px 20px 8px; }
+
+  /* ---------- App frame ---------- */
+  .app { display: grid; grid-template-columns: 56px minmax(340px, .95fr) minmax(400px, 1.15fr); width: min(1440px, 100%); height: 820px; overflow: hidden; border-radius: 16px; background: var(--panel); box-shadow: 0 20px 60px rgb(15 23 42 / .18); }
+  .rail { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 14px 0; background: #f8fafc; border-right: 1px solid var(--line); }
+  .rail span { width: 30px; height: 30px; border-radius: 9px; background: #e2e8f0; }
+  .rail span:first-child { background: #0f172a; }
+  .tabs { display: none; }
+
+  /* ---------- Middle: chat ---------- */
+  .chat { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; min-width: 0; border-right: 1px solid var(--line); }
+  .chat-head { display: flex; align-items: baseline; gap: 8px; padding: 16px 22px 12px; border-bottom: 1px solid var(--line-soft); }
+  .chat-head h1 { margin: 0; font-size: 15px; font-weight: 650; }
+  .chat-head span { color: var(--faint); font-size: 12px; }
+  .msgs { display: flex; flex-direction: column; gap: 18px; padding: 20px 22px; overflow: auto; }
+  .user-msg { align-self: flex-end; max-width: 82%; padding: 10px 14px; border-radius: 14px 14px 4px 14px; background: #f1f5f9; color: var(--ink-2); }
+  .reply { display: grid; grid-template-columns: 36px 1fr; gap: 10px; }
+  .reply-who { display: flex; align-items: baseline; gap: 6px; margin-bottom: 3px; }
+  .reply-who b { font-weight: 650; }
+  .reply-who small { color: var(--muted); }
+  .reply-who em { margin-left: 4px; padding: 0 7px; border-radius: 999px; background: #f1f5f9; color: var(--muted); font-size: 11px; font-style: normal; }
+  .reply p { margin: 0; color: var(--ink-2); }
+  .claim { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line); color: var(--muted); font-size: 12px; }
+  .claim-label { display: inline-flex; align-items: center; gap: 5px; color: var(--ink-2); font-weight: 600; }
+  .claim-label::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+  .task-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 5px 10px 5px 8px; border: 1px solid var(--line); border-radius: 999px; background: #fff; cursor: pointer; font-size: 12px; }
+  .task-chip:hover { border-color: #c7d2fe; background: var(--accent-soft); }
+  .task-chip[aria-current="true"] { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+  .composer { margin: 0 16px 16px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 14px; color: var(--faint); box-shadow: var(--shadow); }
+
+  /* Avatar (matches DomainActorIdentity bot avatar: dark 12px-radius tile) */
+  .av { display: inline-grid; place-items: center; width: 36px; height: 36px; border-radius: 12px; background: #24262c; border: 1px solid #3a3d45; flex: none; }
+  .av svg { width: 22px; height: 22px; }
+  .av.sm { width: 22px; height: 22px; border-radius: 7px; }
+  .av.sm svg { width: 14px; height: 14px; }
+  .av.lg { width: 40px; height: 40px; border-radius: 13px; }
+
+  /* ---------- Right: dashboard ---------- */
+  .side { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg); }
+  .dash { display: flex; flex-direction: column; min-height: 0; overflow: auto; }
+  .dash-head { position: sticky; top: 0; z-index: 3; display: grid; grid-template-columns: 1fr auto; gap: 10px; padding: 16px 20px 14px; background: rgb(245 246 250 / .92); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line-soft); }
+  .dash-head h2 { margin: 0; font-size: 15px; font-weight: 650; }
+  .pulse { display: flex; flex-wrap: wrap; gap: 6px; grid-column: 1 / -1; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border-radius: 999px; background: #fff; border: 1px solid var(--line); color: var(--ink-2); font-size: 12px; }
+  .pill i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+  .pill.attn { background: var(--attn-soft); border-color: var(--attn-line); color: var(--attn); }
+  .pill.attn i { background: #f59e0b; }
+  .pill.ok i { background: #10b981; }
+  .spark { display: flex; align-items: center; gap: 6px; color: var(--faint); font-size: 11px; }
+  .spark svg { width: 96px; height: 22px; }
+
+  .actors { display: flex; flex-direction: column; gap: 12px; padding: 16px 20px 24px; }
+  .actor { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); box-shadow: var(--shadow); }
+  .actor[data-attn] { border-color: var(--attn-line); box-shadow: 0 0 0 3px rgb(251 191 36 / .12), var(--shadow); }
+  .actor-head { display: grid; grid-template-columns: auto 1fr auto; gap: 12px; align-items: center; padding: 14px 16px 12px; }
+  .actor-name { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+  .actor-name b { font-size: 14px; font-weight: 650; }
+  .actor-name span { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .actor-role { margin: 2px 0 0; color: var(--faint); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .actor-state { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+  .tag { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 999px; background: #f1f5f9; color: var(--ink-2); font-size: 11.5px; font-weight: 550; white-space: nowrap; }
+  .tag.run { background: var(--accent-soft); color: var(--accent); }
+  .tag.attn { background: var(--attn-soft); color: var(--attn); }
+  .tag.concl { background: #f5f3ff; color: #6d28d9; }
+  .tag .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: breathe 1.6s ease-in-out infinite; }
+  @keyframes breathe { 50% { opacity: .35; } }
+
+  .subs { display: flex; align-items: center; gap: 6px; margin: -4px 16px 10px 68px; color: var(--muted); font-size: 12px; }
+
+  /* Session blocks: compact by default */
+  .tasks { list-style: none; margin: 0; padding: 4px 8px 8px; border-top: 1px solid var(--line-soft); }
+  .task { position: relative; border-radius: 10px; }
+  .task + .task { margin-top: 2px; }
+  .task-row { display: grid; grid-template-columns: 14px minmax(0, 1fr) auto auto auto; align-items: center; gap: 8px; min-height: 36px; padding: 0 6px 0 10px; border-radius: 10px; }
+  .task:hover > .task-row, .task[data-expanded="true"] > .task-row { background: #f8fafc; }
+  .status { width: 8px; height: 8px; border-radius: 50%; justify-self: center; }
+  .status.run { background: var(--accent); box-shadow: 0 0 0 3px #dbeafe; animation: breathe 1.6s ease-in-out infinite; }
+  .status.attn { background: #f59e0b; box-shadow: 0 0 0 3px #fef3c7; }
+  .status.done { background: #10b981; }
+  .task-title { display: flex; align-items: center; gap: 4px; min-width: 0; padding: 4px 0; border: 0; background: none; cursor: pointer; text-align: left; color: var(--ink-2); font-weight: 550; }
+  .task-title span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .task-title svg { opacity: 0; color: var(--faint); transition: opacity .15s; }
+  .task-title:hover svg, .task-title:focus-visible svg { opacity: 1; }
+  .task[data-done] .task-title { color: var(--muted); font-weight: 500; }
+  .time { color: var(--faint); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .time.attn { color: var(--attn); font-weight: 550; }
+  .icon-btn { display: inline-grid; place-items: center; width: 26px; height: 26px; padding: 0; border: 0; border-radius: 7px; background: transparent; color: var(--faint); cursor: pointer; }
+  .icon-btn:hover { background: #eef2f7; color: var(--ink-2); }
+  .icon-btn.stop:hover { background: #fef2f2; color: var(--stop); }
+  .icon-btn.stop svg { fill: currentColor; stroke: none; width: 11px; height: 11px; }
+  .disclose svg { transition: transform .18s; }
+  .task[data-expanded="true"] .disclose svg { transform: rotate(180deg); }
+  .spacer { width: 26px; }
+
+  /* Details: one content block; shown inline when pinned, as a hover peek otherwise */
+  .details { display: grid; gap: 10px; padding: 10px 12px 12px 32px; }
+  .task > .details { display: none; }
+  .task[data-expanded="true"] > .details { display: grid; }
+  .peek { position: absolute; z-index: 10; top: calc(100% + 4px); left: 6px; right: 6px; padding: 0; border: 1px solid var(--line); border-radius: 12px; background: #fff; box-shadow: 0 12px 32px rgb(15 23 42 / .14); opacity: 0; visibility: hidden; transform: translateY(-4px); transition: opacity .14s, transform .14s, visibility 0s .14s; pointer-events: none; }
+  .peek .details { padding: 12px 14px 14px; }
+  @media (hover: hover) and (pointer: fine) {
+    .task:not([data-expanded="true"]) > .task-row:hover + .peek,
+    .task:not([data-expanded="true"]) > .peek:hover { opacity: 1; visibility: visible; transform: none; pointer-events: auto; transition-delay: .25s, .25s, 0s; }
+  }
+  .demo-hover .task[data-demo-peek] > .peek { opacity: 1; visibility: visible; transform: none; pointer-events: auto; transition-delay: 0s; }
+  .metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin: 0; }
+  .metrics div { padding: 6px 8px; border-radius: 8px; background: #f8fafc; }
+  .metrics dt { color: var(--faint); font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; }
+  .metrics dd { margin: 1px 0 0; color: var(--ink-2); font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .add { color: var(--ok); } .del { color: var(--stop); }
+  .req { margin: 0; padding: 8px 10px; border-left: 2px solid #c7d2fe; background: #fafbff; color: var(--ink-2); border-radius: 0 8px 8px 0; }
+  .req span { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .req small { display: block; color: var(--faint); font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; }
+  .detail-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+  .ghost { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border: 1px solid var(--line); border-radius: 8px; background: #fff; cursor: pointer; font-size: 12px; color: var(--ink-2); }
+  .ghost:hover { border-color: #cbd5e1; }
+  .toggle { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; }
+  .toggle i { position: relative; width: 26px; height: 15px; border-radius: 999px; background: #cbd5e1; }
+  .toggle i::after { content: ""; position: absolute; top: 2px; left: 2px; width: 11px; height: 11px; border-radius: 50%; background: #fff; }
+
+  .quiet { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border: 1px dashed #d5dae4; border-radius: var(--radius); color: var(--muted); font-size: 12px; }
+  .quiet .stack { display: flex; }
+  .quiet .stack .av { margin-left: -6px; box-shadow: 0 0 0 2px var(--bg); }
+  .quiet .stack .av:first-child { margin-left: 0; }
+  .other { border-style: dashed; background: transparent; box-shadow: none; }
+  .other .actor-head { padding: 10px 16px 8px; }
+  .other h3 { margin: 0; color: var(--muted); font-size: 12px; font-weight: 600; }
+
+  /* Task session open in the dashboard slot (existing flow, actor-aware header) */
+  .session { display: none; flex-direction: column; min-height: 0; height: 100%; background: #fff; }
+  [data-view="session"] .dash { display: none; }
+  [data-view="session"] .session { display: flex; }
+  .session-head { display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--line); background: #fafbfc; }
+  .session-head h2 { margin: 0; font-size: 14px; font-weight: 650; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .session-meta { grid-column: 2; display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+  .session-body { flex: 1; display: flex; flex-direction: column; gap: 14px; padding: 18px 20px; overflow: auto; }
+  .skel { height: 10px; border-radius: 6px; background: linear-gradient(90deg, #eef1f6, #f6f8fb); }
+  .bubble { padding: 12px 14px; border: 1px solid var(--line-soft); border-radius: 12px; display: grid; gap: 8px; }
+
+  /* Narrow (< 768px): existing Chat / Dashboard tabs */
+  .narrow .app { grid-template-columns: 1fr; grid-template-rows: 44px minmax(0, 1fr); width: 390px; }
+  .narrow .rail { display: none; }
+  .narrow .tabs { display: flex; gap: 4px; align-items: center; padding: 0 12px; border-bottom: 1px solid var(--line); background: #f8fafc; }
+  .narrow .tabs button { padding: 5px 12px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); }
+  .narrow .tabs button[aria-pressed="true"] { background: #dbeafe; color: #1d4ed8; }
+  .narrow .chat, .narrow .side { grid-row: 2; grid-column: 1; }
+  .narrow[data-panel="chat"] .side, .narrow[data-panel="details"] .chat { display: none; }
+  .narrow .actor-head { grid-template-columns: auto 1fr; }
+  .narrow .actor-state { grid-column: 1 / -1; justify-content: flex-start; }
+  .narrow .subs { margin-left: 16px; }
+  .narrow .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+  /* ---------- Design notes (mockup only) ---------- */
+  .notes { width: min(1440px, 100%); margin: 20px auto 48px; padding: 0 20px; display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
+  .notes section { padding: 16px 18px; border-radius: 12px; background: #fff; }
+  .notes h3 { margin: 0 0 8px; font-size: 13px; }
+  .notes ul { margin: 0; padding-left: 18px; color: var(--ink-2); }
+  .notes li + li { margin-top: 4px; }
+  .notes code { font-size: 11.5px; color: #6d28d9; }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+  <symbol id="i-open" viewBox="0 0 24 24"><path d="M7 7h10v10"/><path d="M7 17 17 7"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M15 3v18"/><path d="m8 9 3 3-3 3"/></symbol>
+  <symbol id="i-fork" viewBox="0 0 24 24"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9"/><path d="M12 12v3"/></symbol>
+  <symbol id="i-msg" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="bot" viewBox="0 0 24 24"><rect x="4" y="7" width="16" height="12" rx="4" fill="#3a3d45"/><path d="M12 3v4" stroke="#6b7280" stroke-width="1.6" stroke-linecap="round"/><circle cx="12" cy="3" r="1.3" fill="currentColor"/><circle cx="9" cy="13" r="1.8" fill="currentColor"/><circle cx="15" cy="13" r="1.8" fill="currentColor"/></symbol>
+</svg>
+
+<div class="mock-bar" role="toolbar" aria-label="Mockup controls">
+  <strong>CONCEPT MOCKUP · not implemented</strong>
+  <fieldset><legend>Right column</legend>
+    <button type="button" data-set="view" data-value="dashboard" aria-pressed="true">Dashboard</button>
+    <button type="button" data-set="view" data-value="session" aria-pressed="false">Task session open</button>
+  </fieldset>
+  <fieldset><legend>Width</legend>
+    <button type="button" data-set="width" data-value="wide" aria-pressed="true">Desktop</button>
+    <button type="button" data-set="width" data-value="narrow" aria-pressed="false">Narrow &lt;768</button>
+  </fieldset>
+  <fieldset><legend>Demo</legend>
+    <button type="button" data-set="hover" data-value="on" aria-pressed="false">Freeze hover peek</button>
+  </fieldset>
+</div>
+
+<div class="stage" id="stage" data-view="dashboard" data-panel="details">
+  <div class="app">
+    <aside class="rail" aria-hidden="true"><span></span><span></span><span></span><span></span></aside>
+    <nav class="tabs" aria-label="Manager panels">
+      <button type="button" data-panel="chat" aria-pressed="false">Chat</button>
+      <button type="button" data-panel="details" aria-pressed="true">Dashboard</button>
+    </nav>
+
+    <!-- Middle column: actor room chat -->
+    <section class="chat" aria-label="Manager conversation">
+      <header class="chat-head"><h1>Actor room</h1><span>threadex · 6 actors</span></header>
+      <div class="msgs">
+        <div class="user-msg">重新設計 dashboard，降低 session 重要性，改為以 actor 為主；當前 session block 平時簡化，hover 先 show。</div>
+        <article class="reply">
+          <span class="av"><svg style="color:#a78bfa"><use href="#bot"/></svg></span>
+          <div>
+            <div class="reply-who"><b>Iris</b><small>· 輸入操作與介面體驗</small><em>work</em></div>
+            <p>我負責呢個 redesign：dashboard 按 actor 分組，session 降為每個 actor 下面嘅精簡行，詳情用 hover peek 同可固定展開嘅 disclosure。唔改 orchestration。</p>
+            <div class="claim">
+              <span class="claim-label">Claimed · full scope</span>
+              <button type="button" class="task-chip" data-open-task="redesign">
+                <span class="status run"></span>Actor-first dashboard redesign<svg class="i"><use href="#i-open"/></svg>
+              </button>
+            </div>
+          </div>
+        </article>
+        <article class="reply">
+          <span class="av"><svg style="color:#60a5fa"><use href="#bot"/></svg></span>
+          <div>
+            <div class="reply-who"><b>Theo</b><small>· agent 執行與背景工作</small><em>opinion</em></div>
+            <p>Runner 同 session 執行語義唔受影響；dashboard 嘅 actor 歸屬可以由 work item 嘅 <code>taskSessionId</code> 對返。</p>
+          </div>
+        </article>
+        <article class="reply">
+          <span class="av"><svg style="color:#34d399"><use href="#bot"/></svg></span>
+          <div>
+            <div class="reply-who"><b>Quinn</b><small>· qa · sub-actor of Iris</small><em>work</em></div>
+            <p>我跟住加 e2e：hover、keyboard disclosure 同 touch 三條路徑都要睇到同一份詳情。</p>
+            <div class="claim">
+              <span class="claim-label">Claimed · partial — e2e coverage</span>
+              <button type="button" class="task-chip" data-open-task="e2e">
+                <span class="status run"></span>Dashboard disclosure e2e<svg class="i"><use href="#i-open"/></svg>
+              </button>
+            </div>
+          </div>
+        </article>
+      </div>
+      <div class="composer">Message actors…  <span style="float:right">@mention · ⏎</span></div>
+    </section>
+
+    <!-- Right column: actor-first dashboard / task session -->
+    <aside class="side" aria-label="Dashboard panel">
+      <div class="dash">
+        <header class="dash-head">
+          <h2>Dashboard</h2>
+          <div class="spark" title="Token activity, last 60 minutes">
+            <svg viewBox="0 0 96 22" aria-hidden="true"><polyline fill="none" stroke="#93c5fd" stroke-width="1.6" points="0,18 8,16 16,17 24,12 32,14 40,9 48,11 56,6 64,10 72,7 80,12 88,8 96,10"/></svg>
+            <span>tokens / min</span>
+          </div>
+          <div class="pulse">
+            <span class="pill"><i></i>4 running</span>
+            <span class="pill attn"><i></i>1 needs you</span>
+            <span class="pill"><span style="color:#6d28d9">●</span>2 conclusions</span>
+            <span class="pill ok"><i></i>3 done · 2h</span>
+          </div>
+        </header>
+
+        <div class="actors">
+          <!-- Actor needing attention sorts first -->
+          <section class="actor" data-attn aria-label="Iris">
+            <div class="actor-head">
+              <span class="av lg"><svg style="color:#a78bfa"><use href="#bot"/></svg></span>
+              <div style="min-width:0">
+                <div class="actor-name"><b>Iris</b><span>輸入操作與介面體驗</span></div>
+                <p class="actor-role">Composer, input handling and interface experience · claude-opus-5-5</p>
+              </div>
+              <div class="actor-state">
+                <span class="tag attn">Needs you 1</span>
+                <span class="tag run"><span class="dot"></span>Running 1</span>
+              </div>
+            </div>
+            <div class="subs"><span class="av sm"><svg style="color:#34d399"><use href="#bot"/></svg></span>Quinn · qa — running 1</div>
+            <ul class="tasks">
+              <li class="task" data-task="redesign" data-demo-peek>
+                <div class="task-row">
+                  <span class="status run" role="img" aria-label="Running"></span>
+                  <button type="button" class="task-title" data-open-task="redesign"><span>Actor-first dashboard redesign</span><svg class="i"><use href="#i-open"/></svg></button>
+                  <span class="time">12m</span>
+                  <button type="button" class="icon-btn stop" aria-label="Stop Actor-first dashboard redesign and cancel queued turns" title="Stop"><svg class="i"><use href="#i-stop"/></svg></button>
+                  <button type="button" class="icon-btn disclose" aria-expanded="false" aria-controls="d-redesign" aria-label="Show details"><svg class="i"><use href="#i-chev"/></svg></button>
+                </div>
+                <div class="details" id="d-redesign">
+                  <dl class="metrics">
+                    <div><dt>Turn</dt><dd>#3</dd></div>
+                    <div><dt>Files</dt><dd>6</dd></div>
+                    <div><dt>Context</dt><dd>41%</dd></div>
+                    <div><dt>Turn lines</dt><dd><span class="add">+214</span> <span class="del">−88</span></dd></div>
+                    <div><dt>Session lines</dt><dd><span class="add">+540</span> <span class="del">−190</span></dd></div>
+                    <div><dt>Model</dt><dd>claude-opus-5-5</dd></div>
+                  </dl>
+                  <p class="req"><small>Current request</small><span>重新設計 dashboard，降低 session 重要性變以 actor 為主，當前 session block 平時大簡化顯示，hover 先 show</span></p>
+                  <div class="detail-row">
+                    <button type="button" class="ghost"><svg class="i"><use href="#i-fork"/></svg>1 queued · Fork</button>
+                    <button type="button" class="ghost"><svg class="i"><use href="#i-msg"/></svg>2 comments</button>
+                    <span class="toggle">Loop <i></i></span>
+                  </div>
+                </div>
+              </li>
+              <li class="task" data-task="paste">
+                <div class="task-row">
+                  <span class="status attn" role="img" aria-label="Needs your input"></span>
+                  <button type="button" class="task-title" data-open-task="paste"><span>Composer paste for Browser Bridge context</span><svg class="i"><use href="#i-open"/></svg></button>
+                  <span class="time attn">Needs you</span>
+                  <span class="spacer"></span>
+                  <button type="button" class="icon-btn disclose" aria-expanded="false" aria-controls="d-paste" aria-label="Show details"><svg class="i"><use href="#i-chev"/></svg></button>
+                </div>
+                <div class="details" id="d-paste">
+                  <p class="req"><small>Waiting on you · 4m</small><span>Should pasted Browser Bridge JSON become page context automatically, or ask first?</span></p>
+                  <div class="detail-row"><button type="button" class="ghost" data-open-task="paste">Answer in session</button></div>
+                </div>
+              </li>
+            </ul>
+          </section>
+
+          <section class="actor" aria-label="Theo">
+            <div class="actor-head">
+              <span class="av lg"><svg style="color:#60a5fa"><use href="#bot"/></svg></span>
+              <div style="min-width:0">
+                <div class="actor-name"><b>Theo</b><span>agent 執行與背景工作</span></div>
+                <p class="actor-role">Runners, discussion workers and background execution · claude-sonnet-5-5</p>
+              </div>
+              <div class="actor-state">
+                <span class="tag concl">Conclusions 2</span>
+                <span class="tag run"><span class="dot"></span>Running 2</span>
+              </div>
+            </div>
+            <ul class="tasks">
+              <li class="task" data-task="backoff">
+                <div class="task-row">
+                  <span class="status run" role="img" aria-label="Running"></span>
+                  <button type="button" class="task-title" data-open-task="backoff"><span>Discussion worker retry backoff</span><svg class="i"><use href="#i-open"/></svg></button>
+                  <span class="time">31m</span>
+                  <button type="button" class="icon-btn stop" aria-label="Stop Discussion worker retry backoff and cancel queued turns" title="Stop"><svg class="i"><use href="#i-stop"/></svg></button>
+                  <button type="button" class="icon-btn disclose" aria-expanded="false" aria-controls="d-backoff" aria-label="Show details"><svg class="i"><use href="#i-chev"/></svg></button>
+                </div>
+                <div class="details" id="d-backoff">
+                  <dl class="metrics">
+                    <div><dt>Turn</dt><dd>#7</dd></div><div><dt>Files</dt><dd>3</dd></div><div><dt>Context</dt><dd>68%</dd></div>
+                    <div><dt>Turn lines</dt><dd><span class="add">+41</span> <span class="del">−12</span></dd></div>
+                    <div><dt>Session lines</dt><dd><span class="add">+302</span> <span class="del">−77</span></dd></div>
+                    <div><dt>Model</dt><dd>claude-sonnet-5-5</dd></div>
+                  </dl>
+                  <p class="req"><small>Current request</small><span>Cap retry backoff at 5 minutes and surface the next attempt time in the worker status.</span></p>
+                  <div class="detail-row"><button type="button" class="ghost"><svg class="i"><use href="#i-msg"/></svg>1 comment</button><span class="toggle">Loop <i></i></span></div>
+                </div>
+              </li>
+              <li class="task" data-task="logs">
+                <div class="task-row">
+                  <span class="status run" role="img" aria-label="Running"></span>
+                  <button type="button" class="task-title" data-open-task="logs"><span>Isolated runner log rotation</span><svg class="i"><use href="#i-open"/></svg></button>
+                  <span class="time">3m</span>
+                  <button type="button" class="icon-btn stop" aria-label="Stop Isolated runner log rotation and cancel queued turns" title="Stop"><svg class="i"><use href="#i-stop"/></svg></button>
+                  <button type="button" class="icon-btn disclose" aria-expanded="false" aria-controls="d-logs" aria-label="Show details"><svg class="i"><use href="#i-chev"/></svg></button>
+                </div>
+                <div class="details" id="d-logs">
+                  <dl class="metrics">
+                    <div><dt>Turn</dt><dd>#1</dd></div><div><dt>Files</dt><dd>—</dd></div><div><dt>Context</dt><dd>9%</dd></div>
+                    <div><dt>Turn lines</dt><dd>Unavailable</dd></div><div><dt>Session lines</dt><dd>Unavailable</dd></div>
+                    <div><dt>Model</dt><dd>claude-sonnet-5-5</dd></div>
+                  </dl>
+                  <p class="req"><small>Current request</small><span>Rotate isolated runner logs at 50 MB and keep the last three files.</span></p>
+                </div>
+              </li>
+            </ul>
+          </section>
+
+          <section class="actor" aria-label="Ada">
+            <div class="actor-head">
+              <span class="av lg"><svg style="color:#fbbf24"><use href="#bot"/></svg></span>
+              <div style="min-width:0">
+                <div class="actor-name"><b>Ada</b><span>模型路由與用量分析</span></div>
+                <p class="actor-role">Model routing, budgets and usage analytics · claude-sonnet-5-5</p>
+              </div>
+              <div class="actor-state"><span class="tag">Idle</span></div>
+            </div>
+            <ul class="tasks">
+              <li class="task" data-task="budget" data-done>
+                <div class="task-row">
+                  <span class="status done" role="img" aria-label="Completed"></span>
+                  <button type="button" class="task-title" data-open-task="budget"><span>Auto model selector budget guard</span><svg class="i"><use href="#i-open"/></svg></button>
+                  <span class="time">Done 14:02</span>
+                  <span class="spacer"></span>
+                  <button type="button" class="icon-btn disclose" aria-expanded="false" aria-controls="d-budget" aria-label="Show details"><svg class="i"><use href="#i-chev"/></svg></button>
+                </div>
+                <div class="details" id="d-budget">
+                  <p class="req"><small>Last request</small><span>Stop auto-selection from choosing a model above the workspace budget tier.</span></p>
+                  <div class="detail-row"><button type="button" class="ghost"><svg class="i"><use href="#i-msg"/></svg>1 comment</button><span class="toggle">Loop <i></i></span></div>
+                </div>
+              </li>
+            </ul>
+          </section>
+
+          <div class="quiet">
+            <span class="stack">
+              <span class="av sm"><svg style="color:#f472b6"><use href="#bot"/></svg></span>
+              <span class="av sm"><svg style="color:#2dd4bf"><use href="#bot"/></svg></span>
+              <span class="av sm"><svg style="color:#f87171"><use href="#bot"/></svg></span>
+            </span>
+            <span><b style="color:var(--ink-2)">Finn, Vera, Sage</b> idle · no open work</span>
+          </div>
+
+          <section class="actor other" aria-label="Sessions without an actor">
+            <div class="actor-head" style="grid-template-columns:1fr auto"><h3>Not owned by an actor</h3><span class="tag run"><span class="dot"></span>Running 1</span></div>
+            <ul class="tasks">
+              <li class="task" data-task="flake">
+                <div class="task-row">
+                  <span class="status run" role="img" aria-label="Running"></span>
+                  <button type="button" class="task-title" data-open-task="flake"><span>Fix roundtable e2e flake</span><svg class="i"><use href="#i-open"/></svg></button>
+                  <span class="time">8m</span>
+                  <button type="button" class="icon-btn stop" aria-label="Stop Fix roundtable e2e flake and cancel queued turns" title="Stop"><svg class="i"><use href="#i-stop"/></svg></button>
+                  <button type="button" class="icon-btn disclose" aria-expanded="false" aria-controls="d-flake" aria-label="Show details"><svg class="i"><use href="#i-chev"/></svg></button>
+                </div>
+                <div class="details" id="d-flake">
+                  <dl class="metrics">
+                    <div><dt>Turn</dt><dd>#2</dd></div><div><dt>Files</dt><dd>1</dd></div><div><dt>Context</dt><dd>22%</dd></div>
+                    <div><dt>Turn lines</dt><dd><span class="add">+9</span> <span class="del">−4</span></dd></div>
+                    <div><dt>Session lines</dt><dd><span class="add">+15</span> <span class="del">−6</span></dd></div>
+                    <div><dt>Model</dt><dd>claude-haiku-5-5</dd></div>
+                  </dl>
+                </div>
+              </li>
+            </ul>
+          </section>
+        </div>
+      </div>
+
+      <!-- Existing flow: the task session replaces the dashboard; close returns to it -->
+      <section class="session" aria-label="Task session">
+        <header class="session-head">
+          <button type="button" class="icon-btn" id="close-session" aria-label="Close session and show dashboard" title="Close session and show dashboard"><svg class="i"><use href="#i-close"/></svg></button>
+          <h2 id="session-title">Actor-first dashboard redesign</h2>
+          <div class="session-meta"><span class="av sm"><svg style="color:#a78bfa"><use href="#bot"/></svg></span><span>Iris</span><span class="tag run"><span class="dot"></span>Running 12m</span></div>
+        </header>
+        <div class="session-body">
+          <div class="bubble"><div class="skel" style="width:40%"></div><div class="skel" style="width:92%"></div><div class="skel" style="width:76%"></div></div>
+          <div class="bubble"><div class="skel" style="width:28%"></div><div class="skel" style="width:88%"></div><div class="skel" style="width:64%"></div><div class="skel" style="width:81%"></div></div>
+          <div class="bubble"><div class="skel" style="width:35%"></div><div class="skel" style="width:70%"></div></div>
+        </div>
+        <div class="composer">Steer this task…</div>
+      </section>
+    </aside>
+  </div>
+</div>
+
+<div class="notes">
+  <section>
+    <h3>Hierarchy</h3>
+    <ul>
+      <li>Actors are the primary unit: avatar, character name, role (<code>roleSummary</code>), model, and one status cluster.</li>
+      <li>Order: needs-you actors → running → idle with recent completions → idle actors folded into one quiet row.</li>
+      <li>Workspace pulse (running / needs you / conclusions / done) and the token sparkline replace the large chart.</li>
+    </ul>
+  </section>
+  <section>
+    <h3>Session block</h3>
+    <ul>
+      <li>Compact: status dot, title, elapsed time, Stop (running only), and a disclosure button.</li>
+      <li>Pointer hover (0.25s delay) shows a floating peek, so the list doesn't shift.</li>
+      <li>The disclosure button (<code>aria-expanded</code>) pins details inline. Keyboard and touch use it, so nothing is hover-only.</li>
+      <li>Details keep every existing field: metrics, request, queued prompts with Fork, comments and Loop.</li>
+    </ul>
+  </section>
+  <section>
+    <h3>Flows kept as they are</h3>
+    <ul>
+      <li>Claim and task chips under actor replies open the session in the dashboard slot; Close returns to the dashboard.</li>
+      <li>The session header gains the owning actor chip. Execution semantics are unchanged.</li>
+      <li>Sessions without an owning actor stay visible under “Not owned by an actor”.</li>
+      <li>Narrow widths keep the Chat / Dashboard tabs.</li>
+    </ul>
+  </section>
+</div>
+
+<script>
+  const stage = document.getElementById("stage");
+  const bar = document.querySelector(".mock-bar");
+  function press(set, value) {
+    bar.querySelectorAll(`[data-set="${set}"]`).forEach(b => b.setAttribute("aria-pressed", String(b.dataset.value === value)));
+  }
+  bar.addEventListener("click", event => {
+    const button = event.target.closest("button[data-set]");
+    if (!button) return;
+    const { set, value } = button.dataset;
+    if (set === "view") setView(value);
+    if (set === "width") { stage.classList.toggle("narrow", value === "narrow"); press("width", value); }
+    if (set === "hover") {
+      const on = button.getAttribute("aria-pressed") !== "true";
+      stage.classList.toggle("demo-hover", on); button.setAttribute("aria-pressed", String(on));
+    }
+  });
+  function setView(view, title) {
+    stage.dataset.view = view; press("view", view);
+    if (title) document.getElementById("session-title").textContent = title;
+    if (view === "session") stage.dataset.panel = "details", syncTabs();
+  }
+  // One details block per task: cloned into a hover peek so both states show identical content.
+  document.querySelectorAll(".task").forEach(task => {
+    const peek = document.createElement("div");
+    peek.className = "peek"; peek.setAttribute("aria-hidden", "true");
+    const clone = task.querySelector(".details").cloneNode(true);
+    clone.removeAttribute("id"); clone.querySelectorAll("button").forEach(b => b.tabIndex = -1);
+    peek.append(clone); task.querySelector(".task-row").after(peek);
+  });
+  document.addEventListener("click", event => {
+    const disclose = event.target.closest(".disclose");
+    if (disclose) {
+      const task = disclose.closest(".task");
+      const open = task.dataset.expanded !== "true";
+      task.dataset.expanded = String(open);
+      disclose.setAttribute("aria-expanded", String(open));
+      disclose.setAttribute("aria-label", open ? "Hide details" : "Show details");
+      return;
+    }
+    const opener = event.target.closest("[data-open-task]");
+    if (opener) {
+      const id = opener.dataset.openTask;
+      const title = document.querySelector(`.task[data-task="${id}"] .task-title span`)?.textContent ?? opener.textContent.trim();
+      document.querySelectorAll(".task-chip").forEach(chip => chip.setAttribute("aria-current", String(chip.dataset.openTask === id)));
+      setView("session", title);
+    }
+  });
+  document.getElementById("close-session").addEventListener("click", () => {
+    document.querySelectorAll(".task-chip").forEach(chip => chip.removeAttribute("aria-current"));
+    setView("dashboard");
+  });
+  function syncTabs() {
+    document.querySelectorAll(".tabs button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.panel === stage.dataset.panel)));
+  }
+  document.querySelector(".tabs").addEventListener("click", event => {
+    const button = event.target.closest("button[data-panel]");
+    if (button) { stage.dataset.panel = button.dataset.panel; syncTabs(); }
+  });
+</script>
+</body>
+</html>

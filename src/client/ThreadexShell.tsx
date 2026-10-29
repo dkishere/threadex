@@ -1,16 +1,27 @@
 // @ts-nocheck
-import { DEFAULT_MODEL } from "../modelCatalog";
+import { DEFAULT_MODEL, crossesModelGroup } from "../modelCatalog";
+import { ModelGroupSwitchDialog } from "./ModelGroupSwitchDialog";
+import { ActorAvatar } from "./ActorAvatar";
+import { CurrentDomainActorsProvider } from "./CurrentDomainActorsContext";
+import { listenToNavigation } from "./navigation";
+import { useActionNotifications, useBlockerNotifications } from "./actionNotifications";
+import { WorkspaceActionNotifications } from "./WorkspaceActionNotifications";
+import { ProjectBlockersButton, TaskBlockersButton, requestOpenBlockers } from "./ActorBlockers";
+import { taskBlockers, visibleBlockers } from "./actorBlockerPresentation";
 import { useEffect as useReactEffect, useLayoutEffect as useReactLayoutEffect } from "react";
 import { flushSync } from "react-dom";
 import { MarkdownWorkspaceContext } from "./MarkdownContent";
 import { CODEX_FOLLOWUP_EVENT } from "./codexFollowup";
+import { BLOCKER_TO_COMPOSER_EVENT, type BlockerComposerRequest } from "./blockerComposer";
 import { COMPOSER_SELECTION_EVENT } from "./composerSelection";
 import { Flame, Repeat2, FolderOpen, Play, GitPullRequestCreateArrow } from "lucide-react";
 import { TurnGrillPanel, useGrilledTurns } from "./TurnGrillPanel";
 import { FileEditIcon } from "./FileEditIcon";
 import { openProjectFiles } from "./ProjectFilesViewer";
 import { SessionChangesPopover } from "./SessionChangesPopover";
+import { SessionHeaderTarget } from "./sessionHeaderTarget";
 import { SideChatPanel } from "./SideChatPanel";
+import { ActorRoundtableSourceLink } from "./ActorRoundtables";
 import { ConcurrentPanel } from "./ConcurrentPanel";
 import { RoundtableSettings, RoundtableTurn, useRoundtable } from "./Roundtable";
 import { Bot, Users, HatGlasses } from "lucide-react";
@@ -18,23 +29,29 @@ import { ForkedTurns } from "./ForkedTurns";
 import "./ForkedTurns.css";
 import { isCollaborationMemberEnded } from "../collaboration";
 import { parseConcurrentMessage } from "./ConcurrentMessage";
-import { WorkspaceManagerApprovals, WorkspaceManagerBackgroundUpdateIndicator, WorkspaceManagerDashboard, WorkspaceManagerFollowUp, WorkspaceManagerHistory, WorkspaceManagerReturnLink, WorkspaceManagerTaskBadges, WorkspaceManagerToggle, WorkspaceManagerView, useWorkspaceManager, useWorkspaceManagerDashboard } from "./WorkspaceManagerPanel";
+import { WorkspaceManagerApprovals, WorkspaceManagerBackgroundUpdateIndicator, WorkspaceManagerDashboard, WorkspaceManagerFollowUp, WorkspaceManagerHistory, WorkspaceManagerReturnLink, WorkspaceManagerTaskBadges, WorkspaceManagerView, useWorkspaceManager, useWorkspaceManagerDashboard } from "./WorkspaceManagerPanel";
 import { mergeManagerHistory, sessionSnapshotUrl } from "./workspaceManagerHistory";
 import { recentWorkspaceManagerMessages, recentWorkspaceManagerTurns, WORKSPACE_MANAGER_MODEL, WORKSPACE_MANAGER_EFFORT } from "../workspaceManager";
 import { apiJson } from "./apiClient";
-import { SessionCategoriesPanel } from "./SessionCategoriesPanel";
+import { ManagerWorkspace } from "./ManagerWorkspace";
+import { ActorView } from "./ActorView";
+import { DomainActorIdentity } from "./DomainActorIdentity";
+import { ActorListPanel, SidebarViewTabs, defaultSidebarView, readSidebarView, useDomainActorSummary, workerProjectGroups, writeSidebarView } from "./ActorListPanel";
+import { UNASSIGNED_ACTOR_PROJECT, mostRecentlyActiveGroupChatKey } from "../domainActors";
+import "./ActorView.css";
 import { ResponseQuotePopover } from "./ResponseQuotePopover";
 import { ComposerFrame, ComposerGearSelector, ComposerSurface, ComposerToolbar } from "./ComposerFrame";
 import { formatAccountTier, formatQuotaWindowReset } from "./accountFormatters";
 import { BrowserBridgeSettingsPanel } from "./BrowserBridgeSettingsPanel";
 import { AutoModelSettingsPanel } from "./AutoModelSettingsPanel";
 import { HelperModelsSettingsPanel } from "./HelperModelsSettingsPanel";
-import { RoundtableActorsPanel } from "./RoundtableActorsPanel";
+import { AgentActorsSettingsPanel } from "./AgentActorsSettingsPanel";
 import { ClaudeAccountRows, ClaudeAccountsSection, ClaudeLoginForm, useClaudeAccounts } from "./ClaudeAccountsSection";
 import "./styles/claude-accounts.css";
 import { GlobalInstructionsSettingsPanel } from "./GlobalInstructionsSettingsPanel";
 import { SecuritySettingsPanel } from "./Security";
-import { ComposerSuggestionMenu, ComposerSuggestionSettingsPanel, findComposerSuggestionTrigger, loadComposerSuggestionKeywords } from "./ComposerSuggestions";
+import { ComposerSuggestionMenu, ComposerSuggestionSettingsPanel, composerSuggestionOptionId, findComposerSuggestionTrigger, loadComposerSuggestionKeywords } from "./ComposerSuggestions";
+import { SessionActorMentionChips, useSessionActorMentions } from "./SessionActorMentions";
 import { registerBrowserContextReceiver, threadexBrowserContextReceiverName } from "./browserContextReceiver";
 import { parseTurnIssueContext, turnIssueContextAttachmentName } from "./turnIssueCopy";
 import { consumeVsCodeAnnotation } from "./vscodeAnnotationBridge";
@@ -98,12 +115,36 @@ export function ThreadexShell(ctx) {
             return null;
         }
         return (_jsxs("div", { className: className ? `prompt-tags ${className}` : "prompt-tags", children: [
-                prompt.managedMode && _jsxs("span", { className: "prompt-tag", title: "Managed mode was enabled for this turn", children: [_jsx(HatGlasses, { size: 12, "aria-hidden": "true" }), "Managed mode"] }),
+                prompt.managedMode && _jsxs("span", { className: "prompt-tag", title: prompt.managedModeForced ? "Managed mode was forced on: actor turns on Sol/Opus or Astra/Fable tier models always use it" : "Managed mode was enabled for this turn", children: [_jsx(HatGlasses, { size: 12, "aria-hidden": "true" }), "Managed mode"] }),
                 prompt.forcePlan && _jsx("span", { className: "prompt-tag", "data-tone": "plan", children: FORCE_PLAN_TAG_LABEL }),
                 contextFork && _jsx("span", { className: "prompt-tag", "data-tone": "fork", children: CONTEXT_FORK_TAG_LABEL }),
                 goalMode && _jsx("span", { className: "prompt-tag", "data-tone": "goal", children: GOAL_MODE_TAG_LABEL }),
                 loopMode && _jsx("span", { className: "prompt-tag", "data-tone": "loop", children: "Loop mode" })
             ] }));
+    }
+    function renderPromptOrigin(prompt) {
+        const origin = prompt?.promptOrigin;
+        if (!origin) return null;
+        const actor = origin.sourceActorId ? actorSummary.summary?.actors?.find((entry) => entry.id === origin.sourceActorId) : null;
+        const name = actor?.name ?? origin.sourceActorName ?? origin.sourceActorId;
+        const sourceSessionId = origin.sourceSessionId;
+        const trigger = origin.trigger ? ` (${origin.trigger})` : "";
+        const avatar = name ? _jsx(ActorAvatar, { actor: { id: origin.sourceActorId ?? name, name, avatar: actor?.avatar }, decorative: true }) : null;
+        if (!sourceSessionId) {
+            if (!name) return null;
+            const label = `Prompt sent by actor ${name}${trigger}`;
+            return _jsxs("span", { className: "prompt-turn-origin", title: label, "aria-label": label, children: [avatar, _jsx("span", { className: "prompt-turn-origin-name", children: name })] });
+        }
+        const label = name
+            ? `Prompt sent by actor ${name} from session ${sourceSessionId}${trigger}. Open source session`
+            : `Prompt sent from session ${sourceSessionId}${trigger}. Open source session`;
+        return _jsxs("button", { type: "button", className: "prompt-turn-origin", title: label, "aria-label": label,
+            onClick: (event) => { event.stopPropagation(); void switchToSessionById(sourceSessionId, { label: "source session" }); },
+            onKeyDown: (event) => event.stopPropagation(), children: [
+            avatar,
+            _jsx("span", { className: "prompt-turn-origin-name", children: name ?? "Source session" }),
+            _jsx(ExternalLink, { "aria-hidden": "true" })
+        ] });
     }
     function renderPromptModelBadge(prompt) {
         const model = typeof prompt?.model === "string" ? prompt.model.trim() : "";
@@ -171,11 +212,13 @@ export function ThreadexShell(ctx) {
     }
     const submissionSending = useSubmissionSending(sessionId);
     const isSubmitting = submissionSending || concurrentSending || roundtableSending || pendingComposer.busy;
-    const [sidebarListTab, setSidebarListTab] = useState("sessions");
+    const [managerHistoryOpen, setManagerHistoryOpen] = useState(false);
     const [threadId, setThreadId] = useState(restoredSession?.threadId ?? null);
     const [activeTurnId, setActiveTurnId] = useState(restoredSession?.activeTurnId ?? null);
     const [status, setStatus] = useState(restoredSession?.status ?? "Idle");
     const [composerSubmissionError, setComposerSubmissionError] = useState(null);
+    // Pending cross-provider (Claude Code <-> Codex) send awaiting the user's confirmation.
+    const [modelGroupSwitch, setModelGroupSwitch] = useState(null);
     function setComposerSubmissionStatus(value) {
         setStatus(value);
         if (typeof value === "string" && value.startsWith("Prompt not sent:")) {
@@ -194,13 +237,63 @@ export function ThreadexShell(ctx) {
     const [composerResponseQuote, setComposerResponseQuote] = useState(null);
     const [sessionTab, setSessionTab] = useState(() => ({ sessionId: null, value: "turns" }));
     const [managerMode, setManagerMode] = useState(false);
+    const [sessionHeaderTarget, setSessionHeaderTarget] = useState(null);
+    const [managerPanelWorkspace, setManagerPanelWorkspace] = useState(() => initialNavigationTarget?.groupChat && initialNavigationTarget.sessionId ? initialNavigationTarget.workspaceId : null);
+    const [managerPanelTarget, setManagerPanelTarget] = useState(() => initialNavigationTarget?.groupChat ? initialNavigationTarget.sessionId : null);
+    const [managerPanelReset, setManagerPanelReset] = useState(0);
+    const managerPanelWorkspaceRef = useRef(managerPanelWorkspace);
+    function clearManagerPanel() {
+        managerPanelWorkspaceRef.current = null;
+        setManagerPanelWorkspace(null);
+        setManagerPanelTarget(null);
+        setManagerPanelReset(value => value + 1);
+    }
+    async function openManagerSession(record) {
+        managerPanelWorkspaceRef.current = record.workspaceId;
+        setManagerPanelWorkspace(record.workspaceId);
+        setManagerPanelTarget(record.id);
+        await switchSession(record, { managerPreview: true });
+        if (sessionIdRef.current !== record.id) throw new Error("Session did not load. Please retry.");
+    }
+    function closeManagerSession() {
+        void toggleWorkspaceManager(true, "push");
+    }
     const managerModeRef = useRef(false);
     const managerSessionRef = useRef(null);
     const managerHistorySnapshotRef = useRef(null);
     const managerHistoryLoadingRef = useRef(null);
     const [managerHistoryState, setManagerHistoryState] = useState(null);
     const [managerNavigationRevision, setManagerNavigationRevision] = useState(0);
-    const managerEntryRequest = useRef(new URLSearchParams(window.location.search).get("view") === "workspace-chat");
+    const managerEntryRequest = useRef(readNavigationTarget().view === "workspace-chat");
+    // Project group chat shown in the group chat view (docs/actor-project-chats.md). A link
+    // without a chat key is an older workspace group chat link: the Unassigned chat.
+    const [groupChatKey, setGroupChatKeyValue] = useState(() => readNavigationTarget().chat ?? UNASSIGNED_ACTOR_PROJECT);
+    const groupChatKeyRef = useRef(groupChatKey);
+    function setGroupChatKey(key) {
+        groupChatKeyRef.current = key;
+        setGroupChatKeyValue(key);
+    }
+    // Workspace ID set by a user-initiated workspace switch: until that workspace's summary arrives the
+    // group chat area shows a loading state (not the Unassigned chat), then its most recently active group
+    // chat opens (replacing the URL entry). Dropped on any other chat choice or navigation.
+    const [autoGroupChatWorkspace, setAutoGroupChatWorkspaceValue] = useState(null);
+    const autoGroupChatRef = useRef(null);
+    function setAutoGroupChatWorkspace(workspaceId) {
+        autoGroupChatRef.current = workspaceId;
+        setAutoGroupChatWorkspaceValue(workspaceId);
+    }
+    // Third shell view: one domain actor's sessions and dialog. It is
+    // sessionless and mutually exclusive with Manager mode and a session.
+    const [actorView, setActorView] = useState(null);
+    const actorViewRef = useRef(null);
+    // Actor id requested by the URL (boot or popstate) until the view opens.
+    const actorEntryRequest = useRef(readNavigationTarget().actorId ?? null);
+    const sessionlessView = managerMode || actorView !== null;
+    function clearActorView() {
+        actorEntryRequest.current = null;
+        actorViewRef.current = null;
+        setActorView(null);
+    }
     const setMessages = useCallback((next) => setSessionMessages(current => {
         const updated = typeof next === "function" ? next(current) : next;
         return managerModeRef.current || managerEntryRequest.current ? recentWorkspaceManagerMessages(updated, Infinity) : updated;
@@ -221,18 +314,29 @@ export function ThreadexShell(ctx) {
             bumpViewKey();
             setManagerOpening(false);
             setManagerOpenError(null);
-            managerEntryRequest.current = readOptionalNavigationTarget()?.view === "workspace-chat";
+            const target = readOptionalNavigationTarget();
+            clearManagerPanel();
+            if (target?.groupChat && target.sessionId) {
+                managerPanelWorkspaceRef.current = target.workspaceId;
+                setManagerPanelWorkspace(target.workspaceId);
+                setManagerPanelTarget(target.sessionId);
+            }
+            managerEntryRequest.current = target?.view === "workspace-chat";
+            if (target?.groupChat) setGroupChatKey(target.chat ?? UNASSIGNED_ACTOR_PROJECT);
             managerModeRef.current = false;
             setManagerMode(false);
+            // The entry effects below reopen Manager or the actor view; any
+            // other target is an ordinary session loaded by useSessionEffects.
+            clearActorView();
+            actorEntryRequest.current = target?.view === "actor" ? target.actorId ?? null : null;
             setManagerNavigationRevision(value => value + 1);
         };
-        window.addEventListener("popstate", navigate);
-        return () => window.removeEventListener("popstate", navigate);
+        return listenToNavigation(navigate);
     }, []);
-    useReactEffect(() => { setSessionTab((current) => ({ sessionId, value: managerMode ? "dashboard" : current.value === "sessions" ? "sessions" : "turns" })); }, [sessionId, managerMode]);
+    useReactEffect(() => { setSessionTab((current) => ({ sessionId, value: managerMode ? "dashboard" : actorView ? "actor-sessions" : current.value === "sessions" ? "sessions" : "turns" })); }, [sessionId, managerMode, actorView?.actorId]);
     useReactEffect(() => {
         if (!compactLayout) return;
-        setSessionTab((current) => ["sessions", "dashboard"].includes(current.value) ? current : { ...current, value: "sessions" });
+        setSessionTab((current) => ["sessions", "dashboard", "actor-sessions"].includes(current.value) ? current : { ...current, value: "sessions" });
     }, [compactLayout]);
     const [responseQuotePopover, setResponseQuotePopover] = useState(null);
     const [sideChatAnnotation, setSideChatAnnotation] = useState(null);
@@ -274,6 +378,9 @@ export function ThreadexShell(ctx) {
     }, []);
     const [composerSuggestionTrigger, setComposerSuggestionTrigger] = useState(null);
     const [composerSuggestionIndex, setComposerSuggestionIndex] = useState(-1);
+    // @ workers in an ordinary session; the Manager history composer is read-only.
+    const actorMentions = useSessionActorMentions(managerMode ? null : sessionId, input);
+    const actorMentionSending = Boolean(actorMentions.sendingNames);
     const [isLoadingSkills, setIsLoadingSkills] = useState(false);
     const [isLoadingPathSuggestions, setIsLoadingPathSuggestions] = useState(false);
     const [promptEditor, setPromptEditor] = useState(null);
@@ -335,8 +442,24 @@ export function ThreadexShell(ctx) {
     const [activeSessionId, setActiveSessionId] = useState(null);
     const [workspaceList, setWorkspaceList] = useState([]);
     const [activeWorkspace, setActiveWorkspace] = useState(null);
+    useReactEffect(() => setManagerHistoryOpen(false), [activeWorkspace?.id]);
     const managerView = useWorkspaceManager(activeWorkspace?.id);
-    const managerDashboard = useWorkspaceManagerDashboard(managerMode ? activeWorkspace?.id : undefined);
+    // The actor view's sessions panel reads the same task snapshot as the Manager dashboard.
+    const managerDashboard = useWorkspaceManagerDashboard(managerMode || actorView || managerPanelWorkspace === activeWorkspace?.id ? activeWorkspace?.id : undefined);
+    const actorSummary = useDomainActorSummary(activeWorkspace?.id);
+    const sidebarActorCount = actorSummary.summary?.actors?.length ?? 0;
+    // Tabs only appear once the workspace has an actor; without one the sidebar stays the session list.
+    const sidebarTabsVisible = sidebarActorCount > 0;
+    const [sidebarViewChoice, setSidebarViewChoice] = useState(null);
+    const storedSidebarView = useMemo(() => activeWorkspace?.id ? readSidebarView(activeWorkspace.id) : null, [activeWorkspace?.id]);
+    const chosenSidebarView = sidebarViewChoice && sidebarViewChoice.workspaceId === activeWorkspace?.id ? sidebarViewChoice.view : storedSidebarView;
+    const sidebarView = sidebarTabsVisible ? chosenSidebarView ?? defaultSidebarView(actorSummary.summary) : "sessions";
+    function changeSidebarView(view) {
+        const workspaceId = activeWorkspace?.id;
+        if (!workspaceId) return;
+        writeSidebarView(workspaceId, view);
+        setSidebarViewChoice({ workspaceId, view });
+    }
     const [accountList, setAccountList] = useState([]);
     const [workspaceAccountList, setWorkspaceAccountList] = useState([]);
     const [workspaceAccountIds, setWorkspaceAccountIds] = useState([]);
@@ -510,7 +633,7 @@ export function ThreadexShell(ctx) {
             return next;
         });
     }
-    useVsCodeAnnotationInbox(sessionId, !managerMode && !pendingComposer.edit && !queuedPromptEditRef.current && !isSubmitting, (annotation) => {
+    useVsCodeAnnotationInbox(sessionId, !sessionlessView && !pendingComposer.edit && !queuedPromptEditRef.current && !isSubmitting, (annotation) => {
         flushSync(() => setComposerInput((current) => {
             const parsed = parseResponseAnnotations(current);
             return formatResponseAnnotationsPrompt([...(parsed?.annotations ?? []), annotation], parsed?.content ?? current);
@@ -900,7 +1023,7 @@ export function ThreadexShell(ctx) {
     const selectedSessionIsReportedRunning = Boolean(sessionId && sessionExecutionStatuses[sessionId] === "running");
     const backgroundRunningCount = Math.max(0, runningSessionCount - (selectedSessionIsReportedRunning ? 1 : 0));
     const composerLinksReady = composerSessionLinks.every((link) => link.status === "ready");
-    const canSend = !isSubmitting && !managerOpening && isBootstrapped && (pendingComposer.edit
+    const canSend = !sessionlessView && !isSubmitting && !actorMentionSending && !managerOpening && isBootstrapped && (pendingComposer.edit
         ? !pendingComposer.edit.held || Boolean(pendingComposer.edit.value.trim())
         : composerLinksReady && (input.trim().length > 0 || attachments.length > 0 || composerSessionLinks.length > 0 ||
             Boolean(composerResponseQuote?.length)));
@@ -926,6 +1049,7 @@ export function ThreadexShell(ctx) {
     const visibleSessionTodo = sessionTodo?.sessionId === sessionId ? sessionTodo : null;
     const hasPlanTab = Boolean(sessionId && hasVisibleTodoPlan(visibleSessionTodo));
     const activeSessionTab = managerMode ? compactLayout && sessionTab.value === "sessions" ? "sessions" : "dashboard"
+        : actorView ? compactLayout && sessionTab.value === "sessions" ? "sessions" : "actor-sessions"
         : compactLayout && sessionTab.value === "sessions" ? "sessions" : ["turns", "side-chat", "plan"].includes(sessionTab.value) && sessionTab.sessionId === sessionId && (sessionTab.value !== "plan" || hasPlanTab) ? sessionTab.value : "turns";
     const visibleParentSessionTodo = parentSessionTodo?.sessionId === effectiveParentSessionId ? parentSessionTodo : null;
     const childSessions = sessionId
@@ -933,6 +1057,11 @@ export function ThreadexShell(ctx) {
         : [];
     const currentSessionIsTodoChild = Boolean(sessionId && visibleParentSessionTodo?.itemSessions?.some((itemSession) => itemSession.childSessionId === sessionId));
     const pendingApprovalSessionIdSet = useMemo(() => new Set(pendingApprovalSessionIds), [pendingApprovalSessionIds]);
+    const actionNotifications = useActionNotifications(centralState.cursor, isBootstrapped);
+    const blockerNotifications = useBlockerNotifications(centralState.cursor, isBootstrapped);
+    const workspaceEscalatedBlockers = useMemo(() => visibleBlockers(actorSummary.summary?.blockers).filter((blocker) => blocker.status === "escalated"), [actorSummary.summary]);
+    const summaryActorName = (id) =>actorSummary.summary?.actors?.find((actor) => actor.id === id)?.name ?? id;
+    const currentTaskBlockers = useMemo(() => taskBlockers(actorSummary.summary?.blockers, sessionId), [actorSummary.summary, sessionId]);
     const workspaceStatusById = useMemo(() => new Map(centralState.statusMonitor.map((workspace) => [workspace.id, workspace])), [centralState.statusMonitor]);
     const activeWorkspacePendingApprovalSessionIdSet = useMemo(() => {
         const backgroundSessionIds = new Set(centralState.statusMonitor.flatMap((workspace) => workspace.active_sessions.map((backgroundSession) => backgroundSession.id)));
@@ -962,7 +1091,7 @@ export function ThreadexShell(ctx) {
     const todoPlanClarificationPending = isTodoPlanAwaitingClarification(visibleSessionTodo);
     const composerTodoPlanModeAvailable = !currentSessionIsTodoChild;
     const composerTodoPlanModeEnabled = composerTodoPlanModeAvailable && forcePlanNextPrompt;
-    const threadTitle = activeSession?.title
+    const threadTitle = managerMode ? (managerHistoryOpen ? "Manager history" : "Workspace manager") : activeSession?.title
         ? displaySessionTitle(activeSession.title)
         : firstUserMessage
             ? summarizeTitle(firstUserMessage.content)
@@ -1143,12 +1272,16 @@ export function ThreadexShell(ctx) {
             insertText: `@${entry.path}${entry.kind === "directory" ? "/" : ""} `
         }));
         const keywords = (suggestionKeywordsWorkspaceId === activeWorkspaceId ? suggestionKeywords : []).map((keyword) => ({ kind: "keyword", name: keyword, description: "Saved suggestion keyword", scope: "keyword", insertText: `${keyword} ` }));
-        return [...paths, ...keywords].filter((suggestion) => !query || suggestion.name.toLowerCase().includes(query));
-    }, [activeWorkspace?.id, autoSelectedProjectSessionId, composerSuggestionTrigger, newSessionProjectId, pathSuggestions, pathSuggestionsScope, sessionId, suggestionKeywords, suggestionKeywordsWorkspaceId]);
+        const actors = pendingComposer.edit ? [] : actorMentions.suggestions(composerSuggestionTrigger.query);
+        return [...actors, ...[...paths, ...keywords].filter((suggestion) => !query || suggestion.name.toLowerCase().includes(query))];
+    }, [activeWorkspace?.id, actorMentions.actors, autoSelectedProjectSessionId, composerSuggestionTrigger, newSessionProjectId, pathSuggestions, pathSuggestionsScope, pendingComposer.edit, sessionId, suggestionKeywords, suggestionKeywordsWorkspaceId]);
+    const composerActorMentionNotice = composerSuggestionTrigger && !pendingComposer.edit && !visibleComposerSuggestions.length ? actorMentions.menuNotice(composerSuggestionTrigger.query) : null;
     useReactEffect(() => {
-        setComposerSuggestionIndex(-1);
-    }, [composerSuggestionTrigger?.start, composerSuggestionTrigger?.end, composerSuggestionTrigger?.query]);
-    useSessionEffects({ accountPopoverRef, activeGearIndex, activePromptTurnIds, activeTurnId, activeTurnIdRef, activeWorkspace, approvalPolicy, backendConnection, backendConnectionRef, bumpViewKey, composerDraftSessionIdRef, currentModelPreferences, currentRunningTurnId, currentSessionIsRunning, currentSessionIsStopping, didBootReconnectRef, effectiveParentSessionId, escStopArmedRef, escStopTimerRef, eventStore, executionMode, explicitNewSessionRef, findAssistantMessageId, forcePlanNextPrompt, forkNextPrompt, gearProfiles, handleDurableEvent, hasRunningTurn, inlinePromptEditor, inlinePromptEditorRef, isAccountLoginOpen, isAccountPopoverOpen, isBootstrapped, isLikelyBackendDisconnect, isSessionSearchOpen, isSettingsOpen, latestMessagesRef, loadContext, loadSessionSearchPage, loadSessionsTimerRef, loadWorkspaceSnapshot, messageIndicatorMarks, messageScrollIndicatorRef, messageScrollTopRef, messages, messagesRef, modelPreferencesEditRevisionRef, navigationTargetRef, noteBackendDisconnect, noteBackendRequestSucceeded, patchStoredComposerDraft, persistModelPreferences, profileAccountId, profileWorkspaceId, promptTurns, promptTurnsScrollRef, queuedModelPreferencesRevisionRef, queuedPrompts, queuedPromptsBySession, queuedPromptsRef, readNavigationTarget, reconnectRunner, reconnectingTurnIdsRef, refreshSelectedSessionSnapshot, resetAccountLoginDialog, resetEscStopPrompt, resizeEditor, responseQuotePopover, restoreBackendConnection, resumeThreadId, runningSessionCount, selectedEffort, selectedModel, sessionExecutionStatusesRef, sessionId, sessionIdRef, sessionSearchQuery, setActivePromptTurnIds, setClockNow, setComposerResponseQuote, setIsAccountPopoverOpen, setIsLoadingProfileAnalytics, setIsLoadingSkills, setIsSettingsOpen, setParentSessionTodo, setPendingApprovalSessionIds, setProfileAnalytics, setProfileAnalyticsError, setProfileWorkspaceId, setResponseQuotePopover, setSelectedSkills, setSessionExecutionStatuses, setSkillSuggestions, setSlashSuggestionIndex, setStatus, setsEqual, settingsSection, showToast, skillSuggestions, slashTrigger, status, stickToMessageBottomRef, stopCurrentTurn, switchingSessionTitle, threadId, toastTimerRef, updateMessageIndicatorPositions, updateMessageViewportIndicator, useLoadBalanceInWorkspace, viewKeyRef, writeStoredSession });
+        // Preselect the first worker so Enter or Tab picks it, as in actor chats.
+        setComposerSuggestionIndex(visibleComposerSuggestions[0]?.kind === "actor" ? 0 : -1);
+    }, [composerSuggestionTrigger?.start, composerSuggestionTrigger?.end, composerSuggestionTrigger?.query, visibleComposerSuggestions[0]?.kind]);
+    const showManagerWorkspace = !actorView && ((managerMode && !managerHistoryOpen) || managerPanelWorkspace === activeWorkspace?.id);
+    useSessionEffects({ accountPopoverRef, activeGearIndex, activePromptTurnIds, activeTurnId, activeTurnIdRef, activeWorkspace, approvalPolicy, backendConnection, backendConnectionRef, bumpViewKey, composerDraftSessionIdRef, currentModelPreferences, currentRunningTurnId, currentSessionIsRunning, currentSessionIsStopping, didBootReconnectRef, effectiveParentSessionId, escStopArmedRef, escStopTimerRef, eventStore, executionMode, explicitNewSessionRef, findAssistantMessageId, forcePlanNextPrompt, forkNextPrompt, gearProfiles, handleDurableEvent, hasRunningTurn, inlinePromptEditor, inlinePromptEditorRef, isAccountLoginOpen, isAccountPopoverOpen, isBootstrapped, isLikelyBackendDisconnect, isSessionSearchOpen, isSettingsOpen, latestMessagesRef, loadContext, loadSessionSearchPage, loadSessionsTimerRef, loadWorkspaceSnapshot, messageIndicatorMarks, messageScrollIndicatorRef, messageScrollTopRef, messages, messagesRef, modelPreferencesEditRevisionRef, navigationTargetRef, noteBackendDisconnect, noteBackendRequestSucceeded, patchStoredComposerDraft, persistModelPreferences, profileAccountId, profileWorkspaceId, promptTurns, promptTurnsScrollRef, queuedModelPreferencesRevisionRef, queuedPrompts, queuedPromptsBySession, queuedPromptsRef, readNavigationTarget, reconnectRunner, reconnectingTurnIdsRef, refreshSelectedSessionSnapshot, resetAccountLoginDialog, resetEscStopPrompt, resizeEditor, responseQuotePopover, restoreBackendConnection, resumeThreadId, runningSessionCount, selectedEffort, selectedModel, sessionExecutionStatusesRef, sessionId, sessionIdRef, sessionSearchQuery, setActivePromptTurnIds, setClockNow, setComposerResponseQuote, setIsAccountPopoverOpen, setIsLoadingProfileAnalytics, setIsLoadingSkills, setIsSettingsOpen, setParentSessionTodo, setPendingApprovalSessionIds, setProfileAnalytics, setProfileAnalyticsError, setProfileWorkspaceId, setResponseQuotePopover, setSelectedSkills, setSessionExecutionStatuses, setSkillSuggestions, setSlashSuggestionIndex, setStatus, setsEqual, settingsSection, showToast, skillSuggestions, slashTrigger, status, stickToMessageBottomRef, stopCurrentTurn, switchingSessionTitle, threadId, toastTimerRef, updateMessageIndicatorPositions, updateMessageViewportIndicator, useLoadBalanceInWorkspace, viewKeyRef, writeStoredSession }, { disableEscapeStop: showManagerWorkspace });
     function showToast(message) { return appActions01.showToast({ setToastMessage, toastTimerRef }, message); }
     async function copyUserPrompt(prompt) {
         if (!navigator.clipboard) {
@@ -1240,10 +1373,10 @@ export function ThreadexShell(ctx) {
     }, []);
     async function startRoundtable(message, turnAttachments, turnSkills, contextFork = false) {
         if (roundtableSending || managerMode) return;
-        if (turnAttachments.length || turnSkills.length) throw new Error("Round table accepts text and quoted context. Remove attachments and skills before sending.");
         const originalSessionId = sessionIdRef.current;
         const workspaceId = activeWorkspaceIdRef.current;
         const payload = { message, actors: roundtable.actors, workspaceId, modelPreferences: currentModelPreferences(), approvalPolicy,
+            attachments: turnAttachments, skills: turnSkills.map(({ name, path }) => ({ name, path })),
             forkFromSessionId: contextFork ? originalSessionId : undefined,
             baseSessionId: originalSessionId ? undefined : newSessionBaseSessionIdRef.current ?? undefined,
             newSessionProjectId: originalSessionId ? undefined : newSessionProjectRef.current?.id ?? undefined };
@@ -1306,12 +1439,23 @@ export function ThreadexShell(ctx) {
         } catch (error) { showToast(error instanceof Error ? error.message : String(error)); }
         finally { setConcurrentSending(false); }
     }
-    async function submit(event, modeOverride = composerMode) {
+    async function submit(event, modeOverride = composerMode, modelSwitchConfirmed = false) {
+        if (managerMode || sessionIdRef.current === managerView.state?.manager?.sessionId) { event?.preventDefault(); showToast("Manager history is read-only. Open Manager to message actors."); return; }
         if (concurrentWorkerEnded) { event?.preventDefault(); return; }
         event?.preventDefault();
         setComposerSubmissionError(null);
         try {
             if (pendingComposer.edit) return await (pendingComposer.edit.held ? pendingComposer.submit() : pendingComposer.retry());
+            if (actorMentions.resolving && sessionIdRef.current === sessionId) { setComposerSubmissionError({ sessionId, message: "Prompt not sent: Still loading workers for @ mentions. Try again in a moment." }); return; }
+            if (actorMentions.mentioned.length > 0 && sessionIdRef.current) return await submitActorMention(modeOverride);
+            if (!modelSwitchConfirmed && modeOverride !== "steer" && canSend && selectedModel !== AUTO_MODEL_VALUE) {
+                const previousModel = messages.findLast(message => message.role === "assistant" && message.model)?.model;
+                if (crossesModelGroup(previousModel, selectedModel)) {
+                    // Nothing is sent and the draft is untouched until the user confirms.
+                    setModelGroupSwitch({ from: previousModel, to: selectedModel, mode: modeOverride });
+                    return;
+                }
+            }
             const managerConcurrentTurnId = managerMode && currentSessionIsRunning
                 ? messages.filter(message => message.role === "assistant" && message.turnStatus === "done" && message.turnId).at(-1)?.turnId ?? null
                 : null;
@@ -1319,6 +1463,32 @@ export function ThreadexShell(ctx) {
         } catch (error) {
             setComposerSubmissionStatus(`Prompt not sent: ${error instanceof Error ? error.message : "Unexpected submission error. Please try again."}`);
         }
+    }
+    /** Sends a prompt that @ mentions workers to `POST /api/sessions/:id/actor-mentions`; never falls back to `/api/chat`. */
+    async function submitActorMention(modeOverride) {
+        const targetSessionId = sessionIdRef.current;
+        const fail = (message) => setComposerSubmissionError({ sessionId: targetSessionId, message: `Prompt not sent: ${message}` });
+        if (actorMentionSending || !canSend) return;
+        if (modeOverride === "steer") return fail("Steer cannot @ workers. Press Enter to send the prompt to them instead.");
+        if (attachments.length > 0) return fail("Attachments cannot be sent with @ workers yet. Remove them or the @ mentions.");
+        if (roundtable.enabled || concurrentSourceTurnId || forkNextPrompt) return fail("Turn off Round table, Concurrent and Fork to @ workers in this session.");
+        const inputMessage = replaceComposerLinkTokens(input, composerSessionLinks).trim();
+        const linkReferences = composerSessionLinks.filter((link) => !input.includes(composerLinkToken(link.id))).map((link) => formatComposerLinkMarkdown(link));
+        const plainMessage = [inputMessage, ...linkReferences].filter(Boolean).join("\n");
+        const message = composerResponseQuote?.length ? formatResponseAnnotationsPrompt(composerResponseQuote, plainMessage) : plainMessage;
+        const result = await actorMentions.send(targetSessionId, message);
+        if (!result.ok) return fail(result.error);
+        if (sessionIdRef.current === targetSessionId) {
+            clearComposerInputDraft();
+            clearComposerSessionLinks();
+            setComposerResponseQuote(null);
+            setResponseQuotePopover(null);
+            setComposerSuggestionTrigger(null);
+            setComposerSubmissionError(null);
+        }
+        else patchStoredComposerDraft(targetSessionId, { input: "" });
+        scheduleLoadSessions();
+        if (sessionIdRef.current === targetSessionId) void refreshSelectedSessionSnapshot(targetSessionId);
     }
     async function submitSteer() { return submit(undefined, "steer"); }
     function fillPromptSuggestion(text) {
@@ -1338,9 +1508,11 @@ export function ThreadexShell(ctx) {
     const promptSuggestionActionsRef = useRef({});
     promptSuggestionActionsRef.current.fill = fillPromptSuggestion;
     promptSuggestionActionsRef.current.send = (text) => void sendPromptSuggestion(text);
-    async function toggleWorkspaceManager(open = !managerMode, history = "push") {
+    async function toggleWorkspaceManager(open = !managerMode, history = "push", legacyHistory = false, preserveSession = true) {
         const workspaceId = activeWorkspaceIdRef.current;
         if (!workspaceId || managerNavigationBusy.current) return;
+        const wasGroupChat = managerModeRef.current || managerPanelWorkspaceRef.current === workspaceId;
+        clearManagerPanel();
         const requestId = ++managerNavigationRequestRef.current;
         const previousSessionId = sessionIdRef.current;
         managerEntryRequest.current = false;
@@ -1348,13 +1520,27 @@ export function ThreadexShell(ctx) {
         setManagerOpening(true);
         setManagerOpenError(null);
         if (open) {
-            if (previousSessionId && previousSessionId !== managerView.state?.manager?.sessionId) {
+            if (preserveSession && !legacyHistory && previousSessionId && !wasGroupChat) {
+                managerPanelWorkspaceRef.current = workspaceId;
+                setManagerPanelWorkspace(workspaceId);
+                setManagerPanelTarget(previousSessionId);
+                managerModeRef.current = false;
+                setManagerMode(false);
+                clearActorView();
+                updateNavigationUrl({ workspaceId, sessionId: previousSessionId }, history);
+                managerNavigationBusy.current = false;
+                setManagerOpening(false);
+                return;
+            }
+            if (!managerModeRef.current && previousSessionId && previousSessionId !== managerView.state?.manager?.sessionId) {
                 managerReturnSessions.current.set(workspaceId, previousSessionId);
             }
             // Commit the route and loading view before either Manager request starts.
             bumpViewKey();
-            const cachedManagerId = managerView.state?.manager?.sessionId ?? null;
+            const cachedManagerId = legacyHistory ? managerView.state?.manager?.sessionId ?? null : null;
+            setManagerHistoryOpen(legacyHistory);
             managerSessionRef.current = cachedManagerId;
+            clearActorView();
             managerModeRef.current = true;
             setManagerMode(true);
             setSessionId(null);
@@ -1371,7 +1557,10 @@ export function ThreadexShell(ctx) {
         let managerSwitchViewKey = viewKey;
         try {
             if (open) {
-                const manager = await apiJson("/api/workspace-manager", { method: "POST", body: { workspaceId } });
+                if (!legacyHistory) { setSwitchingSessionTitle(null); return; }
+                const state = await apiJson(`/api/workspace-manager/conversation?workspaceId=${encodeURIComponent(workspaceId)}&summary=true`);
+                const manager = state.manager;
+                if (!manager) throw new Error("No Manager history exists for this workspace.");
                 if (requestId !== managerNavigationRequestRef.current || activeWorkspaceIdRef.current !== workspaceId || !isCurrentViewKey(viewKey)) return;
                 // The Manager ID is known now. The switch endpoint supplies its
                 // transcript, so a separate snapshot fetch is unnecessary.
@@ -1429,7 +1618,58 @@ export function ThreadexShell(ctx) {
         if (!isBootstrapped || !activeWorkspace?.id || !managerEntryRequest.current) return;
         const target = readOptionalNavigationTarget();
         if (target?.workspaceId && target.workspaceId !== activeWorkspace.id) return;
-        void toggleWorkspaceManager(true, "replace");
+        void toggleWorkspaceManager(true, "replace", Boolean(target?.sessionId), false);
+    }, [isBootstrapped, activeWorkspace?.id, managerNavigationRevision]);
+    function openActorView(actorId, history = "push") {
+        clearManagerPanel();
+        const workspaceId = activeWorkspaceIdRef.current;
+        if (!workspaceId || !actorId) return;
+        // Supersede any Manager navigation still in flight.
+        managerNavigationRequestRef.current += 1;
+        managerNavigationBusy.current = false;
+        setManagerOpening(false);
+        setManagerOpenError(null);
+        managerEntryRequest.current = false;
+        actorEntryRequest.current = null;
+        const previousSessionId = sessionIdRef.current;
+        if (!managerModeRef.current && !actorViewRef.current && previousSessionId && previousSessionId !== managerView.state?.manager?.sessionId) {
+            managerReturnSessions.current.set(workspaceId, previousSessionId);
+        }
+        bumpViewKey();
+        setManagerHistoryOpen(false);
+        managerModeRef.current = false;
+        setManagerMode(false);
+        actorViewRef.current = { actorId };
+        setActorView(actorViewRef.current);
+        setSessionTab(current => ({ ...current, value: "actor-sessions" }));
+        setSessionId(null);
+        sessionIdRef.current = null;
+        setActiveSessionId(null);
+        setActiveTurnId(null);
+        setThreadId(null);
+        replaceComposerDraftForSession(null);
+        setMessages([]);
+        setSwitchingSessionTitle(null);
+        updateNavigationUrl({ workspaceId, sessionId: null }, history);
+    }
+    async function closeActorView() {
+        const workspaceId = activeWorkspaceIdRef.current;
+        if (!workspaceId) return;
+        const previous = managerReturnSessions.current.get(workspaceId)
+            ?? flatSessions.find(record => record.id !== managerView.state?.manager?.sessionId)?.id;
+        try {
+            if (previous) await switchToSessionById(previous);
+            else await newSession();
+        } catch (error) {
+            showToast(error instanceof Error ? error.message : String(error));
+        }
+    }
+    useReactEffect(() => {
+        const actorId = actorEntryRequest.current;
+        if (!isBootstrapped || !activeWorkspace?.id || !actorId) return;
+        const target = readOptionalNavigationTarget();
+        if (target?.workspaceId && target.workspaceId !== activeWorkspace.id) return;
+        openActorView(actorId, "replace");
     }, [isBootstrapped, activeWorkspace?.id, managerNavigationRevision]);
     async function startChatTurn(message, turnAttachments, turnExecutionMode = executionMode, turnSkills = selectedSkills, contextForkRequest = false, forcePlan = false, clearComposer = true, grillOrigin = undefined, submissionId = undefined) { return appActions01.startChatTurn({ managedMode: !managerMode && !roundtable.enabled && !concurrentSourceTurnId && managedMode, AUTO_MODEL_VALUE, activeAccount, activeWorkspace, activeWorkspaceIdRef, approvalPolicy, clearComposerInputDraft, clearComposerSessionLinks, composerDraftSessionIdRef, currentModelPreferences: managerMode ? () => ({ ...currentModelPreferences(), selectedModel: WORKSPACE_MANAGER_MODEL, selectedEffort: WORKSPACE_MANAGER_EFFORT }) : currentModelPreferences, explicitNewSessionRef, handleStreamEvent, isLikelyBackendDisconnect, markTurnFinished, markTurnRunning, modelPreferencesWorkspaceIdRef, moveStoredComposerDraft, newSessionBaseSessionIdRef, newSessionProjectRef, noteBackendDisconnect, noteBackendRequestSucceeded, patchAssistantMessage, persistedModelPreferencesWorkspaceIdRef, readEventStream, reconnectRunner, registerStreamTarget, restoreKnownActiveSessionBeforeSend, resumeThreadId, scheduleLoadSessions, selectedEffort, selectedModel, sessionAutoModel, sessionIdRef, setActiveSessionId, setActiveTurnId, setAttachments, setComposerResponseQuote, setMessages, setResponseQuotePopover, setSelectedSkills, setSessionId, setSlashTrigger, setStatus: setComposerSubmissionStatus, stickToMessageBottomRef, streamTargetsRef, unregisterStreamTarget, updateNavigationUrl, useLoadBalanceInWorkspace, viewKeyRef }, message, turnAttachments, turnExecutionMode, turnSkills, contextForkRequest, forcePlan, clearComposer, grillOrigin, submissionId); }
     function queuePrompt(message, mode = executionMode, skills = selectedSkills, forcePlan = composerTodoPlanModeEnabled) { return appActions01.queuePrompt({ attachments, enqueuePrompt }, message, mode, skills, forcePlan); }
@@ -1509,6 +1749,7 @@ export function ThreadexShell(ctx) {
         setActiveWorkspace(workspace);
     }
     async function switchWorkspace(workspaceId, options = {}) {
+        clearManagerPanel();
         // An already-selected workspace is a no-op, including a second click
         // while its manager transcript is still loading.
         if (!workspaceId || workspaceId === activeWorkspaceIdRef.current) return true;
@@ -1521,7 +1762,7 @@ export function ThreadexShell(ctx) {
         managerModeRef.current = false;
         setManagerMode(false);
         managerEntryRequest.current = false;
-        let directManagerSessionId = null;
+        clearActorView();
         if (shouldOpenManager) {
             managerNavigationBusy.current = true;
             setManagerOpening(true);
@@ -1529,21 +1770,17 @@ export function ThreadexShell(ctx) {
         try {
             const switching = appActions02.switchWorkspace({ activeWorkspace, applyAccountPayload, bumpViewKey, clearNewSessionProjectSelection, clearTodoPanelState, createSystemMessage, eventStore, explicitNewSessionRef, isCurrentViewKey, loadWorkspaceSnapshot, parentSessionTodo, replaceComposerDraftForSession, sessionIdRef, sessionTodo, setActiveSessionId, setActiveTurnId, setActiveWorkspace: setSwitchedActiveWorkspace, setMessages, setParentSessionTodo, setQueuedPrompts, setResumeThreadId, setSessionExecutionStatuses, setSessionId, setSessionTodo, setStatus, setThreadId, setWorkspaceList, toSessionPageState, updateNavigationUrl, viewKeyRef, workspaceList }, workspaceId, shouldOpenManager ? {
                 ...options,
-                directManager: true,
-                onManagerTarget: (managerSessionId) => {
-                    directManagerSessionId = managerSessionId;
-                    managerSessionRef.current = managerSessionId;
-                    managerModeRef.current = true;
-                    setManagerMode(true);
-                }
+                includeActiveSession: false,
+                navigationTarget: { workspaceId, sessionId: null, view: "workspace-chat" },
+                history: "none"
             } : options);
             const viewKey = viewKeyRef.current;
             const switched = await switching;
             if (requestId !== workspaceSwitchRequestRef.current || !isCurrentViewKey(viewKey)) return false;
-            if (!switched && directManagerSessionId && activeWorkspaceIdRef.current === workspaceId && managerSessionRef.current === directManagerSessionId) {
-                managerSessionRef.current = null;
-                managerModeRef.current = false;
-                setManagerMode(false);
+            if (switched && shouldOpenManager) {
+                setAutoGroupChatWorkspace(workspaceId);
+                managerNavigationBusy.current = false;
+                await toggleWorkspaceManager(true, options.history ?? "push");
             }
             return switched;
         } finally {
@@ -1573,7 +1810,19 @@ export function ThreadexShell(ctx) {
     function scheduleLoadSessions(delayMs = 350) { return appActions03.scheduleLoadSessions({ loadSessions, loadSessionsTimerRef }, delayMs); }
     function bumpViewKey() { return appActions03.bumpViewKey({ viewKeyRef }); }
     function isCurrentViewKey(viewKey) { return appActions03.isCurrentViewKey({ viewKeyRef }, viewKey); }
-    function updateNavigationUrl(target, mode) { return appActions03.updateNavigationUrl({ navigationTargetRef, navigationUrl }, { ...target, view: managerModeRef.current || managerEntryRequest.current ? "workspace-chat" : null }, mode); }
+    function updateNavigationUrl(target, mode) {
+        if (managerPanelWorkspaceRef.current && managerPanelWorkspaceRef.current === target.workspaceId && !managerModeRef.current) {
+            const current = readNavigationTarget();
+            const focus = current.sessionId === target.sessionId ? current : {};
+            return appActions03.updateNavigationUrl({ navigationTargetRef, navigationUrl }, { ...focus, ...target, view: null, actorId: null, groupChat: true, chat: groupChatKeyRef.current }, mode);
+        }
+        // A session URL is never an actor view; a pending URL entry keeps its actor through canonicalization.
+        const actorId = target.sessionId ? null : actorViewRef.current?.actorId ?? actorEntryRequest.current;
+        const groupChatView = managerModeRef.current || managerEntryRequest.current;
+        const view = actorId ? { view: "actor", actorId }
+            : { view: groupChatView ? "workspace-chat" : null, actorId: null, ...(groupChatView ? { chat: groupChatKeyRef.current } : {}) };
+        return appActions03.updateNavigationUrl({ navigationTargetRef, navigationUrl }, { ...target, ...view }, mode);
+    }
     function replaceNavigationUrl(target) { return appActions03.replaceNavigationUrl({ updateNavigationUrl }, target); }
     function registerStreamTarget(turnId, assistantMessageId, targetSessionId, viewKey) { return appActions03.registerStreamTarget({ streamTargetsRef }, turnId, assistantMessageId, targetSessionId, viewKey); }
     function unregisterStreamTarget(target, originalTurnId = target.turnId) { return appActions03.unregisterStreamTarget({ streamTargetsRef }, target, originalTurnId); }
@@ -1598,9 +1847,26 @@ export function ThreadexShell(ctx) {
     async function bindAccount(accountId = bindAccountId) { return appActions03.bindAccount({ activeWorkspace, applyAccountPayload, setBindAccountId, setStatus }, accountId); }
     async function unbindAccount(accountId) { return appActions03.unbindAccount({ activeWorkspace, applyAccountPayload, setStatus }, accountId); }
     async function deleteAccount(account) { return appActions03.deleteAccount({ accountIdentityLabel, applyAccountPayload, deletingAccountId, setBindAccountId, setDeletingAccountId, setProfileAccountId, setStatus, showToast }, account); }
-    async function switchSession(record, options = {}) { if (options.workspaceManagerView) managerSessionRef.current = record.id; managerModeRef.current = options.workspaceManagerView === true; setManagerMode(managerModeRef.current); managerEntryRequest.current = false; closeMiddlePanel(); return appActions03.switchSession({ applyComposerDraftState, applySelectedSessionSnapshot, bumpViewKey, clearTodoPanelState, currentComposerDraft, displaySessionTitle, executionMode, explicitNewSessionRef, forcePlanNextPrompt, forkNextPrompt, input, isCurrentViewKey, isLikelyBackendDisconnect, messages, noteBackendDisconnect, noteBackendRequestSucceeded, parentSessionTodo, reconnectRunner, replaceComposerDraftForSession, scheduleLoadSessions, sessionIdRef, sessionTodo, setMessages, setParentSessionTodo, setSessionTodo, setStatus, setSwitchingSessionTitle, stickToMessageBottomRef, updateNavigationUrl, viewKeyRef }, record, options); }
+    async function switchSession(record, options = {}) {
+        // Only claims and task cards keep the session inside Manager. Global
+        // navigation must release that local selection before updating the URL.
+        if (!options.managerPreview) clearManagerPanel();
+        if (options.workspaceManagerView) managerSessionRef.current = record.id;
+        managerModeRef.current = options.workspaceManagerView === true;
+        setManagerMode(managerModeRef.current);
+        managerEntryRequest.current = false;
+        clearActorView();
+        closeMiddlePanel();
+        return appActions03.switchSession({ applyComposerDraftState, applySelectedSessionSnapshot, bumpViewKey, clearTodoPanelState, currentComposerDraft, displaySessionTitle, executionMode, explicitNewSessionRef, forcePlanNextPrompt, forkNextPrompt, input, isCurrentViewKey, isLikelyBackendDisconnect, messages, noteBackendDisconnect, noteBackendRequestSucceeded, parentSessionTodo, reconnectRunner, replaceComposerDraftForSession, scheduleLoadSessions, sessionIdRef, sessionTodo, setMessages, setParentSessionTodo, setSessionTodo, setStatus, setSwitchingSessionTitle, stickToMessageBottomRef, updateNavigationUrl, viewKeyRef }, record, options);
+    }
     async function openLinkedSession(record) { return appActions04.openLinkedSession({ activeWorkspace, switchSession, switchWorkspace }, record); }
     async function switchToSessionById(targetSessionId, options = {}) { return appActions04.switchToSessionById({ isCurrentViewKey, sessionList, setStatus, showToast, switchSession, viewKeyRef }, targetSessionId, options); }
+    async function openActionSession(targetSessionId, workspaceId) {
+        if (workspaceId !== activeWorkspace?.id) {
+            if (!(await switchWorkspace(workspaceId, { history: "none", preserveTargetSession: true }))) return;
+        }
+        await switchToSessionById(targetSessionId);
+    }
     async function switchToParentSession(parentSessionId) { return appActions04.switchToParentSession({ switchToSessionById }, parentSessionId); }
     async function restoreKnownActiveSessionBeforeSend() { return appActions04.restoreKnownActiveSessionBeforeSend({ activeSessionId, eventStore, explicitNewSessionRef, navigationTargetRef, newSessionRequestInFlightRef, readOptionalNavigationTarget, sessionIdRef, sessionList, setStatus, switchSession, switchToSessionById }); }
     async function achieveSessionGoal(record) { return appActions04.achieveSessionGoal({ achievingSessionIds, centralState, eventStore, isLikelyBackendDisconnect, noteBackendDisconnect, noteBackendRequestSucceeded, scheduleLoadSessions, setAchievingSessionIds, setStatus, showToast }, record); }
@@ -1614,7 +1880,7 @@ export function ThreadexShell(ctx) {
     function applyStreamItem(target, item) { return appActions04.applyStreamItem({ appendAssistantMessage, describeStreamItem, isTargetVisible, liveItemKey, readAgentMessageAppendText, setStatus, threadIdRef, upsertLiveItem }, target, item); }
     function upsertLiveItem(target, item) { return appActions04.upsertLiveItem({ applyLiveItemToMessage, isTargetVisible, itemEventRank, liveItemKey, setMessages }, target, item); }
     function removePendingApprovalItem(approvalId) { return appActions04.removePendingApprovalItem({ refreshApprovalState, setPendingApprovalItems }, approvalId); }
-    async function newSession(project = null, baseSessionId = null) { roundtable.resetNewTask(); managerModeRef.current = false; setManagerMode(false); managerEntryRequest.current = false; closeMiddlePanel(); return appActions04.newSession({ activeWorkspace, applyComposerDraftState, bumpViewKey, clearTodoPanelState, createSystemMessage, currentComposerDraft, eventStore, executionMode, explicitNewSessionRef, forcePlanNextPrompt, forkNextPrompt, input, isCurrentViewKey, isLikelyBackendDisconnect, navigationRequestIdRef, newSessionBaseSessionIdRef, newSessionProjectRef, newSessionRequestInFlightRef, noteBackendDisconnect, noteBackendRequestSucceeded, parentSessionTodo, prepareNewLocalModelPreferences, replaceComposerDraftForSession, sessionIdRef, sessionTodo, setActiveSessionId, setActiveTurnId, setComposerInput, setIsBootstrapped, setMessages, setNewSessionProjectId, setNewSessionProjectName, setParentSessionTodo, setPendingApprovalItems, setQueuedPrompts, setResumeThreadId, setSessionAutoModel, setSessionId, setSessionTodo, setStatus, setThreadId, updateNavigationUrl, viewKeyRef }, project, baseSessionId); }
+    async function newSession(project = null, baseSessionId = null) { clearManagerPanel(); roundtable.resetNewTask(); managerModeRef.current = false; setManagerMode(false); managerEntryRequest.current = false; clearActorView(); closeMiddlePanel(); return appActions04.newSession({ activeWorkspace, applyComposerDraftState, bumpViewKey, clearTodoPanelState, createSystemMessage, currentComposerDraft, eventStore, executionMode, explicitNewSessionRef, forcePlanNextPrompt, forkNextPrompt, input, isCurrentViewKey, isLikelyBackendDisconnect, navigationRequestIdRef, newSessionBaseSessionIdRef, newSessionProjectRef, newSessionRequestInFlightRef, noteBackendDisconnect, noteBackendRequestSucceeded, parentSessionTodo, prepareNewLocalModelPreferences, replaceComposerDraftForSession, sessionIdRef, sessionTodo, setActiveSessionId, setActiveTurnId, setComposerInput, setIsBootstrapped, setMessages, setNewSessionProjectId, setNewSessionProjectName, setParentSessionTodo, setPendingApprovalItems, setQueuedPrompts, setResumeThreadId, setSessionAutoModel, setSessionId, setSessionTodo, setStatus, setThreadId, updateNavigationUrl, viewKeyRef }, project, baseSessionId); }
     function focusComposer() { window.requestAnimationFrame(() => inputEditorRef.current?.focus()); }
     useReactEffect(() => {
         const onFollowup = (event: CustomEvent<string>) => {
@@ -1625,6 +1891,23 @@ export function ThreadexShell(ctx) {
         window.addEventListener(CODEX_FOLLOWUP_EVENT, onFollowup);
         return () => window.removeEventListener(CODEX_FOLLOWUP_EVENT, onFollowup);
     }, [setComposerInput]);
+    // Blocker "Send to session composer" / "New session composer": prefill only, never send; existing drafts are appended to, not replaced.
+    const blockerComposerRef = useRef<(request: BlockerComposerRequest) => void>(() => {});
+    blockerComposerRef.current = async (request) => {
+        if (!request.text.trim()) return;
+        if (request.target === "new") {
+            await newSession();
+            setComposerInput(request.text);
+        } else {
+            setComposerInput((current) => current.trim() ? `${current}\n\n${request.text}` : request.text);
+        }
+        focusComposer();
+    };
+    useReactEffect(() => {
+        const onBlockerComposer = (event: CustomEvent<BlockerComposerRequest>) => void blockerComposerRef.current(event.detail);
+        window.addEventListener(BLOCKER_TO_COMPOSER_EVENT, onBlockerComposer);
+        return () => window.removeEventListener(BLOCKER_TO_COMPOSER_EVENT, onBlockerComposer);
+    }, []);
     function editQueuedPrompt(promptId) { return appActions04.editQueuedPrompt({ focusComposer, input, queuedPromptEditRef, queuedPromptsRef, setComposerInput, setQueuedPrompts, setStatus }, promptId); }
     function commitQueuedPromptEdit(content) { return appActions04.commitQueuedPromptEdit({ focusComposer, queuedPromptEditRef, setComposerInput, setQueuedPrompts, setStatus }, content); }
     function focusInlinePromptEditorAtEnd() { return appActions04.focusInlinePromptEditorAtEnd({ inlinePromptEditorRef }); }
@@ -1687,6 +1970,7 @@ export function ThreadexShell(ctx) {
                         ? persistedTurn.cachedInputTokens
                         : undefined,
                     tokenOut: Number.isFinite(persistedTurn.tokenOut) ? persistedTurn.tokenOut : current.tokenOut,
+                    subagentUsage: persistedTurn.subagentUsage ?? current.subagentUsage,
                     executionDurationMs: turnDurationMs({}, persistedTurn) ?? current.executionDurationMs,
                     turnStatus: persistedTurn.status ?? current.turnStatus,
                     developerInstructions: persistedDeveloperInstructions.length > 0
@@ -1900,6 +2184,9 @@ export function ThreadexShell(ctx) {
         if (pendingComposer.edit && event.key === "Escape" && !event.nativeEvent.isComposing) {
             event.preventDefault(); event.stopPropagation(); void pendingComposer.cancel(); return;
         }
+        if (composerActorMentionNotice && event.key === "Escape" && !event.nativeEvent.isComposing) {
+            event.preventDefault(); setComposerSuggestionTrigger(null); return;
+        }
         return appActions05.handleEditorKeyDown({ canSend, composerSuggestionIndex, composerSuggestionTrigger: managerMode ? null : composerSuggestionTrigger, currentSessionIsRunning, selectComposerSuggestion, selectSlashSuggestion, setComposerSuggestionIndex, setComposerSuggestionTrigger, setSlashSuggestionIndex, setSlashTrigger, slashSuggestionIndex, slashTrigger: managerMode ? null : slashTrigger, submitSteer, visibleComposerSuggestions, visibleSlashSuggestions }, event); }
     function selectSlashSuggestion(suggestion) { return appActions06.selectSlashSuggestion({ capitalize, executionMode, input: pendingComposer.edit?.value ?? input, inputEditorRef, setComposerExecutionMode, setComposerInput, setSelectedSkills, setSlashTrigger, setStatus, slashTrigger, toggleTodoPlanMode }, suggestion); }
     function selectComposerSuggestion(suggestion) { return appActions06.selectComposerSuggestion({ composerSuggestionTrigger, input: pendingComposer.edit?.value ?? input, inputEditorRef, setComposerInput, setComposerSuggestionTrigger }, suggestion); }
@@ -1971,7 +2258,8 @@ export function ThreadexShell(ctx) {
     const sessionTitleById = new Map(sessionList.map((session) => [session.id, session.title]));
     const waitEventById = new Map(centralState.waitEvents.map((event) => [event.id, event]));
     const activeWaitRows = centralState.waitSubscriptions.flatMap((subscription) => {
-        if (subscription.status !== "waiting" && subscription.status !== "dispatching" && subscription.status !== "error") {
+        // Dispatching means the resume has started; it stays dispatching until the resumed turn ends.
+        if (subscription.status !== "waiting" && subscription.status !== "error") {
             return [];
         }
         const event = waitEventById.get(subscription.eventId);
@@ -2164,7 +2452,7 @@ export function ThreadexShell(ctx) {
                 messageElementsRef.current[message.id] = element;
             }, children: _jsxs("div", { className: "message-content", children: [
 managerMode && message.role === "assistant" && message.managerNotification?.length > 0 && _jsx("div", { className: "manager-notification-envelope", "aria-label": "Notification context", children: message.managerNotification.map((notification, index) => _jsxs("div", { className: "manager-notification-source", children: [_jsx("span", { className: "manager-notification-type", children: notification.type }), notification.threadName && _jsx("strong", { children: notification.threadName }), notification.userPrompt && _jsxs("div", { className: "manager-notification-prompt", children: [_jsx("span", { children: "Original turn prompt" }), _jsx("p", { children: notification.userPrompt })] })] }, index)) }),
-message.role === "assistant" && associatedPrompt && (_jsxs("div", { className: "agent-turn-prompt", children: [associatedPrompt.attachments && associatedPrompt.attachments.length > 0 && _jsx(AttachmentList, { attachments: associatedPrompt.attachments }), associatedPromptAnnotations && _jsx(ResponseAnnotationList, { annotations: associatedPromptAnnotations.annotations }), _jsx(MarkdownContent, { children: associatedPromptAnnotations?.request ?? (associatedPromptMetadata?.visible || "Attachment prompt") }), _jsxs("div", { className: "agent-turn-prompt-footer", children: [renderPromptModelBadge(associatedPrompt), renderPromptTags(associatedPrompt), renderPromptActionButtons(associatedPrompt, "prompt-turn-actions agent-turn-prompt-actions")] })] })),
+message.role === "assistant" && associatedPrompt && (_jsxs("div", { className: "agent-turn-prompt", children: [associatedPrompt.attachments && associatedPrompt.attachments.length > 0 && _jsx(AttachmentList, { attachments: associatedPrompt.attachments }), associatedPromptAnnotations && _jsx(ResponseAnnotationList, { annotations: associatedPromptAnnotations.annotations }), _jsx(MarkdownContent, { children: associatedPromptAnnotations?.request ?? (associatedPromptMetadata?.visible || "Attachment prompt") }), _jsxs("div", { className: "agent-turn-prompt-footer", children: [renderPromptOrigin(associatedPrompt), renderPromptModelBadge(associatedPrompt), renderPromptTags(associatedPrompt), renderPromptActionButtons(associatedPrompt, "prompt-turn-actions agent-turn-prompt-actions")] })] })),
 message.role === "assistant" && messageRoundtable && _jsx(RoundtableTurn, { round: messageRoundtable, onRetry: () => void roundtable.retry(messageRoundtable), onSkip: (actorId) => roundtable.skip(messageRoundtable, actorId), nextRound: roundtable.nextRoundFor(messageRoundtable) }),
 message.turnStatus === "todo" && (_jsx("span", { className: "turn-status", children: pendingStatusLabel })), message.role === "user" && renderPromptTags(message), message.role === "user" && (_jsx(ServerPrefixPanels, { startupSnapshot: startupSnapshot, developerInstructions: message.developerInstructions, showStartup: message.id === firstUserMessageId })), message.attachments && message.attachments.length > 0 && _jsx(AttachmentList, { attachments: message.attachments }), responseAnnotations && !isEditingUserPrompt && _jsx(ResponseAnnotationList, { annotations: responseAnnotations.annotations }), message.role === "assistant" && messageRoundtable?.synthesis ? _jsx("span", { "data-copy-markdown": messageRoundtable.summary, hidden: true }) : message.role === "assistant" && messageRoundtable?.status === "host" ? null : message.role === "assistant" && message.turnStatus === "done" && message.turnId ? (_jsx(CompletedTurn, { message: message, codexSessionId: threadId, sessionId: sessionId, steerMessages: steerMessages, workspaceId: activeWorkspace?.id, promptSuggestionActions: promptSuggestionActions })) : shouldRenderMessageTimeline(message) ? (_jsx(MessageTimeline, { anchorPrefix: message.id, completed: message.turnStatus === "done", running: message.turnStatus === "running" && !(messageRoundtable && message.runnerStarted === false), statusText: message.runnerStarted === false && !messageRoundtable ? "Connecting" : undefined, segments: message.segments ?? [], codexSessionId: threadId, sessionId: sessionId, turnId: message.turnId, workspaceId: activeWorkspace?.id })) : (_jsxs(_Fragment, { children: [isEditingUserPrompt ? (_jsxs("form", { className: "user-prompt-inline-editor", onSubmit: (event) => void submitInlineUserPromptEdit(event, message), children: [_jsx("textarea", { ref: inlinePromptEditorRef, className: "composer-editor", "aria-label": "Edit prompt", value: inlinePromptEditor?.value ?? "", onChange: (event) => {
                                     const value = event.currentTarget.value;
@@ -2178,9 +2466,9 @@ message.turnStatus === "todo" && (_jsx("span", { className: "turn-status", child
             ? accountList.find((account) => account.id === record.accountId) ?? { id: record.accountId }
             : null;
         const executionAccountLabel = executionAccount ? accountIdentityLabel(executionAccount) : "Not recorded";
-        const sessionApprovals = pendingApprovalItems.filter((item) => item.sessionId === record.id);
         const keywords = Object.keys(record.keywordWeights ?? {});
         const modelTokenUsage = record.modelTokenUsage ?? [];
+        const subagentTokenUsage = record.subagentTokenUsage;
         const isAchievingGoal = achievingSessionIds.has(record.id);
         const canAchieveGoal = Boolean(record.threadId) && executionStatus === "completed" && !isAchievingGoal;
         return (_jsxs("div", { className: "session-tree-node", "data-depth": node.depth, style: { "--session-tree-depth": node.depth }, children: [_jsxs("div", { className: "session-list-item", onMouseEnter: (event) => {
@@ -2203,11 +2491,11 @@ message.turnStatus === "todo" && (_jsx("span", { className: "turn-status", child
                                 if (!event.currentTarget.parentElement?.contains(event.relatedTarget)) {
                                     scheduleHoveredSessionClose();
                                 }
-}, disabled: record.id === sessionId, "data-active": record.id === sessionId || record.id === activeSessionId, "data-child-session": node.depth > 0 ? "true" : undefined, children: [_jsx("span", { className: "session-status-indicator", "data-status": executionStatus, "aria-hidden": "true", children: executionStatus === "running" ? _jsx(Loader2, { className: "spin" }) : _jsx(Circle, {}) }), _jsx("span", { className: "session-title", children: displaySessionTitle(record.title) }), _jsx("span", { className: "thread-time", children: formatTimestampShort(record.updated) })] }), hoveredSession?.id === record.id && sessionApprovals.length > 0 ? (_jsx("div", { className: `approval-mini-popover${sessionApprovals.some((item) => item.method === "item/tool/requestUserInput") ? " user-input-mini-popover" : ""}`, role: "dialog", "aria-label": "Session action requested", style: { ...hoveredSession.position, overflowY: "auto" }, onMouseEnter: cancelHoveredSessionClose, children: sessionApprovals.map((item) => (_jsx(ApprovalEvent, { compact: true, item: item, onDecisionSubmitted: removePendingApprovalItem }, item.approvalId))) })) : hoveredSession?.id === record.id ? (_jsxs("section", { className: "thread-status-popover", role: "dialog", "aria-label": "Session details", style: { ...hoveredSession.position, overflowY: "auto" }, onMouseEnter: cancelHoveredSessionClose, children: [_jsxs("div", { className: "thread-status-popover-header", children: [_jsx("span", { className: "session-status-indicator", "data-status": executionStatus, "aria-hidden": "true", children: executionStatus === "running" ? _jsx(Loader2, { className: "spin" }) : _jsx(Circle, {}) }), _jsx("strong", { children: sessionExecutionStatusLabel(executionStatus) }), _jsx("button", { className: "thread-status-achieve", type: "button", title: canAchieveGoal ? "Achieve session" : record.threadId ? "Goal can be achieved when the session is idle" : "Session has no Codex thread", "aria-label": "Achieve session", disabled: !canAchieveGoal, onClick: (event) => {
+}, disabled: record.id === sessionId && !showManagerWorkspace, "data-active": record.id === sessionId || record.id === activeSessionId, "data-child-session": node.depth > 0 ? "true" : undefined, children: [_jsx("span", { className: "session-status-indicator", "data-status": executionStatus, "aria-hidden": "true", children: executionStatus === "running" ? _jsx(Loader2, { className: "spin" }) : _jsx(Circle, {}) }), _jsx("span", { className: "session-title", children: displaySessionTitle(record.title) }), _jsx("span", { className: "thread-time", children: formatTimestampShort(record.updated) })] }), hoveredSession?.id === record.id ? (_jsxs("section", { className: "thread-status-popover", role: "dialog", "aria-label": "Session details", style: { ...hoveredSession.position, overflowY: "auto" }, onMouseEnter: cancelHoveredSessionClose, children: [_jsxs("div", { className: "thread-status-popover-header", children: [_jsx("span", { className: "session-status-indicator", "data-status": executionStatus, "aria-hidden": "true", children: executionStatus === "running" ? _jsx(Loader2, { className: "spin" }) : _jsx(Circle, {}) }), _jsx("strong", { children: sessionExecutionStatusLabel(executionStatus) }), _jsx("button", { className: "thread-status-achieve", type: "button", title: canAchieveGoal ? "Achieve session" : record.threadId ? "Goal can be achieved when the session is idle" : "Session has no Codex thread", "aria-label": "Achieve session", disabled: !canAchieveGoal, onClick: (event) => {
                                                     event.preventDefault();
                                                     event.stopPropagation();
                                                     void achieveSessionGoal(record);
-}, children: isAchievingGoal ? _jsx(Loader2, { className: "spin", "aria-hidden": "true" }) : _jsx(CheckCircle2, { "aria-hidden": "true" }) })] }), _jsx("span", { className: "thread-status-title", children: displaySessionTitle(record.title) }), _jsxs("div", { className: "thread-status-meta", children: [_jsx(Database, { "aria-hidden": "true" }), _jsx("span", { className: "thread-status-meta-value", children: record.id }), _jsx("button", { className: "thread-status-copy", type: "button", title: `Copy ${buildCodexReference(record.workspaceId, record.id)}`, "aria-label": `Copy ${buildCodexReference(record.workspaceId, record.id)}`, onClick: () => void copySessionReference(record.workspaceId, record.id), children: _jsx(Copy, { "aria-hidden": "true" }) })] }), _jsxs("div", { className: "thread-status-meta", children: [_jsx(Folder, { "aria-hidden": "true" }), _jsx("span", { children: record.cwd })] }), _jsxs("div", { className: "thread-status-meta", children: [_jsx(TerminalSquare, { "aria-hidden": "true" }), _jsx("span", { className: "thread-status-meta-value", children: record.threadId ?? "No Codex thread" }), record.threadId && (_jsx("button", { className: "thread-status-copy", type: "button", title: `Copy ${buildCodexReference(record.workspaceId, record.threadId)}`, "aria-label": `Copy ${buildCodexReference(record.workspaceId, record.threadId)}`, onClick: () => void copySessionReference(record.workspaceId, record.threadId), children: _jsx(Copy, { "aria-hidden": "true" }) }))] }), modelTokenUsage.length > 0 && (_jsxs("div", { className: "thread-status-meta thread-status-token-usage", children: [_jsx(Cpu, { "aria-hidden": "true" }), _jsxs("div", { className: "thread-status-token-list", children: [_jsx("span", { className: "thread-status-token-label", children: "Tokens used" }), modelTokenUsage.map((usage) => (_jsxs("span", { className: "thread-status-token-model", children: [_jsx("span", { children: usage.model }), _jsx("strong", { children: `In ${formatTokenCount(usage.inputTokenCount)} · Cached ${formatTokenCount(usage.cachedInputTokenCount)} · Out ${formatTokenCount(usage.outputTokenCount)}` })] }, `${record.id}:${usage.model}`)))] })] })), _jsxs("div", { className: "thread-status-meta", children: [_jsx(User, { "aria-hidden": "true" }), _jsxs("span", { title: record.accountId ?? undefined, children: ["Exec account: ", executionAccountLabel] })] }), _jsxs("div", { className: "thread-status-meta", children: [_jsx(Clock3, { "aria-hidden": "true" }), _jsxs("span", { children: ["Updated ", formatTimestamp(record.updated)] })] }), keywords.length > 0 && (_jsx("div", { className: "thread-status-keyword-list", children: keywords.map((keyword) => (_jsx("span", { children: keyword }, `${record.id}:${keyword}`))) }))] })) : null] }), node.children.length > 0 && (_jsx("div", { className: "session-tree-children", children: node.children.map((child) => renderSessionTreeNode(child)) }))] }, record.id));
+}, children: isAchievingGoal ? _jsx(Loader2, { className: "spin", "aria-hidden": "true" }) : _jsx(CheckCircle2, { "aria-hidden": "true" }) })] }), _jsx("span", { className: "thread-status-title", children: displaySessionTitle(record.title) }), _jsxs("div", { className: "thread-status-meta", children: [_jsx(Database, { "aria-hidden": "true" }), _jsx("span", { className: "thread-status-meta-value", children: record.id }), _jsx("button", { className: "thread-status-copy", type: "button", title: `Copy ${buildCodexReference(record.workspaceId, record.id)}`, "aria-label": `Copy ${buildCodexReference(record.workspaceId, record.id)}`, onClick: () => void copySessionReference(record.workspaceId, record.id), children: _jsx(Copy, { "aria-hidden": "true" }) })] }), _jsxs("div", { className: "thread-status-meta", children: [_jsx(Folder, { "aria-hidden": "true" }), _jsx("span", { children: record.cwd })] }), _jsxs("div", { className: "thread-status-meta", children: [_jsx(TerminalSquare, { "aria-hidden": "true" }), _jsx("span", { className: "thread-status-meta-value", children: record.threadId ?? "No Codex thread" }), record.threadId && (_jsx("button", { className: "thread-status-copy", type: "button", title: `Copy ${buildCodexReference(record.workspaceId, record.threadId)}`, "aria-label": `Copy ${buildCodexReference(record.workspaceId, record.threadId)}`, onClick: () => void copySessionReference(record.workspaceId, record.threadId), children: _jsx(Copy, { "aria-hidden": "true" }) }))] }), (modelTokenUsage.length > 0 || subagentTokenUsage) && (_jsxs("div", { className: "thread-status-meta thread-status-token-usage", children: [_jsx(Cpu, { "aria-hidden": "true" }), _jsxs("div", { className: "thread-status-token-list", children: [_jsx("span", { className: "thread-status-token-label", children: "Tokens used" }), modelTokenUsage.map((usage) => (_jsxs("span", { className: "thread-status-token-model", children: [_jsx("span", { children: usage.model }), _jsx("strong", { children: `In ${formatTokenCount(usage.inputTokenCount)} · Cached ${formatTokenCount(usage.cachedInputTokenCount)} · Out ${formatTokenCount(usage.outputTokenCount)}` })] }, `${record.id}:${usage.model}`))), subagentTokenUsage && (_jsxs("span", { className: "thread-status-token-model", title: "Subagent usage is not included in the model totals above", children: [_jsx("span", { children: `Subagents (${subagentTokenUsage.agentCount})` }), _jsx("strong", { children: `In ${formatTokenCount(subagentTokenUsage.inputTokens)} · Cached ${formatTokenCount(subagentTokenUsage.cachedInputTokens)} · Out ${formatTokenCount(subagentTokenUsage.outputTokens)}` })] }, `${record.id}:subagents`))] })] })), _jsxs("div", { className: "thread-status-meta", children: [_jsx(User, { "aria-hidden": "true" }), _jsxs("span", { title: record.accountId ?? undefined, children: ["Exec account: ", executionAccountLabel] })] }), _jsxs("div", { className: "thread-status-meta", children: [_jsx(Clock3, { "aria-hidden": "true" }), _jsxs("span", { children: ["Updated ", formatTimestamp(record.updated)] })] }), keywords.length > 0 && (_jsx("div", { className: "thread-status-keyword-list", children: keywords.map((keyword) => (_jsx("span", { children: keyword }, `${record.id}:${keyword}`))) }))] })) : null] }), node.children.length > 0 && (_jsx("div", { className: "session-tree-children", children: node.children.map((child) => renderSessionTreeNode(child)) }))] }, record.id));
     }
     function renderAccountLoginModal() {
         const title = accountLoginTargetId ? "Login account" : "Add account";
@@ -2249,6 +2537,10 @@ message.turnStatus === "todo" && (_jsx("span", { className: "turn-status", child
         const inputTokenCount = Number.isFinite(promptDetails.tokenIn) ? formatTokenCount(promptDetails.tokenIn) : "Not recorded";
         const cachedInputTokenCount = Number.isFinite(promptDetails.cachedInputTokens) ? formatTokenCount(promptDetails.cachedInputTokens) : "Not recorded";
         const outputTokenCount = Number.isFinite(promptDetails.tokenOut) ? formatTokenCount(promptDetails.tokenOut) : "Not recorded";
+        const subagentUsage = promptDetails.subagentUsage;
+        const subagentTokenSummary = subagentUsage
+            ? `${subagentUsage.agentCount} · in ${formatTokenCount(subagentUsage.inputTokens)} · cached ${formatTokenCount(subagentUsage.cachedInputTokens)} · out ${formatTokenCount(subagentUsage.outputTokens)}`
+            : "None recorded";
         const tabIdBase = `turn-details-${promptDetails.turnId ?? promptDetails.id}`;
         const roundsAvailable = Boolean(promptDetails.turnId);
         const roundsJson = JSON.stringify(turnRounds.events, null, 2);
@@ -2276,6 +2568,7 @@ message.turnStatus === "todo" && (_jsx("span", { className: "turn-status", child
                             <div className="prompt-details-stat"><span>Input tokens</span><strong>{inputTokenCount}</strong></div>
                             <div className="prompt-details-stat"><span>Cached input</span><strong>{cachedInputTokenCount}</strong></div>
                             <div className="prompt-details-stat"><span>Output tokens</span><strong>{outputTokenCount}</strong></div>
+                            <div className="prompt-details-stat" title="Subagent usage is not included in the input and output tokens above"><span>Subagents</span><strong>{subagentTokenSummary}</strong></div>
                             <div className="prompt-details-stat"><span>Model</span><strong>{promptDetails.model || "Not recorded"}</strong></div>
                             <div className="prompt-details-stat"><span>Effort</span><strong>{promptDetails.reasoningEffort || "Not recorded"}</strong></div>
                             <div className="prompt-details-stat"><span>Requested tier</span><strong>{promptDetails.requestedServiceTier === "fast" ? "Fast" : promptDetails.requestedServiceTier === "default" ? "Standard" : "Not recorded"}</strong></div>
@@ -2347,11 +2640,163 @@ message.turnStatus === "todo" && (_jsx("span", { className: "turn-status", child
             </div>
         );
     }
-    const pendingCommandApprovals = pendingApprovalItems.filter((item) => item.method !== "item/tool/requestUserInput");
-    const commandApprovalModal = pendingCommandApprovals.length > 0 ? (_jsx("div", { className: "modal-backdrop approval-backdrop", role: "presentation", children: _jsxs("section", { className: "approval-modal", role: "dialog", "aria-modal": "true", "aria-labelledby": "approval-modal-title", onMouseDown: (event) => event.stopPropagation(), children: [_jsxs("div", { className: "modal-header", children: [_jsx("h2", { id: "approval-modal-title", children: "Approval required" }), _jsx("span", { children: pendingCommandApprovals.length })] }), _jsx("div", { className: "approval-modal-list", children: pendingCommandApprovals.map((item) => (_jsx(ApprovalEvent, { item: item, onDecisionSubmitted: removePendingApprovalItem }, item.approvalId))) })] }) })) : null;
-    const approvalModal = commandApprovalModal;
     const promptDetailsModal = _jsxs(_Fragment, { children: [renderTurnDetailsModal(), _jsx(SessionChangesPopover, { sessionId: sessionId })] });
-    const shell = (_jsx(FileAnnotationComposerContext.Provider, { value: fileAnnotationContextValue, children: _jsxs("main", { className: "shell", "data-session-tab": activeSessionTab, children: [approvalModal, promptDetailsModal, _jsxs("header", { className: "workspace-header", "aria-label": "Workspaces", children: [_jsxs("div", { className: "workspace-tabs", role: "tablist", "aria-label": "Workspaces", children: [workspaceList.length === 0 && (_jsxs("span", { className: "workspace-tab", "data-active": "true", children: [_jsx(Folder, { "aria-hidden": "true" }), _jsx("span", { children: "Default" })] })), workspaceList.map((workspace) => {
+    // The actor view replaces the whole session `.chat`: no session tabs, transcript, composer or dashboard.
+    const actorViewIdentity = actorView ? actorSummary.summary?.actors?.find((entry) => entry.id === actorView.actorId) : null;
+    const actorChat = actorView && activeWorkspace?.id ? _jsxs("section", { className: "chat", "data-actor-view": "true", "data-session-tab": activeSessionTab, "aria-label": "Actor view", children: [
+            _jsxs("header", { className: "content-header", children: [_jsx("div", { className: "content-header-heading", children: _jsx("h1", { children: actorViewIdentity ? _jsx(DomainActorIdentity, { actor: actorViewIdentity }) : actorView.actorId }) }),
+                _jsxs("div", { className: "content-header-actions", children: [_jsx("button",{ type: "button", className: "secondary", onClick: () => void closeActorView(), children: "Back" })] })] }),
+            compactLayout && _jsx("button", { className: "workspace-manager-panel-switch", type: "button", "aria-controls": activeSessionTab === "sessions" ? "session-panel-actor-sessions" : "session-panel-sessions",
+                onClick: () => setSessionTab({ sessionId, value: activeSessionTab === "sessions" ? "actor-sessions" : "sessions" }), children: activeSessionTab === "sessions" ? "Back to actor" : "Sessions" }),
+            _jsx(ActorView, { workspaceId: activeWorkspace.id, approvalPolicy, actorId: actorView.actorId, snapshot: managerDashboard.snapshot, sessions: flatSessions,
+                middleHidden: compactLayout && activeSessionTab !== "actor-sessions", onOpenSession: (targetSessionId) => void switchToSessionById(targetSessionId, { label: "task" }) }, actorView.actorId)
+        ] }) : null;
+    // Both standalone sessions and Manager use this exact main block and controller.
+    function renderSessionMainBlock(embedded = false, leadingControl = null) {
+        return _jsxs(managerMode ? WorkspaceManagerView : "section", { className: embedded ? "chat session-main-block" : "chat", "data-session-tab": activeSessionTab, "aria-label": "Codex chat", children: [_jsxs("header", { className: "content-header", children: [_jsxs("div", { className: "content-header-heading", children: [leadingControl, effectiveParentSessionId ? (_jsxs("div", { className: "session-title-stack", children: [_jsxs("button", { className: "parent-session-link", type: "button", onClick: () => void switchToParentSession(effectiveParentSessionId), title: `Back to main agent ${effectiveParentSessionId}`, children: [_jsx(ArrowLeft, { "aria-hidden": "true" }), _jsx("span", { children: parentSession
+                                                        ? displaySessionTitle(parentSession.title)
+                                                        : "Main agent" })] }), _jsx("h1", { children: threadTitle })] })) : (_jsx("h1", { children: threadTitle })), managerMode && _jsx(WorkspaceManagerTaskBadges, { snapshot: managerDashboard.snapshot })] }), _jsxs("div", { className: "content-header-actions", ref: setSessionHeaderTarget, children: [!managerMode && _jsx(TaskBlockersButton, { blockers: currentTaskBlockers, actorName: summaryActorName }), !managerMode && !embedded && sessionId && activeWorkspace?.id && _jsx(ActorRoundtableSourceLink, { workspaceId: activeWorkspace.id, sessionId, onOpen: () => void toggleWorkspaceManager(true, "push") }, sessionId), managerMode && _jsx("button", { type: "button", className: "secondary", disabled: managerOpening, onClick: () => void toggleWorkspaceManager(true, "push", !managerHistoryOpen), children: managerHistoryOpen ? "Back to actors" : "Manager history" }), !managerMode && sessionId === managerView.state?.manager?.sessionId && _jsx(WorkspaceManagerReturnLink, { manager: managerView.state.manager, onNavigate: () => void toggleWorkspaceManager(true) }), !managerMode && childSessions.length > 0 && (_jsxs("button", { className: "parent-session-link", type: "button", onClick: () => void switchSession(childSessions[0]), title: `Open latest child task: ${displaySessionTitle(childSessions[0].title)}`, children: [_jsx(GitFork, { "aria-hidden": "true" }), _jsxs("span", { children: [childSessions.length, " child task", childSessions.length === 1 ? "" : "s"] })] }))] })] }),
+managerMode && managerHistoryOpen && compactLayout && _jsx("button", { className: "workspace-manager-panel-switch", type: "button", "aria-controls": activeSessionTab === "sessions" ? "session-panel-dashboard" : "session-panel-sessions", onClick: () => setSessionTab({ sessionId, value: activeSessionTab === "sessions" ? "dashboard" : "sessions" }), children: activeSessionTab === "sessions" ? "Back to Dashboard" : "Sessions" }),
+!managerMode && _jsx("div", { className: "session-view-tabs", role: "tablist", "aria-label": "Session views", children: [
+    ...(compactLayout ? [["sessions", "Sessions"]] : []), ...(managerMode ? [["dashboard", "Dashboard"]] : [["turns", "Turns"], ...(sessionId ? [["side-chat", "Side chat"]] : []), ...(hasPlanTab ? [["plan", "Plan"]] : [])])
+].map(([value, label]) => _jsx("button", {
+    className: value === "sessions" ? "session-sessions-tab" : undefined,
+    type: "button", role: "tab", id: `session-tab-${value}`, "aria-selected": activeSessionTab === value,
+    "aria-controls": `session-panel-${value}`, tabIndex: activeSessionTab === value ? 0 : -1,
+    onClick: () => setSessionTab({ sessionId, value }),
+    onKeyDown: (event) => {
+        const tabs = Array.from(event.currentTarget.parentElement.querySelectorAll('[role="tab"]:not(:disabled)'));
+        const index = tabs.indexOf(event.currentTarget);
+        const next = event.key === "ArrowRight" ? (index + 1) % tabs.length : event.key === "ArrowLeft" ? (index + tabs.length - 1) % tabs.length : event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : -1;
+        if (next >= 0) { event.preventDefault(); tabs[next].focus(); tabs[next].click(); }
+    }, "aria-busy": value === "side-chat" && sideChatRunning ? true : undefined, children: [label, value === "side-chat" && sideChatRunning && _jsx(Loader2, { className: "spin", "aria-label": "Waiting for side chat reply", size: 14 })]
+}, value)) }),
+        !managerMode && sessionId && _jsx("div", { className: "session-side-chat-view", id: "session-panel-side-chat", role: "tabpanel", "aria-labelledby": "session-tab-side-chat", hidden: activeSessionTab !== "side-chat", children: _jsx(SideChatPanel, { active: activeSessionTab === "side-chat", codexSessionId: threadId ?? undefined, sessionId, sessionReady: activeSession?.id === sessionId, workspaceId: activeWorkspace?.id, CompletedTurn, annotation: sideChatAnnotation, onClearAnnotation: () => setSideChatAnnotation(null), onRunningChange: setSideChatRunning }, sessionId) }),
+managerMode && managerHistoryOpen && _jsx(WorkspaceManagerDashboard, { hidden: activeSessionTab !== "dashboard", workspaceId: activeWorkspace?.id, dashboard: managerDashboard, onOpenTask: (targetSessionId) => void switchToSessionById(targetSessionId, { label: "task" }) }),
+
+!managerMode && hasPlanTab && _jsx("div", { className: "session-plan-view", id: "session-panel-plan", role: "tabpanel", "aria-labelledby": "session-tab-plan", hidden: activeSessionTab !== "plan", children: _jsx(TodoPanel, { todo: visibleSessionTodo, sessionExecutionStatuses: sessionExecutionStatuses, pendingApprovalSessionIds: pendingApprovalSessionIdSet, onOpenSession: (targetSessionId) => void switchToSessionById(targetSessionId, { label: "subtask" }), onPause: setTodoPaused, onCreateItem: createTodoItem, onUpdateItem: updateTodoItem, onSetContext: setTodoContext, onComment: addTodoComment, onResolveChallenge: resolveTodoChallenge }) }),
+(!managerMode || managerHistoryOpen) && _jsxs("div", { className: "messages-pane", children: [
+_jsxs("aside", { className: "prompt-turns", id: "session-panel-turns", role: managerMode ? "region" : "tabpanel", "aria-labelledby": managerMode ? undefined : "session-tab-turns", "aria-label": managerMode ? "Manager turns" : undefined, children: [_jsx("div", { ref: promptTurnsScrollRef, className: "prompt-turns-scroll", children: promptTurns.filter(({ prompt }) => visibleMessageIds.has(prompt.id)).map(({ prompt, response, index, editCount, toolCount, agentRoundTripCount, steerCount, issueCount, resolvedIssueCount }) => {
+                                            const accent = `var(--turn-accent-${(index % 6) + 1})`;
+                                            const isRunning = response?.turnStatus === "running";
+                                            const isEditing = inlinePromptEditor?.messageId === prompt.id;
+                                             const openTurn = () => {
+                                                     setActivePromptTurnIds(new Set([prompt.turnId]));
+                                                     setFeaturedPromptTurnId(prompt.turnId);
+                                                     closeMiddlePanel();
+                                                     window.requestAnimationFrame(() => messagesRef.current?.querySelector(`.message.assistant[data-turn-id="${prompt.turnId}"]`)?.scrollIntoView({ behavior: "smooth", block: "start" }));
+                                             };
+                                            const promptMetadata = promptDisplayMetadata(prompt.rawContent ?? prompt.content);
+                                            const originalPromptText = parseResponseAnnotations(promptMetadata.visible)?.content || promptMetadata.visible || "Attachment prompt";
+                                            const concurrentResult = parseConcurrentMessage(prompt.rawContent ?? prompt.content);
+                                            const sourceTurnId = concurrentResult?.result && concurrentResult.to === "main" && concurrentSourceGroup?.sessionId === sessionId && concurrentSourceGroup.group.id === concurrentResult.groupId
+                                                ? concurrentSourceGroup.group.members.find((member) => member.localId === concurrentResult.from)?.sourceTurnId : null;
+                                            const sourcePrompt = sourceTurnId ? promptTurns.find((turn) => turn.prompt.turnId === sourceTurnId)?.prompt : null;
+                                            const sourceMetadata = sourcePrompt ? promptDisplayMetadata(sourcePrompt.rawContent ?? sourcePrompt.content) : null;
+                                            const sourcePromptText = sourceMetadata ? parseResponseAnnotations(sourceMetadata.visible)?.content || sourceMetadata.visible || "Attachment prompt" : null;
+                                            const promptText = sourcePromptText ? `Concurrent response to ${sourcePromptText.trim().replace(/\s+/g, " ")}` : originalPromptText;
+                                            const copyPrompt = (event) => {
+                                                event.stopPropagation();
+                                                void copyUserPrompt(prompt);
+                                            };
+                                            const promptActions = renderPromptActionButtons(prompt);
+                                            const promptRoundtable = roundtable.rounds.find(round => round.turnId === prompt.turnId);
+                                            const hasGrill = grilledTurns.has(`${sessionId}:${prompt.turnId}`);
+                                            const hasPromptStats = hasGrill || editCount > 0 || toolCount > 0 || agentRoundTripCount > 0 || steerCount > 0 || issueCount > 0;
+                                            return (_jsxs("div", { className: "prompt-turn-card", role: "button", tabIndex: 0, "data-turn-id": prompt.turnId, "data-active": activePromptTurnIds.has(prompt.turnId) ? "true" : undefined, "data-featured": effectiveFeaturedPromptTurnId === prompt.turnId ? "true" : undefined, style: { "--turn-accent": accent }, onClick: openTurn, onKeyDown: (event) => {
+                                                    if (event.key === "Enter" || event.key === " ") {
+                                                        event.preventDefault();
+                                                        openTurn();
+                                                    }
+                                                }, children: [
+                                                    _jsx("span", { className: "prompt-turn-meta", children: isRunning ? _jsx(Loader2, { className: "spin prompt-turn-spinner", "aria-label": "Running" }) : _jsx("b", { children: String(index + 1).padStart(2, "0") }) }),
+                                                    isEditing ? (_jsxs("form", { className: "prompt-turn-inline-editor", onClick: (event) => event.stopPropagation(), onSubmit: (event) => void submitInlineUserPromptEdit(event, prompt), children: [
+                                                        _jsx("textarea", { ref: inlinePromptEditorRef, value: inlinePromptEditor?.value ?? "", "aria-label": "Edit prompt", onChange: (event) => {
+                                                                const value = event.currentTarget.value;
+                                                                setInlinePromptEditor((current) => current?.messageId === prompt.id ? { ...current, value } : current);
+                                                            }, onKeyDown: (event) => handleInlinePromptEditorKeyDown(event, prompt) }),
+                                                        _jsxs("span", { className: "prompt-turn-actions", children: [
+                                                            _jsx("button", { className: "message-action-icon", type: "button", title: "Copy prompt", "aria-label": "Copy prompt", onClick: copyPrompt, children: _jsx(Copy, { "aria-hidden": "true" }) }),
+                                                            _jsx("button", { className: "message-action-icon", type: "button", title: "Cancel edit", "aria-label": "Cancel edit", onClick: cancelInlineUserPromptEdit, children: _jsx(X, { "aria-hidden": "true" }) }),
+                                                            _jsx("button", { className: "message-action-icon", type: "submit", title: "Resend edited prompt", "aria-label": "Resend edited prompt", disabled: !(inlinePromptEditor?.value.trim() || (inlinePromptEditor?.attachments.length ?? 0) > 0) || isSteering, children: _jsx(Send, { "aria-hidden": "true" }) })
+                                                        ] })
+                                                    ] })) : (_jsxs("div", { className: "prompt-turn-summary", children: [prompt.model && (_jsxs("span", { className: "prompt-turn-model", title: `Model used: ${prompt.model}`, children: [prompt.autoModelProvider === "typesafe" ? _jsx("span", { className: "prompt-turn-auto-prefix", "data-provider": "typesafe", "data-low-confidence": prompt.autoModelConfidence !== undefined && prompt.autoModelConfidence < 0.3, children: "J " }) : prompt.autoModel ? _jsx("span", { className: "prompt-turn-auto-prefix", children: "A " }) : null, modelOptionLabel(prompt.model)] })), sourcePromptText ? _jsx("span", { className: "prompt-turn-copy", children: promptText }) : _jsx(MarkdownContent, { className: "prompt-turn-copy", children: promptText })] })),
+                                                    (!isEditing || hasPromptStats) && (_jsxs("span", { className: "prompt-turn-details", children: [
+                                                        hasGrill && _jsx("span", { className: "prompt-turn-stat prompt-turn-grill-tag", "data-await-ack": pendingGrillTurns.has(`${sessionId}:${prompt.turnId}`) || undefined, title: pendingGrillTurns.has(`${sessionId}:${prompt.turnId}`) ? "Grill: Await ack" : "Grill review", "aria-label": pendingGrillTurns.has(`${sessionId}:${prompt.turnId}`) ? "Grill: Await ack" : "Grilled", children: _jsx(Flame, { "aria-hidden": "true" }) }),
+                                                        _jsxs("span", { className: "prompt-turn-model-flags", children: [renderPromptOrigin(prompt), renderPromptModelBadge(prompt), renderPromptTags(prompt, "prompt-turn-tags"), promptRoundtable && _jsxs("span", { className: "prompt-turn-stat prompt-turn-roundtable", children: [_jsx(Users, { "aria-hidden": "true" }), `Round table(${promptRoundtable.answers.length})`] })] }),
+                                                        editCount > 0 && (_jsxs("span", { className: "prompt-turn-stat", title: `${editCount} edited file${editCount === 1 ? "" : "s"}`, children: [_jsx(FileEditIcon, { "aria-hidden": "true" }), editCount] })),
+                                                        issueCount > 0 && (_jsxs("span", { className: "prompt-turn-stat prompt-turn-issues", "data-resolved": resolvedIssueCount === issueCount ? "true" : undefined, title: `${resolvedIssueCount}/${issueCount} issues resolved`, children: [resolvedIssueCount === issueCount ? _jsx(CheckCircle2, { "aria-hidden": "true" }) : _jsx(Circle, { "aria-hidden": "true" }), resolvedIssueCount, "/", issueCount] })),
+                                                        agentRoundTripCount > 0 && (_jsxs("span", { className: "prompt-turn-stat", title: `${agentRoundTripCount} agent round trip${agentRoundTripCount === 1 ? "" : "s"}`, children: [_jsx(RotateCcw, { "aria-hidden": "true" }), agentRoundTripCount] })),
+                                                        steerCount > 0 && (_jsxs("span", { className: "prompt-turn-stat", title: `${steerCount} steer${steerCount === 1 ? "" : "s"}`, children: [_jsx(BetweenHorizontalStart, { "aria-hidden": "true" }), steerCount] })),
+                                                        toolCount > 0 && (_jsxs("span", { className: "prompt-turn-stat", title: `${toolCount} tool${toolCount === 1 ? "" : "s"}`, children: [_jsx(TerminalSquare, { "aria-hidden": "true" }), toolCount] })),
+                                                        !isEditing && promptActions
+                                                    ] }))
+                                                ] }, prompt.id));
+                                        }) }), (backendQueuedPrompts.length > 0 || visibleLocalQueuedPrompts.length > 0 || visibleQueuedPromptReceipts.length > 0) && (_jsx("div", { className: "prompt-turn-queue", "aria-label": "Queued prompts", children: [backendQueuedPrompts.map((item, index) => renderBackendQueuedPrompt(item, index, true)), visibleLocalQueuedPrompts.map((prompt, index) => renderLocalQueuedPrompt(prompt, index, true)), visibleQueuedPromptReceipts.map((prompt) => renderQueuedPromptReceipt(prompt, true))] }))] }),
+_jsxs("div", { ref: messageScrollIndicatorRef, className: "message-scroll-indicator", onClick: scrollFromMessageRail, onWheel: scrollFromMessageRailWheel, children: [_jsx("span", { className: "message-scroll-indicator-track", "aria-hidden": "true" }), _jsx("span", { ref: messageViewportIndicatorRef, className: "message-scroll-indicator-viewport", "aria-hidden": "true", onClick: (event) => event.stopPropagation(), onPointerDown: startMessageRailDrag, onPointerMove: dragMessageRailViewport, onPointerUp: finishMessageRailDrag, onPointerCancel: finishMessageRailDrag }), messageIndicatorMarks.map((mark) => (_jsx("button", { className: "message-scroll-indicator-mark", "data-tone": mark.tone, "data-tooltip": mark.title, type: "button", "aria-label": `Jump to ${mark.title}`, onClick: () => scrollToMessage(mark.targetId, mark.anchorId), style: { top: messageIndicatorMarkTop(messageIndicatorPositions[mark.id] ?? mark.position) } }, mark.id)))] }), _jsx("div", { ref: messagesRef, className: "messages", onScroll: (event) => {
+                                        setResponseQuotePopover(null);
+                                        const container = event.currentTarget;
+                                        messageScrollTopRef.current = container.scrollTop;
+                                        stickToMessageBottomRef.current =
+                                            container.scrollHeight - container.scrollTop - container.clientHeight <= MESSAGE_BOTTOM_THRESHOLD;
+                                        updateMessageViewportIndicator(container);
+                                    }, onMouseUp: captureResponseQuoteSelection, children: [
+                                        !managerMode && visibleTranscript.total > TRANSCRIPT_PAGE_TURNS && _jsxs("nav", { className: "transcript-history-navigation", "aria-label": "Conversation history", children: [
+                                            _jsx("button", { type: "button", disabled: !visibleTranscript.previousAnchor, onClick: () => changeTranscriptPage(visibleTranscript.previousAnchor), children: "Earlier turns" }),
+                                            _jsxs("span", { children: [` Turns ${visibleTranscript.start + 1}–${visibleTranscript.end} of ${visibleTranscript.total} `] }),
+                                            _jsx("button", { type: "button", disabled: !visibleTranscript.nextAnchor, onClick: () => changeTranscriptPage(visibleTranscript.nextAnchor), children: "Newer turns" }),
+                                            visibleTranscript.nextAnchor && _jsx("button", { type: "button", onClick: () => changeTranscriptPage(null), children: "Latest turns" })
+                                        ] }),
+                                        managerMode && managerOpenError && _jsx("p", { role: "alert", children: `Could not load workspace manager: ${managerOpenError}` }),
+                                        managerMode && managerHistoryState?.sessionId === sessionId && managerHistoryState?.viewKey === viewKeyRef.current && _jsx(WorkspaceManagerHistory, { ...managerHistoryState, onLoad: () => void loadEarlierManagerMessages() }),
+                                        managerMode && _jsx(WorkspaceManagerApprovals, { state: managerView.state, ApprovalEvent, onChanged: managerView.refresh }), transcript.length === 0 ? (_jsx("div", { className: "empty", children: switchingSessionTitle ? (_jsxs(_Fragment, { children: [_jsx(Loader2, { className: "spin", "aria-hidden": "true" }), _jsx("h2", { children: managerMode ? "Loading workspace manager" : "Loading session" })] })) : (_jsxs(_Fragment, { children: [_jsx("h2", { children: managerMode ? "Your workspace manager" : "Let's build" }), !managerMode && _jsxs("div", { className: "project-picker-menu", children: [_jsxs("button", { className: "project-picker", type: "button", onClick: toggleProjectPicker, "aria-expanded": isProjectPickerOpen, "aria-haspopup": "listbox", children: [_jsx("span", { children: projectName }), _jsx(ChevronRight, { "aria-hidden": "true" })] }), isProjectPickerOpen && (_jsx("div", { className: "project-picker-options", role: "listbox", "aria-label": "Projects in active workspace", children: isLoadingWorkspaceProjects ? (_jsx("p", { children: "Loading projects…" })) : workspaceProjectsError ? (_jsx("p", { className: "project-picker-error", children: workspaceProjectsError })) : workspaceProjects.length === 0 ? (_jsx("p", { children: "No projects in this workspace." })) : (workspaceProjects.map((project) => (_jsx("button", { type: "button", role: "option", onClick: () => {
+                                                            setIsProjectPickerOpen(false);
+                                                            void newSession(project);
+                                                        }, children: project.name }, project.name)))) }))] })] })) })) : (transcriptEntries.map((entry) => {
+                                        if (entry.kind === "message") {
+                                            return renderMessageArticle(entry.message);
+                                        }
+                                        return (_jsx("section", { className: "message-step-group", children: _jsxs("details", { className: "message-step-card", open: entry.open, children: [_jsxs("summary", { className: "message-step-summary", children: [_jsx(ChevronRight, { className: "command-chevron", "aria-hidden": "true" }), _jsx(CheckSquare2, { "aria-hidden": "true" }), _jsxs("span", { className: "message-step-index", children: ["Step ", entry.stepNumber] }), _jsx("span", { className: "message-step-title", children: entry.title }), _jsxs("span", { className: "message-step-count", children: [entry.messages.length, " ", entry.messages.length === 1 ? "message" : "messages"] })] }), _jsx("div", { className: "message-step-details", children: entry.messages.map(renderMessageArticle) })] }) }, entry.id));
+                                    }))] })] }), !managerMode && concurrentWorkerEnded && _jsx("p", { className: "composer-ended-notice", role: "status", children: "This Concurrent worker has ended and cannot accept new prompts." }), !managerMode && _jsxs("form", { hidden: concurrentWorkerEnded, style: concurrentWorkerEnded ? { display: "none" } : undefined, className: "composer", "aria-label": pendingComposer.edit ? "Edit queued prompt" : undefined, onSubmit: submit, children: [
+                                        managerMode && managerView.state?.manager?.sessionId === sessionId && _jsx(WorkspaceManagerBackgroundUpdateIndicator, { status: managerView.state.manager.backgroundUpdateStatus }),
+                                        composerSubmissionError?.sessionId === sessionId && _jsx("p", { className: "composer-submission-error", role: "alert", children: composerSubmissionError.message }),
+                                        _jsx(UnconfirmedPrompts, { sessionId, storedTurnIds: selectedSnapshotSession?.id === sessionId ? (selectedSessionSnapshot?.turns ?? []).map(turn => turn.id) : [], busy: isSubmitting || Boolean(pendingComposer.edit), running: currentSessionIsRunning, onRetry: entry => entry.settings.queued ? enqueuePrompt(entry.message, "queue", "default", [], entry.attachments, false, false, false, entry.id) : startChatTurn(entry.message, entry.attachments, "default", [], false, false, false, undefined, entry.id) }),
+                                        (backendQueuedPrompts.length > 0 || visibleLocalQueuedPrompts.length > 0 || visibleQueuedPromptReceipts.length > 0) && (_jsx("div", { className: "queued-prompts", "aria-label": "Queued prompts", children: [backendQueuedPrompts.map((item, index) => renderBackendQueuedPrompt(item, index)), visibleLocalQueuedPrompts.map((prompt, index) => renderLocalQueuedPrompt(prompt, index)), visibleQueuedPromptReceipts.map((prompt) => renderQueuedPromptReceipt(prompt))] })), _jsxs(ComposerFrame, { children: [modelGroupSwitch && _jsx(ModelGroupSwitchDialog, { from: modelGroupSwitch.from, to: modelGroupSwitch.to, onCancel: () => setModelGroupSwitch(null), onConfirm: () => { const pending = modelGroupSwitch; setModelGroupSwitch(null); void submit(undefined, pending.mode, true); } }), _jsx(ComposerGearSelector, { idPrefix: "main-composer-gear", label: "Model gears", disabled: Boolean(pendingComposer.edit), gears: gearProfiles, activeGearIndex: activeGearIndex, modelOptions: MODEL_OPTIONS, effortOptions: EFFORT_OPTIONS, ultraEffortOptions: ULTRA_EFFORT_OPTIONS, supportsUltraEffort: supportsUltraEffort, modelOptionLabel: modelOptionLabel, effortOptionLabel: capitalize, onActivateGear: activateGearProfile, onModelChange: (index, model) => updateGearProfile(index, { model }), onEffortChange: (index, effort) => updateGearProfile(index, { effort }), onFastModeChange: (index, enabled) => updateGearProfile(index, { fastMode: enabled }), autoModelValue: AUTO_MODEL_VALUE, autoEffort: sessionAutoModel?.enabled ? sessionAutoModel.effort : undefined }), _jsxs(ComposerSurface, { onDropFiles: isSubmitting || pendingComposer.edit ? undefined : addFiles, children: [slashTrigger ? (_jsx(ComposerSuggestionMenu, { suggestions: visibleSlashSuggestions, activeIndex: slashSuggestionIndex, onSelect: selectSlashSuggestion, loading: isLoadingSkills })) : composerSuggestionTrigger && (visibleComposerSuggestions.length > 0 || isLoadingPathSuggestions || composerActorMentionNotice) && (_jsx(ComposerSuggestionMenu, { id: "main-composer-suggestions", suggestions: visibleComposerSuggestions, activeIndex: composerSuggestionIndex, onSelect: selectComposerSuggestion, loading: isLoadingPathSuggestions, emptyText: composerActorMentionNotice })), !pendingComposer.edit && _jsx(SessionActorMentionChips, { actors: actorMentions.mentioned, sendingNames: actorMentions.sendingNames, disabled: isSubmitting || actorMentionSending, onRemove: (actor) => { setComposerInput((current) => actorMentions.remove(current, actor)); setComposerSuggestionTrigger(null); } }),!pendingComposer.edit && composerResponseQuote?.map((quote, quoteIndex) => (_jsxs("div", { className: "composer-response-quote", "aria-label": annotationLabel(quote), children: [_jsx("span", { className: "composer-response-quote-icon", "aria-hidden": "true", children: _jsx(Quote, {}) }), _jsxs("div", { children: [_jsx("strong", { children: annotationLabel(quote) }), _jsx("span", { children: quote.text }), quote.annotation && _jsx("small", { children: quote.annotation })] }), _jsx("button", { type: "button", onClick: () => setComposerResponseQuote((current) => { const remaining = current.filter((_, index) => index !== quoteIndex); return remaining.length ? remaining : null; }), title: quote.source?.type === "file" ? "Remove file annotation" : "Remove quote", "aria-label": quote.source?.type === "file" ? "Remove file annotation" : "Remove quote", children: _jsx(X, { "aria-hidden": "true" }) })] }, quoteIndex))), (pendingComposer.edit?.attachments ?? attachments).length > 0 && (_jsx(AttachmentList, { attachments: pendingComposer.edit?.attachments ?? attachments, onRemove: pendingComposer.edit ? undefined : removeAttachment })), _jsx(InlineLinkComposer, { ref: inputEditorRef, ariaControls: !slashTrigger && composerSuggestionTrigger && (visibleComposerSuggestions.length > 0 || composerActorMentionNotice) ? "main-composer-suggestions" : undefined, ariaActiveDescendant: !slashTrigger && composerSuggestionTrigger && composerSuggestionIndex >= 0 && visibleComposerSuggestions[composerSuggestionIndex] ? composerSuggestionOptionId("main-composer-suggestions", composerSuggestionIndex) : undefined, disabled: managerMode || isSubmitting || actorMentionSending || Boolean(pendingComposer.edit && !pendingComposer.edit.held), value: pendingComposer.edit?.value ?? input, links: pendingComposer.edit ? [] : composerSessionLinks, placeholder: managerMode ? "Manager history is read-only. Open Actors to send a request." : currentSessionIsRunning ? "Type to queue or steer…" : "Type a message…", onChange: (value, caret) => {
+                                                        if (!pendingComposer.edit) pruneComposerLinks(value);
+                                                        setComposerInput(value);
+                                                        setSlashTrigger(managerMode ? null : findSlashTrigger(value, caret ?? value.length));
+                                                        setComposerSuggestionTrigger(managerMode ? null : findComposerSuggestionTrigger(value, caret));
+                                                    }, onPasteLink: pendingComposer.edit ? () => null : addPastedComposerLink, onRemoveLink: removeComposerSessionLink, onOpenLink: (link) => link.session && void openLinkedSession(link.session), onUnhandledPaste: pendingComposer.edit ? () => undefined : handleEditorPaste, onKeyDown: handleEditorKeyDown, onBlur: () => { setSlashTrigger(null); setComposerSuggestionTrigger(null); } }), _jsxs(ComposerToolbar, { children: [ _jsxs("label", { className: "composer-icon composer-upload", title: "Attach files", "aria-label": "Attach files", tabIndex: 0, onKeyDown: (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); event.currentTarget.querySelector("input")?.click(); } }, children: [_jsx(Plus, { "aria-hidden": "true" }), _jsx("input", { type: "file", multiple: true, onChange: (event) => {
+                                                                        void addFiles(event.currentTarget.files);
+                                                                        event.currentTarget.value = "";
+                                                                    }, disabled: isSubmitting || Boolean(pendingComposer.edit) || attachments.length >= MAX_ATTACHMENTS })] }), _jsx("button", { className: "composer-icon composer-loop-mode", type: "button", "aria-label": "Loop next prompt", "aria-pressed": executionMode === "loop", "data-active": executionMode === "loop" ? "true" : undefined, title: executionMode === "loop" ? "Next turn will Grill and start work automatically" : "Loop next prompt: Grill this turn and start work on issues", disabled: Boolean(pendingComposer.edit), onClick: () => setComposerExecutionMode((mode) => mode === "loop" ? "default" : "loop"), children: _jsx(Repeat2, { "aria-hidden": "true" }) }), !managerMode && _jsx("button", { type: "button", className: "composer-icon composer-managed-mode", "aria-label": "Managed mode", "aria-pressed": managedMode && !roundtable.enabled && !concurrentSourceTurnId, "data-active": managedMode && !roundtable.enabled && !concurrentSourceTurnId ? "true" : undefined, title: concurrentSourceTurnId ? "Managed mode is inactive during Concurrent; your preference is kept for ordinary turns." : "Managed mode: native sub-agents execute plans using suitable models, no stronger than the supervisor. Applies to new turns, not Steer.", disabled: Boolean(pendingComposer.edit) || Boolean(concurrentSourceTurnId), onClick: () => { const next = !managedMode; if (next) roundtable.disable(); setManagedMode(next); patchStoredComposerDraft(composerDraftSessionIdRef.current, { managedMode: next }); }, children: _jsx(HatGlasses, { "aria-hidden": "true" }) }), renderConcurrentIcon(null, true, true), renderRoundtableToggle(), sessionId && (_jsx("button", { className: "composer-icon composer-fork-toggle", type: "button", "aria-label": "Fork next prompt into a new thread", "aria-pressed": forkNextPrompt, "data-active": forkNextPrompt ? "true" : undefined, title: forkNextPrompt ? "Next prompt will open in a child thread" : "Fork next prompt into a new thread", disabled: Boolean(pendingComposer.edit), onClick: () => setComposerForkNextPrompt((enabled) => !enabled), children: _jsx(GitFork, { "aria-hidden": "true" }) })), composerTodoPlanModeEnabled && _jsxs("button", { className: "composer-chip composer-plan-prefix", type: "button", disabled: Boolean(pendingComposer.edit), onClick: toggleTodoPlanMode, title: "Turn off outcome tracking", children: ["Todo", _jsx(X, { "aria-hidden": "true" })] }), executionMode !== "default" && executionMode !== "loop" && (_jsxs("button", { className: "composer-chip composer-execution-mode", type: "button", disabled: Boolean(pendingComposer.edit), onClick: () => setExecutionMode("default"), title: `Turn off ${executionMode} mode`, children: [capitalize(executionMode), " mode", _jsx(X, { "aria-hidden": "true" })] })), _jsx("span", { className: "composer-fill" }), _jsx("button", { className: `composer-icon${pendingComposer.edit ? " composer-edit-action" : ""}`, type: "button", onClick: clearInput, disabled: isSubmitting || (!pendingComposer.edit && !input && !composerResponseQuote), title: pendingComposer.edit ? "Cancel edit" : "Clear", "aria-label": pendingComposer.edit ? "Cancel edit" : "Clear", children: _jsx(X, { "aria-hidden": "true" }) }), currentSessionIsRunning && !currentRoundtable && (_jsx("button", { className: "send-button composer-steer-button", type: "button", "aria-label": "Steer", disabled: Boolean(pendingComposer.edit) || !canSend || isSteering, title: "Steer", onClick: () => void submitSteer(), children: isSteering ? _jsx(Loader2, { className: "spin", "aria-hidden": "true" }) : _jsx(BetweenHorizontalStart, { "aria-hidden": "true" }) })), _jsx("button", { className: `send-button${sendButtonIsStop ? " stop-button" : ""}${currentSessionIsRunning && !pendingComposer.edit && !sendButtonIsStop ? " composer-queue-button" : ""}`, type: sendButtonIsStop ? "button" : "submit", disabled: isSubmitting || (sendButtonIsStop ? currentSessionIsStopping : !canSend || isSteering), "aria-busy": isSubmitting, title: isSubmitting ? "Sending" : sendButtonIsStop ? "Stop agent" : pendingComposer.edit && !pendingComposer.edit.held ? "Retry edit" : currentSessionIsRunning && !pendingComposer.edit ? "Queue" : "Send", "aria-label": isSubmitting ? "Sending" : sendButtonIsStop ? "Stop agent" : pendingComposer.edit && !pendingComposer.edit.held ? "Retry edit" : currentSessionIsRunning && !pendingComposer.edit ? "Queue" : "Send", onClick: sendButtonIsStop ? () => void stopCurrentTurn() : undefined, children: isSubmitting || isSteering ? (_jsx(Loader2, { className: "spin", "aria-hidden": "true" })) : sendButtonIsStop && currentSessionIsStopping ? (_jsx(Loader2, { className: "spin", "aria-hidden": "true" })) : sendButtonIsStop ? (_jsx(Square, { "aria-hidden": "true" })) : currentSessionIsRunning && !pendingComposer.edit ? (_jsx(Clock3, { "aria-hidden": "true" })) : (_jsx(Send, { "aria-hidden": "true" })) })] })] })] })] })] });
+    }
+    useReactEffect(() => {
+        const pending = autoGroupChatRef.current;
+        if (!pending) return;
+        const summary = actorSummary.summary;
+        if (pending !== activeWorkspace?.id || !managerModeRef.current) { setAutoGroupChatWorkspace(null); return; }
+        // A failed summary read falls back to the default chat instead of waiting forever.
+        if ((!summary || summary.workspaceId !== pending) && !actorSummary.error) return;
+        setAutoGroupChatWorkspace(null);
+        const key = summary?.workspaceId === pending ? mostRecentlyActiveGroupChatKey(summary.groups) : null;
+        if (!key || key === groupChatKeyRef.current) return;
+        setGroupChatKey(key);
+        updateNavigationUrl({ workspaceId: pending, sessionId: null }, "replace");
+    }, [actorSummary.summary, actorSummary.error, activeWorkspace?.id, managerMode, autoGroupChatWorkspace]);
+    // A chat key this workspace does not have (another workspace's link) falls back to its Unassigned chat.
+    const workerGroups = workerProjectGroups(actorSummary.summary);
+    const activeGroupChat = workerGroups.find(group => group.key === groupChatKey)
+        ?? (actorSummary.summary ? workerGroups.find(group => group.key === UNASSIGNED_ACTOR_PROJECT) : null)
+        ?? { key: groupChatKey, name: undefined };
+    const managerWorkspace = showManagerWorkspace && _jsxs("section", { className: "chat manager-chat", "data-workspace-manager": "true", "data-session-tab": "dashboard", "aria-label": "Workspace manager chat", children: [
+        _jsx(ManagerWorkspace, { workspaceId: activeWorkspace?.id, approvalPolicy, dashboard: managerDashboard,
+            selectedSessionId: managerPanelTarget,
+            chatKey: activeGroupChat.key, chatName: activeGroupChat.name, chatLoading: autoGroupChatWorkspace === activeWorkspace?.id,
+            onOpenSession: openManagerSession, onCloseSession: closeManagerSession, resetKey: managerPanelReset,
+            renderSession: (collapseButton) => !managerMode && renderSessionMainBlock(true, collapseButton) }, activeWorkspace?.id)
+    ] });
+    const shell = (_jsx(FileAnnotationComposerContext.Provider, { value: fileAnnotationContextValue, children: _jsxs("main", { className: "shell", "data-session-tab": activeSessionTab, children: [promptDetailsModal, _jsxs("header", { className: "workspace-header", "aria-label": "Workspaces", children: [_jsxs("div", { className: "workspace-tabs", role: "tablist", "aria-label": "Workspaces", children: [workspaceList.length === 0 && (_jsxs("span", { className: "workspace-tab", "data-active": "true", children: [_jsx(Folder, { "aria-hidden": "true" }), _jsx("span", { children: "Default" })] })), workspaceList.map((workspace) => {
                                     const isActive = workspace.id === activeWorkspace?.id;
                                     const summary = workspaceTabSummaries.get(workspace.id);
                                     return (_jsxs("div", { className: "workspace-tab-wrap", onMouseEnter: (event) => {
@@ -2363,7 +2808,7 @@ message.turnStatus === "todo" && (_jsx("span", { className: "turn-status", child
                                                 top: bounds.bottom - 1,
                                                 left: Math.max(8, Math.min(bounds.left, window.innerWidth - 368))
                                             });
-                                        }, onMouseLeave: () => setHoveredWorkspace(null), children: [_jsxs("button", { className: "workspace-tab", type: "button", role: "tab", "aria-selected": isActive, "data-active": isActive, "data-status": summary.status, onClick: () => void switchWorkspace(workspace.id), children: [_jsx("span", { className: "workspace-tab-status", "aria-hidden": "true", children: summary.status === "running" ? _jsx(Loader2, { className: "spin" }) : _jsx(Circle, {}) }), _jsx("span", { className: "workspace-tab-name", children: workspace.name }), summary.sessions.length > 0 && (_jsx("span", { className: "workspace-tab-count", title: `${summary.sessions.length} active session${summary.sessions.length === 1 ? "" : "s"}${summary.approvalCount > 0 ? `, ${summary.approvalCount} approval required` : ""}`, children: summary.sessions.length > 99 ? "99+" : summary.sessions.length }))] }), hoveredWorkspace?.id === workspace.id && summary.sessions.length > 0 && (_jsxs("section", { className: "workspace-status-popover", role: "tooltip", style: { top: hoveredWorkspace.top, left: hoveredWorkspace.left }, children: [_jsx("strong", { children: workspace.name }), _jsxs("span", { className: "workspace-status-summary", children: [summary.sessions.length, " background session", summary.sessions.length === 1 ? "" : "s"] }), _jsx("div", { className: "workspace-status-sessions", children: summary.sessions.map((backgroundSession) => (_jsxs("div", { className: "workspace-status-session-group", children: [_jsxs("div", { className: "workspace-status-session", children: [_jsx("span", { className: "session-status-indicator", "data-status": backgroundSession.approvalCount > 0 ? "awaiting_approval" : "running", "aria-hidden": "true", children: backgroundSession.approvalCount > 0 ? _jsx(Circle, {}) : _jsx(Loader2, { className: "spin" }) }), _jsx("span", { children: backgroundSession.name }), backgroundSession.approvalCount > 0 && (_jsxs("small", { children: [backgroundSession.approvalCount, " approval"] }))] }), backgroundSession.approvals.map((approval) => (_jsx(ApprovalEvent, { item: approvalEventToLiveItem(approval, "pending"), onDecisionSubmitted: removePendingApprovalItem }, approval.approvalId)))] }, backgroundSession.id))) })] }))] }, workspace.id));
+                                        }, onMouseLeave: () => setHoveredWorkspace(null), children: [_jsxs("button", { className: "workspace-tab", type: "button", role: "tab", "aria-selected": isActive, "data-active": isActive, "data-status": summary.status, onClick: () => void switchWorkspace(workspace.id), children: [_jsx("span", { className: "workspace-tab-status", "aria-hidden": "true", children: summary.status === "running" ? _jsx(Loader2, { className: "spin" }) : _jsx(Circle, {}) }), _jsx("span", { className: "workspace-tab-name", children: workspace.name }), summary.sessions.length > 0 && (_jsx("span", { className: "workspace-tab-count", title: `${summary.sessions.length} active session${summary.sessions.length === 1 ? "" : "s"}${summary.approvalCount > 0 ? `, ${summary.approvalCount} approval required` : ""}`, children: summary.sessions.length > 99 ? "99+" : summary.sessions.length }))] }), _jsx(WorkspaceActionNotifications, { workspace, items: actionNotifications.items.filter(item => item.workspaceId === workspace.id), blockers: blockerNotifications.items.filter(blocker => blocker.workspaceId === workspace.id), onBlockerDecided: blockerNotifications.remove, error: actionNotifications.error, loaded: actionNotifications.loaded, onRefresh: actionNotifications.refresh, onDecisionSubmitted: (id) => { actionNotifications.remove(id); removePendingApprovalItem(id); }, onOpenSession: (id) => openActionSession(id, workspace.id), ApprovalEvent }), hoveredWorkspace?.id === workspace.id && summary.sessions.length > 0 && (_jsxs("section", { className: "workspace-status-popover", role: "tooltip", style: { top: hoveredWorkspace.top, left: hoveredWorkspace.left }, children: [_jsx("strong", { children: workspace.name }), _jsxs("span", { className: "workspace-status-summary", children: [summary.sessions.length, " background session", summary.sessions.length === 1 ? "" : "s"] }), _jsx("div", { className: "workspace-status-sessions", children: summary.sessions.map((backgroundSession) => (_jsxs("div", { className: "workspace-status-session-group", children: [_jsxs("div", { className: "workspace-status-session", children: [_jsx("span", { className: "session-status-indicator", "data-status": backgroundSession.approvalCount > 0 ? "awaiting_approval" : "running", "aria-hidden": "true", children: backgroundSession.approvalCount > 0 ? _jsx(Circle, {}) : _jsx(Loader2, { className: "spin" }) }), _jsx("span", { children: backgroundSession.name }), backgroundSession.approvalCount > 0 && (_jsxs("small", { children: [backgroundSession.approvalCount, " approval"] }))] }), null] }, backgroundSession.id))) })] }))] }, workspace.id));
                                 })] }), _jsx("button", { className: "ghost-icon workspace-add", type: "button", onClick: () => void createWorkspace(), title: "Add workspace", "aria-label": "Add workspace", children: _jsx(Plus, { "aria-hidden": "true" }) }), _jsxs("div", { className: "workspace-header-controls", children: [_jsxs("div", { className: "header-approval-policy-wrap", title: "How should Codex actions be approved?", children: [_jsx(ShieldCheck, { "aria-hidden": "true" }), _jsx("select", { className: "header-approval-policy", "aria-label": "How should Codex actions be approved?", value: approvalPolicy, onChange: (event) => setApprovalPolicy(event.target.value), children: APPROVAL_POLICY_OPTIONS.map((option) => (_jsx("option", { value: option.value, children: option.label }, option.value))) })] }), _jsxs("button", { className: "header-loop-toggle", type: "button", "aria-label": "Global Loop mode", "aria-pressed": globalLoopEnabled, "data-active": globalLoopEnabled ? "true" : undefined, disabled: globalLoopSaving, title: globalLoopEnabled ? "Loop on: automatically Grill turns with commands or file changes and start work on issues" : "Turn on global Loop mode", onClick: () => void toggleGlobalLoopMode(), children: [_jsx(Repeat2, { "aria-hidden": "true" }), _jsx("span", { children: globalLoopEnabled ? "Loop ON" : "Loop" })] }), _jsxs("div", { className: "header-account-popover-wrap", ref: accountPopoverRef, children: [_jsxs("button", { className: "header-account-control", type: "button", "aria-label": "Account", "aria-haspopup": "dialog", "aria-expanded": isAccountPopoverOpen, onClick: () => setIsAccountPopoverOpen((open) => !open), children: [_jsx(User, { "aria-hidden": "true" }), _jsx("span", { children: useLoadBalanceInWorkspace
                                                         ? formatLoadBalanceAccountLabel(activeAccount, workspaceAccountList)
                                                         : activeAccount ? formatAccountSelectLabel(activeAccount) : "No account" }), _jsx(ChevronDown, { "aria-hidden": "true" })] }), isAccountPopoverOpen && (_jsxs("section", { className: "header-account-popover", role: "dialog", "aria-label": "Choose account", children: [_jsxs("button", { className: "account-popover-load-balance", type: "button", "data-selected": useLoadBalanceInWorkspace, onClick: () => void switchAccount("__load_balance__"), children: [_jsx("strong", { children: "Load balance" }), _jsx("span", { children: "Automatically choose from checked accounts" })] }), _jsxs("div", { className: "account-popover-list", children: [accountList.map((account) => {
@@ -2374,7 +2819,7 @@ message.turnStatus === "todo" && (_jsx("span", { className: "turn-status", child
                                                             const selected = workspaceAccountIds.includes(account.id) || (!useLoadBalanceInWorkspace && activeAccount?.id === account.id);
                                                             const resetting = resettingAccountId === account.id;
                                                             return (_jsxs("article", { className: "account-popover-card", "data-selected": selected, children: [_jsxs("button", { className: "account-popover-select", type: "button", onClick: () => void switchAccount(account.id), children: [_jsxs("span", { className: "account-popover-identity", children: [_jsx("strong", { children: accountIdentityLabel(account) }), _jsxs("small", { children: [account.email || account.externalAccountId || account.id, tier ? ` · ${tier}` : ""] })] }), _jsxs("span", { className: "account-popover-quota", children: [windows.fiveHour && _jsxs("span", { children: ["5hr ", _jsx("strong", { children: formatQuotaPercent(windows.fiveHour) }), _jsxs("small", { children: ["Auto reset: ", formatQuotaWindowReset(windows.fiveHour, "relative")] })] }), windows.weekly && _jsxs("span", { children: ["Weekly ", _jsx("strong", { children: formatQuotaPercent(windows.weekly) }), _jsxs("small", { children: ["Reset: ", formatQuotaWindowReset(windows.weekly, "dateTime")] })] }), !windows.fiveHour && !windows.weekly && _jsx("span", { children: "Usage unavailable" })] })] }), _jsxs("div", { className: "account-popover-reset", children: [_jsxs("span", { children: [_jsx("strong", { children: resetCredits.availableCount }), " reset", resetCredits.availableCount === 1 ? "" : "s", _jsxs("small", { children: ["Earliest expiry: ", formatResetCreditExpiry(earliestCredit, resetCredits.availableCount)] })] }), _jsxs("button", { type: "button", onClick: () => void resetAccountRateLimit(account), disabled: resetCredits.availableCount <= 0 || Boolean(resettingAccountId) || accountNeedsLogin(account), title: resetCredits.availableCount > 0 ? "Use one rate-limit reset" : "No reset available", children: [_jsx(RotateCcw, { className: resetting ? "spin" : undefined, "aria-hidden": "true" }), resetting ? "Resetting" : "Use reset"] })] }), account.quotaError && (_jsxs("div", { className: "account-popover-error-row", children: [_jsx("small", { className: "account-popover-error", children: account.quotaError }), accountNeedsLogin(account) && (_jsx("button", { className: "account-popover-login", type: "button", onClick: () => beginAccountRelogin(account), children: "Relogin" }))] }))] }, account.id));
-                }), accountList.length === 0 && _jsx("p", { className: "account-popover-empty", children: "No accounts" })] }), _jsx(ClaudeAccountsSection, { claude: claudeAccounts, onLogin: beginClaudeRelogin })] }))] }), _jsx("button", { className: "ghost-icon header-settings", type: "button", "data-active": isSettingsOpen, onClick: () => setIsSettingsOpen((open) => !open), title: "Settings", "aria-label": "Settings", children: _jsx(Settings, { "aria-hidden": "true" }) })] })] }), _jsxs("aside", { className: "sidebar", id: "session-panel-sessions", role: managerMode ? "region" : "tabpanel", "aria-labelledby": managerMode ? undefined : "session-tab-sessions", "aria-label": "Sessions", children: [_jsxs("div", { className: "sidebar-toolbar", children: [_jsx(WorkspaceManagerToggle, { active: managerMode, busy: managerOpening, onToggle: () => void toggleWorkspaceManager() }), _jsx("button", { className: "ghost-icon", type: "button", onClick: () => {
+                }), accountList.length === 0 && _jsx("p", { className: "account-popover-empty", children: "No accounts" })] }), _jsx(ClaudeAccountsSection, { claude: claudeAccounts, onLogin: beginClaudeRelogin })] }))] }), _jsx("button", { className: "ghost-icon header-settings", type: "button", "data-active": isSettingsOpen, onClick: () => setIsSettingsOpen((open) => !open), title: "Settings", "aria-label": "Settings", children: _jsx(Settings, { "aria-hidden": "true" }) })] })] }), _jsxs("aside", { className: "sidebar", id: "session-panel-sessions", role: sessionlessView ? "region" : "tabpanel", "aria-labelledby": sessionlessView ? undefined : "session-tab-sessions", "aria-label": "Sessions", children: [_jsxs("div", { className: "sidebar-toolbar", children: [_jsx("button", { className: "ghost-icon", type: "button", onClick: () => {
                                         setSessionSearchQuery("");
                                         setSessionSearchResults([]);
                                         setSessionSearchPage({ offset: 0, limit: 20, hasMore: false, nextOffset: null, total: 0 });
@@ -2383,7 +2828,13 @@ message.turnStatus === "todo" && (_jsx("span", { className: "turn-status", child
                                     }, title: "Search sessions", "aria-label": "Search sessions", children: _jsx(Search, { "aria-hidden": "true" }) }), selectedSessionRecords.length > 0 && (_jsxs("div", { className: "session-selection-actions", children: [_jsx("button", { className: "ghost-icon", type: "button", onClick: () => void copySelectedSessionReferences(), title: `Copy ${selectedSessionRecords.length} selected session URL${selectedSessionRecords.length === 1 ? "" : "s"}`, "aria-label": `Copy ${selectedSessionRecords.length} selected session URL${selectedSessionRecords.length === 1 ? "" : "s"}`, children: _jsx(Copy, { "aria-hidden": "true" }) }), _jsx("button", { className: "ghost-icon", type: "button", onClick: clearSessionSelection, title: "Clear selected sessions", "aria-label": "Clear selected sessions", children: _jsx(X, { "aria-hidden": "true" }) })] })), _jsxs("button", { className: "ghost-icon pending-waits-trigger", type: "button", onClick: () => {
                                         setIsSessionSearchOpen(false);
                                         setIsPendingWaitsOpen(true);
-                                    }, title: "Pending waits", "aria-label": `Pending waits${activeWaitCount > 0 ? ` (${activeWaitCount})` : ""}`, children: [_jsx(Clock3, { "aria-hidden": "true" }), activeWaitCount > 0 && (_jsx("span", { className: "pending-waits-badge", "aria-hidden": "true", children: activeWaitCount > 99 ? "99+" : activeWaitCount }))] }), _jsx("button", { className: "ghost-icon", type: "button", onClick: () => void newSessionInProjectGroup(mostRecentlyActiveProject), title: mostRecentlyActiveProject ? `New thread in ${mostRecentlyActiveProject.label}` : "New thread", "aria-label": mostRecentlyActiveProject ? `New thread in ${mostRecentlyActiveProject.label}` : "New thread", children: _jsx(Plus, { "aria-hidden": "true" }) })] }), _jsxs("div", { className: "session-list-tabs", role: "tablist", "aria-label": "Session lists", children: ["sessions", "categories"].map(tab => _jsx("button", { type: "button", role: "tab", "aria-selected": sidebarListTab === tab, onClick: () => setSidebarListTab(tab), children: tab === "sessions" ? "Sessions" : "Categories · Lab" }, tab)) }), sidebarListTab === "categories" && _jsx(SessionCategoriesPanel, { workspaceId: activeWorkspace?.id, sessionId, onOpenSession: switchToSessionById }, activeWorkspace?.id), _jsx("section", { className: "thread-tree", style: sidebarListTab === "categories" ? { display: "none" } : undefined, "aria-label": "Saved sessions", children: _jsxs("div", { className: "session-list", "data-has-selection": selectedSessionRecords.length > 0 ? "true" : undefined, children: [sessionList.length === 0 ? (_jsx("p", { className: "session-empty", children: "No saved sessions yet." })) : (groupedSessions.map((group) => {
+                                    }, title: "Pending waits", "aria-label": `Pending waits${activeWaitCount > 0 ? ` (${activeWaitCount})` : ""}`, children: [_jsx(Clock3, { "aria-hidden": "true" }), activeWaitCount > 0 && (_jsx("span", { className: "pending-waits-badge", "aria-hidden": "true", children: activeWaitCount > 99 ? "99+" : activeWaitCount }))] }), _jsx(ProjectBlockersButton, { blockers: workspaceEscalatedBlockers, actorName: summaryActorName,
+                                        onOpenSession: (targetSessionId) => void switchToSessionById(targetSessionId, { label: "task" }) }),_jsx("button", { className: "ghost-icon", type: "button", onClick: () => void newSessionInProjectGroup(mostRecentlyActiveProject), title: mostRecentlyActiveProject ? `New thread in ${mostRecentlyActiveProject.label}` : "New thread", "aria-label": mostRecentlyActiveProject ? `New thread in ${mostRecentlyActiveProject.label}` : "New thread", children: _jsx(Plus, { "aria-hidden": "true" }) })] }), sidebarTabsVisible && _jsx(SidebarViewTabs, { value: sidebarView, onChange: changeSidebarView, runningActors: (actorSummary.summary?.actors ?? []).reduce((total, actor) => total + (actor.running || 0), 0), runningSessions: ordinaryRunningSessionCount }), sidebarView === "actors" ? _jsx(ActorListPanel, { summary: actorSummary.summary, error: actorSummary.error, authRequired: actorSummary.authRequired, selectedActorId: actorView?.actorId ?? null, roomSelected: managerMode || showManagerWorkspace, roomChatKey: activeGroupChat.key, onSelectActor: (actorId) => openActorView(actorId), onOpenActorBlockers: (actorId) => {
+                                    requestOpenBlockers(`actor:${actorId}`);
+                                    if (actorViewRef.current?.actorId !== actorId) openActorView(actorId);
+                                    // On compact layouts the Blockers tab lives in the actor-sessions column.
+                                    else setSessionTab(current => ({ ...current, value: "actor-sessions" }));
+                                }, onOpenRoom: (chatKey) => { setAutoGroupChatWorkspace(null); setGroupChatKey(chatKey); void toggleWorkspaceManager(true, "push", false, false); } }) : _jsx("section", { className: "thread-tree", id: "sidebar-panel-sessions", role: sidebarTabsVisible ? "tabpanel" : undefined, "aria-labelledby": sidebarTabsVisible ? "sidebar-tab-sessions" : undefined, "aria-label": sidebarTabsVisible ? undefined : "Saved sessions", children: _jsxs("div", { className: "session-list", "data-has-selection": selectedSessionRecords.length > 0 ? "true" : undefined, children: [sessionList.length === 0 ? (_jsx("p", { className: "session-empty", children: "No saved sessions yet." })) : (groupedSessions.map((group) => {
                                         const isCollapsed = collapsedSessionDirs.has(group.cwd);
                                         const launchSessionId = sessionId && flatSessions.some((record) => record.id === sessionId && record.cwd === group.cwd)
                                             ? sessionId
@@ -2451,122 +2902,7 @@ message.turnStatus === "todo" && (_jsx("span", { className: "turn-status", child
                                                         left: hoveredProcessMonitor.left,
                                                         maxHeight: `calc(100vh - ${hoveredProcessMonitor.bottom + 16}px)`
                                                     }, onMouseEnter: cancelHoveredProcessMonitorClose, children: [_jsxs("div", { className: "thread-status-popover-header", children: [_jsx("span", { className: "process-monitor-dot", "data-status": monitor.status, "aria-hidden": "true" }), _jsx("strong", { children: capitalize(monitor.status) })] }), _jsx("span", { className: "thread-status-title", children: monitor.label }), _jsxs("div", { className: "thread-status-meta", children: [_jsx(TerminalSquare, { "aria-hidden": "true" }), _jsx("span", { children: launchLabel })] }), _jsxs("div", { className: "thread-status-meta", children: [_jsx(Folder, { "aria-hidden": "true" }), _jsx("span", { children: monitor.cwd })] }), monitor.logFile && (_jsxs("div", { className: "thread-status-meta", children: [_jsx(FileText, { "aria-hidden": "true" }), _jsxs("span", { title: monitor.logFile, children: ["Log: ", monitor.logFile] })] })), monitor.pid && (_jsxs("div", { className: "thread-status-meta", children: [_jsx(Cpu, { "aria-hidden": "true" }), _jsxs("span", { children: ["PID ", monitor.pid] })] })), entryPoints.length > 0 && (_jsx("div", { className: "process-monitor-entry-points", children: entryPoints.map((entryPoint) => (_jsxs("a", { className: "process-monitor-entry-link", href: entryPoint, target: "_blank", rel: "noreferrer", title: `Open ${entryPoint}`, children: [_jsx(ExternalLink, { "aria-hidden": "true" }), _jsx("span", { children: entryPoint })] }, entryPoint))) })), monitor.wakePrompt && (_jsxs("div", { className: "thread-status-meta", children: [_jsx(Clock3, { "aria-hidden": "true" }), _jsxs("span", { children: ["Wake-up: ", monitor.wakeStatus] })] })), monitor.error && _jsx("small", { className: "process-monitor-error", children: monitor.error }), monitor.readOnly && _jsx("small", { children: monitor.restartable ? "Restartable via local supervisor" : "Managed externally" }), _jsxs("div", { className: "process-monitor-popover-actions", children: [_jsxs("button", { type: "button", onClick: () => void openProcessMonitorLog(latestCommandRun ?? monitor), disabled: isBusy || (monitor.status === "available" && !latestCommandRun), title: monitor.status === "available" ? latestCommandRun ? "View latest run output" : "No run output yet" : "View process output", children: [_jsx(FileText, { "aria-hidden": "true" }), "Logs"] }), _jsxs("button", { type: "button", onClick: () => void restartProcessMonitor(monitor), disabled: isBusy || (!monitor.managed && !monitor.restartable) || (monitor.readOnly && !monitor.restartable), title: monitor.restartable ? "Restart via supervisor" : monitor.readOnly ? "This process is restarted by its external supervisor" : monitor.status === "available" ? "Run command" : monitor.managed ? "Restart process" : "PID monitors cannot be restarted", children: [_jsx(RotateCcw, { className: processMonitorAction === `restart:${monitor.id}` ? "spin" : undefined, "aria-hidden": "true" }), monitor.status === "available" ? "Run" : "Restart"] }), _jsxs("button", { type: "button", onClick: () => void stopProcessMonitor(monitor), disabled: isBusy || monitor.readOnly || !monitor.pid || (monitor.status !== "running" && monitor.status !== "starting"), title: monitor.readOnly ? "Built-in processes cannot be stopped here" : monitor.pid ? "Stop process and keep monitor" : "No running process to stop", children: [_jsx(Square, { className: processMonitorAction === `stop:${monitor.id}` ? "spin" : undefined, "aria-hidden": "true" }), "Stop"] }), _jsxs("button", { type: "button", "data-danger": "true", onClick: () => void removeProcessMonitor(monitor), disabled: isBusy || monitor.readOnly, title: monitor.readOnly ? "Built-in process records cannot be removed" : "Remove process monitor", children: [_jsx(X, { "aria-hidden": "true" }), "Remove"] })] })] }))] }, monitor.id));
-                                    }) }))] }), _jsx("div", { className: "sidebar-spacer" })] }), _jsxs(managerMode ? WorkspaceManagerView : "section", { className: "chat", "data-session-tab": activeSessionTab, "aria-label": "Codex chat", children: [_jsxs("header", { className: "content-header", children: [_jsxs("div", { className: "content-header-heading", children: [effectiveParentSessionId ? (_jsxs("div", { className: "session-title-stack", children: [_jsxs("button", { className: "parent-session-link", type: "button", onClick: () => void switchToParentSession(effectiveParentSessionId), title: `Back to main agent ${effectiveParentSessionId}`, children: [_jsx(ArrowLeft, { "aria-hidden": "true" }), _jsx("span", { children: parentSession
-                                                        ? displaySessionTitle(parentSession.title)
-                                                        : "Main agent" })] }), _jsx("h1", { children: threadTitle })] })) : (_jsx("h1", { children: threadTitle })), managerMode && _jsx(WorkspaceManagerTaskBadges, { snapshot: managerDashboard.snapshot })] }), _jsxs("div", { className: "content-header-actions", children: [managerMode && _jsx(WorkspaceManagerFollowUp, { manager: managerView.state?.manager?.sessionId === sessionId ? managerView.state.manager : null, onChanged: managerView.refresh, onReset: clearWorkspaceManager, onOpenRaw: (manager) => void switchToSessionById(manager.sessionId, { label: "manager session" }) }), !managerMode && sessionId === managerView.state?.manager?.sessionId && _jsx(WorkspaceManagerReturnLink, { manager: managerView.state.manager, onNavigate: () => void toggleWorkspaceManager(true) }), !managerMode && childSessions.length > 0 && (_jsxs("button", { className: "parent-session-link", type: "button", onClick: () => void switchSession(childSessions[0]), title: `Open latest child task: ${displaySessionTitle(childSessions[0].title)}`, children: [_jsx(GitFork, { "aria-hidden": "true" }), _jsxs("span", { children: [childSessions.length, " child task", childSessions.length === 1 ? "" : "s"] })] }))] })] }),
-managerMode && compactLayout && _jsx("button", { className: "workspace-manager-panel-switch", type: "button", "aria-controls": activeSessionTab === "sessions" ? "session-panel-dashboard" : "session-panel-sessions", onClick: () => setSessionTab({ sessionId, value: activeSessionTab === "sessions" ? "dashboard" : "sessions" }), children: activeSessionTab === "sessions" ? "Back to Dashboard" : "Sessions" }),
-!managerMode && _jsx("div", { className: "session-view-tabs", role: "tablist", "aria-label": "Session views", children: [
-    ...(compactLayout ? [["sessions", "Sessions"]] : []), ...(managerMode ? [["dashboard", "Dashboard"]] : [["turns", "Turns"], ...(sessionId ? [["side-chat", "Side chat"]] : []), ...(hasPlanTab ? [["plan", "Plan"]] : [])])
-].map(([value, label]) => _jsx("button", {
-    className: value === "sessions" ? "session-sessions-tab" : undefined,
-    type: "button", role: "tab", id: `session-tab-${value}`, "aria-selected": activeSessionTab === value,
-    "aria-controls": `session-panel-${value}`, tabIndex: activeSessionTab === value ? 0 : -1,
-    onClick: () => setSessionTab({ sessionId, value }),
-    onKeyDown: (event) => {
-        const tabs = Array.from(event.currentTarget.parentElement.querySelectorAll('[role="tab"]:not(:disabled)'));
-        const index = tabs.indexOf(event.currentTarget);
-        const next = event.key === "ArrowRight" ? (index + 1) % tabs.length : event.key === "ArrowLeft" ? (index + tabs.length - 1) % tabs.length : event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : -1;
-        if (next >= 0) { event.preventDefault(); tabs[next].focus(); tabs[next].click(); }
-    }, "aria-busy": value === "side-chat" && sideChatRunning ? true : undefined, children: [label, value === "side-chat" && sideChatRunning && _jsx(Loader2, { className: "spin", "aria-label": "Waiting for side chat reply", size: 14 })]
-}, value)) }),
-        !managerMode && sessionId && _jsx("div", { className: "session-side-chat-view", id: "session-panel-side-chat", role: "tabpanel", "aria-labelledby": "session-tab-side-chat", hidden: activeSessionTab !== "side-chat", children: _jsx(SideChatPanel, { active: activeSessionTab === "side-chat", codexSessionId: threadId ?? undefined, sessionId, sessionReady: activeSession?.id === sessionId, workspaceId: activeWorkspace?.id, CompletedTurn, annotation: sideChatAnnotation, onClearAnnotation: () => setSideChatAnnotation(null), onRunningChange: setSideChatRunning }, sessionId) }),
-managerMode && _jsx(WorkspaceManagerDashboard, { hidden: activeSessionTab !== "dashboard", workspaceId: activeWorkspace?.id, dashboard: managerDashboard, onOpenTask: (targetSessionId) => void switchToSessionById(targetSessionId, { label: "task" }) }),
-!managerMode && hasPlanTab && _jsx("div", { className: "session-plan-view", id: "session-panel-plan", role: "tabpanel", "aria-labelledby": "session-tab-plan", hidden: activeSessionTab !== "plan", children: _jsx(TodoPanel, { todo: visibleSessionTodo, sessionExecutionStatuses: sessionExecutionStatuses, pendingApprovalSessionIds: pendingApprovalSessionIdSet, onOpenSession: (targetSessionId) => void switchToSessionById(targetSessionId, { label: "subtask" }), onPause: setTodoPaused, onCreateItem: createTodoItem, onUpdateItem: updateTodoItem, onSetContext: setTodoContext, onComment: addTodoComment, onResolveChallenge: resolveTodoChallenge }) }),
-_jsxs("div", { className: "messages-pane", children: [
-_jsxs("aside", { className: "prompt-turns", id: "session-panel-turns", role: managerMode ? "region" : "tabpanel", "aria-labelledby": managerMode ? undefined : "session-tab-turns", "aria-label": managerMode ? "Manager turns" : undefined, children: [_jsx("div", { ref: promptTurnsScrollRef, className: "prompt-turns-scroll", children: promptTurns.filter(({ prompt }) => visibleMessageIds.has(prompt.id)).map(({ prompt, response, index, editCount, toolCount, agentRoundTripCount, steerCount, issueCount, resolvedIssueCount }) => {
-                                            const accent = `var(--turn-accent-${(index % 6) + 1})`;
-                                            const isRunning = response?.turnStatus === "running";
-                                            const isEditing = inlinePromptEditor?.messageId === prompt.id;
-                                             const openTurn = () => {
-                                                     setActivePromptTurnIds(new Set([prompt.turnId]));
-                                                     setFeaturedPromptTurnId(prompt.turnId);
-                                                     closeMiddlePanel();
-                                                     window.requestAnimationFrame(() => messagesRef.current?.querySelector(`.message.assistant[data-turn-id="${prompt.turnId}"]`)?.scrollIntoView({ behavior: "smooth", block: "start" }));
-                                             };
-                                            const promptMetadata = promptDisplayMetadata(prompt.rawContent ?? prompt.content);
-                                            const originalPromptText = parseResponseAnnotations(promptMetadata.visible)?.content || promptMetadata.visible || "Attachment prompt";
-                                            const concurrentResult = parseConcurrentMessage(prompt.rawContent ?? prompt.content);
-                                            const sourceTurnId = concurrentResult?.result && concurrentResult.to === "main" && concurrentSourceGroup?.sessionId === sessionId && concurrentSourceGroup.group.id === concurrentResult.groupId
-                                                ? concurrentSourceGroup.group.members.find((member) => member.localId === concurrentResult.from)?.sourceTurnId : null;
-                                            const sourcePrompt = sourceTurnId ? promptTurns.find((turn) => turn.prompt.turnId === sourceTurnId)?.prompt : null;
-                                            const sourceMetadata = sourcePrompt ? promptDisplayMetadata(sourcePrompt.rawContent ?? sourcePrompt.content) : null;
-                                            const sourcePromptText = sourceMetadata ? parseResponseAnnotations(sourceMetadata.visible)?.content || sourceMetadata.visible || "Attachment prompt" : null;
-                                            const promptText = sourcePromptText ? `Concurrent response to ${sourcePromptText.trim().replace(/\s+/g, " ")}` : originalPromptText;
-                                            const copyPrompt = (event) => {
-                                                event.stopPropagation();
-                                                void copyUserPrompt(prompt);
-                                            };
-                                            const promptActions = renderPromptActionButtons(prompt);
-                                            const promptRoundtable = roundtable.rounds.find(round => round.turnId === prompt.turnId);
-                                            const hasGrill = grilledTurns.has(`${sessionId}:${prompt.turnId}`);
-                                            const hasPromptStats = hasGrill || editCount > 0 || toolCount > 0 || agentRoundTripCount > 0 || steerCount > 0 || issueCount > 0;
-                                            return (_jsxs("div", { className: "prompt-turn-card", role: "button", tabIndex: 0, "data-turn-id": prompt.turnId, "data-active": activePromptTurnIds.has(prompt.turnId) ? "true" : undefined, "data-featured": effectiveFeaturedPromptTurnId === prompt.turnId ? "true" : undefined, style: { "--turn-accent": accent }, onClick: openTurn, onKeyDown: (event) => {
-                                                    if (event.key === "Enter" || event.key === " ") {
-                                                        event.preventDefault();
-                                                        openTurn();
-                                                    }
-                                                }, children: [
-                                                    _jsx("span", { className: "prompt-turn-meta", children: isRunning ? _jsx(Loader2, { className: "spin prompt-turn-spinner", "aria-label": "Running" }) : _jsx("b", { children: String(index + 1).padStart(2, "0") }) }),
-                                                    isEditing ? (_jsxs("form", { className: "prompt-turn-inline-editor", onClick: (event) => event.stopPropagation(), onSubmit: (event) => void submitInlineUserPromptEdit(event, prompt), children: [
-                                                        _jsx("textarea", { ref: inlinePromptEditorRef, value: inlinePromptEditor?.value ?? "", "aria-label": "Edit prompt", onChange: (event) => {
-                                                                const value = event.currentTarget.value;
-                                                                setInlinePromptEditor((current) => current?.messageId === prompt.id ? { ...current, value } : current);
-                                                            }, onKeyDown: (event) => handleInlinePromptEditorKeyDown(event, prompt) }),
-                                                        _jsxs("span", { className: "prompt-turn-actions", children: [
-                                                            _jsx("button", { className: "message-action-icon", type: "button", title: "Copy prompt", "aria-label": "Copy prompt", onClick: copyPrompt, children: _jsx(Copy, { "aria-hidden": "true" }) }),
-                                                            _jsx("button", { className: "message-action-icon", type: "button", title: "Cancel edit", "aria-label": "Cancel edit", onClick: cancelInlineUserPromptEdit, children: _jsx(X, { "aria-hidden": "true" }) }),
-                                                            _jsx("button", { className: "message-action-icon", type: "submit", title: "Resend edited prompt", "aria-label": "Resend edited prompt", disabled: !(inlinePromptEditor?.value.trim() || (inlinePromptEditor?.attachments.length ?? 0) > 0) || isSteering, children: _jsx(Send, { "aria-hidden": "true" }) })
-                                                        ] })
-                                                    ] })) : (_jsxs("div", { className: "prompt-turn-summary", children: [prompt.model && (_jsxs("span", { className: "prompt-turn-model", title: `Model used: ${prompt.model}`, children: [prompt.autoModelProvider === "typesafe" ? _jsx("span", { className: "prompt-turn-auto-prefix", "data-provider": "typesafe", "data-low-confidence": prompt.autoModelConfidence !== undefined && prompt.autoModelConfidence < 0.3, children: "J " }) : prompt.autoModel ? _jsx("span", { className: "prompt-turn-auto-prefix", children: "A " }) : null, modelOptionLabel(prompt.model)] })), sourcePromptText ? _jsx("span", { className: "prompt-turn-copy", children: promptText }) : _jsx(MarkdownContent, { className: "prompt-turn-copy", children: promptText })] })),
-                                                    (!isEditing || hasPromptStats) && (_jsxs("span", { className: "prompt-turn-details", children: [
-                                                        hasGrill && _jsx("span", { className: "prompt-turn-stat prompt-turn-grill-tag", "data-await-ack": pendingGrillTurns.has(`${sessionId}:${prompt.turnId}`) || undefined, title: pendingGrillTurns.has(`${sessionId}:${prompt.turnId}`) ? "Grill: Await ack" : "Grill review", "aria-label": pendingGrillTurns.has(`${sessionId}:${prompt.turnId}`) ? "Grill: Await ack" : "Grilled", children: _jsx(Flame, { "aria-hidden": "true" }) }),
-                                                        _jsxs("span", { className: "prompt-turn-model-flags", children: [renderPromptModelBadge(prompt), renderPromptTags(prompt, "prompt-turn-tags"), promptRoundtable && _jsxs("span", { className: "prompt-turn-stat prompt-turn-roundtable", children: [_jsx(Users, { "aria-hidden": "true" }), `Round table(${promptRoundtable.answers.length})`] })] }),
-                                                        editCount > 0 && (_jsxs("span", { className: "prompt-turn-stat", title: `${editCount} edited file${editCount === 1 ? "" : "s"}`, children: [_jsx(FileEditIcon, { "aria-hidden": "true" }), editCount] })),
-                                                        issueCount > 0 && (_jsxs("span", { className: "prompt-turn-stat prompt-turn-issues", "data-resolved": resolvedIssueCount === issueCount ? "true" : undefined, title: `${resolvedIssueCount}/${issueCount} issues resolved`, children: [resolvedIssueCount === issueCount ? _jsx(CheckCircle2, { "aria-hidden": "true" }) : _jsx(Circle, { "aria-hidden": "true" }), resolvedIssueCount, "/", issueCount] })),
-                                                        agentRoundTripCount > 0 && (_jsxs("span", { className: "prompt-turn-stat", title: `${agentRoundTripCount} agent round trip${agentRoundTripCount === 1 ? "" : "s"}`, children: [_jsx(RotateCcw, { "aria-hidden": "true" }), agentRoundTripCount] })),
-                                                        steerCount > 0 && (_jsxs("span", { className: "prompt-turn-stat", title: `${steerCount} steer${steerCount === 1 ? "" : "s"}`, children: [_jsx(BetweenHorizontalStart, { "aria-hidden": "true" }), steerCount] })),
-                                                        toolCount > 0 && (_jsxs("span", { className: "prompt-turn-stat", title: `${toolCount} tool${toolCount === 1 ? "" : "s"}`, children: [_jsx(TerminalSquare, { "aria-hidden": "true" }), toolCount] })),
-                                                        !isEditing && promptActions
-                                                    ] }))
-                                                ] }, prompt.id));
-                                        }) }), (backendQueuedPrompts.length > 0 || visibleLocalQueuedPrompts.length > 0 || visibleQueuedPromptReceipts.length > 0) && (_jsx("div", { className: "prompt-turn-queue", "aria-label": "Queued prompts", children: [backendQueuedPrompts.map((item, index) => renderBackendQueuedPrompt(item, index, true)), visibleLocalQueuedPrompts.map((prompt, index) => renderLocalQueuedPrompt(prompt, index, true)), visibleQueuedPromptReceipts.map((prompt) => renderQueuedPromptReceipt(prompt, true))] }))] }),
-_jsxs("div", { ref: messageScrollIndicatorRef, className: "message-scroll-indicator", onClick: scrollFromMessageRail, onWheel: scrollFromMessageRailWheel, children: [_jsx("span", { className: "message-scroll-indicator-track", "aria-hidden": "true" }), _jsx("span", { ref: messageViewportIndicatorRef, className: "message-scroll-indicator-viewport", "aria-hidden": "true", onClick: (event) => event.stopPropagation(), onPointerDown: startMessageRailDrag, onPointerMove: dragMessageRailViewport, onPointerUp: finishMessageRailDrag, onPointerCancel: finishMessageRailDrag }), messageIndicatorMarks.map((mark) => (_jsx("button", { className: "message-scroll-indicator-mark", "data-tone": mark.tone, "data-tooltip": mark.title, type: "button", "aria-label": `Jump to ${mark.title}`, onClick: () => scrollToMessage(mark.targetId, mark.anchorId), style: { top: messageIndicatorMarkTop(messageIndicatorPositions[mark.id] ?? mark.position) } }, mark.id)))] }), _jsx("div", { ref: messagesRef, className: "messages", onScroll: (event) => {
-                                        setResponseQuotePopover(null);
-                                        const container = event.currentTarget;
-                                        messageScrollTopRef.current = container.scrollTop;
-                                        stickToMessageBottomRef.current =
-                                            container.scrollHeight - container.scrollTop - container.clientHeight <= MESSAGE_BOTTOM_THRESHOLD;
-                                        updateMessageViewportIndicator(container);
-                                    }, onMouseUp: captureResponseQuoteSelection, children: [
-                                        !managerMode && visibleTranscript.total > TRANSCRIPT_PAGE_TURNS && _jsxs("nav", { className: "transcript-history-navigation", "aria-label": "Conversation history", children: [
-                                            _jsx("button", { type: "button", disabled: !visibleTranscript.previousAnchor, onClick: () => changeTranscriptPage(visibleTranscript.previousAnchor), children: "Earlier turns" }),
-                                            _jsxs("span", { children: [` Turns ${visibleTranscript.start + 1}–${visibleTranscript.end} of ${visibleTranscript.total} `] }),
-                                            _jsx("button", { type: "button", disabled: !visibleTranscript.nextAnchor, onClick: () => changeTranscriptPage(visibleTranscript.nextAnchor), children: "Newer turns" }),
-                                            visibleTranscript.nextAnchor && _jsx("button", { type: "button", onClick: () => changeTranscriptPage(null), children: "Latest turns" })
-                                        ] }),
-                                        managerMode && managerOpenError && _jsx("p", { role: "alert", children: `Could not load workspace manager: ${managerOpenError}` }),
-                                        managerMode && managerHistoryState?.sessionId === sessionId && managerHistoryState?.viewKey === viewKeyRef.current && _jsx(WorkspaceManagerHistory, { ...managerHistoryState, onLoad: () => void loadEarlierManagerMessages() }),
-                                        managerMode && _jsx(WorkspaceManagerApprovals, { state: managerView.state, ApprovalEvent, onChanged: managerView.refresh }), transcript.length === 0 ? (_jsx("div", { className: "empty", children: switchingSessionTitle ? (_jsxs(_Fragment, { children: [_jsx(Loader2, { className: "spin", "aria-hidden": "true" }), _jsx("h2", { children: managerMode ? "Loading workspace manager" : "Loading session" })] })) : (_jsxs(_Fragment, { children: [_jsx("h2", { children: managerMode ? "Your workspace manager" : "Let's build" }), !managerMode && _jsxs("div", { className: "project-picker-menu", children: [_jsxs("button", { className: "project-picker", type: "button", onClick: toggleProjectPicker, "aria-expanded": isProjectPickerOpen, "aria-haspopup": "listbox", children: [_jsx("span", { children: projectName }), _jsx(ChevronRight, { "aria-hidden": "true" })] }), isProjectPickerOpen && (_jsx("div", { className: "project-picker-options", role: "listbox", "aria-label": "Projects in active workspace", children: isLoadingWorkspaceProjects ? (_jsx("p", { children: "Loading projects…" })) : workspaceProjectsError ? (_jsx("p", { className: "project-picker-error", children: workspaceProjectsError })) : workspaceProjects.length === 0 ? (_jsx("p", { children: "No projects in this workspace." })) : (workspaceProjects.map((project) => (_jsx("button", { type: "button", role: "option", onClick: () => {
-                                                            setIsProjectPickerOpen(false);
-                                                            void newSession(project);
-                                                        }, children: project.name }, project.name)))) }))] })] })) })) : (transcriptEntries.map((entry) => {
-                                        if (entry.kind === "message") {
-                                            return renderMessageArticle(entry.message);
-                                        }
-                                        return (_jsx("section", { className: "message-step-group", children: _jsxs("details", { className: "message-step-card", open: entry.open, children: [_jsxs("summary", { className: "message-step-summary", children: [_jsx(ChevronRight, { className: "command-chevron", "aria-hidden": "true" }), _jsx(CheckSquare2, { "aria-hidden": "true" }), _jsxs("span", { className: "message-step-index", children: ["Step ", entry.stepNumber] }), _jsx("span", { className: "message-step-title", children: entry.title }), _jsxs("span", { className: "message-step-count", children: [entry.messages.length, " ", entry.messages.length === 1 ? "message" : "messages"] })] }), _jsx("div", { className: "message-step-details", children: entry.messages.map(renderMessageArticle) })] }) }, entry.id));
-                                    }))] })] }), _jsxs("form", { hidden: concurrentWorkerEnded, style: concurrentWorkerEnded ? { display: "none" } : undefined, className: "composer", "aria-label": pendingComposer.edit ? "Edit queued prompt" : undefined, onSubmit: submit, children: [
-                                        managerMode && managerView.state?.manager?.sessionId === sessionId && _jsx(WorkspaceManagerBackgroundUpdateIndicator, { status: managerView.state.manager.backgroundUpdateStatus }),
-                                        composerSubmissionError?.sessionId === sessionId && _jsx("p", { className: "composer-submission-error", role: "alert", children: composerSubmissionError.message }),
-                                        _jsx(UnconfirmedPrompts, { sessionId, storedTurnIds: selectedSnapshotSession?.id === sessionId ? (selectedSessionSnapshot?.turns ?? []).map(turn => turn.id) : [], busy: isSubmitting || Boolean(pendingComposer.edit), running: currentSessionIsRunning, onRetry: entry => entry.settings.queued ? enqueuePrompt(entry.message, "queue", "default", [], entry.attachments, false, false, false, entry.id) : startChatTurn(entry.message, entry.attachments, "default", [], false, false, false, undefined, entry.id) }),
-                                        (backendQueuedPrompts.length > 0 || visibleLocalQueuedPrompts.length > 0 || visibleQueuedPromptReceipts.length > 0) && (_jsx("div", { className: "queued-prompts", "aria-label": "Queued prompts", children: [backendQueuedPrompts.map((item, index) => renderBackendQueuedPrompt(item, index)), visibleLocalQueuedPrompts.map((prompt, index) => renderLocalQueuedPrompt(prompt, index)), visibleQueuedPromptReceipts.map((prompt) => renderQueuedPromptReceipt(prompt))] })), _jsxs(ComposerFrame, { children: [_jsx(ComposerGearSelector, { idPrefix: "main-composer-gear", label: "Model gears", disabled: Boolean(pendingComposer.edit), gears: gearProfiles, activeGearIndex: activeGearIndex, modelOptions: MODEL_OPTIONS, effortOptions: EFFORT_OPTIONS, ultraEffortOptions: ULTRA_EFFORT_OPTIONS, supportsUltraEffort: supportsUltraEffort, modelOptionLabel: modelOptionLabel, effortOptionLabel: capitalize, onActivateGear: activateGearProfile, onModelChange: (index, model) => updateGearProfile(index, { model }), onEffortChange: (index, effort) => updateGearProfile(index, { effort }), onFastModeChange: (index, enabled) => updateGearProfile(index, { fastMode: enabled }), autoModelValue: AUTO_MODEL_VALUE, autoEffort: sessionAutoModel?.enabled ? sessionAutoModel.effort : undefined }), _jsxs(ComposerSurface, { onDropFiles: isSubmitting || pendingComposer.edit ? undefined : addFiles, children: [slashTrigger ? (_jsx(ComposerSuggestionMenu, { suggestions: visibleSlashSuggestions, activeIndex: slashSuggestionIndex, onSelect: selectSlashSuggestion, loading: isLoadingSkills })) : composerSuggestionTrigger && (visibleComposerSuggestions.length > 0 || isLoadingPathSuggestions) && (_jsx(ComposerSuggestionMenu, { suggestions: visibleComposerSuggestions, activeIndex: composerSuggestionIndex, onSelect: selectComposerSuggestion, loading: isLoadingPathSuggestions })), !pendingComposer.edit && composerResponseQuote?.map((quote, quoteIndex) => (_jsxs("div", { className: "composer-response-quote", "aria-label": annotationLabel(quote), children: [_jsx("span", { className: "composer-response-quote-icon", "aria-hidden": "true", children: _jsx(Quote, {}) }), _jsxs("div", { children: [_jsx("strong", { children: annotationLabel(quote) }), _jsx("span", { children: quote.text }), quote.annotation && _jsx("small", { children: quote.annotation })] }), _jsx("button", { type: "button", onClick: () => setComposerResponseQuote((current) => { const remaining = current.filter((_, index) => index !== quoteIndex); return remaining.length ? remaining : null; }), title: quote.source?.type === "file" ? "Remove file annotation" : "Remove quote", "aria-label": quote.source?.type === "file" ? "Remove file annotation" : "Remove quote", children: _jsx(X, { "aria-hidden": "true" }) })] }, quoteIndex))), (pendingComposer.edit?.attachments ?? attachments).length > 0 && (_jsx(AttachmentList, { attachments: pendingComposer.edit?.attachments ?? attachments, onRemove: pendingComposer.edit ? undefined : removeAttachment })), _jsx(InlineLinkComposer, { ref: inputEditorRef, disabled: isSubmitting || (managerMode && managerOpening) || Boolean(pendingComposer.edit && !pendingComposer.edit.held), value: pendingComposer.edit?.value ?? input, links: pendingComposer.edit ? [] : composerSessionLinks, placeholder: managerMode ? "Tell your workspace manager…" : currentSessionIsRunning ? "Type to queue or steer…" : "Type a message…", onChange: (value, caret) => {
-                                                        if (!pendingComposer.edit) pruneComposerLinks(value);
-                                                        setComposerInput(value);
-                                                        setSlashTrigger(managerMode ? null : findSlashTrigger(value, caret ?? value.length));
-                                                        setComposerSuggestionTrigger(managerMode ? null : findComposerSuggestionTrigger(value, caret));
-                                                    }, onPasteLink: pendingComposer.edit ? () => null : addPastedComposerLink, onRemoveLink: removeComposerSessionLink, onOpenLink: (link) => link.session && void openLinkedSession(link.session), onUnhandledPaste: pendingComposer.edit ? () => undefined : handleEditorPaste, onKeyDown: handleEditorKeyDown, onBlur: () => { setSlashTrigger(null); setComposerSuggestionTrigger(null); } }), _jsxs(ComposerToolbar, { children: [ _jsxs("label", { className: "composer-icon composer-upload", title: "Attach files", "aria-label": "Attach files", tabIndex: 0, onKeyDown: (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); event.currentTarget.querySelector("input")?.click(); } }, children: [_jsx(Plus, { "aria-hidden": "true" }), _jsx("input", { type: "file", multiple: true, onChange: (event) => {
-                                                                        void addFiles(event.currentTarget.files);
-                                                                        event.currentTarget.value = "";
-                                                                    }, disabled: isSubmitting || Boolean(pendingComposer.edit) || attachments.length >= MAX_ATTACHMENTS })] }), _jsx("button", { className: "composer-icon composer-loop-mode", type: "button", "aria-label": "Loop next prompt", "aria-pressed": executionMode === "loop", "data-active": executionMode === "loop" ? "true" : undefined, title: executionMode === "loop" ? "Next turn will Grill and start work automatically" : "Loop next prompt: Grill this turn and start work on issues", disabled: Boolean(pendingComposer.edit), onClick: () => setComposerExecutionMode((mode) => mode === "loop" ? "default" : "loop"), children: _jsx(Repeat2, { "aria-hidden": "true" }) }), !managerMode && _jsx("button", { type: "button", className: "composer-icon composer-managed-mode", "aria-label": "Managed mode", "aria-pressed": managedMode && !roundtable.enabled && !concurrentSourceTurnId, "data-active": managedMode && !roundtable.enabled && !concurrentSourceTurnId ? "true" : undefined, title: concurrentSourceTurnId ? "Managed mode is inactive during Concurrent; your preference is kept for ordinary turns." : "Managed mode: native sub-agents execute plans using suitable models, no stronger than the supervisor. Applies to new turns, not Steer.", disabled: Boolean(pendingComposer.edit) || Boolean(concurrentSourceTurnId), onClick: () => { const next = !managedMode; if (next) roundtable.disable(); setManagedMode(next); patchStoredComposerDraft(composerDraftSessionIdRef.current, { managedMode: next }); }, children: _jsx(HatGlasses, { "aria-hidden": "true" }) }), renderConcurrentIcon(null, true, true), renderRoundtableToggle(), sessionId && (_jsx("button", { className: "composer-icon composer-fork-toggle", type: "button", "aria-label": "Fork next prompt into a new thread", "aria-pressed": forkNextPrompt, "data-active": forkNextPrompt ? "true" : undefined, title: forkNextPrompt ? "Next prompt will open in a child thread" : "Fork next prompt into a new thread", disabled: Boolean(pendingComposer.edit), onClick: () => setComposerForkNextPrompt((enabled) => !enabled), children: _jsx(GitFork, { "aria-hidden": "true" }) })), composerTodoPlanModeEnabled && _jsxs("button", { className: "composer-chip composer-plan-prefix", type: "button", disabled: Boolean(pendingComposer.edit), onClick: toggleTodoPlanMode, title: "Turn off outcome tracking", children: ["Todo", _jsx(X, { "aria-hidden": "true" })] }), executionMode !== "default" && executionMode !== "loop" && (_jsxs("button", { className: "composer-chip composer-execution-mode", type: "button", disabled: Boolean(pendingComposer.edit), onClick: () => setExecutionMode("default"), title: `Turn off ${executionMode} mode`, children: [capitalize(executionMode), " mode", _jsx(X, { "aria-hidden": "true" })] })), _jsx("span", { className: "composer-fill" }), _jsx("button", { className: `composer-icon${pendingComposer.edit ? " composer-edit-action" : ""}`, type: "button", onClick: clearInput, disabled: isSubmitting || (!pendingComposer.edit && !input && !composerResponseQuote), title: pendingComposer.edit ? "Cancel edit" : "Clear", "aria-label": pendingComposer.edit ? "Cancel edit" : "Clear", children: _jsx(X, { "aria-hidden": "true" }) }), currentSessionIsRunning && !currentRoundtable && (_jsx("button", { className: "send-button composer-steer-button", type: "button", "aria-label": "Steer", disabled: Boolean(pendingComposer.edit) || !canSend || isSteering, title: "Steer", onClick: () => void submitSteer(), children: isSteering ? _jsx(Loader2, { className: "spin", "aria-hidden": "true" }) : _jsx(BetweenHorizontalStart, { "aria-hidden": "true" }) })), _jsx("button", { className: `send-button${sendButtonIsStop ? " stop-button" : ""}${currentSessionIsRunning && !pendingComposer.edit && !sendButtonIsStop ? " composer-queue-button" : ""}`, type: sendButtonIsStop ? "button" : "submit", disabled: isSubmitting || (sendButtonIsStop ? currentSessionIsStopping : !canSend || isSteering), "aria-busy": isSubmitting, title: isSubmitting ? "Sending" : sendButtonIsStop ? "Stop agent" : pendingComposer.edit && !pendingComposer.edit.held ? "Retry edit" : currentSessionIsRunning && !pendingComposer.edit ? "Queue" : "Send", "aria-label": isSubmitting ? "Sending" : sendButtonIsStop ? "Stop agent" : pendingComposer.edit && !pendingComposer.edit.held ? "Retry edit" : currentSessionIsRunning && !pendingComposer.edit ? "Queue" : "Send", onClick: sendButtonIsStop ? () => void stopCurrentTurn() : undefined, children: isSubmitting || isSteering ? (_jsx(Loader2, { className: "spin", "aria-hidden": "true" })) : sendButtonIsStop && currentSessionIsStopping ? (_jsx(Loader2, { className: "spin", "aria-hidden": "true" })) : sendButtonIsStop ? (_jsx(Square, { "aria-hidden": "true" })) : currentSessionIsRunning && !pendingComposer.edit ? (_jsx(Clock3, { "aria-hidden": "true" })) : (_jsx(Send, { "aria-hidden": "true" })) })] })] })] })] })] }), responseQuotePopover && (_jsx(ResponseQuotePopover, { quote: responseQuotePopover, onChange: setResponseQuotePopover, onAsk: () => askAboutResponseQuote(responseQuotePopover), onAskSideChat: sessionId ? () => { setSideChatAnnotation({ text: responseQuotePopover.text, source: responseQuotePopover.source, annotation: responseQuotePopover.annotation?.trim() }); setSessionTab({ sessionId, value: "side-chat" }); setResponseQuotePopover(null); window.getSelection()?.removeAllRanges(); } : undefined })), processCommandPrompt && _jsx(ProcessCommandDialog, { label: processCommandPrompt.label, parameters: processCommandPrompt.parameters, onRun: (values) => restartProcessMonitor(processCommandPrompt, values), onClose: () => setProcessCommandPrompt(null) }, processCommandPrompt.id), toastMessage && (_jsx("div", { className: "toast", role: "status", "aria-live": "polite", children: toastMessage })), processMonitorLog && (_jsx("div", { className: "modal-backdrop process-monitor-log-backdrop", role: "presentation", onMouseDown: () => setProcessMonitorLog(null), children: _jsxs("section", { className: "process-monitor-log-modal", role: "dialog", "aria-modal": "true", "aria-labelledby": "process-monitor-log-title", onMouseDown: (event) => event.stopPropagation(), onKeyDown: (event) => {
+                                    }) }))] }), _jsx("div", { className: "sidebar-spacer" })] }), actorChat ?? (showManagerWorkspace ? managerWorkspace : renderSessionMainBlock()), responseQuotePopover && (_jsx(ResponseQuotePopover, { quote: responseQuotePopover, onChange: setResponseQuotePopover, onAsk: () => askAboutResponseQuote(responseQuotePopover), onAskSideChat: sessionId ? () => { setSideChatAnnotation({ text: responseQuotePopover.text, source: responseQuotePopover.source, annotation: responseQuotePopover.annotation?.trim() }); setSessionTab({ sessionId, value: "side-chat" }); setResponseQuotePopover(null); window.getSelection()?.removeAllRanges(); } : undefined })), processCommandPrompt && _jsx(ProcessCommandDialog, { label: processCommandPrompt.label, parameters: processCommandPrompt.parameters, onRun: (values) => restartProcessMonitor(processCommandPrompt, values), onClose: () => setProcessCommandPrompt(null) }, processCommandPrompt.id), toastMessage && (_jsx("div", { className: "toast", role: "status", "aria-live": "polite", children: toastMessage })), processMonitorLog && (_jsx("div", { className: "modal-backdrop process-monitor-log-backdrop", role: "presentation", onMouseDown: () => setProcessMonitorLog(null), children: _jsxs("section", { className: "process-monitor-log-modal", role: "dialog", "aria-modal": "true", "aria-labelledby": "process-monitor-log-title", onMouseDown: (event) => event.stopPropagation(), onKeyDown: (event) => {
                             if (event.key === "Escape")
                                 setProcessMonitorLog(null);
                         }, children: [_jsxs("div", { className: "process-monitor-log-header", children: [_jsx(TerminalSquare, { "aria-hidden": "true" }), _jsxs("div", { children: [_jsx("strong", { id: "process-monitor-log-title", children: processMonitorLog.label }), _jsxs("small", { children: ["Process output", processMonitorLog.status === "ready" ? ` · ${formatBytes(processMonitorLog.size)}` : ""] })] }), _jsx("button", { className: "ghost-icon", type: "button", onClick: () => setProcessMonitorLog(null), title: "Close logs", "aria-label": "Close logs", autoFocus: true, children: _jsx(X, { "aria-hidden": "true" }) })] }), _jsx("div", { className: "process-monitor-log-content", "aria-live": "polite", children: processMonitorLog.status === "loading" ? (_jsxs("div", { className: "process-monitor-log-state", children: [_jsx(Loader2, { className: "spin", "aria-hidden": "true" }), " Loading logs\u2026"] })) : processMonitorLog.status === "error" ? (_jsx("div", { className: "process-monitor-log-state", "data-error": "true", children: processMonitorLog.error })) : processMonitorLog.content ? (_jsx("pre", { children: processMonitorLog.content })) : (_jsx("div", { className: "process-monitor-log-state", children: "No output captured yet." })) }), _jsxs("div", { className: "process-monitor-log-footer", children: [_jsxs("small", { children: [processMonitorLog.truncated ? "Showing the latest 256 KB" : "Complete captured output", processMonitorLog.updatedAt ? ` · Updated ${formatTimestamp(processMonitorLog.updatedAt)}` : ""] }), _jsxs("button", { className: "secondary", type: "button", onClick: () => void openProcessMonitorLog({ id: processMonitorLog.monitorId, label: processMonitorLog.label }), disabled: processMonitorLog.status === "loading", children: [_jsx(RotateCcw, { className: processMonitorLog.status === "loading" ? "spin" : undefined, "aria-hidden": "true" }), "Refresh"] })] })] }) })), isPendingWaitsOpen && (_jsx("div", { className: "modal-backdrop session-search-backdrop", role: "presentation", onMouseDown: () => setIsPendingWaitsOpen(false), children: _jsxs("section", { className: "session-search-modal pending-waits-modal", role: "dialog", "aria-modal": "true", "aria-labelledby": "pending-waits-title", onMouseDown: (event) => event.stopPropagation(), onKeyDown: (event) => {
@@ -2595,7 +2931,9 @@ _jsxs("div", { ref: messageScrollIndicatorRef, className: "message-scroll-indica
                                                             setIsSessionSearchOpen(false);
                                                             void switchSession(record);
                                                         }
-                                                    }, children: [_jsxs("td", { className: "session-search-name", children: [_jsx("strong", { children: highlightSessionSearchText(displaySessionTitle(record.title), sessionSearchQuery) }), _jsxs("span", { className: "session-search-keyword-list", children: [Object.keys(record.keywordWeights).slice(0, 4).map((keyword) => (_jsx("span", { children: keyword }, `${record.id}:${keyword}`))), Object.keys(record.keywordWeights).length === 0 && _jsx("span", { children: "\u2014" })] }), sessionSearchQuery.trim() && (_jsx("small", { children: highlightSessionSearchText(record.matchedTurn || record.description || record.cwd, sessionSearchQuery) }))] }), _jsx("td", { children: formatTimestamp(record.updated) }), _jsx("td", { children: record.turnCount ?? 0 }), _jsx("td", { children: formatTokenCount(record.tokenCount ?? 0) })] }, record.id))) })] }) })) }), _jsxs("div", { className: "session-search-pagination", children: [_jsx("button", { type: "button", onClick: () => void loadSessionSearchPage(Math.max(0, sessionSearchPage.offset - sessionSearchPage.limit)), disabled: isSearchingSessions || sessionSearchPage.offset === 0, children: "Previous" }), _jsxs("span", { children: ["Page ", Math.floor(sessionSearchPage.offset / sessionSearchPage.limit) + 1, " /", " ", Math.max(1, Math.ceil(sessionSearchPage.total / sessionSearchPage.limit))] }), _jsx("button", { type: "button", onClick: () => void loadSessionSearchPage(sessionSearchPage.nextOffset ?? sessionSearchPage.offset), disabled: isSearchingSessions || !sessionSearchPage.hasMore || sessionSearchPage.nextOffset === null, children: "Next" })] })] }) })), promptEditor?.kind === "wait" && (_jsx("div", { className: "modal-backdrop", role: "presentation", onMouseDown: () => setPromptEditor(null), children: _jsxs("section", { className: "prompt-editor-modal", role: "dialog", "aria-modal": "true", "aria-labelledby": "prompt-editor-title", onMouseDown: (event) => event.stopPropagation(), children: [_jsxs("div", { className: "modal-header", children: [_jsx("h2", { id: "prompt-editor-title", children: promptEditor.title }), _jsx("button", { className: "ghost-icon", type: "button", onClick: () => setPromptEditor(null), title: "Close", "aria-label": "Close", children: _jsx(X, { "aria-hidden": "true" }) })] }), _jsxs("form", { className: "prompt-editor-form", onSubmit: (event) => void savePromptEditor(event), children: [_jsx("textarea", { value: promptEditor.value, onChange: (event) => setPromptEditor((current) => (current ? { ...current, value: event.target.value } : current)), autoFocus: true }), _jsxs("div", { className: "account-login-actions", children: [_jsx("button", { className: "secondary", type: "button", onClick: () => setPromptEditor(null), children: "Cancel" }), _jsxs("button", { className: "secondary primary", type: "submit", disabled: !promptEditor.value.trim(), children: [_jsx(CheckSquare2, { "aria-hidden": "true" }), "Save"] })] })] })] }) })), isAccountLoginOpen && !isSettingsOpen && renderAccountLoginModal(), isSettingsOpen && (_jsxs("section", { className: "settings-page", "aria-label": "Settings", children: [_jsxs("header", { className: "settings-header", children: [_jsxs("div", { children: [_jsx("h1", { children: "Settings" }), _jsx("p", { children: "Review workspace activity and manage Codex accounts." })] }), _jsx("button", { className: "ghost-icon", type: "button", onClick: () => setIsSettingsOpen(false), title: "Close settings", "aria-label": "Close settings", children: _jsx(X, { "aria-hidden": "true" }) })] }), _jsxs("div", { className: "settings-layout", children: [_jsxs("nav", { className: "settings-tabs", "aria-label": "Settings sections", children: [_jsxs("button", { type: "button", role: "tab", "aria-selected": settingsSection === "globalInstructions", "data-active": settingsSection === "globalInstructions", onClick: () => setSettingsSection("globalInstructions"), children: [_jsx(FileText, { "aria-hidden": "true" }), "Global instructions"] }), _jsxs("button", { type: "button", role: "tab", "aria-selected": settingsSection === "autoModel", "data-active": settingsSection === "autoModel", onClick: () => setSettingsSection("autoModel"), children: [_jsx(Cpu, { "aria-hidden": "true" }), "Auto model"] }), _jsxs("button", { type: "button", role: "tab", "aria-selected": settingsSection === "helperModels", "data-active": settingsSection === "helperModels", onClick: () => setSettingsSection("helperModels"), children: [_jsx(Bot, { "aria-hidden": "true" }), "Helper models"] }), _jsxs("button", { type: "button", role: "tab", "aria-selected": settingsSection === "roundtableActors", "data-active": settingsSection === "roundtableActors", onClick: () => setSettingsSection("roundtableActors"), children: [_jsx(Users, { "aria-hidden": "true" }), "Agent actors"] }),_jsxs("button", { type: "button", role: "tab", "aria-selected": settingsSection === "security", "data-active": settingsSection === "security", onClick: () => setSettingsSection("security"), children: [_jsx(ShieldCheck, { "aria-hidden": "true" }), "Security"] }), _jsxs("button", { type: "button", role: "tab", "aria-selected": settingsSection === "profile", "data-active": settingsSection === "profile", onClick: () => setSettingsSection("profile"), children: [_jsx(Activity, { "aria-hidden": "true" }), "Profile"] }), _jsxs("button", { type: "button", role: "tab", "aria-selected": settingsSection === "suggestions", "data-active": settingsSection === "suggestions", onClick: () => setSettingsSection("suggestions"), children: [_jsx(Search, { "aria-hidden": "true" }), "Suggestions"] }), _jsxs("button", { type: "button", role: "tab", "aria-selected": settingsSection === "accounts", "data-active": settingsSection === "accounts", onClick: () => setSettingsSection("accounts"), children: [_jsx(User, { "aria-hidden": "true" }), "Accounts"] }), _jsxs("button", { type: "button", role: "tab", "aria-selected": settingsSection === "browserBridge", "data-active": settingsSection === "browserBridge", onClick: () => setSettingsSection("browserBridge"), children: [_jsx(TerminalSquare, { "aria-hidden": true }), "Browser Bridge"] })] }), settingsSection === "globalInstructions" ? (_jsx(GlobalInstructionsSettingsPanel, {})) : settingsSection === "autoModel" ? (_jsx(AutoModelSettingsPanel, {})) : settingsSection === "roundtableActors" ? (_jsx(RoundtableActorsPanel, {})) : settingsSection === "helperModels" ? (_jsx(HelperModelsSettingsPanel, {})) :settingsSection === "profile" ? (_jsx(ProfileSettingsPanel, { analytics: profileAnalytics, error: profileAnalyticsError, isLoading: isLoadingProfileAnalytics, workspaceId: profileWorkspaceId, workspaces: workspaceList, accountId: profileAccountId, onWorkspaceChange: (workspaceId) => {
+                                                    }, children: [_jsxs("td", { className: "session-search-name", children: [_jsx("strong", { children: highlightSessionSearchText(displaySessionTitle(record.title), sessionSearchQuery) }), _jsxs("span", { className: "session-search-keyword-list", children: [Object.keys(record.keywordWeights).slice(0, 4).map((keyword) => (_jsx("span", { children: keyword }, `${record.id}:${keyword}`))), Object.keys(record.keywordWeights).length === 0 && _jsx("span", { children: "\u2014" })] }), sessionSearchQuery.trim() && (_jsx("small", { children: highlightSessionSearchText(record.matchedTurn || record.description || record.cwd, sessionSearchQuery) }))] }), _jsx("td", { children: formatTimestamp(record.updated) }), _jsx("td", { children: record.turnCount ?? 0 }), _jsx("td", { title: record.subagentTokenUsage ? `Main agent ${formatTokenCount(record.tokenCount ?? 0)}; ${record.subagentTokenUsage.agentCount} subagents ${formatTokenCount(record.subagentTokenUsage.totalTokens)}` : undefined, children: record.subagentTokenUsage
+                                                            ? `${formatTokenCount(record.tokenCount ?? 0)} + ${formatTokenCount(record.subagentTokenUsage.totalTokens)} sub`
+                                                            : formatTokenCount(record.tokenCount ?? 0) })] }, record.id))) })] }) })) }), _jsxs("div", { className: "session-search-pagination", children: [_jsx("button", { type: "button", onClick: () => void loadSessionSearchPage(Math.max(0, sessionSearchPage.offset - sessionSearchPage.limit)), disabled: isSearchingSessions || sessionSearchPage.offset === 0, children: "Previous" }), _jsxs("span", { children: ["Page ", Math.floor(sessionSearchPage.offset / sessionSearchPage.limit) + 1, " /", " ", Math.max(1, Math.ceil(sessionSearchPage.total / sessionSearchPage.limit))] }), _jsx("button", { type: "button", onClick: () => void loadSessionSearchPage(sessionSearchPage.nextOffset ?? sessionSearchPage.offset), disabled: isSearchingSessions || !sessionSearchPage.hasMore || sessionSearchPage.nextOffset === null, children: "Next" })] })] }) })), promptEditor?.kind === "wait" && (_jsx("div", { className: "modal-backdrop", role: "presentation", onMouseDown: () => setPromptEditor(null), children: _jsxs("section", { className: "prompt-editor-modal", role: "dialog", "aria-modal": "true", "aria-labelledby": "prompt-editor-title", onMouseDown: (event) => event.stopPropagation(), children: [_jsxs("div", { className: "modal-header", children: [_jsx("h2", { id: "prompt-editor-title", children: promptEditor.title }), _jsx("button", { className: "ghost-icon", type: "button", onClick: () => setPromptEditor(null), title: "Close", "aria-label": "Close", children: _jsx(X, { "aria-hidden": "true" }) })] }), _jsxs("form", { className: "prompt-editor-form", onSubmit: (event) => void savePromptEditor(event), children: [_jsx("textarea", { value: promptEditor.value, onChange: (event) => setPromptEditor((current) => (current ? { ...current, value: event.target.value } : current)), autoFocus: true }), _jsxs("div", { className: "account-login-actions", children: [_jsx("button", { className: "secondary", type: "button", onClick: () => setPromptEditor(null), children: "Cancel" }), _jsxs("button", { className: "secondary primary", type: "submit", disabled: !promptEditor.value.trim(), children: [_jsx(CheckSquare2, { "aria-hidden": "true" }), "Save"] })] })] })] }) })), isAccountLoginOpen && !isSettingsOpen && renderAccountLoginModal(), isSettingsOpen && (_jsxs("section", { className: "settings-page", "aria-label": "Settings", children: [_jsxs("header", { className: "settings-header", children: [_jsxs("div", { children: [_jsx("h1", { children: "Settings" }), _jsx("p", { children: "Review workspace activity and manage Codex accounts." })] }), _jsx("button", { className: "ghost-icon", type: "button", onClick: () => setIsSettingsOpen(false), title: "Close settings", "aria-label": "Close settings", children: _jsx(X, { "aria-hidden": "true" }) })] }), _jsxs("div", { className: "settings-layout", children: [_jsxs("nav", { className: "settings-tabs", "aria-label": "Settings sections", children: [_jsxs("button", { type: "button", role: "tab", "aria-selected": settingsSection === "globalInstructions", "data-active": settingsSection === "globalInstructions", onClick: () => setSettingsSection("globalInstructions"), children: [_jsx(FileText, { "aria-hidden": "true" }), "Global instructions"] }), _jsxs("button", { type: "button", role: "tab", "aria-selected": settingsSection === "autoModel", "data-active": settingsSection === "autoModel", onClick: () => setSettingsSection("autoModel"), children: [_jsx(Cpu, { "aria-hidden": "true" }), "Decision"] }), _jsxs("button", { type: "button", role: "tab", "aria-selected": settingsSection === "helperModels", "data-active": settingsSection === "helperModels", onClick: () => setSettingsSection("helperModels"), children: [_jsx(Bot, { "aria-hidden": "true" }), "Helper models"] }), _jsxs("button", { type: "button", role: "tab", "aria-selected": settingsSection === "roundtableActors", "data-active": settingsSection === "roundtableActors", onClick: () => setSettingsSection("roundtableActors"), children: [_jsx(Users, { "aria-hidden": "true" }), "Agent actors"] }),_jsxs("button", { type: "button", role: "tab", "aria-selected": settingsSection === "security", "data-active": settingsSection === "security", onClick: () => setSettingsSection("security"), children: [_jsx(ShieldCheck, { "aria-hidden": "true" }), "Security"] }), _jsxs("button", { type: "button", role: "tab", "aria-selected": settingsSection === "profile", "data-active": settingsSection === "profile", onClick: () => setSettingsSection("profile"), children: [_jsx(Activity, { "aria-hidden": "true" }), "Profile"] }), _jsxs("button", { type: "button", role: "tab", "aria-selected": settingsSection === "suggestions", "data-active": settingsSection === "suggestions", onClick: () => setSettingsSection("suggestions"), children: [_jsx(Search, { "aria-hidden": "true" }), "Suggestions"] }), _jsxs("button", { type: "button", role: "tab", "aria-selected": settingsSection === "accounts", "data-active": settingsSection === "accounts", onClick: () => setSettingsSection("accounts"), children: [_jsx(User, { "aria-hidden": "true" }), "Accounts"] }), _jsxs("button", { type: "button", role: "tab", "aria-selected": settingsSection === "browserBridge", "data-active": settingsSection === "browserBridge", onClick: () => setSettingsSection("browserBridge"), children: [_jsx(TerminalSquare, { "aria-hidden": true }), "Browser Bridge"] })] }), settingsSection === "globalInstructions" ? (_jsx(GlobalInstructionsSettingsPanel, {})) : settingsSection === "autoModel" ? (_jsx(AutoModelSettingsPanel, {})) : settingsSection === "roundtableActors" ? (_jsx(AgentActorsSettingsPanel, { workspaceId: activeWorkspace?.id, workspaceName: activeWorkspace?.name ?? "Current workspace", summary: actorSummary.summary, error: actorSummary.error, authRequired: actorSummary.authRequired, onSelectActor: (actorId) => { setIsSettingsOpen(false); openActorView(actorId); }, onOpenRoom: (chatKey) => { setIsSettingsOpen(false); setGroupChatKey(chatKey); void toggleWorkspaceManager(true); } })) : settingsSection === "helperModels" ? (_jsx(HelperModelsSettingsPanel, {})) :settingsSection === "profile" ? (_jsx(ProfileSettingsPanel, { analytics: profileAnalytics, error: profileAnalyticsError, isLoading: isLoadingProfileAnalytics, workspaceId: profileWorkspaceId, workspaces: workspaceList, accountId: profileAccountId, onWorkspaceChange: (workspaceId) => {
                                         setProfileWorkspaceId(workspaceId);
                                         setProfileAccountId("");
                                         setProfileAnalytics(null);
@@ -2633,6 +2971,6 @@ _jsxs("div", { ref: messageScrollIndicatorRef, className: "message-scroll-indica
                                                                                 }
                                                                             } }) }), _jsxs("span", { children: [_jsx("strong", { children: account.name }), _jsxs("small", { children: [account.email || account.externalAccountId || account.id, tier ? ` · ${tier}` : ""] })] }), _jsx("span", { children: formatQuotaRemaining(account) }), _jsx("span", { children: formatQuotaReset(account) }), _jsx("span", { children: formatQuotaStatus(account, activeAccount?.id ?? null) }), _jsxs("span", { className: "settings-account-actions", children: [_jsx("button", { className: "secondary", type: "button", onClick: () => beginAccountRelogin(account), disabled: isSavingAccount || Boolean(pendingAccountLogin) || Boolean(deletingAccountId), "aria-label": `Relogin ${accountIdentityLabel(account)}`, children: "Relogin" }), _jsx("button", { className: "settings-delete-account", type: "button", onClick: () => void deleteAccount(account), disabled: Boolean(deletingAccountId), title: `Delete ${accountIdentityLabel(account)}`, "aria-label": `Delete ${accountIdentityLabel(account)}`, children: deletingAccountId === account.id ? _jsx(Loader2, { className: "spin", "aria-hidden": "true" }) : _jsx(Trash2, { "aria-hidden": "true" }) })] })] }, account.id));
                                                         }), _jsx(ClaudeAccountRows, { claude: claudeAccounts, onRelogin: beginClaudeRelogin }), accountList.length === 0 && claudeAccounts.accounts.length === 0 && _jsx("p", { className: "settings-empty", children: "No accounts yet. Add one to get started." })] })] })] }))] })] }))] }) }));
-    return _jsxs(MarkdownWorkspaceContext.Provider, { value: { sessionId: sessionId ?? undefined, workspaceId: activeWorkspace?.id ?? undefined }, children: [shell, !managerMode && _jsx(RoundtableSettings, { controller: roundtable }), sessionId && _jsx(ConcurrentPanel, { sessionId, sourceTurnId: managerMode ? null : concurrentSourceTurnId, refreshToken: concurrentRefreshToken, onGroupChange: setConcurrentView, onClose: () => setConcurrentSelection(null), onOpen: (id) => switchToSessionById(id) }, sessionId)] });
+    return _jsx(CurrentDomainActorsProvider, { workspaceId: activeWorkspace?.id, summary: actorSummary.summary, children: _jsx(SessionHeaderTarget.Provider, { value: sessionHeaderTarget, children: _jsxs(MarkdownWorkspaceContext.Provider, { value: { sessionId: sessionId ?? undefined, workspaceId: activeWorkspace?.id ?? undefined }, children: [shell, !sessionlessView && _jsx(RoundtableSettings, { controller: roundtable }), sessionId && _jsx(ConcurrentPanel, { sessionId, sourceTurnId: managerMode ? null : concurrentSourceTurnId, refreshToken: concurrentRefreshToken, onGroupChange: setConcurrentView, onClose: () => setConcurrentSelection(null), onOpen: (id) => switchToSessionById(id) }, sessionId)] }) }) });
 
 }

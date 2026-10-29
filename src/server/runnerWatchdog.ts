@@ -27,6 +27,18 @@ export function runnerStartupIsWithinGrace(
   return claimedAt > 0 && now - claimedAt <= startupGraceMs;
 }
 
+/**
+ * A claimed turn whose runner was never spawned (no PID, no start, no log) ran
+ * nothing, e.g. its server restarted during preparation. Requeue it instead of
+ * saving it as user-stopped, which never runs automatically.
+ */
+export function runnerNeverSpawned(
+  turn: Pick<RunnerStartupState, "runnerPid" | "runnerStarted">,
+  runnerLogExists: boolean
+) {
+  return turn.runnerPid === null && turn.runnerStarted === null && !runnerLogExists;
+}
+
 function parseTimestamp(value: string | null) {
   if (!value) return null;
   const parsed = Date.parse(value);

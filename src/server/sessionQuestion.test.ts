@@ -54,6 +54,9 @@ test("side-chat CLI config exposes only saved-history commands", () => {
 
   assert.equal(config.env.THREADEX_WORKSPACE_MANAGER, "0");
   assert.equal(config.env.THREADEX_CONTEXT_FORK_REQUEST, "0");
+  assert.equal(config.env.THREADEX_DOMAIN_ACTOR, "0");
+  assert.equal(config.env.THREADEX_ACTOR_CAPABILITY, "");
+  assert.equal(config.env.THREADEX_TURN_ID, "");
 });
 
 test("validates selectable side-chat reasoning efforts", () => {

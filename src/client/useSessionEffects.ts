@@ -4,6 +4,7 @@ import { deferSnapshotWrite } from "./deferredSnapshot";
 import { CLIENT_EVENT_TYPES } from "../eventProtocol";
 import { EventPollLease } from "./eventPollLease";
 import { recentWorkspaceManagerMessages } from "../workspaceManager";
+import { listenToNavigation } from "./navigation";
 // Below the server's 25s cap and common proxy idle timeouts.
 const EVENT_LONG_POLL_MS = 20_000;
 const EVENT_LONG_POLL_MIN_GAP_MS = 250;
@@ -11,7 +12,7 @@ const EVENT_LONG_POLL_MIN_GAP_MS = 250;
 // take the lease while this tab's held request is still open.
 const eventPollLease = new EventPollLease();
 
-export function useSessionEffects(ctx) {
+export function useSessionEffects(ctx, { disableEscapeStop = false } = {}) {
   const { accountPopoverRef, activeGearIndex, activePromptTurnIds, activeTurnId, activeTurnIdRef, activeWorkspace, approvalPolicy, backendConnection, backendConnectionRef, bumpViewKey, composerDraftSessionIdRef, currentModelPreferences, currentRunningTurnId, currentSessionIsRunning, currentSessionIsStopping, didBootReconnectRef, effectiveParentSessionId, escStopArmedRef, escStopTimerRef, eventStore, executionMode, explicitNewSessionRef, findAssistantMessageId, forcePlanNextPrompt, forkNextPrompt, gearProfiles, handleDurableEvent, hasRunningTurn, inlinePromptEditor, inlinePromptEditorRef, isAccountLoginOpen, isAccountPopoverOpen, isBootstrapped, isLikelyBackendDisconnect, isSessionSearchOpen, isSettingsOpen, latestMessagesRef, loadContext, loadSessionSearchPage, loadSessionsTimerRef, loadWorkspaceSnapshot, messageIndicatorMarks, messageScrollIndicatorRef, messageScrollTopRef, messages, messagesRef, modelPreferencesEditRevisionRef, navigationTargetRef, noteBackendDisconnect, noteBackendRequestSucceeded, patchStoredComposerDraft, persistModelPreferences, profileAccountId, profileWorkspaceId, promptTurns, promptTurnsScrollRef, queuedModelPreferencesRevisionRef, queuedPrompts, queuedPromptsBySession, queuedPromptsRef, readNavigationTarget, reconnectRunner, reconnectingTurnIdsRef, refreshSelectedSessionSnapshot, resetAccountLoginDialog, resetEscStopPrompt, resizeEditor, responseQuotePopover, restoreBackendConnection, resumeThreadId, runningSessionCount, selectedEffort, selectedModel, sessionExecutionStatusesRef, sessionId, sessionIdRef, sessionSearchQuery, setActivePromptTurnIds, setClockNow, setComposerResponseQuote, setIsAccountPopoverOpen, setIsLoadingProfileAnalytics, setIsLoadingSkills, setIsSettingsOpen, setParentSessionTodo, setPendingApprovalSessionIds, setProfileAnalytics, setProfileAnalyticsError, setProfileWorkspaceId, setResponseQuotePopover, setSelectedSkills, setSessionExecutionStatuses, setSkillSuggestions, setSlashSuggestionIndex, setStatus, setsEqual, settingsSection, showToast, skillSuggestions, slashTrigger, status, stickToMessageBottomRef, stopCurrentTurn, switchingSessionTitle, threadId, toastTimerRef, updateMessageIndicatorPositions, updateMessageViewportIndicator, useLoadBalanceInWorkspace, viewKeyRef, writeStoredSession } = ctx;
 useEffect(() => {
         const validTurnIds = new Set(promptTurns.map(({ prompt }) => prompt.turnId));
@@ -245,9 +246,9 @@ useEffect(() => {
             }
             void loadWorkspaceSnapshot({ navigationTarget: target, canonicalizeUrl: true, viewKey });
         };
-        window.addEventListener("popstate", onPopState);
+        const stopNavigation = listenToNavigation(onPopState);
         void loadContext();
-        return () => window.removeEventListener("popstate", onPopState);
+        return stopNavigation;
     }, []);
 useEffect(() => {
         // A Vite restart can finish before the API server has returned. Keep
@@ -476,14 +477,15 @@ useEffect(() => () => {
         }
     }, []);
 useEffect(() => {
-        if (!currentSessionIsRunning) {
+        if (!currentSessionIsRunning || disableEscapeStop) {
             resetEscStopPrompt();
         }
-    }, [currentSessionIsRunning]);
+    }, [currentSessionIsRunning, disableEscapeStop]);
 useEffect(() => {
         function handleEscapeToStop(event) {
             if (event.key !== "Escape" ||
                 event.defaultPrevented ||
+                disableEscapeStop ||
                 !currentSessionIsRunning ||
                 !currentRunningTurnId ||
                 currentSessionIsStopping ||
@@ -510,6 +512,7 @@ useEffect(() => {
         window.addEventListener("keydown", handleEscapeToStop);
         return () => window.removeEventListener("keydown", handleEscapeToStop);
     }, [
+        disableEscapeStop,
         currentRunningTurnId,
         currentSessionIsRunning,
         currentSessionIsStopping,

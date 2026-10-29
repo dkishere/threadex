@@ -1,5 +1,5 @@
 export const USER_INPUT_METHOD = "item/tool/requestUserInput";
-export type InputQuestion = { id: string; header: string; question: string; isOther?: boolean; isSecret?: boolean; options?: Array<{ label: string; description: string }> | null };
+export type InputQuestion = { id: string; header: string; question: string; isOther?: boolean; isSecret?: boolean; multiSelect?: boolean; options?: Array<{ label: string; description: string }> | null };
 export type InputResponse = { answers: Record<string, { answers: string[] }> };
 export type AsyncInputQuestion = { title: string; options?: string[] };
 
@@ -42,8 +42,10 @@ export function inputResponse(value: unknown, params: unknown): InputResponse | 
   for (const q of questions) {
     if (!Object.hasOwn(answers, q.id)) return null;
     const list = answers[q.id]?.answers;
-    if (!Array.isArray(list) || list.length !== 1 || typeof list[0] !== "string" || !list[0].trim()) return null;
-    if (q.options?.length && !q.isOther && !q.options.some((o) => o.label === list[0])) return null;
+    const multi = q.multiSelect === true && !!q.options?.length;
+    if (!Array.isArray(list) || (multi ? !list.length : list.length !== 1) || list.some((a) => typeof a !== "string" || !a.trim())) return null;
+    if (multi && new Set(list).size !== list.length) return null;
+    if (q.options?.length && !q.isOther && list.some((a) => !q.options!.some((o) => o.label === a))) return null;
   }
   return { answers: Object.fromEntries(questions.map((q) => [q.id, { answers: [...answers[q.id].answers] }])) };
 }

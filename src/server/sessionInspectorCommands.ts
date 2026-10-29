@@ -3,6 +3,7 @@ import { INTENT_APPROVAL_TOOL, intentRequest } from "../intentApproval";
 import { AUTO_MODEL_ORDER, isClaudeModel } from "../modelCatalog";
 import type { CollaborationView } from "../collaboration";
 import { WORKSPACE_MANAGER_TOOLS, WORKSPACE_MANAGER_ACTIONS } from "./workspaceManagerTools";
+import { DOMAIN_ACTOR_TOOLS } from "./domainActorTools";
 import { createTurnGrillHistoryReader } from "./turnGrillContext";
 import type {
   SessionInspectInput,
@@ -50,6 +51,7 @@ const apiBaseUrl = (process.env.RUNNER_SERVER_URL || process.env.SESSION_INSPECT
 const managerSessionId = process.env.THREADEX_SESSION_ID?.trim() || null;
 const collaborationId = process.env.THREADEX_CONCURRENT_ID?.trim() || process.env.THREADEX_COLLABORATION_ID?.trim() || null;
 const workspaceManager = process.env.THREADEX_WORKSPACE_MANAGER === "1";
+const domainActor = process.env.THREADEX_DOMAIN_ACTOR === "1";
 const managerConcurrent = workspaceManager && process.env.THREADEX_MANAGER_CONCURRENT === "1";
 const managerThreadId = process.env.THREADEX_THREAD_ID?.trim() || null;
 const managerTurnId = process.env.THREADEX_TURN_ID?.trim() || null;
@@ -305,6 +307,20 @@ const tools: ToolSpec[] = [
         turnId: { type: "string" },
         actionType: { type: "string", enum: ["retry_turn", "enqueue_prompt", "notify"] },
         actionPayload: { type: "object", additionalProperties: true }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "wait_for_task_end",
+    description: "When another running task blocks your work (it holds a file, process, branch or result you need), do not give up or report it as blocked. Find it with search_sessions status=running or get_session, then call this with its session ID and a self-contained resume instruction. Your session is woken with that instruction when the blocker's turn completes, fails or is stopped. If the result is already_ended, continue now. Otherwise end your turn unless independent work remains. Waiting on a task that already waits for you is rejected as a deadlock.",
+    inputSchema: {
+      type: "object",
+      required: ["targetSessionId", "message"],
+      properties: {
+        targetSessionId: { type: "string", description: "Session ID of the blocking task." },
+        targetTurnId: { type: "string", description: "Specific blocking turn; defaults to the target's running turn." },
+        message: { type: "string", minLength: 1, maxLength: 20000, description: "Instruction delivered to your session when the blocker ends: what to re-check and resume." }
       },
       additionalProperties: false
     }
@@ -744,6 +760,12 @@ const collaborationTools: ToolSpec[] = [{
 
 export function toolsForAgent() {
   const base = [...baseToolsForAgent()].filter(tool => tool.name !== INTENT_APPROVAL_TOOL.name || !isClaudeModel(managerModel));
+  if (domainActor) {
+    // Actor task mutations use server-checked tree actions. Ordinary task creation,
+    // arbitrary follow-ups and autonomous subscriptions bypass that binding.
+    const outsideActorTree = new Set(["create_task", "todo_create_task", "prompt_session", "subscribe_wait_event"]);
+    return [...base.filter(tool => !outsideActorTree.has(tool.name)), ...DOMAIN_ACTOR_TOOLS];
+  }
   if (managerConcurrent && !["side_chat", "turn_grill"].includes(todoAgentRole)) {
     base.push(...WORKSPACE_MANAGER_TOOLS.filter(tool => todoAgentRole !== "planner" ||
       ["workspace_status", "workspace_search_tasks", "workspace_inspect_task"].includes(tool.name)));
@@ -794,6 +816,15 @@ function isToolExposed(name: string) {
 export async function runCommand(name: string, args: Record<string, unknown>) {
   if (!name || !isToolExposed(name)) {
     throw new Error(`Command is not available to this ${todoAgentRole} agent: ${name ?? "unknown"}`);
+  }
+  if (domainActor && DOMAIN_ACTOR_TOOLS.some(tool => tool.name === name)) {
+    if (!managerSessionId || !managerTurnId) throw new Error("An active actor task turn is required.");
+    // Claude runners inject the calling agent's credential into the JSON argument; the model never writes it.
+    const { _actorCredential: credential, _actorWorkItem: workItem, ...input } = args;
+    return postJson(`/api/domain-actors/sessions/${encodeURIComponent(managerSessionId)}/action`, {
+      ...input, action: name, sourceTurnId: managerTurnId
+    }, { "x-threadex-actor-capability": typeof credential === "string" ? credential : process.env.THREADEX_ACTOR_CAPABILITY ?? "",
+      ...(typeof workItem === "string" && workItem ? { "x-threadex-actor-work-item": workItem } : {}) });
   }
   if (name === "record_subagent_prompt") {
     if (!managerSessionId || !managerTurnId) throw new Error("A Threadex runner turn is required.");
@@ -916,6 +947,17 @@ export async function runCommand(name: string, args: Record<string, unknown>) {
             }
           }
         : {})
+    }));
+  }
+
+  if (name === "wait_for_task_end") {
+    if (!managerSessionId) throw new Error("wait_for_task_end requires a Threadex runner session.");
+    return (await postJson("/api/wait-subscriptions/task-end", {
+      sessionId: managerSessionId,
+      targetSessionId: readRequiredString(args, "targetSessionId"),
+      targetTurnId: readString(args.targetTurnId) ?? undefined,
+      message: readRequiredString(args, "message"),
+      ...(managerApprovalPolicy ? { approvalPolicy: managerApprovalPolicy } : {})
     }));
   }
 
@@ -1085,6 +1127,7 @@ export async function runCommand(name: string, args: Record<string, unknown>) {
     return (await postJson("/api/session-tasks", {
       parentSessionId: sessionId,
       ...(managerSessionId ? { sourceSessionId: managerSessionId } : {}),
+      ...(managerTurnId ? { sourceTurnId: managerTurnId } : {}),
       todoItemId: readRequiredString(args, "itemId"),
       prompt: readRequiredString(args, "prompt"),
       ...(readString(args.title) ? { title: readString(args.title) } : {}),
@@ -1177,6 +1220,7 @@ export async function runCommand(name: string, args: Record<string, unknown>) {
     return (await postJson("/api/session-tasks", {
       parentSessionId: managerSessionId,
       sourceSessionId: managerSessionId,
+      ...(managerTurnId ? { sourceTurnId: managerTurnId } : {}),
       ...(managerContextForkRequest ? { contextFork: true } : {}),
       ...(managerContextForkRequest ? { managedMode: process.env.THREADEX_CHILD_MANAGED_MODE === "1" } : {}),
       ...(attachmentForkRequestId ? { queueForkRequestId: attachmentForkRequestId } : {}),
@@ -1269,7 +1313,10 @@ async function promptSession(input: SessionPromptInput) {
     ...(Array.isArray(input.skills) ? { skills: input.skills } : {}),
     ...(input.forcePlan !== undefined ? { forcePlan: input.forcePlan === true } : {}),
     ...(input.autoModel !== undefined ? { autoModel: input.autoModel === true } : {}),
-    ...(input.loadBalanceInWorkspace !== undefined ? { loadBalanceInWorkspace: input.loadBalanceInWorkspace === true } : {})
+    ...(input.loadBalanceInWorkspace !== undefined ? { loadBalanceInWorkspace: input.loadBalanceInWorkspace === true } : {}),
+    // An agent prompting another session records itself; the server resolves its actor.
+    ...(managerSessionId && managerSessionId !== sessionId ? { promptOrigin: { kind: "inter-actor", trigger: "session-tool",
+      sourceSessionId: managerSessionId, ...(managerTurnId ? { sourceTurnId: managerTurnId } : {}) } } : {})
   };
 
   if (runningTurns.length > 0 && input.queueIfRunning !== false) {
@@ -1566,13 +1613,13 @@ async function getJson(path: string) {
   return responseJsonOrThrow(response);
 }
 
-async function postJson(path: string, payload: unknown) {
+async function postJson(path: string, payload: unknown, headers?: Record<string, string>) {
   if (!apiBaseUrl) {
     throw new Error("SESSION_INSPECTOR_SERVER_URL is not configured.");
   }
   const response = await fetch(`${apiBaseUrl}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify(payload)
   });
   return responseJsonOrThrow(response);

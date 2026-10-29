@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
+import { SessionHeaderTarget } from "./sessionHeaderTarget";
 import { createPortal } from "react-dom";
-import { CheckCircle2, Users, Loader2, MessageSquare, Repeat, Scale, X } from "lucide-react";
+import { CheckCircle2, ClipboardCheck, CircleHelp, Users, Loader2, MessageSquare, Repeat, Scale, X } from "lucide-react";
 import { MODEL_OPTIONS, modelLabel, normalizeModelEffort } from "../modelCatalog";
 import { ROUNDTABLE_TASK_LABELS, newRoundtableActor, roundtableEfforts, roundtableIssueKind, roundtableRunning, roundtableStatus, type RoundtableActor, type RoundtableIssueKind, type RoundtableRound, type RoundtableConclusion } from "../roundtable";
 import { apiJson } from "./apiClient";
@@ -148,12 +149,13 @@ export function useRoundtable({ sessionId, workspaceId, gearProfiles, onChanged 
 export type RoundtableController = ReturnType<typeof useRoundtable>;
 
 export function RoundtableSettings({ controller }: { controller: RoundtableController }) {
+  const headerTarget = useContext(SessionHeaderTarget);
   const [editing, setEditing] = useState<string | null>(null);
   const [libraryOpen, setLibraryOpen] = useState(false);
   const [anchor, setAnchor] = useState<Element | null>(null);
   const root = useRef<HTMLDivElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
-  useEffect(() => { setAnchor(document.querySelector(".content-header-actions")); });
+  useEffect(() => { setAnchor(headerTarget === undefined ? document.querySelector(".content-header-actions") : headerTarget); }, [headerTarget]);
   useEffect(() => {
     if (!controller.open) return;
     const outside = (event: MouseEvent) => { if (!root.current?.contains(event.target as Node)) controller.setOpen(false); };
@@ -279,7 +281,7 @@ function RoundtableSynthesisCard({ round, synthesis, nextRound }: { round: Round
   const actorOrder = new Map(round.answers.map((answer, index) => [answer.actor.name, index]));
   const rank = (names: string[]) => Math.min(...names.map(name => actorOrder.get(name) ?? Infinity));
   const byActors = <T extends { actors: string[] },>(items: T[]) => [...items].sort((a, b) => rank(a.actors) - rank(b.actors));
-  const tags = (names: string[]) => <span className="roundtable-supporters" aria-label={synthesis.template === "summary" ? "Contributors" : "Supported by"}>{[...names].sort((a, b) => rank([a]) - rank([b])).map(name => <span key={name} className="roundtable-supporter">
+  const tags = (names: string[], label = synthesis.template === "summary" ? "Contributors" : "Supported by") => <span className="roundtable-supporters" aria-label={label}>{[...names].sort((a, b) => rank([a]) - rank([b])).map(name => <span key={name} className="roundtable-supporter">
     {actors.has(name) && <ActorAvatar actor={actors.get(name)!} />}{name}</span>)}</span>;
   return <section className="roundtable-turn roundtable-synthesis" aria-label="Round table synthesis" data-status={round.status} data-template={synthesis.template ?? "decision"}>
     <header><Users aria-hidden="true" /><strong>Round table</strong><small>{round.answers.length} actors · {synthesis.template === "summary" ? `${synthesis.sections.reduce((count, section) => count + section.items.length, 0)} points` : `${synthesis.issues.length} topics`}</small>
@@ -301,20 +303,25 @@ function RoundtableSynthesisCard({ round, synthesis, nextRound }: { round: Round
         <ul>{issues.map((issue, index) => <li key={index} className="roundtable-issue">
           <MarkdownContent className="roundtable-topic">{issue.topic}</MarkdownContent>
           <div className="roundtable-positions">{byActors(issue.positions).map(position => <div key={position.view} className="roundtable-position">
-            {byActors([
-              { actors: position.actors.filter(name => !position.details?.some(item => item.actors.includes(name))), detail: position.view },
-              ...(position.details ?? [])
-            ].filter(item => item.actors.length)).map((item, detailIndex) => item.detail
-              ? <div className="roundtable-detail" key={detailIndex}>
-                {tags(item.actors)}<span>：</span><MarkdownContent>{item.detail}</MarkdownContent>
-              </div>
-              : <span key={detailIndex}>{tags(item.actors)}</span>)}
+            <div className="roundtable-view">{tags(position.actors)}<span>：</span><MarkdownContent>{position.view}</MarkdownContent></div>
+            {byActors(position.details ?? []).map((item, detailIndex) => <div className="roundtable-detail" key={detailIndex}>
+              {tags(item.actors)}<span>：</span><MarkdownContent>{item.detail}</MarkdownContent>
+            </div>)}
           </div>)}</div>
           {completed.some(answer => !issue.positions.some(position => position.actors.includes(answer.actor.name))) &&
             <p className="roundtable-unaddressed">No position recorded: {completed.filter(answer => !issue.positions.some(position => position.actors.includes(answer.actor.name))).map(answer => answer.actor.name).join(", ")}</p>}
         </li>)}</ul>
       </section>;
     })}
+    {synthesis.template !== "summary" && [
+      { kind: "questions", title: "Open questions", label: "Raised by", Icon: CircleHelp, notes: synthesis.openQuestions },
+      { kind: "scope", title: "Verification scope", label: "Reported by", Icon: ClipboardCheck, notes: synthesis.scope }
+    ].map(({ kind, title, label, Icon, notes }) => notes && notes.length > 0 && <section key={kind} className="roundtable-group" data-kind={kind} aria-label={title}>
+      <h4><Icon aria-hidden="true" />{title}<small>{notes.length}</small></h4>
+      <ul>{byActors(notes).map((note, index) => <li key={index} className="roundtable-detail">
+        {tags(note.actors, label)}<span>：</span><MarkdownContent>{note.text}</MarkdownContent>
+      </li>)}</ul>
+    </section>)}
     <details className="roundtable-responses"><summary>Actor responses ({round.answers.length})</summary><RoundtableAnswers round={round} /></details>
     <NextRoundButton nextRound={nextRound} />
   </section>;

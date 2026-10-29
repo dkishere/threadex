@@ -29,6 +29,10 @@ test("client events omit redundant transcript payloads while preserving renderab
     assert.deepEqual(clientEvent(input), input);
   }
   assert.deepEqual(clientEvent(event(1, "runner.approval.resolved", { approvalId: "approval", params: "large" }))?.payload, { approvalId: "approval" });
+  assert.deepEqual(clientEvent(event(1, "runner.approval.resolved", { approvalId: "approval", params: "large", decision: { answers: { scope: { answers: ["UI"] } } }, error: "Closed" }))?.payload,
+    { approvalId: "approval", decision: { answers: { scope: { answers: ["UI"] } } }, error: "Closed" });
+  assert.deepEqual(clientEvent(event(1, "runner.approval.resolved", { approvalId: "approval", expired: true, error: "Expired" }))?.payload,
+    { approvalId: "approval", expired: true, error: "Expired" });
   assert.deepEqual(clientEvent(event(1, "runner.runner.callback_error", { event: "done", stack: "large" }))?.payload, { event: "done" });
 });
 

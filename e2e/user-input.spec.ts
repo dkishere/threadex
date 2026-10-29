@@ -4,6 +4,7 @@ import { scenarioSessions } from "./support/scenarios";
 
 for (const width of [1280, 600]) {
 test(`questions survive reload, validate answers, retry and submit at ${width}px`, async ({ page, request }, testInfo) => {
+  test.setTimeout(90000);
   await page.setViewportSize({ width, height: 900 });
   const security = await (await page.request.get("/api/security/status")).json();
   const login = await page.request.post(`/api/security/${security.configured ? "login" : "password"}`, { data: { password: "Threadex-e2e-questions-2026" } });
@@ -20,22 +21,24 @@ test(`questions survive reload, validate answers, retry and submit at ${width}px
   await runnerUpdate(request, { id: `question-event-${width}`, sessionId, turnId, event: "approval.requested", data: question });
   await selectSession(request, scenarioSessions.switchBeta.id);
   await page.goto("/");
-  if (width < 1080) await page.getByRole("button", { name: "Toggle sessions panel" }).click();
-  const sessionRow = page.locator(".session-list-item", { hasText: scenarioSessions.switchAlpha.title });
-  await sessionRow.hover();
-  const card = page.getByRole("dialog", { name: "Session action requested" });
+  const openQuestion = async () => {
+    const trigger = page.getByRole("button", { name: /^Default actions/ });
+    if (!await trigger.isVisible()) await page.getByRole("button", { name: /^Toggle workspace menu/ }).click();
+    await trigger.click();
+    await page.getByRole("dialog", { name: "Default actions", exact: true }).locator(`button[data-approval-id="${approvalId}"]`).click();
+  };
+  await expect(page.locator("dialog[open]")).toHaveCount(0);
+  await openQuestion();
+  const card = page.getByRole("dialog", { name: "Your input requested", exact: true });
   await expect(card.getByText("Agent is continuing")).toBeVisible();
-  const rowBounds = await sessionRow.boundingBox();
-  const popoverBounds = await card.boundingBox();
-  expect(rowBounds && popoverBounds && (popoverBounds.x >= rowBounds.x + rowBounds.width || popoverBounds.y >= rowBounds.y + rowBounds.height || popoverBounds.y + popoverBounds.height <= rowBounds.y)).toBeTruthy();
-  await sessionRow.locator("button.session-row").click();
-  await expect(sessionRow.locator("button.session-row")).toBeDisabled();
+  await card.getByRole("button", { name: "Go to session" }).click();
+  await expect(page).toHaveURL(new RegExp(`sessionId=${sessionId}`));
+  await openQuestion();
   const questionCards = page.locator(`.user-input-card[data-approval-id="${approvalId}"]`);
   await expect(questionCards).toHaveCount(2);
   await expect(page.getByRole("heading", { name: "Approval required" })).toHaveCount(0);
   await page.reload();
-  if (width < 1080) await page.getByRole("button", { name: "Toggle sessions panel" }).click();
-  await sessionRow.hover();
+  await openQuestion();
   await page.screenshot({ path: testInfo.outputPath("question-card.png") });
   await expect(card.getByRole("button", { name: "Send answers" })).toBeDisabled();
   await card.getByRole("radio", { name: "Write my own answer" }).check();
@@ -54,7 +57,8 @@ test(`questions survive reload, validate answers, retry and submit at ${width}px
   const waited = await postJson(request, `/api/approvals/${approvalId}/wait`, {});
   expect(waited.decision).toEqual(decision);
   await runnerUpdate(request, { id: `question-resolved-${width}`, sessionId, turnId, event: "approval.resolved", data: { ...question, decision } });
-  await expect(card).toHaveCount(0);
+  await expect(card.getByRole("status")).toContainText("no longer pending");
+  await card.getByRole("button", { name: "Close request" }).click();
   await expect(questionCards).toContainText("UI and keyboard navigation");
 });
 }

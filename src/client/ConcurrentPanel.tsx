@@ -1,5 +1,6 @@
 import { GitPullRequestCreateArrow, X, ArrowUpRight, Pause, Play, Send, Users } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
+import { SessionHeaderTarget } from "./sessionHeaderTarget";
 import { createPortal } from "react-dom";
 import type { CollaborationView } from "../collaboration";
 import { isCollaborationMemberEnded } from "../collaboration";
@@ -20,6 +21,7 @@ export function ConcurrentPanel({ sessionId, sourceTurnId, refreshToken, onGroup
   onClose: () => void; onOpen: (id: string) => void;
 }) {
   const [anchor, setAnchor] = useState<Element | null>(null);
+  const headerTarget = useContext(SessionHeaderTarget);
   const [open, setOpen] = useState(false);
   const [group, setGroup] = useState<CollaborationView | null>(null);
   const [task, setTask] = useState("");
@@ -31,7 +33,7 @@ export function ConcurrentPanel({ sessionId, sourceTurnId, refreshToken, onGroup
   const request = useRef<{ fingerprint: string; id: string } | null>(null);
   const base = `/api/concurrent/sessions/${encodeURIComponent(sessionId)}`;
   useEffect(() => { onGroupChange?.({ sessionId, group }); }, [sessionId, group, onGroupChange]);
-  useEffect(() => { setAnchor(document.querySelector(".content-header-actions")); }, [sessionId]);
+  useEffect(() => { setAnchor(headerTarget === undefined ? document.querySelector(".content-header-actions") : headerTarget); }, [sessionId, headerTarget]);
   useEffect(() => { if (sourceTurnId) setOpen(true); }, [sourceTurnId]);
   useEffect(() => {
     if (!open) return;

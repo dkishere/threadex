@@ -1,6 +1,36 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isTerminalRunnerDurableEvent, switchWorkspace } from "./sessionActions02.js";
+import { handleDurableEvent, isTerminalRunnerDurableEvent, switchWorkspace } from "./sessionActions02.js";
+
+test("durable approval resolution updates transcript items and segments without a runner stream", async () => {
+  const item = { itemType: "approval", approvalId: "question", status: "pending" };
+  let messages: any[] = [{ role: "assistant", liveItems: [item], segments: [{ type: "live", item }, { type: "text", text: "Keep this text" }] }];
+  const decision = { answers: { scope: { answers: ["UI"] } } };
+  const removed: string[] = [];
+  const ctx = { sessionIdRef: { current: "selected" }, removePendingApprovalItem: (id: string) => removed.push(id), setMessages: (update: any) => { messages = update(messages); } };
+  await handleDurableEvent(ctx, { type: "runner.approval.resolved", sessionId: "background", payload: { sessionId: "background", approvalId: "question", decision } });
+  assert.equal(messages[0].liveItems[0].status, "pending");
+  await handleDurableEvent(ctx, { type: "runner.approval.resolved", sessionId: "selected", payload: { sessionId: "selected", approvalId: "question", decision } });
+  assert.equal(messages[0].liveItems[0].status, "resolved");
+  assert.deepEqual(messages[0].segments[0].item.decision, decision);
+  assert.equal(messages[0].segments[1].text, "Keep this text");
+  assert.deepEqual(removed, ["question", "question"]);
+});
+
+test("durable approval expiry marks transcript cards expired and a re-registration revives them", async () => {
+  const item = { itemType: "approval", approvalId: "command", status: "pending" };
+  let messages: any[] = [{ role: "assistant", liveItems: [item], segments: [{ type: "live", item }] }];
+  const ctx = { sessionIdRef: { current: "selected" }, removePendingApprovalItem: () => undefined,
+    approvalEventToLiveItem: (approval: any, status: string) => ({ ...approval, itemType: "approval", status }),
+    setPendingApprovalItems: () => undefined, setPendingApprovalSessionIds: () => undefined, upsertPendingApprovalItem: (current: unknown) => current,
+    setMessages: (update: any) => { messages = update(messages); } };
+  await handleDurableEvent(ctx, { type: "runner.approval.resolved", sessionId: "selected", payload: { sessionId: "selected", approvalId: "command", expired: true, error: "Expired" } });
+  assert.equal(messages[0].liveItems[0].status, "expired");
+  assert.equal(messages[0].segments[0].item.status, "expired");
+  await handleDurableEvent(ctx, { type: "runner.approval.requested", sessionId: "selected", payload: { sessionId: "selected", approvalId: "command" } });
+  assert.equal(messages[0].liveItems[0].status, "pending");
+  assert.equal(messages[0].segments[0].item.error, undefined);
+});
 
 test("raw Codex completion does not finish a retrying manager turn", () => {
   assert.equal(isTerminalRunnerDurableEvent({

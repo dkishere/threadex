@@ -45,6 +45,35 @@ export function loopWorkInstructions(workCycle: number, sourceTurnId?: string) {
   ].join("\n\n");
 }
 
+type AutoGrillDeps = { fetch?: typeof fetch; sleep?: (ms: number) => Promise<void>; stopped?: () => boolean; pollMs?: number };
+const AUTO_GRILL_POLL_MS = 5_000;
+
+/** Auto Grill has no deadline: follow a running review while its worker is alive.
+ * The Grill GET marks a review whose in-memory worker was lost as an error. */
+export async function waitForRunningGrill(url: string, deps: AutoGrillDeps = {}): Promise<TurnGrill | null> {
+  const request = deps.fetch ?? fetch;
+  while (true) {
+    if (deps.stopped?.()) throw new Error("Server is shutting down; Auto Grill will resume after restart.");
+    const response = await request(url);
+    if (!response.ok) throw new Error(`Automatic Grill recovery returned HTTP ${response.status}`);
+    const review = (await response.json()).grill as TurnGrill | null;
+    if (review?.status !== "running") return review;
+    await (deps.sleep ?? ((ms) => new Promise((done) => setTimeout(done, ms))))(deps.pollMs ?? AUTO_GRILL_POLL_MS);
+  }
+}
+
+/** A review can outlive fetch's response timeout, and a retry can meet the
+ * review it already started (HTTP 409). Both continue by following that review. */
+export async function startAutoGrill(url: string, revision: number, deps: AutoGrillDeps = {}): Promise<TurnGrill | null> {
+  const started = await (deps.fetch ?? fetch)(url, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "start", autoLoop: true, revision })
+  }).catch(() => null);
+  if (started?.ok) return (await started.json()).grill as TurnGrill;
+  if (started && started.status !== 409) throw new Error(`Automatic Grill returned HTTP ${started.status}: ${(await started.text()).slice(0, 500)}`);
+  return waitForRunningGrill(url, deps);
+}
+
 export async function acceptLoopTodos(store: SessionStore, sessionId: string, turnId: string, review: TurnGrill) {
   const issues = loopTodoIssues(review);
   if (!issues.length) return { review, todoChanged: false };

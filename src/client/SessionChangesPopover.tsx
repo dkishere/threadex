@@ -1,5 +1,6 @@
 import { FolderOpen, MessageSquarePlus } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
+import { SessionHeaderTarget } from "./sessionHeaderTarget";
 import { createPortal } from "react-dom";
 import { FileEditIcon } from "./FileEditIcon";
 import { compactFilePath } from "./filePathDisplay";
@@ -32,6 +33,7 @@ function fileChangeLabel(kind: string) {
 }
 
 export function SessionChangesPopover({ sessionId }: { sessionId?: string | null }) {
+  const headerTarget = useContext(SessionHeaderTarget);
   const [target, setTarget] = useState<Element | null>(null);
   const [isOpen, setIsOpen] = useState(false);
   const [isPinned, setIsPinned] = useState(false);
@@ -44,8 +46,8 @@ export function SessionChangesPopover({ sessionId }: { sessionId?: string | null
   const summaryRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    setTarget(document.querySelector(".content-header-actions"));
-  }, [sessionId]);
+    setTarget(headerTarget === undefined ? document.querySelector(".content-header-actions") : headerTarget);
+  }, [sessionId, headerTarget]);
 
   useEffect(() => {
     if (!sessionId) return;

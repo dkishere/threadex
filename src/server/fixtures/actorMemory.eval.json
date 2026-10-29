@@ -1,0 +1,102 @@
+[
+  {
+    "id": "one-off",
+    "description": "A one-off build typo fixed in a single turn; nothing durable is learned.",
+    "memory": {
+      "rolePrompt": "Owns transcript presentation and summaries.",
+      "roleSummary": "Transcript presentation and summaries.",
+      "longTerm": "{\"standingDecisions\":[\"Conclusions appear in the actor view only after review passes (tx_a/t1).\"]}",
+      "rolling": ""
+    },
+    "event": {
+      "id": "task:e1", "workspaceId": "ws", "actorIds": ["transcript"], "type": "task.turn_completed", "created": "2026-10-24T00:00:00.000Z",
+      "summary": "{\"status\":\"done\",\"runnerExitCode\":0,\"originalRequest\":\"fix the build\",\"userPrompt\":\"fix the build\",\"result\":\"Fixed a typo in ActorView.tsx (`conclsion` -> `conclusion`). Build passed; 39 unit tests passed.\",\"sessionId\":\"tx_b\",\"turnId\":\"t2\"}"
+    },
+    "context": { "relation": "executor", "tree": { "parent": null, "subActors": [] } },
+    "rubric": [
+      "longTerm keeps the existing standingDecisions entry and gains no recurringIssues or methods entry for the typo.",
+      "rolling holds at most one short sentence about the fix, without the per-run test counts."
+    ]
+  },
+  {
+    "id": "decision",
+    "description": "The user states a product rule; the actor's own proposal in the same turn was not approved.",
+    "memory": { "rolePrompt": "Owns transcript presentation and summaries.", "roleSummary": "Transcript presentation and summaries.", "longTerm": "", "rolling": "" },
+    "event": {
+      "id": "sh:e2", "workspaceId": "ws", "actorIds": ["transcript"], "type": "sh.completed", "created": "2026-10-24T00:00:00.000Z",
+      "summary": "User: issue summaries must stay in the user's language, never translated to English. Actor reply: agreed; I also suggest caching summaries per turn."
+    },
+    "context": { "relation": "self", "tree": { "parent": null, "subActors": [] }, "request": "issue summaries must stay in the user's language, never translated to English" },
+    "rubric": [
+      "standingDecisions records that issue summaries stay in the user's language, with its scope and a source reference.",
+      "The caching suggestion is not recorded as a user decision."
+    ]
+  },
+  {
+    "id": "recurring-issue",
+    "description": "A sandbox failure seen before recurs and has a verified workaround.",
+    "memory": {
+      "rolePrompt": "Owns transcript presentation and summaries.", "roleSummary": "Transcript presentation and summaries.", "longTerm": "",
+      "rolling": "npx tsx --test failed with EPERM listen on a /tmp pipe inside the sandbox (tx_c/t1); cause unconfirmed."
+    },
+    "event": {
+      "id": "task:e3", "workspaceId": "ws", "actorIds": ["transcript"], "type": "task.turn_completed", "created": "2026-10-24T00:00:00.000Z",
+      "summary": "{\"status\":\"done\",\"runnerExitCode\":0,\"originalRequest\":\"run the actor tests\",\"userPrompt\":\"run the actor tests\",\"result\":\"npx tsx --test failed again with EPERM listen on its IPC pipe; tsx opens an IPC server the sandbox blocks. Running node --import tsx --test outside the sandbox passed.\",\"sessionId\":\"tx_d\",\"turnId\":\"t1\"}"
+    },
+    "context": { "relation": "executor", "tree": { "parent": null, "subActors": [] } },
+    "rubric": [
+      "recurringIssues holds the EPERM issue with the tsx IPC pipe root cause and the node --import tsx --test solution.",
+      "The earlier unconfirmed entry is removed from rolling instead of being kept alongside."
+    ]
+  },
+  {
+    "id": "method",
+    "description": "The executor reports the verification commands it uses on every actor change.",
+    "memory": { "rolePrompt": "Owns transcript presentation and summaries.", "roleSummary": "Transcript presentation and summaries.", "longTerm": "", "rolling": "" },
+    "event": {
+      "id": "task:e4", "workspaceId": "ws", "actorIds": ["transcript"], "type": "task.turn_completed", "created": "2026-10-24T00:00:00.000Z",
+      "summary": "{\"status\":\"done\",\"runnerExitCode\":0,\"originalRequest\":\"tighten conclusion review\",\"userPrompt\":\"tighten conclusion review\",\"result\":\"Changed src/server/actorConclusions.ts. Verified as for every actor change: node --import tsx --test src/server/domainActorRunner.test.ts src/server/actorConclusions.test.ts, then npm run typecheck.\",\"sessionId\":\"tx_e\",\"turnId\":\"t1\"}"
+    },
+    "context": { "relation": "executor", "tree": { "parent": null, "subActors": [] } },
+    "rubric": [
+      "methods records the focused test command and npm run typecheck as the verification workflow for actor changes.",
+      "The change itself is not recorded as a recurring issue."
+    ]
+  },
+  {
+    "id": "supersede",
+    "description": "A new decision replaces an older one in the same scope; a decision for another scope remains.",
+    "memory": {
+      "rolePrompt": "Owns transcript presentation and summaries.", "roleSummary": "Transcript presentation and summaries.",
+      "longTerm": "{\"standingDecisions\":[\"Actor list badge shows the unread conclusion count (tx_f/t1).\",\"Session list badge shows the pending approval count (tx_f/t2).\"]}",
+      "rolling": ""
+    },
+    "event": {
+      "id": "sh:e5", "workspaceId": "ws", "actorIds": ["transcript"], "type": "sh.completed", "created": "2026-10-24T00:00:00.000Z",
+      "summary": "User: change the actor list badge to a dot only, no count."
+    },
+    "context": { "relation": "self", "tree": { "parent": null, "subActors": [] }, "request": "change the actor list badge to a dot only, no count" },
+    "rubric": [
+      "standingDecisions says the actor list badge is a dot only and notes it replaced the count decision; the count entry is gone.",
+      "The session list badge decision is unchanged."
+    ]
+  },
+  {
+    "id": "stakeholder-unrelated",
+    "description": "A stakeholder event that does not affect this actor's role.",
+    "memory": {
+      "rolePrompt": "Owns transcript presentation and summaries.", "roleSummary": "Transcript presentation and summaries.",
+      "longTerm": "{\"standingDecisions\":[\"Conclusions appear in the actor view only after review passes (tx_a/t1).\"]}",
+      "rolling": "Awaiting the dialog badge consumer for actorPublishableConclusions."
+    },
+    "event": {
+      "id": "task:e6", "workspaceId": "ws", "actorIds": ["browser", "transcript"], "type": "task.turn_completed", "created": "2026-10-24T00:00:00.000Z",
+      "summary": "{\"status\":\"done\",\"runnerExitCode\":0,\"originalRequest\":\"add copy and quote buttons to chat messages\",\"userPrompt\":\"add copy and quote buttons to chat messages\",\"result\":\"Added copy/quote buttons. Build and 39 unit tests passed; 55/56 browser tests passed.\",\"sessionId\":\"tx_g\",\"turnId\":\"t1\"}"
+    },
+    "context": { "relation": "stakeholder", "tree": { "parent": null, "subActors": [] } },
+    "rubric": [
+      "Memory is returned unchanged.",
+      "No filler such as 'no impact on this actor' is added."
+    ]
+  }
+]

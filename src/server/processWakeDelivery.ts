@@ -1,3 +1,5 @@
+import type { PromptOrigin } from "./promptOrigin";
+
 /** A rejected pre-delivery lookup can fall back to a queued turn; an ambiguous
  * delivery failure must remain an error to avoid sending the prompt twice. */
 export async function steerProcessWake(
@@ -28,6 +30,7 @@ export async function deliverProcessWake(
     workspaceId: string;
     approvalPolicy?: string;
     loadBalanceInWorkspace: boolean;
+    promptOrigin?: PromptOrigin;
   },
   dependencies: {
     runningTurnId: (sessionId: string) => Promise<string | null>;
@@ -39,13 +42,17 @@ export async function deliverProcessWake(
       workspaceId: string;
       approvalPolicy?: string;
       loadBalanceInWorkspace: boolean;
+      promptOrigin?: PromptOrigin;
     }) => Promise<Response>;
   }
 ): Promise<"steered" | "started"> {
   if (await steerProcessWake(input.sessionId, input.message, dependencies)) return "steered";
   const response = await dependencies.start(input);
   if (response.ok) {
-    await response.arrayBuffer();
+    // The start response streams the woken turn until it ends. Callers may hold the
+    // shared runner update queue, which that turn's own callbacks need, so drain the
+    // stream in the background instead of waiting for the turn.
+    void response.body?.pipeTo(new WritableStream()).catch(() => undefined);
     return "started";
   }
   const body = await response.text();

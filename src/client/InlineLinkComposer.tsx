@@ -84,6 +84,9 @@ function keepFocusAtEnd(editor: Editor) {
 }
 
 type Props = {
+  ariaLabel?: string;
+  ariaControls?: string;
+  ariaActiveDescendant?: string;
   disabled?: boolean;
   value: string;
   links: ComposerInlineLink[];
@@ -126,7 +129,7 @@ function serializedCaretOffset(nodes: ComposerNode[], path: number[], offset: nu
   return "text" in node ? result + Math.min(offset, node.text.length) : result;
 }
 
-export const InlineLinkComposer = forwardRef<InlineLinkComposerHandle, Props>(function InlineLinkComposer({ value, links, placeholder, disabled = false, onChange, onPasteLink, onRemoveLink, onOpenLink, onUnhandledPaste, onKeyDown, onBlur }, ref) {
+export const InlineLinkComposer = forwardRef<InlineLinkComposerHandle, Props>(function InlineLinkComposer({ value, links, placeholder, disabled = false, ariaLabel = "Message", ariaControls, ariaActiveDescendant, onChange, onPasteLink, onRemoveLink, onOpenLink, onUnhandledPaste, onKeyDown, onBlur }, ref) {
   const editableRef = useRef<HTMLDivElement | null>(null);
   const disabledRef = useRef(disabled);
   disabledRef.current = disabled;
@@ -231,9 +234,13 @@ export const InlineLinkComposer = forwardRef<InlineLinkComposerHandle, Props>(fu
   }}>
     <Editable
       className="composer-editor composer-inline-editor"
+      role="textbox"
       ref={editableRef}
       style={{ minHeight: 42 }}
-      aria-label="Message"
+      aria-label={ariaLabel}
+      aria-controls={ariaControls}
+      aria-activedescendant={ariaActiveDescendant}
+      aria-autocomplete={ariaControls ? "list" : undefined}
       readOnly={disabled}
       aria-disabled={disabled}
       data-placeholder={placeholder}

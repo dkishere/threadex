@@ -18,24 +18,49 @@ class RoundtableService extends Service {
 const actors = [newRoundtableActor({ model: DEFAULT_MODEL, effort: "low" }), newRoundtableActor({ model: MODEL_CATALOG.claudeSonnet.id, effort: "high" })];
 const response = (responseText: string) => ({ responseText, usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } });
 
-for (const history of [false, true]) test(`round table forks context before creating its round, history=${history}`, async () => {
+test("host effort has a medium floor without changing actor or session preferences", async () => {
+  const store = await fixture();
+  const service = new RoundtableService({ store, summarizerModel: () => DEFAULT_MODEL, run: async () => response("Position") });
+  // Hold the queue so this test only exercises persisted dispatch settings.
+  await store.recordSessionTurn({ id: "busy", sessionId: "host", userInput: "Working", agentResponse: "", tokenIn: 0, tokenOut: 0, status: "running" });
+  try {
+    for (const effort of ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]) {
+      await store.setSessionModelPreferences("host", { selectedModel: MODEL_CATALOG.astra.id, selectedEffort: effort });
+      const round = await service.create("host", { turnId: `rt_effort_${effort}`, message: "Choose a rollout", actors });
+      assert.equal(round.hostModel, MODEL_CATALOG.astra.id);
+      assert.equal(round.hostEffort, ["minimal", "low"].includes(effort) ? "medium" : effort);
+      assert.deepEqual(round.answers.map(answer => answer.actor.effort), actors.map(actor => actor.effort));
+      assert.equal((await store.getSessionModelPreferences("host")).selectedEffort, effort);
+    }
+  } finally { service.stopAll(); await store.close(); }
+});
+
+for (const history of [false, true]) test(`round table fork starts an empty session with a prepared prompt, history=${history}`, async () => {
   const store = await fixture();
   const childId = `tx_${randomUUID()}`;
   const service = new RoundtableService({ store, summarizerModel: () => DEFAULT_MODEL, run: async () => response("Answer") });
   try {
     if (history) await store.recordSessionTurn({ id: "before", sessionId: "host", userInput: "Keep this constraint", agentResponse: "Noted", tokenIn: 0, tokenOut: 0 });
     const parent = (await store.getSession("host"))!;
-    await prepareRoundtableFork(store, parent, childId);
-    await prepareRoundtableFork(store, parent, childId);
+    let preparations = 0;
+    const prepare = async () => {
+      preparations++;
+      assert.equal(await store.getSession(childId), null, "Prepare the prompt before creating the child");
+      return { title: "Child discussion", prompt: "Discuss in child\nRelevant constraint: keep this constraint." };
+    };
+    const message = await prepareRoundtableFork(store, parent, childId, "rt_fork", prepare);
     assert.equal((await store.getSession(childId))?.parentSessionId, parent.id);
     const copied = await store.listSessionTurns(childId);
-    assert.equal(copied.length, history ? 1 : 0);
-    if (history) assert.equal(copied[0].userInput, "Keep this constraint");
-    await service.create(childId, { turnId: "rt_fork", message: "Discuss in child", actors });
+    assert.equal(copied.length, 0);
+    assert.equal((await store.getSession(childId))?.threadId, null);
+    await service.create(childId, { turnId: "rt_fork", message, actors });
     await service.idle("rt_fork");
     assert.equal((await store.getRoundtableRound("rt_fork"))?.sessionId, childId);
+    assert.equal((await store.getRoundtableRound("rt_fork"))?.prompt, message);
+    assert.equal(await prepareRoundtableFork(store, parent, childId, "rt_fork", prepare), message);
+    assert.equal(preparations, 1, "A retry reuses the saved prompt");
     assert.equal((await store.listSessionTurns("host")).length, history ? 1 : 0);
-    await assert.rejects(prepareRoundtableFork(store, parent, "host"), /new session ID/);
+    await assert.rejects(prepareRoundtableFork(store, parent, "host", "rt_fork", prepare), /new session ID/);
   } finally { service.stopAll(); await service.idle("rt_fork"); await store.close(); }
 });
 
@@ -227,6 +252,33 @@ test("next round continues the latest completed round's topic; actors see every 
   } finally { service.stopAll(); await service.idle("rt_topic"); await service.idle("rt_next"); await service.idle("rt_third"); await store.close(); }
 });
 
+test("actors receive attached files and skills; the transcript lists files and a next round inherits both", async () => {
+  const store = await fixture();
+  const calls: RoundtableInference[] = [];
+  const service = new RoundtableService({ store, summarizerModel: () => DEFAULT_MODEL, run: async input => {
+    calls.push(input);
+    return response(input.systemPrompt.startsWith("Prepare focused context") ? "Recap" : "Position");
+  } });
+  const attachments = [{ name: "plan.png", mimeType: "image/png", size: 42, path: "/uploads/rt_files/01-plan.png" }];
+  const skills = [{ name: "review", path: "/skills/review/SKILL.md" }];
+  try {
+    await service.create("host", { turnId: "rt_files", message: "Review this plan", actors, attachments, skills });
+    await until(async () => (await store.getRoundtableRound("rt_files"))?.status === "host");
+    await service.idle("rt_files");
+    const prompt = JSON.parse(calls.at(-1)!.prompt);
+    assert.deepEqual(prompt.attachedFiles.files, attachments);
+    assert.deepEqual(prompt.skills.items, skills);
+    assert.equal((await store.getSessionTurn("rt_files"))!.userInput, "Review this plan\n\n[Attached files]\n- plan.png (image/png, 42 bytes)");
+    await store.claimPendingSessionTurn("rt_files", "host");
+    await store.updateSessionTurn({ id: "rt_files", status: "done", agentResponse: "Synthesis", tokenIn: 0, tokenOut: 0 });
+    const next = await service.create("host", { turnId: "rt_files_next", message: "Next round: actors, continue the discussion.", actors, continueFrom: "rt_files" });
+    assert.deepEqual([next.attachments, next.skills], [attachments, skills]);
+    assert.equal((await store.getSessionTurn("rt_files_next"))!.userInput, "Next round: actors, continue the discussion.");
+    await until(async () => (await store.getRoundtableRound("rt_files_next"))?.status === "host");
+    assert.deepEqual(JSON.parse(calls.at(-1)!.prompt).attachedFiles.files, attachments);
+  } finally { service.stopAll(); await service.idle("rt_files"); await service.idle("rt_files_next"); await store.close(); }
+});
+
 test("watchdog listings preserve round table ownership while Concurrent results queue", async () => {
   const store = await fixture();
   let release!: () => void;
@@ -368,12 +420,17 @@ test("host JSON becomes a validated synthesis with derived consensus and disagre
     await until(async () => (await store.getRoundtableRound("rt_synthesis"))?.status === "host");
     await service.idle("rt_synthesis");
     await store.claimPendingSessionTurn("rt_synthesis", "host");
+    const scope = [{ actors: [a], text: "No tests were run." }];
+    const openQuestions = [{ actors: [b], text: "When will deployment data be available?" }];
     await store.updateSessionTurn({ id: "rt_synthesis", status: "done", runnerExitCode: 0, tokenIn: 0, tokenOut: 0,
-      agentResponse: "```json\n" + JSON.stringify({ issues: [{ topic: "Direction", positions: [{ view: "Wait for data", actors: [a, b] }] }] }) + "\n```" });
+      agentResponse: "```json\n" + JSON.stringify({ issues: [{ topic: "Direction", positions: [{ view: "Wait for data", actors: [a, b] }] }], scope, openQuestions }) + "\n```" });
     const round = (await store.getRoundtableRound("rt_synthesis"))!;
     assert.ok(round.synthesis && round.synthesis.template !== "summary");
     assert.equal(round.synthesis.issues[0].topic, "Direction");
+    assert.deepEqual(round.synthesis.scope, scope);
+    assert.deepEqual(round.synthesis.openQuestions, openQuestions);
     assert.match(round.summary, /\*\*Consensus\*\*/);
+    assert.match(round.summary, /\*\*Open questions\*\*[\s\S]*\*\*Verification scope\*\*/);
     assert.equal((await store.getSessionTurn("rt_synthesis"))?.agentResponse, round.summary, "history keeps readable markdown, not raw JSON");
     await service.create("host", { turnId: "rt_malformed", message: "Continue", actors });
     await until(async () => (await store.getRoundtableRound("rt_malformed"))?.status === "host");

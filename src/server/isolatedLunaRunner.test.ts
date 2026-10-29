@@ -22,6 +22,31 @@ test("isolated Luna runner starts a read-only app-server with no approval path",
   ]);
 });
 
+test("structured helpers pass their schema to turn/start and keep the completed message intact", async () => {
+  const schema = { type: "object", properties: { rolling: { type: "string" } }, required: ["rolling"], additionalProperties: false };
+  const response = '{"rolling":"Recent"} \r\n\t';
+  const fixture = createFakeCodexFixture("isolated-memory-schema-", `
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method === "initialize") send({ id: request.id, result: {} });
+  if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "thread-1" } } });
+  if (request.method === "turn/start") {
+    if (JSON.stringify(request.params.outputSchema) !== ${JSON.stringify(JSON.stringify(schema))}) {
+      send({ id: request.id, error: { message: "Missing output schema" } }); return;
+    }
+    send({ id: request.id, result: { turn: { id: "turn-1" } } });
+    send({ method: "item/agentMessage/delta", params: { threadId: "thread-1", delta: "Partial text" } });
+    send({ method: "item/completed", params: { threadId: "thread-1", item: { type: "agentMessage", text: "Earlier message" } } });
+    send({ method: "item/completed", params: { threadId: "thread-1", item: { type: "agentMessage", text: ${JSON.stringify(response)} } } });
+    send({ method: "turn/completed", params: { threadId: "thread-1", turn: { status: "completed" } } });
+  }
+});`);
+  const runner = fixture.runner({ name: "memory-schema", baseInstructions: "Return JSON." });
+  try {
+    assert.equal((await runner.run("Maintain memory", { outputSchema: schema })).responseText, response);
+  } finally { runner.stop(); fixture.cleanup(); }
+});
+
 test("scratch-write jobs may run shell commands in a writable sandbox", () => {
   const args = buildIsolatedLunaAppServerArgs([], false, true);
   assert.ok(args.includes('sandbox_mode="workspace-write"'));
@@ -233,6 +258,39 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   }
 });
 
+for (const stalls of [false, true]) {
+  test(`idle Codex timeouts ${stalls ? "expire when events stop" : "renew during startup and the active turn"}`, async () => {
+    const fixture = createFakeCodexFixture("isolated-luna-idle-test-", `
+createInterface({ input: process.stdin }).on("line", line => {
+  const request = JSON.parse(line);
+  if (request.method === "initialize") send({ id: request.id, result: {} });
+  if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "thread-1" } } });
+  if (request.method === "turn/start") {
+    let count = 0;
+    const timer = setInterval(() => {
+      send({ method: "item/reasoning/summaryTextDelta", params: { threadId: "thread-1", delta: "working" } });
+      if (++count === 8) send({ id: request.id, result: { turn: { id: "turn-1" } } });
+      if (count === 16) {
+        clearInterval(timer);
+        if (${stalls}) return;
+        send({ method: "item/completed", params: { threadId: "thread-1", item: { type: "agentMessage", text: "done" } } });
+        send({ method: "turn/completed", params: { threadId: "thread-1", turn: { status: "completed" } } });
+      }
+    }, 100);
+  }
+});`);
+    let events = 0;
+    const runner = fixture.runner({ name: "idle-test", baseInstructions: "Return done.", timeoutMs: 500, idleTimeout: true });
+    try {
+      const result = runner.run("test", { onEvent: () => { events++; } });
+      if (stalls) await assert.rejects(result, /turn timed out/);
+      else assert.equal((await result).responseText, "done");
+      assert.ok(events >= 16, "per-run observers receive activity before and after the turn/start ACK");
+      assert.equal((runner as unknown as { activityTimeouts: Set<unknown> }).activityTimeouts.size, 0);
+    } finally { runner.stop(); fixture.cleanup(); }
+  });
+}
+
 test("isolated Luna runner retains thread token usage for the completed turn", async () => {
   const fixture = createFakeCodexFixture("isolated-luna-usage-test-", `
 let threadNumber = 0;
@@ -408,7 +466,7 @@ ${body}
   process.env.CODEX_PATH = fakeCodexPath;
   return {
     root,
-    runner: (options: Pick<ConstructorParameters<typeof IsolatedLunaRunner>[0], "name" | "baseInstructions" | "freshThreadPerRun" | "maxRunsPerProcess" | "workspaceCwd" | "allowWorkspaceRead" | "scratchWrite" | "timeoutMs" | "onEvent" | "inspectorCli" | "browserBridgeCli" | "githubReadCli">) => new IsolatedLunaRunner({
+    runner: (options: Pick<ConstructorParameters<typeof IsolatedLunaRunner>[0], "name" | "baseInstructions" | "freshThreadPerRun" | "maxRunsPerProcess" | "workspaceCwd" | "allowWorkspaceRead" | "scratchWrite" | "timeoutMs" | "idleTimeout" | "onEvent" | "inspectorCli" | "browserBridgeCli" | "githubReadCli">) => new IsolatedLunaRunner({
       model: "gpt-5.6-luna",
       reasoningEffort: "none",
       timeoutMs: 2_000,

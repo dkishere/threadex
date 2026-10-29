@@ -1,7 +1,7 @@
 import { MODEL_CATALOG, WORKSPACE_MANAGER_MODEL_ORDER } from "../modelCatalog";
 
 const text = { type: "string", minLength: 1 };
-const model = { type: "string", enum: [...WORKSPACE_MANAGER_MODEL_ORDER, MODEL_CATALOG.sol.id], description: "Explicit worker model chosen by the persistent workload policy. Use gpt-6.1-sol for the Sol tier; gpt-6-sol is accepted only for an existing requestId retry. Luna is for tightly scoped mechanical work; Astra for 3D, security or large reviews/plans." };
+const model = { type: "string", enum: [...WORKSPACE_MANAGER_MODEL_ORDER, MODEL_CATALOG.sol.id], description: "Explicit worker model chosen by the persistent workload policy. Use gpt-6.1-terra for the Terra tier and gpt-6.1-sol for the Sol tier; gpt-6-sol is accepted only for an existing requestId retry. Luna is for tightly scoped mechanical work; Astra for 3D, security or large reviews/plans." };
 const session = { ...text, description: "An exact session ID from this workspace's status or search results." };
 const attachmentSourceTurnId = { ...text, description: "Exact turn ID holding the original uploaded files in this workspace. Omit for files on the current manager turn. The server copies saved files into the destination turn; a filename, path or summary in the brief does not attach them." };
 const requestId = { ...text, maxLength: 100, description: "A unique ID for this action. Reuse it only when retrying the same action." };
@@ -37,7 +37,7 @@ export const WORKSPACE_MANAGER_TOOLS = [
   spec("workspace_stop_task", "Stop running work and cancel pending turns in an ordinary task in this workspace. Never restart user-stopped work without authorization.", {
     sessionId: session
   }, ["sessionId"]),
-  spec("workspace_continue_stronger", "Always available, independent of Loop alerts. For a manager-approved intervention, stop a task's running and queued turns, then continue the same task context on the next stronger supported model (Luna → Sol → Astra). Preserve the existing objective in the continuation brief and explain the intervention. Inspect the returned turnId before claiming the stronger turn started. Never restart work stopped by the user without authorization; a stall alert alone does not require intervention. Reuse requestId on retry.", {
+  spec("workspace_continue_stronger", "Always available, independent of Loop alerts. For a manager-approved intervention, stop a task's running and queued turns, then continue the same task context on the next stronger supported model (Luna → Terra → Sol → Astra). Preserve the existing objective in the continuation brief and explain the intervention. Inspect the returned turnId before claiming the stronger turn started. Never restart work stopped by the user without authorization; a stall alert alone does not require intervention. Reuse requestId on retry.", {
     sessionId: session, message: followup, requestId
   }, ["sessionId", "message", "requestId"])
 ];

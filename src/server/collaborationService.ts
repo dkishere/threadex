@@ -5,8 +5,10 @@ import type { CollaborationGroup, CollaborationMember, CollaborationMessage, Col
 import { isCollaborationMemberEnded } from "../collaboration";
 import type { SessionStore, SessionTurnRecord } from "./sessionStore";
 import type { UploadedAttachment } from "./attachmentUploads";
-import { MODEL_OPTIONS, DEFAULT_MODEL } from "../modelCatalog";
+import { MODEL_OPTIONS, DEFAULT_MODEL, isClaudeModel } from "../modelCatalog";
 import { changedFilePaths } from "./changedFilePaths";
+import { isClaudeThreadId } from "./claudeEvents";
+import { buildSessionRecoveryContext } from "./sessionRecovery";
 
 // One source for discoverable guidance and automatic runner instructions. Fail
 // visibly if the bundled skill is missing rather than start an uninformed worker.
@@ -105,8 +107,9 @@ export class CollaborationService {
     return payload;
   }
 
-  async view(sessionId: string): Promise<CollaborationView | null> {
-    const group = (await this.store.listCollaborationGroups(sessionId))[0];
+  async view(sessionId: string, groupId?: string): Promise<CollaborationView | null> {
+    const groups = await this.store.listCollaborationGroups(sessionId);
+    const group = groupId ? groups.find(group => group.id === groupId) : groups[0];
     if (!group) return null;
     const activity: CollaborationView["activity"] = {};
     const paths = new Map<string, Set<string>>();
@@ -151,10 +154,11 @@ export class CollaborationService {
     const sourceMember = memberOf(group, typeof body.source === "string" ? body.source : "main");
     if (sourceMember.localId !== "main") throw new Error("Ephemeral workers have no durable native fork source. Fork from main, which receives their conclusions and changes.");
     const source = await this.store.getSession(sourceMember.sessionId);
-    if (!source?.threadId) throw new Error("The source session has no native thread to fork.");
+    if (!source) throw new Error("The source session is unavailable.");
     const sourceTurns = await this.store.listSessionTurns(source.id);
     const target = body.turnId ? sourceTurns.find(t => t.id === body.turnId) : sourceTurns.filter(t => t.status === "done").at(-1);
-    if (!target || target.status !== "done") throw new Error("Choose a completed source turn.");
+    if (!target) throw new Error("The selected source turn does not belong to this session.");
+    if (target.status !== "done") throw new Error("Choose a completed source turn. A running turn has no stable boundary to fork; pick an earlier completed turn.");
     const childSessionId = `tx_${stableId(group.id, requestId)}`;
     const requestFingerprint = stableId(JSON.stringify({ task, source: source.id, turnId: body.turnId ?? null,
       model: body.model ?? null, effort: body.modelReasoningEffort ?? null, fastMode: body.fastMode === true,
@@ -167,11 +171,14 @@ export class CollaborationService {
       await this.ensureMember(group, existing);
       return existing;
     }
-    const nativeFork = await this.store.collaborationNativeTurn(source.id, target.id, source.threadId);
-    if (!nativeFork) throw new Error("The selected turn has no verified native turn mapping. Wait for transcript synchronization or choose another completed turn.");
     const preferences = await this.store.getSessionModelPreferences(source.id);
     const model = typeof body.model === "string" ? required(body.model, "model") : preferences.selectedModel === "auto" ? DEFAULT_MODEL : preferences.selectedModel;
     if (!MODEL_OPTIONS.includes(model)) throw new Error("Unsupported Concurrent model.");
+    // Codex thread/fork is the only native fork. Claude sources, Claude workers and
+    // turns without a native link (roundtables, unsynchronized turns) start a fresh
+    // worker thread seeded with the source transcript up to the selected turn.
+    const nativeFork = source.threadId && !isClaudeThreadId(source.threadId) && !isClaudeModel(model)
+      ? await this.store.collaborationNativeTurn(source.id, target.id, source.threadId) : null;
     const effort = typeof body.modelReasoningEffort === "string" ? body.modelReasoningEffort : preferences.selectedEffort;
     if (!["minimal", "low", "medium", "high", "xhigh", "max", "ultra"].includes(effort)) throw new Error("Invalid reasoning effort.");
     const approvalPolicy = typeof body.approvalPolicy === "string" ? body.approvalPolicy : await this.store.resolveApprovalPolicy(source.id);
@@ -203,15 +210,16 @@ export class CollaborationService {
     return member;
   }
 
-  async send(sessionId: string, body: Record<string, unknown>) {
-    const group = (await this.store.listCollaborationGroups(sessionId))[0];
+  async send(sessionId: string, body: Record<string, unknown>, groupId?: string) {
+    const groups = await this.store.listCollaborationGroups(sessionId);
+    const group = groupId ? groups.find(group => group.id === groupId) : groups[0];
     if (!group) throw new Error("Concurrent is not enabled for this session.");
     const from = requester(group, sessionId);
     const to = required(body.to, "to");
     const requestId = required(body.requestId, "requestId");
     const text = required(body.message, "message", 100_000);
     const reason = required(body.reason, "reason", 4000);
-    const view = await this.view(sessionId);
+    const view = await this.view(sessionId, group.id);
     if (view && isCollaborationMemberEnded(view, to)) throw new Error("This Concurrent worker has ended and cannot accept new prompts.");
     const currentTurn = typeof body.turnId === "string" ? await this.store.getSessionTurn(body.turnId) : null;
     if (body.turnId && currentTurn?.sessionId !== sessionId) throw new Error("Source turn does not belong to the caller.");
@@ -310,6 +318,7 @@ export class CollaborationService {
     ].join("\n\n") : "";
     return { groupId: group.id, fork: self.fork,
       priorContext,
+      recovery: self.localId !== "main" && !self.fork ? await this.transcriptForkContext(self, currentTurnId) : null,
       instructions: [
         `Threadex Concurrent ${group.id}; your local ID is ${self.localId} (display ID ${self.localId.toUpperCase()}); your Threadex session is ${self.sessionId}; your current turn is ${currentTurnId}; main session is ${group.mainSessionId}.`,
         self.localId === "main"
@@ -329,6 +338,20 @@ export class CollaborationService {
         `Roster snapshot ${group.updated}: ${JSON.stringify(group.members.map(m => ({ localId: m.localId, sessionId: m.sessionId, isSelf: m.sessionId === sessionId, task: m.task.slice(0, 2000), ...group.activity[m.localId] })))}`,
         `Concurrent file overlaps (coordinate before further edits): ${JSON.stringify(group.conflicts)}`
       ].join("\n") };
+  }
+
+  /** A worker without a native fork keeps its own resumable thread; this seeds a new
+   * or lost thread with the source session up to the fork boundary plus its own turns. */
+  private async transcriptForkContext(self: CollaborationMember, currentTurnId: string) {
+    const [source, sourceTurns, ownTurns, sourceSteers, ownSteers] = await Promise.all([
+      this.store.getSession(self.sourceSessionId), this.store.listSessionTurns(self.sourceSessionId),
+      this.store.listSessionTurns(self.sessionId), this.store.listSessionSteerMessages(self.sourceSessionId),
+      this.store.listSessionSteerMessages(self.sessionId)]);
+    if (!source) return null;
+    const boundary = sourceTurns.findIndex(turn => turn.id === self.sourceTurnId);
+    return buildSessionRecoveryContext({ session: source, currentTurnId,
+      turns: [...(boundary < 0 ? [] : sourceTurns.slice(0, boundary + 1)), ...ownTurns],
+      steerMessagesByTurn: { ...sourceSteers, ...ownSteers }, sourceThreadId: source.threadId ?? null, reason: "thread_unavailable" });
   }
 
   private async ensureMember(group: CollaborationGroup, member: CollaborationMember) {
@@ -456,7 +479,9 @@ export class CollaborationService {
     if (!stillActive) return;
     const preferences = await this.store.getSessionModelPreferences(target.sessionId);
     const approvalPolicy = await this.store.resolveApprovalPolicy(target.sessionId) ?? target.approvalPolicy;
+    const sender = group.members.find(member => member.localId === item.from);
     await this.post("/api/pending-turns", { sessionId: target.sessionId, turnId: queuedTurnId,
+      ...(sender?.sessionId ? { promptOrigin: { kind: "inter-actor", trigger: "concurrent", sourceSessionId: sender.sessionId } } : {}),
       workspaceId: group.workspaceId, message: text, model: preferences.selectedModel === "auto" ? DEFAULT_MODEL : preferences.selectedModel,
       modelReasoningEffort: preferences.selectedEffort,
       fastMode: preferences.gearProfiles[preferences.activeGearIndex]?.fastMode === true,
@@ -484,10 +509,10 @@ export class CollaborationService {
           for (const member of group.members.filter(m => m.stopped)) await this.stopMember(member);
           await this.collect(group);
           // One dispatch per group per pulse bounds lease duration and gives siblings fair progress.
-          const fresh = (await this.store.listCollaborationGroups(group.mainSessionId))[0];
+          const fresh = (await this.store.listCollaborationGroups(group.mainSessionId)).find(candidate => candidate.id === group.id);
           const next = fresh?.messages.find(m => (m.state === "pending" || m.state === "steering") &&
             (m.nextAttemptAt ?? 0) <= Date.now() && !memberOf(fresh, m.to).stopped);
-          if (next) {
+          if (fresh && next) {
             const renewed = await this.store.changeCollaboration(group.id, null, current => {
               if (current.lease?.owner !== this.owner) return false;
               current.lease.until = Date.now() + 120_000; return true;

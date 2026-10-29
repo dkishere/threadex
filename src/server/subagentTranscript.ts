@@ -373,6 +373,11 @@ function normalizeTranscriptItem(value: unknown): StreamItem | null {
       ...(boundedString(item.reasoningEffort, 128)
         ? { reasoningEffort: boundedString(item.reasoningEffort, 128) }
         : {}),
+      ...(boundedString(item.actualModel, 256) ? { actualModel: boundedString(item.actualModel, 256) } : {}),
+      ...(boundedString(item.actorContext, MAX_TEXT_CHARS) ? { actorContext: boundedString(item.actorContext, MAX_TEXT_CHARS) } : {}),
+      ...(boundedString(item.actualReasoningEffort, 128)
+        ? { actualReasoningEffort: boundedString(item.actualReasoningEffort, 128) }
+        : {}),
       agents: agents.flatMap((candidate) => {
         const agent = readObject(candidate);
         const agentId = boundedIdentifier(agent?.id);

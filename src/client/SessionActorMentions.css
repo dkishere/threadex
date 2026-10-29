@@ -1,0 +1,17 @@
+.session-actor-mentions { display: grid; gap: 4px; padding: 6px 10px 0; min-width: 0; }
+.session-actor-mention-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.session-actor-mention-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; min-width: 0; padding: 2px 4px 2px 3px; border: 1px solid #ddd6fe; border-radius: 999px; background: #f5f3ff; color: #4c1d95; font-size: 12px; font-weight: 600; }
+.session-actor-mention-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-actor-mention-chip button { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: inherit; cursor: pointer; }
+.session-actor-mention-chip button:hover, .session-actor-mention-chip button:focus-visible { background: #ede9fe; }
+.session-actor-mention-chip button svg { width: 12px; height: 12px; }
+.session-actor-mention-avatar { display: inline-flex; flex: 0 0 auto; }
+.session-actor-mention-avatar .actor-avatar { box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; overflow: hidden; border-radius: 50%; background: #ede9fe; color: #6d28d9; font-size: 9px; }
+.session-actor-mention-avatar .actor-avatar img { width: 100%; height: 100%; object-fit: cover; }
+.session-actor-mention-avatar .actor-avatar-bot { background: #24262c; }
+.session-actor-mention-avatar .actor-avatar-bot svg { display: block; width: 100%; height: 100%; }
+.slash-suggestions .session-actor-mention-avatar .actor-avatar { width: 22px; height: 22px; }
+.slash-suggestion-name.slash-suggestion-actor { display: inline-flex; align-items: center; gap: 6px; }
+.session-actor-mention-hint { display: inline-flex; align-items: center; gap: 6px; margin: 0; color: #5b21b6; font-size: 12px; }
+.session-actor-mention-hint[data-warning="true"] { color: #b91c1c; }
+.session-actor-mention-hint svg { width: 12px; height: 12px; }

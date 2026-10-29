@@ -1,0 +1,11 @@
+/* Shell layout for the actor view: actor sessions in the middle column and the
+   actor dialog on the right. The default `.chat` rows (header / auto / panel /
+   composer) apply on desktop; the sessions panel spans rows 2-4 there. */
+.sidebar > .actor-list-panel { flex: 1 1 auto; }
+
+@media (width < 1080px) {
+  /* Row 2 holds the Sessions / Back to actor switch, as in the compact Manager. */
+  .responsive-layout[data-middle-open="true"] .chat[data-actor-view="true"][data-session-tab] { grid-template-rows: var(--chat-header-height) 40px minmax(0, 1fr) auto; }
+  .responsive-layout[data-middle-open="true"] .chat[data-actor-view="true"] > .actor-sessions-panel { grid-row: 3 / 5; }
+  .responsive-layout .chat[data-actor-view="true"] .content-header-actions { max-width: 52%; }
+}

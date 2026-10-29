@@ -17,7 +17,8 @@ export function IntentApprovalCard({ item, onDecisionSubmitted }: {
   const [error, setError] = useState("");
   const [stale, setStale] = useState(false);
   const saved = intentDecision(item.decision, item.params) ?? localDecision;
-  const resolved = item.status === "resolved" || !!localDecision || stale;
+  const expired = item.status === "expired" && !localDecision;
+  const resolved = item.status === "resolved" || !!localDecision || stale || expired;
   const approved = saved && saved !== "cancel" && saved.outcome === "approved" ? saved : null;
   async function submit(decision: IntentDecision) {
     if (busy || resolved) return;
@@ -27,7 +28,7 @@ export function IntentApprovalCard({ item, onDecisionSubmitted }: {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ decision })
       });
       if (!response.ok) {
-        if (response.status === 409) setStale(true);
+        if (response.status === 409) { setStale(true); onDecisionSubmitted?.(item.approvalId); }
         const body = await response.json().catch(() => ({}));
         throw new Error(body.error || "Could not submit the decision.");
       }
@@ -36,7 +37,7 @@ export function IntentApprovalCard({ item, onDecisionSubmitted }: {
     finally { setBusy(false); }
   }
   return <section className="user-input-card intent-approval-card" data-approval-id={item.approvalId} data-resolved={resolved} aria-label="Intent approval">
-    <header><ShieldCheck size={18} /><strong>Approve intention</strong><span className="user-input-status">{resolved ? approved ? "Approved" : saved && saved !== "cancel" ? "Declined" : "Closed" : "Waiting for you"}</span></header>
+    <header><ShieldCheck size={18} /><strong>Approve intention</strong><span className="user-input-status">{resolved ? approved ? "Approved" : saved && saved !== "cancel" ? "Declined" : expired ? "Expired" : "Closed" : "Waiting for you"}</span></header>
     {request ? <>
       <h3>{request.title}</h3>
       <dl><dt>Scope</dt><dd>{request.scope}</dd><dt>Not included</dt><dd>{request.exclusions}</dd><dt>Consequences</dt><dd>{request.consequences}</dd><dt>Valid until</dt><dd>This turn ends</dd></dl>

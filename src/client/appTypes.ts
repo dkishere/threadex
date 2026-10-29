@@ -1,7 +1,16 @@
 import type { ProcessMonitor, SessionPageState, SessionProjectPageState, WaitEvent, WaitSubscription, WorkspaceStatusMonitor } from "./eventStore";
+import type { SendMessageRecord } from "../eventProtocol";
 import type { ResponseAnnotation, ResponseAnnotationSource } from "./responseAnnotations";
 
 export type Role = "user" | "assistant" | "system";
+
+export type SubagentTokenUsage = {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  agentCount: number;
+};
 
 export type MessageAttachment = {
   id: string;
@@ -41,13 +50,15 @@ export type ChatMessage = {
   /** True when the turn was submitted through the Auto gear. */
   autoModel?: boolean;
   /** Provider that selected an Auto turn's model. */
-  autoModelProvider?: "typesafe" | "fallback";
+  autoModelProvider?: "typesafe" | "openai" | "llm" | "fake" | "fallback";
   autoModelConfidence?: number;
   /** Token usage recorded for this turn, when the runner reports it. */
   tokenIn?: number;
   /** Cached portion of the input-token usage, when the runner reports it. */
   cachedInputTokens?: number;
   tokenOut?: number;
+  /** Subagent usage, reported separately from tokenIn/tokenOut. */
+  subagentUsage?: SubagentTokenUsage;
   kind?: "steer";
   pending?: boolean;
   liveItems?: LiveItem[];
@@ -69,6 +80,8 @@ export type ChatMessage = {
   developerInstructions?: DeveloperInstructionRecord[];
   forcePlan?: boolean;
   managedMode?: boolean;
+  /** Set when the actor tier policy turned Managed mode on, not the requester. */
+  managedModeForced?: boolean;
   contextFork?: boolean;
   executionMode?: ExecutionMode;
 };
@@ -141,7 +154,8 @@ export type ComposerSuggestion =
   | { kind: "todo"; name: string; description: string }
   | ({ kind: "skill" } & SkillSuggestion)
   | { kind: "path"; name: string; path: string; description: string; scope: "file" | "directory"; insertText: string }
-  | { kind: "keyword"; name: string; description: string; scope: "keyword"; insertText: string };
+  | { kind: "keyword"; name: string; description: string; scope: "keyword"; insertText: string }
+  | { kind: "actor"; name: string; description: string; scope: "actor"; insertText: string; actor: { id: string; name: string; avatar?: string } };
 
 /** @deprecated Use ComposerSuggestion. */
 export type SlashSuggestion = ComposerSuggestion;
@@ -191,7 +205,7 @@ export type StreamEvent =
   | { type: "approval.resolved"; data: ApprovalEventData & { decision?: unknown; error?: string } }
   | {
       type: "auto_model.selected";
-      data: SessionAutoModelConfig & { turnId: string; provider: "typesafe" | "fallback"; reason: string; confidence?: number };
+      data: SessionAutoModelConfig & { turnId: string; provider: "typesafe" | "openai" | "llm" | "fake" | "fallback"; reason: string; confidence?: number };
     }
   | {
       type: "auto_model.phase_transition";
@@ -303,6 +317,11 @@ export type LiveItem = LiveItemOrigin & (
       prompt?: string;
       model?: string;
       reasoningEffort?: string;
+      actualModel?: string;
+      actualReasoningEffort?: string;
+      actorContext?: string;
+      /** tool "send_message": the authoritative SendMessage record (see eventProtocol). */
+      sendMessage?: SendMessageRecord;
       agents: Array<{ id: string; name?: string; status: string; message?: string }>;
     }
   | {
@@ -314,7 +333,7 @@ export type LiveItem = LiveItemOrigin & (
       turnId: string;
       method: string;
       params: unknown;
-      status: "pending" | "resolved";
+      status: "pending" | "resolved" | "expired";
       decision?: unknown;
       error?: string;
     }
@@ -479,7 +498,7 @@ export type WorkspaceModelPreferences = {
 export type AccountLoginMode = "api" | "chatgpt";
 export type SettingsSection = "profile" | "accounts" | "browserBridge" | "security";
 export type BackendConnectionState = "unknown" | "online" | "reconnecting";
-export type SessionTitleSource = "initial" | "summarizer" | "user";
+export type SessionTitleSource = "initial" | "summarizer" | "user" | "actor";
 
 export type SessionModelTokenUsage = {
   model: string;
@@ -507,6 +526,8 @@ export type SessionRecord = {
   turnCount?: number;
   tokenCount?: number;
   modelTokenUsage?: SessionModelTokenUsage[];
+  /** Subagent usage across the session; not included in tokenCount or modelTokenUsage. */
+  subagentTokenUsage?: SubagentTokenUsage;
   matchedTurn?: string | null;
 };
 
@@ -606,6 +627,8 @@ export type SessionTurnRecord = {
   tokenOut: number;
   /** Cached input accumulated over this turn, not just the latest request. */
   cachedInputTokens?: number;
+  /** Usage of subagents this turn started; not included in tokenIn/tokenOut. */
+  subagentUsage?: SubagentTokenUsage;
   usageSample?: {
     id: string;
     source: string;

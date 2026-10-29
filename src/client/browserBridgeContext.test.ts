@@ -9,7 +9,7 @@ const context = {
   url: "http://localhost:8082/session-conversation/example",
   title: "FairShot Hub",
   selector: "main > p",
-  element: { tagName: "p", className: "muted" },
+  element: { tagName: "p", className: "muted", innerText: "所選元素 👩🏽‍💻" },
   "page-values": { workspace: "fairshot", environment: "local" },
   "match-by-url": ["http://localhost:8082/"],
   "react-components": [{ name: "App", source: "/src/client/App.tsx" }],

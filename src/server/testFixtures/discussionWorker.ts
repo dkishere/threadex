@@ -14,7 +14,9 @@ IsolatedLunaRunner.prototype.run = async function () {
     cancellations.set(this, () => { clearInterval(timer); reject(new Error("Stopped")); });
   });
   cancellations.delete(this);
-  return { responseText: "Detached actor answer", usage: null, authIdentity: {} as any };
+  return { responseText: job.kind === "actor-room" ? JSON.stringify({ text: "Detached actor answer", claim: false,
+    rolePrompt: "Discuss", roleSummary: "Discussion", longTerm: "", rolling: "Answered" }) : "Detached actor answer", usage: null,
+    authIdentity: { externalAccountId: null, externalUserId: null } };
 };
 IsolatedLunaRunner.prototype.stop = function () { cancellations.get(this)?.(); };
 const job = JSON.parse(readFileSync(resolve(directory, "job.json"), "utf8"));

@@ -37,6 +37,7 @@ test("manager policy preserves routing order, ownership and minimal handoffs wit
   assert.ok(tool("workspace_create_task").inputSchema.properties.parentSessionId);
   assert.ok(tool("workspace_inspect_task").inputSchema.properties.turnId);
   assert.ok((tool("workspace_create_task").inputSchema.properties.model as { enum: string[] }).enum.includes("gpt-6.1-sol"));
+  assert.ok((tool("workspace_create_task").inputSchema.properties.model as { enum: string[] }).enum.includes("gpt-6.1-terra"));
 });
 
 test("compact manager policy retains continuation gates and workload/escalation requirements", () => {
@@ -48,6 +49,7 @@ test("compact manager policy retains continuation gates and workload/escalation 
   assert.match(policy, /Never restart user-stopped work without authorization/);
   assert.match(policy, /gpt-6-luna: only tightly scoped mechanical work/);
   assert.match(policy, /gpt-6\.1-sol or higher/);
+  assert.match(policy, /gpt-6\.1-terra \(the user's Terra workload category\): routine small development\/search and ordinary debugging; never prompt work/);
   assert.match(policy, /gpt-6-astra: 3D, security, large reviews/);
   assert.match(policy, /next stronger supported model/);
   assert.match(policy, /never use workspace_continue_stronger to bypass rate limits/);

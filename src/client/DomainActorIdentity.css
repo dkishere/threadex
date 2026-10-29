@@ -1,0 +1,11 @@
+.domain-actor-identity { display: inline-flex; align-items: center; gap: 10px; min-width: 0; max-width: 100%; text-align: left; }
+.domain-actor-identity .actor-avatar { box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 36px; width: 36px; height: 36px; overflow: hidden; border: 1px solid #ddd6fe; border-radius: 12px; background: #ede9fe; color: #6d28d9; font-size: 13px; font-weight: 650; }
+.domain-actor-identity .actor-avatar img { width: 100%; height: 100%; object-fit: cover; }
+.domain-actor-identity .actor-avatar-bot { border-color: #3a3d45; background: #24262c; }
+.domain-actor-identity .actor-avatar-bot svg { display: block; width: 100%; height: 100%; }
+.actor-room-messages .domain-actor-identity > .actor-avatar { flex-basis: 56px; width: 56px; height: 56px; border-radius: 18px; }
+@media (max-width: 650px) { .actor-room-messages .domain-actor-identity > .actor-avatar { flex-basis: 48px; width: 48px; height: 48px; border-radius: 16px; } }
+.domain-actor-identity-copy { display: grid; min-width: 0; gap: 3px; }
+.domain-actor-identity-copy > strong { color: #26334b; font-size: 13px; font-weight: 650; overflow-wrap: anywhere; }
+.domain-actor-role { color: #52637a; font-weight: 500; }
+.domain-actor-identity-copy > small { color: #64748b; font-size: 11px; overflow-wrap: anywhere; }

@@ -145,6 +145,7 @@
 }
 
 .composer-response-quote strong {
+  overflow-wrap: anywhere;
   color: #71717a;
   font-size: 10px;
   line-height: 13px;

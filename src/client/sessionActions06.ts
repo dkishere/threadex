@@ -31,7 +31,7 @@ export function selectSlashSuggestion(ctx, suggestion) {
 
 export function selectComposerSuggestion(ctx, suggestion) {
     const { composerSuggestionTrigger, input, inputEditorRef, setComposerInput, setComposerSuggestionTrigger } = ctx;
-        if (!composerSuggestionTrigger || (suggestion.kind !== "path" && suggestion.kind !== "keyword"))
+        if (!composerSuggestionTrigger || (suggestion.kind !== "path" && suggestion.kind !== "keyword" && suggestion.kind !== "actor"))
             return;
         const before = input.slice(0, composerSuggestionTrigger.start);
         const after = input.slice(composerSuggestionTrigger.end);

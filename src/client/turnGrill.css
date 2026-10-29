@@ -75,6 +75,7 @@
 .turn-grill .grill-implement:hover:not(:disabled) { background: #4338ca; border-color: #4338ca; color: #fff; }
 .turn-grill .grill-implement:disabled { box-shadow: none; }
 .grill-progress { display: flex; align-items: center; gap: 8px; padding: 12px 16px; color: #64748b; font-size: 11px; }
+.grill-activity { margin: -8px 0 0; padding: 0 16px 12px 38px; color: #94a3b8; font-size: 11px; }
 .grill-error { display: grid; gap: 8px; padding: 12px 16px; color: #b45309; background: #fffbeb; font-size: 11px; overflow-wrap: anywhere; }
 .grill-error > div { display: flex; gap: 6px; }
 .grill-empty { display: flex; align-items: flex-start; gap: 10px; padding: 20px 16px; color: #059669; }

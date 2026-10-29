@@ -642,7 +642,7 @@ export function describeStreamItem(ctx, item) {
         return `${subagentToolLabel(item.tool)}: ${subagentNames(item).join(", ") || "subagent"}`;
     }
     if (item.itemType === "approval") {
-        return item.status === "pending" ? "Approval requested" : `Approval ${approvalDecisionLabel(item.decision)}`;
+        return item.status === "pending" ? "Approval requested" : item.status === "expired" ? "Approval expired" : `Approval ${approvalDecisionLabel(item.decision)}`;
     }
     return item.message;
 

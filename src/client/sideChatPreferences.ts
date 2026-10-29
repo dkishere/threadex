@@ -8,10 +8,14 @@ export type SideChatPreferences = {
   activeGearIndex: number;
 };
 
-export function readSideChatPreferences(): SideChatPreferences {
+export function sideChatPreferencesKey(workspaceId?: string): string {
+  return workspaceId ? `${SIDE_CHAT_PREFERENCES_KEY}:${encodeURIComponent(workspaceId)}` : SIDE_CHAT_PREFERENCES_KEY;
+}
+
+export function readSideChatPreferences(workspaceId?: string): SideChatPreferences {
   const fallback = { gearProfiles: defaultGearProfiles(), activeGearIndex: 1 };
   try {
-    const saved = JSON.parse(localStorage.getItem(SIDE_CHAT_PREFERENCES_KEY) ?? "null");
+    const saved = JSON.parse(localStorage.getItem(sideChatPreferencesKey(workspaceId)) ?? localStorage.getItem(SIDE_CHAT_PREFERENCES_KEY) ?? "null");
     if (!saved || typeof saved !== "object") return fallback;
     const gearProfiles = fallback.gearProfiles.map((gear, index) => {
       const candidate = saved.gearProfiles?.[index];
@@ -29,8 +33,8 @@ export function readSideChatPreferences(): SideChatPreferences {
   }
 }
 
-export function saveSideChatPreferences(preferences: SideChatPreferences): void {
+export function saveSideChatPreferences(preferences: SideChatPreferences, workspaceId?: string): void {
   try {
-    localStorage.setItem(SIDE_CHAT_PREFERENCES_KEY, JSON.stringify(preferences));
+    localStorage.setItem(sideChatPreferencesKey(workspaceId), JSON.stringify(preferences));
   } catch { /* Keep the current selection usable when storage is unavailable. */ }
 }

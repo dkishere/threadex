@@ -2,12 +2,14 @@ import { expect, test } from "@playwright/test";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { writeFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { SessionStore } from "../src/server/sessionStore.js";
 import {
   apiBaseUrl,
   checkedJson,
+  e2eDataDir,
   postJson,
   runnerLogPath,
-  runnerUpdate,
   selectSession
 } from "./support/mock-runner.js";
 import { scenarioSessions } from "./support/scenarios.js";
@@ -69,34 +71,46 @@ test("dead-runner diagnosis drains a large log before marking the turn stopped",
   await once(exitedRunner, "exit");
   expect(() => process.kill(deadPid, 0)).toThrow();
 
-  await postJson(request, "/api/pending-turns", {
-    sessionId: session.id,
-    turnId,
-    message: "Recover this completed runner from its durable log"
-  });
-  await runnerUpdate(request, {
-    id: `${turnId}:runner-started`,
-    sessionId: session.id,
-    turnId,
-    event: "runner.started",
-    runnerPid: deadPid,
-    logPath,
-    data: { pid: deadPid, logPath }
-  });
+  // Seed the running attempt directly. Queue dispatch reserves its own UUID
+  // path and correctly rejects a runner.started callback for a different log.
+  const store = new SessionStore(resolve(e2eDataDir, "session-manager.duckdb"));
+  try {
+    await store.ready();
+    await store.recordSessionTurn({
+      id: turnId,
+      sessionId: session.id,
+      userInput: "Recover this completed runner from its durable log",
+      agentResponse: "",
+      status: "running",
+      tokenIn: 0,
+      tokenOut: 0
+    });
+    expect(await store.markSessionTurnRunning({ id: turnId, runnerPid: deadPid, runnerLogPath: logPath })).toBe(true);
+  } finally {
+    await store.close();
+  }
   await selectSession(request, session.id);
 
-  const snapshot = await checkedJson(await request.get(`${apiBaseUrl}/api/workspace/snapshot`));
-  const recoveredTurn = snapshot.activeSession.turns.find((turn: { id: string }) => turn.id === turnId);
-  expect(recoveredTurn).toMatchObject({
-    status: "done",
-    agentResponse: reply,
-    tokenIn: 31,
-    tokenOut: 17,
-    runnerPid: null,
-    runnerExitCode: 0,
-    pendingReason: null
+  // Snapshot reconciliation runs after the response, so wait for a later
+  // snapshot to expose both the recovered turn and cleared execution status.
+  await expect.poll(async () => {
+    const snapshot = await checkedJson(await request.get(`${apiBaseUrl}/api/workspace/snapshot`));
+    return {
+      turn: snapshot.activeSession.turns.find((turn: { id: string }) => turn.id === turnId),
+      executionStatus: snapshot.sessionExecutionStatuses[session.id]
+    };
+  }).toMatchObject({
+    turn: {
+      status: "done",
+      agentResponse: reply,
+      tokenIn: 31,
+      tokenOut: 17,
+      runnerPid: null,
+      runnerExitCode: 0,
+      pendingReason: null
+    },
+    executionStatus: undefined
   });
-  expect(snapshot.sessionExecutionStatuses[session.id]).toBeUndefined();
 
   const watchdogInspection = await postJson(request, "/api/session-inspector/session", {
     sessionId: session.id,

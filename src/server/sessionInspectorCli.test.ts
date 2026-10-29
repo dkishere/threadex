@@ -7,6 +7,91 @@ import { IntentApprovals } from "./intentApprovals";
 
 const cliPath = resolve(import.meta.dirname, "../../scripts/session-inspector.mjs");
 
+test("actor CLI binds actions to its current turn and blocks arbitrary task creation", async () => {
+  let received: any;
+  let capabilityHeader: unknown;
+  const server = createServer(async (req, res) => {
+    let body = ""; for await (const chunk of req) body += chunk;
+    received = { path: req.url, body: JSON.parse(body) };
+    capabilityHeader = req.headers["x-threadex-actor-capability"];
+    res.setHeader("Content-Type", "application/json"); res.end(JSON.stringify({ ok: true }));
+  });
+  await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
+  const address = server.address(); assert.ok(address && typeof address === "object");
+  const env = { RUNNER_SERVER_URL: `http://127.0.0.1:${address.port}`, THREADEX_DOMAIN_ACTOR: "1",
+    THREADEX_SESSION_ID: "actor-task", THREADEX_TURN_ID: "actor-turn", THREADEX_ACTOR_CAPABILITY: "public-cli-fixture" };
+  try {
+    const result = await runCli(["actor_tree_status", JSON.stringify({ sourceTurnId: "forged" })], env);
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(capabilityHeader, "public-cli-fixture");
+    assert.equal(result.stdout.includes("public-cli-fixture"), false);
+    assert.deepEqual(received, { path: "/api/domain-actors/sessions/actor-task/action", body: {
+      sourceTurnId: "actor-turn", action: "actor_tree_status"
+    } });
+    const denied = await runCli(["create_task", JSON.stringify({ prompt: "Unscoped work" })], env);
+    assert.equal(denied.code, 1);
+    assert.match(denied.stderr, /not available/);
+  } finally { server.closeAllConnections(); await new Promise<void>(done => server.close(() => done())); }
+});
+
+test("hook-injected actor credentials travel only in headers and the removed terminal stays unavailable", async () => {
+  const calls: any[] = [];
+  const server = createServer(async (req, res) => {
+    let body = ""; for await (const chunk of req) body += chunk;
+    calls.push({ path: req.url, body: JSON.parse(body), capability: req.headers["x-threadex-actor-capability"], workItem: req.headers["x-threadex-actor-work-item"] });
+    res.setHeader("Content-Type", "application/json"); res.end(JSON.stringify({ ok: true }));
+  });
+  await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
+  const address = server.address(); assert.ok(address && typeof address === "object");
+  const env = { RUNNER_SERVER_URL: `http://127.0.0.1:${address.port}`, THREADEX_DOMAIN_ACTOR: "1",
+    THREADEX_SESSION_ID: "host", THREADEX_TURN_ID: "current", THREADEX_ACTOR_CAPABILITY: "" };
+  try {
+    const terminal = await runCli(["terminal_broadcast", JSON.stringify({ requestId: "api", type: "api_ready", summary: "ready" })], env);
+    assert.equal(terminal.code, 1); assert.match(terminal.stderr, /not available/);
+    const child = await runCli(["actor_read_memory", JSON.stringify({ field: "rolePrompt", _actorCredential: "child-secret", _actorWorkItem: "child-work" })], env);
+    assert.equal(child.code, 0, child.stderr);
+    assert.deepEqual(calls[0], { path: "/api/domain-actors/sessions/host/action", capability: "child-secret", workItem: "child-work",
+      body: { field: "rolePrompt", action: "actor_read_memory", sourceTurnId: "current" } });
+    assert.doesNotMatch(child.stdout, /child-secret/);
+    const main = await runCli(["actor_read_memory", JSON.stringify({ field: "rolePrompt", _actorCredential: "main-secret" })], env);
+    assert.equal(main.code, 0, main.stderr);
+    assert.equal(calls[1].capability, "main-secret"); assert.equal(calls[1].workItem, undefined);
+  } finally { server.closeAllConnections(); await new Promise<void>(done => server.close(() => done())); }
+});
+
+test("worker consultant commands bind the source session/turn and preserve both consultation triggers", async () => {
+  const calls: any[] = [];
+  const server = createServer(async (req, res) => {
+    let body = ""; for await (const chunk of req) body += chunk;
+    calls.push({ path: req.url, body: JSON.parse(body), capability: req.headers["x-threadex-actor-capability"] });
+    res.setHeader("Content-Type", "application/json"); res.end(JSON.stringify({ status: "queued" }));
+  });
+  await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
+  const address = server.address(); assert.ok(address && typeof address === "object");
+  const env = { RUNNER_SERVER_URL: `http://127.0.0.1:${address.port}`, THREADEX_DOMAIN_ACTOR: "1",
+    THREADEX_SESSION_ID: "worker", THREADEX_TURN_ID: "current", THREADEX_ACTOR_CAPABILITY: "test-consultant-capability" };
+  try {
+    for (const [name, args] of [
+      ["consultant_list", {}],
+      ["consultant_ask", { requestId: "ask", consultantId: "critic", question: "Assess", trigger: "on_demand", sourceTurnId: "forged", sessionId: "other" }],
+      ["consultant_round_table", { requestId: "round", consultantIds: ["critic", "researcher"], question: "Discuss", trigger: "user_requested" }],
+      ["consultant_status", { requestId: "ask" }],
+      ["consultant_cancel", { requestId: "round" }]
+    ] as const) {
+      const result = await runCli([name, JSON.stringify(args)], env);
+      assert.equal(result.code, 0, result.stderr);
+      const received = calls.at(-1);
+      assert.equal(received.path, "/api/domain-actors/sessions/worker/action");
+      assert.equal(received.body.sourceTurnId, "current"); assert.equal(received.body.action, name);
+      assert.equal(received.capability, "test-consultant-capability");
+    }
+    assert.equal(calls[1].body.trigger, "on_demand"); assert.equal(calls[2].body.trigger, "user_requested");
+    const denied = await runCli(["consultant_ask", JSON.stringify({ requestId: "r", consultantId: "critic", question: "Delegate" })],
+      { ...env, THREADEX_DOMAIN_ACTOR: "0", THREADEX_ACTOR_CAPABILITY: "", THREADEX_TODO_AGENT_ROLE: "side_chat" });
+    assert.equal(denied.code, 1); assert.match(denied.stderr, /not available/); assert.equal(calls.length, 5);
+  } finally { server.closeAllConnections(); await new Promise<void>(done => server.close(() => done())); }
+});
+
 test("subagent prompt recording binds the current host turn and preserves multiline text", async () => {
   let received: any;
   const server = createServer(async (req, res) => {
@@ -116,6 +201,7 @@ test("intention CLI binds the host turn, polls and returns the host decision", a
 async function runCli(args: string[], env: NodeJS.ProcessEnv = {}, stdin = "") {
   const child = spawn(process.execPath, [cliPath, ...args], { env: { ...process.env,
     RUNNER_SERVER_URL: "", SESSION_INSPECTOR_SERVER_URL: "", THREADEX_TODO_AGENT_ROLE: "default",
+    THREADEX_DOMAIN_ACTOR: "0", THREADEX_ACTOR_CAPABILITY: "",
     THREADEX_WORKSPACE_MANAGER: "0", THREADEX_MANAGER_CONCURRENT: "0", THREADEX_CONTINUITY_ONLY: "0", ...env },
     stdio: ["pipe", "pipe", "pipe"] });
   let stdout = "", stderr = "";

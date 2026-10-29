@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 export type DiscussionJob = {
   id: string;
   sessionId: string;
-  kind: "roundtable" | "side-chat";
+  kind: "roundtable" | "side-chat" | "actor-room" | "consultant";
   created: string;
   payload: Record<string, any>;
 };

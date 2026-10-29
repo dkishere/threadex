@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import type { WorkspaceRecord } from "./sessionStore";
 
 const sessionInspectorSkillName = "session-inspector";
-const builtinSkillNames = [sessionInspectorSkillName, "browser-bridge", "threadex-config", "threadex-author", "threadex-concurrent"] as const;
+const builtinSkillNames = [sessionInspectorSkillName, "browser-bridge", "threadex-config", "threadex-author", "threadex-concurrent", "threadex-pr-review"] as const;
 
 function injectSkill(workspace: WorkspaceRecord, sourceRoot: string, skillName: string) {
   const source = resolve(sourceRoot, skillName);
@@ -40,14 +40,16 @@ export function injectThreadexAuthorSkills(workspaces: WorkspaceRecord[], source
 }
 
 export function injectBuiltinSkills(workspace: WorkspaceRecord, sourceRoot: string) {
-  const legacy = resolve(workspace.codexHome, "skills", "threadex-collaboration");
-  try {
-    if (lstatSync(legacy).isSymbolicLink() &&
-      resolve(workspace.codexHome, "skills", readlinkSync(legacy)) === resolve(sourceRoot, "threadex-collaboration")) {
-      rmSync(legacy);
+  for (const retired of ["threadex-collaboration", "threadex-actors"]) {
+    const legacy = resolve(workspace.codexHome, "skills", retired);
+    try {
+      if (lstatSync(legacy).isSymbolicLink() &&
+        resolve(workspace.codexHome, "skills", readlinkSync(legacy)) === resolve(sourceRoot, retired)) {
+        rmSync(legacy);
+      }
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
     }
-  } catch (error) {
-    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
   }
   const destinations = builtinSkillNames.map((skillName) => injectSkill(workspace, sourceRoot, skillName));
   injectBrowserBridgeRule(workspace);

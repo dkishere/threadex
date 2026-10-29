@@ -17,7 +17,7 @@ import {
 import { createPortal } from "react-dom";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Download, ExternalLink, FileText, MessageSquare, X } from "lucide-react";
+import { Check, Copy, Download, ExternalLink, FileText, MessageSquare, X } from "lucide-react";
 import { isHtmlFilePath, workspaceHtmlPreviewUrl } from "./markdownUrls";
 import { CODEX_FOLLOWUP_EVENT, remarkCodexFileCitation, remarkCodexFollowup } from "./codexFollowup";
 import { UrlTagIcon } from "./UrlTagIcon";
@@ -49,7 +49,7 @@ const markdownComponents: Components = {
     if (language === "mermaid") return <MermaidBlock source={String(children).replace(/\n$/, "")} />;
     return <code className={className} {...props}>{children}</code>;
   },
-  pre: ({ children }) => findMermaidChild(children) ?? <pre className="markdown-code-block">{children}</pre>,
+  pre: ({ children }) => findMermaidChild(children) ?? <CodeBlock>{children}</CodeBlock>,
   img: ({ node: _node, ...props }) => <MarkdownImage {...props} />
 };
 const markdownPlugins = [remarkGfm, remarkCodexFollowup, remarkCodexFileCitation];
@@ -72,6 +72,54 @@ export const MarkdownContent = memo(function MarkdownContent({ children, classNa
 const MarkdownPart = memo(function MarkdownPart({ source, context, sourcePath }: { source: string; context: WorkspaceFilePreviewContext; sourcePath?: string }) {
   return <ReactMarkdown remarkPlugins={markdownPlugins} components={markdownComponents} urlTransform={(url) => transformMarkdownUrl(sourcePath ? resolveWorkspaceMarkdownUrl(url, sourcePath) : url, context)}>{source}</ReactMarkdown>;
 });
+
+function copyTextFallback(text: string) {
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.cssText = "position:fixed;top:0;left:0;opacity:0;";
+  document.body.appendChild(textarea);
+  textarea.select();
+  try {
+    return document.execCommand("copy");
+  } finally {
+    textarea.remove();
+  }
+}
+
+function CodeBlock({ children }: { children: ReactNode }) {
+  const preRef = useRef<HTMLPreElement>(null);
+  const [status, setStatus] = useState<"idle" | "copied" | "failed">("idle");
+  const timer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(timer.current), []);
+
+  const copy = async () => {
+    const text = (preRef.current?.textContent ?? "").replace(/\n$/, "");
+    let ok = false;
+    try {
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    } catch {
+      try { ok = copyTextFallback(text); } catch { ok = false; }
+    }
+    setStatus(ok ? "copied" : "failed");
+    window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => setStatus("idle"), 1800);
+  };
+
+  const label = status === "copied" ? "Copied" : status === "failed" ? "Copy failed" : "Copy code";
+  return (
+    <div className="markdown-code-wrap">
+      <pre className="markdown-code-block" ref={preRef}>{children}</pre>
+      <button type="button" className="markdown-code-copy" data-status={status} aria-label={label} title={label}
+        onMouseDown={(event) => event.stopPropagation()}
+        onClick={(event) => { event.stopPropagation(); void copy(); }}>
+        {status === "copied" ? <Check size={14} aria-hidden="true" /> : status === "failed" ? <X size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
+        <span className="markdown-code-copy-text" role="status" aria-live="polite">{status === "idle" ? "" : label}</span>
+      </button>
+    </div>
+  );
+}
 
 function MarkdownImage({ alt, src, ...props }: ComponentPropsWithoutRef<"img">) {
   const [open, setOpen] = useState(false);

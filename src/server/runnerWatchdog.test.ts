@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { runnerStartupIsWithinGrace, type RunnerStartupState } from "./runnerWatchdog.js";
+import { runnerNeverSpawned, runnerStartupIsWithinGrace, type RunnerStartupState } from "./runnerWatchdog.js";
 
 const now = Date.parse("2026-09-04T09:00:00.000Z");
 
@@ -33,4 +33,14 @@ test("allows an unstarted orphan to be released after the startup grace period",
 
 test("does not apply startup grace after a PID has been attached", () => {
   assert.equal(runnerStartupIsWithinGrace(startupState({ runnerPid: 12345 }), now, 45_000), false);
+});
+
+test("treats a claimed turn without PID, start or log as never spawned", () => {
+  assert.equal(runnerNeverSpawned(startupState(), false), true);
+});
+
+test("does not requeue a turn whose runner started or wrote a log", () => {
+  assert.equal(runnerNeverSpawned(startupState({ runnerPid: 12345 }), false), false);
+  assert.equal(runnerNeverSpawned(startupState({ runnerStarted: "2026-09-04T08:59:59.000Z" }), false), false);
+  assert.equal(runnerNeverSpawned(startupState(), true), false);
 });

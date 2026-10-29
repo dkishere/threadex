@@ -1,11 +1,11 @@
 import { useState } from "react";
 import { AVATAR_STYLES, dicebearAvatar } from "../actorAvatar";
 
-export function ActorAvatar({ actor }: { actor: { id: string; name: string; avatar?: string } }) {
+export function ActorAvatar({ actor, decorative = false }: { actor: { id: string; name: string; avatar?: string }; decorative?: boolean }) {
   const source = actor.avatar ?? dicebearAvatar(actor.id);
   const [failed, setFailed] = useState("");
-  return <span className="actor-avatar">{failed === source ? <span>{actor.name.trim().slice(0, 2).toUpperCase() || "?"}</span>
-    : <img src={source} alt={`${actor.name || "Actor"} avatar`} referrerPolicy="no-referrer" onError={() => setFailed(source)} />}</span>;
+  return <span className="actor-avatar" aria-hidden={decorative || undefined}>{failed === source ? <span>{actor.name.trim().slice(0, 2).toUpperCase() || "?"}</span>
+    : <img src={source} alt={decorative ? "" : `${actor.name || "Actor"} avatar`} referrerPolicy="no-referrer" onError={() => setFailed(source)} />}</span>;
 }
 
 export function ActorAvatarEditor({ actor, onChange }: { actor: { id: string; name: string; avatar?: string }; onChange: (avatar: string) => void }) {

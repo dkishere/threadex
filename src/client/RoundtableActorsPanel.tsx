@@ -5,9 +5,10 @@ import { roundtableEfforts } from "../roundtable";
 import { roundtableLibraryEndpoint, type RoundtableLibrary, type RoundtablePreset } from "../roundtablePresets";
 import { apiJson } from "./apiClient";
 import { ActorAvatarEditor } from "./ActorAvatar";
+import { ACTOR_TYPE_LABELS } from "../actorTypes";
 import "./Roundtable.css";
 
-export function RoundtableActorsPanel({ addNew = false }: { addNew?: boolean }) {
+export function RoundtableActorsPanel({ addNew = false, embedded = false }: { addNew?: boolean; embedded?: boolean }) {
   const root = useRef<HTMLDivElement>(null);
   const focusedNewActor = useRef(false);
   const [library, setLibrary] = useState<RoundtableLibrary | null>(null);
@@ -18,7 +19,7 @@ export function RoundtableActorsPanel({ addNew = false }: { addNew?: boolean }) 
   async function load(signal?: AbortSignal) {
     try {
       const data = await apiJson<RoundtableLibrary>(roundtableLibraryEndpoint, { fresh: true, signal });
-      if (!signal?.aborted) { setLibrary(data); setActors(addNew && data.actors.length < 100 ? [...data.actors, { id: crypto.randomUUID(), name: "", model: DEFAULT_MODEL, effort: "high", rolePrompt: "", isDefault: false }] : data.actors); setError(""); }
+      if (!signal?.aborted) { setLibrary(data); setActors(addNew && data.actors.length < 100 ? [...data.actors, { type: "consultant", id: crypto.randomUUID(), name: "", model: DEFAULT_MODEL, effort: "high", rolePrompt: "", isDefault: false }] : data.actors); setError(""); }
     } catch (cause) { if (!signal?.aborted) setError(String(cause instanceof Error ? cause.message : cause)); }
   }
   useEffect(() => { const controller = new AbortController(); void load(controller.signal); return () => controller.abort(); }, []);
@@ -41,8 +42,8 @@ export function RoundtableActorsPanel({ addNew = false }: { addNew?: boolean }) 
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
     finally { setBusy(false); }
   }
-  return <div ref={root} className="settings-content roundtable-library" role="tabpanel" aria-label="Agent actors">
-    <div className="settings-section-heading"><div><h2>Agent actors</h2><p>A reusable cast of perspectives for round tables and side chat.</p></div><span className="roundtable-library-count">{actors.length} actors · {actors.filter(actor => actor.isDefault).length} default</span></div>
+  return <div ref={root} className={embedded ? "roundtable-library" : "settings-content roundtable-library"} role={embedded ? "region" : "tabpanel"} aria-label="Consultants">
+    <div className="settings-section-heading"><div><h2>{ACTOR_TYPE_LABELS.consultant}</h2><p>Shared across workspaces. A reusable cast of perspectives for round tables and side chat.</p></div><span className="roundtable-library-count">{actors.length} consultants · {actors.filter(actor => actor.isDefault).length} default</span></div>
     <form className="roundtable-library-form" onSubmit={event => { event.preventDefault(); void save(); }}>
       <div className="roundtable-library-hint"><Users size={18} /><p>Default actors join new round tables automatically. You can choose others before each discussion.</p></div>
       <fieldset disabled={busy || !library} className="roundtable-library-fields">
@@ -60,7 +61,7 @@ export function RoundtableActorsPanel({ addNew = false }: { addNew?: boolean }) 
           <label>Role prompt<textarea rows={3} maxLength={8000} value={actor.rolePrompt} placeholder="Optional perspective or role…" onChange={event => change(actor.id, { rolePrompt: event.target.value })} /></label>
         </section>)}
         {!actors.length && library && <div className="roundtable-library-empty"><Users size={28} /><h3>Build your round table</h3><p>Add a critic, a builder, or a fresh perspective.<br />Give each actor a model and a role.</p></div>}
-        <button type="button" className="roundtable-library-add" disabled={actors.length >= 100} onClick={() => { setActors(items => [...items, { id: crypto.randomUUID(), name: "", model: DEFAULT_MODEL, effort: "high", rolePrompt: "", isDefault: false }]); setNotice(""); }}><Plus size={16} />Add saved actor</button>
+        <button type="button" className="roundtable-library-add" disabled={actors.length >= 100} onClick={() => { setActors(items => [...items, { type: "consultant", id: crypto.randomUUID(), name: "", model: DEFAULT_MODEL, effort: "high", rolePrompt: "", isDefault: false }]); setNotice(""); }}><Plus size={16} />Add saved actor</button>
       </fieldset>
       <footer className="roundtable-library-footer"><span>Fewer than 2 defaults? Gearbox models fill the remaining places.</span><div><button type="button" className="roundtable-library-reload" aria-label="Reload saved actors" title="Reload saved actors" disabled={busy} onClick={() => void load()}><RotateCcw size={16} /></button><button type="submit" className="roundtable-library-save" disabled={busy || !library || JSON.stringify(actors) === JSON.stringify(library.actors)}><Check size={16} />{busy ? "Saving…" : "Save actors"}</button></div></footer>
       {!library && !error && <p role="status">Loading actors…</p>}

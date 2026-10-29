@@ -4,6 +4,8 @@ export type BrowserBridgeContextElement = {
   className?: string | null;
   role?: string | null;
   ariaLabel?: string | null;
+  /** Single-line visible text of the selected element, capped at 128 Unicode code points. */
+  innerText?: string;
 };
 
 export type BrowserBridgeReactComponent = {

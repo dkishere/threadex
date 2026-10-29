@@ -1,4 +1,5 @@
 import { Cog, Zap } from "lucide-react";
+import { createPortal } from "react-dom";
 import { modelEfforts } from "../modelCatalog";
 import { useEffect, useRef, useState, type DragEvent, type MouseEvent, type ReactNode } from "react";
 import type { ModelReasoningEffort } from "./appTypes";
@@ -167,6 +168,8 @@ export function ComposerGearSelector({
   const classes = className ? `composer-gears ${className}` : "composer-gears";
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const rootRef = useRef<HTMLElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const [menuPosition, setMenuPosition] = useState({ left: 12, top: 12, width: 420, maxHeight: 360 });
   const menuId = `${idPrefix}-menu`;
   const [isPhone, setIsPhone] = useState(() => typeof window !== "undefined" && window.matchMedia("(width < 768px)").matches);
 
@@ -188,7 +191,7 @@ export function ComposerGearSelector({
     if (!isMenuOpen) return;
 
     function closeOnOutsidePointer(event: PointerEvent) {
-      if (!rootRef.current?.contains(event.target as Node)) setIsMenuOpen(false);
+      if (!rootRef.current?.contains(event.target as Node) && !menuRef.current?.contains(event.target as Node)) setIsMenuOpen(false);
     }
 
     function closeOnEscape(event: KeyboardEvent) {
@@ -200,6 +203,41 @@ export function ComposerGearSelector({
     return () => {
       document.removeEventListener("pointerdown", closeOnOutsidePointer);
       document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [isMenuOpen]);
+
+  useEffect(() => {
+    if (!isMenuOpen) return;
+    function positionMenu() {
+      const anchor = rootRef.current?.getBoundingClientRect();
+      if (!anchor) return;
+      const viewport = window.visualViewport;
+      const leftEdge = (viewport?.offsetLeft ?? 0) + 12;
+      const topEdge = (viewport?.offsetTop ?? 0) + 12;
+      const width = Math.min(446, (viewport?.width ?? window.innerWidth) - 24);
+      const bottomEdge = topEdge + (viewport?.height ?? window.innerHeight) - 24;
+      const above = Math.max(0, anchor.top - topEdge - 6);
+      const below = Math.max(0, bottomEdge - anchor.bottom - 6);
+      const openAbove = above >= below;
+      const maxHeight = Math.max(1, openAbove ? above : below);
+      const height = Math.min(menuRef.current?.scrollHeight ?? 360, maxHeight);
+      setMenuPosition({ width, maxHeight,
+        left: Math.max(leftEdge, Math.min(anchor.left, leftEdge + (viewport?.width ?? window.innerWidth) - 24 - width)),
+        top: openAbove ? Math.max(topEdge, anchor.top - height - 6) : anchor.bottom + 6 });
+    }
+    positionMenu();
+    const observer = new ResizeObserver(positionMenu);
+    if (menuRef.current) observer.observe(menuRef.current);
+    window.addEventListener("resize", positionMenu);
+    window.addEventListener("scroll", positionMenu, true);
+    window.visualViewport?.addEventListener("resize", positionMenu);
+    window.visualViewport?.addEventListener("scroll", positionMenu);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", positionMenu);
+      window.removeEventListener("scroll", positionMenu, true);
+      window.visualViewport?.removeEventListener("resize", positionMenu);
+      window.visualViewport?.removeEventListener("scroll", positionMenu);
     };
   }, [isMenuOpen]);
 
@@ -259,8 +297,9 @@ export function ComposerGearSelector({
           })}
         </div>
       </div>
-      {isMenuOpen && (
-        <div id={menuId} className="composer-gear-menu" role="group" aria-label="Model gear configuration">
+      {isMenuOpen && createPortal(
+        <div ref={menuRef} id={menuId} className="composer-gear-menu" role="group" aria-label="Model gear configuration"
+          style={{ position: "fixed", zIndex: 1000, bottom: "auto", ...menuPosition, boxSizing: "border-box", overflowY: "auto", overscrollBehavior: "contain" }}>
           <div className="composer-gear-menu-title">
             <span className="composer-gear-menu-icon"><Cog aria-hidden="true" /></span>
             <span><strong>Model gears</strong><small>Choose a model, effort and Fast mode for each gear · Fast uses more quota</small></span>
@@ -310,7 +349,7 @@ export function ComposerGearSelector({
               );
             })}
           </div>
-        </div>
+        </div>, document.body
       )}
     </aside>
   );

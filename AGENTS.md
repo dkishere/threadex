@@ -7,6 +7,8 @@
 - Do not apply another company's or organization's documentation or decision-recording workflow to Threadex, or write Threadex records into their repositories.
 - An external skill or framework's location does not make Threadex part of its owning company or organization.
 
+For workspace worker names and avatars, follow [Actor identity](docs/actor-identity.md).
+
 ## Directory Layout
 
 - Client React code lives in `src/client`.

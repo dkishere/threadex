@@ -1,0 +1,48 @@
+.manager-workspace { grid-column: 1 / -1; grid-row: 1 / -1; display: grid; grid-template-columns: minmax(320px, .9fr) minmax(380px, 1.2fr); min-width: 0; min-height: 0; overflow: hidden; }
+.responsive-layout .chat[data-workspace-manager="true"][data-session-tab]:has(> .manager-workspace) { grid-template-rows: minmax(0, 1fr); }
+.manager-conversation { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; min-width: 0; min-height: 0; overflow: hidden; background: #fff; border-right: 1px solid #d8e2ee; }
+.manager-conversation > .messages-pane { display: contents; }
+.manager-conversation .messages.actor-room-messages { grid-column: 1; grid-row: 1; min-height: 0; overflow: auto; padding-top: 0; }
+.manager-conversation > .composer { grid-column: 1; grid-row: 2; min-height: 0; max-height: 50dvh; overflow-y: auto; overscroll-behavior: contain; }
+.manager-details { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; background: #f3f6fa; }
+.manager-details { container-type: inline-size; }
+.responsive-layout .manager-details > .chat.session-main-block[data-session-tab] { flex: 1; width: 100%; height: 100%; min-height: 0; margin: 0; grid-template-columns: minmax(0, 1fr); grid-template-rows: 80px 0 minmax(0, 1fr) auto; }
+.responsive-layout .manager-details > .session-main-block > .messages-pane > .messages { display: block; grid-column: 1; grid-row: 3; min-height: 0; }
+.responsive-layout .manager-details > .session-main-block > .composer { display: block; grid-column: 1; grid-row: 4; }
+.responsive-layout .manager-details > .session-main-block > .composer > .queued-prompts { display: grid; box-sizing: border-box; max-height: min(30dvh, 240px); overflow-y: auto; overscroll-behavior: contain; }
+.responsive-layout .manager-details > .session-main-block :is(.session-view-tabs, .session-plan-view, .session-side-chat-view, .prompt-turns) { display: none; }
+.responsive-layout .manager-details > .session-main-block > .content-header { position: relative; padding: 8px 12px; gap: 6px; flex-wrap: wrap; align-content: center; border-bottom: 1px solid #dbe3ee; background: #f8fafc; }
+.manager-details .content-header-heading { flex-basis: 100%; }
+.manager-details .content-header h1 { font-size: 14px; }
+.manager-details .content-header-actions { margin-left: auto; flex-wrap: wrap; gap: 6px; }
+.manager-details :is(.concurrent-panel, .roundtable-settings, .session-changes-popover) { width: min(420px, calc(100cqw - 24px)); max-height: min(480px, calc(100dvh - 220px)); }
+.manager-session-collapse { flex: none; }
+.manager-dashboard-header { display: flex; flex: none; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 14px 18px; border-bottom: 1px solid #e2e8f0; background: #f8fafc; }
+.manager-dashboard-header h2 { margin: 0; color: #334155; font-size: 14px; }
+.manager-dashboard-header span { color: #64748b; font-size: 11px; }
+.manager-details > .workspace-manager-dashboard { box-sizing: border-box; flex: 1; height: auto; padding: 18px; border: 0; }
+.responsive-layout .manager-details > .workspace-manager-dashboard:not([hidden]) { display: block; }
+.manager-workspace-tabs { display: none; }
+.manager-task-session { display: flex; flex-direction: column; height: 100%; min-height: 0; background: #fff; }
+.manager-task-header { display: flex; flex: none; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 18px; border-bottom: 1px solid #e2e8f0; }
+.manager-task-header > div { min-width: 0; }
+.manager-task-header h2 { flex: 1; min-width: 0; margin: 3px 0 0; font-size: 14px; overflow-wrap: anywhere; }
+.manager-task-transcript { flex: 1; min-height: 0; padding: 18px; overflow: auto; overflow-wrap: anywhere; overscroll-behavior: contain; }
+.manager-workspace button:focus-visible, .manager-task-transcript:focus-visible { outline: 2px solid #2563eb; outline-offset: -2px; }
+.actor-room-claim { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 0 0; color: #475569; font-size: 12px; }
+.actor-room-claim span { color: #64748b; }
+.actor-room-claim .secondary { width: auto; padding: 5px 8px; }
+.manager-conversation .actor-room-work { width: 100%; box-sizing: border-box; background: #f8fafc; }
+@media (768px <= width < 1080px) {
+  .manager-workspace { grid-template-columns: minmax(280px, .9fr) minmax(320px, 1.1fr); }
+}
+@media (width < 768px) {
+  .manager-workspace { grid-template-columns: minmax(0, 1fr); grid-template-rows: 42px minmax(0, 1fr); }
+  .manager-workspace-tabs { display: flex; gap: 4px; padding: 4px 52px; border-bottom: 1px solid #e2e8f0; background: #f8fafc; }
+  .manager-workspace-tabs button { padding: 4px 12px; border-radius: 6px; background: transparent; color: #64748b; cursor: pointer; }
+  .manager-workspace-tabs button[aria-pressed="true"] { color: #1d4ed8; background: #dbeafe; }
+  .manager-conversation, .manager-details { grid-row: 2; grid-column: 1; }
+  .manager-workspace[data-mobile-panel="details"] > .manager-conversation, .manager-workspace[data-mobile-panel="chat"] > .manager-details { display: none; }
+  .manager-conversation { border-right: 0; }
+  .manager-task-header, .manager-task-transcript { padding: 12px; }
+}

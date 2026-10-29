@@ -73,6 +73,11 @@ export function saveUploadedAttachments(
   return saved;
 }
 
+export function formatStoredUserInput(message: string, attachments: Pick<SavedAttachment, "name" | "mimeType" | "size">[]) {
+  const attachmentLines = attachments.map((attachment) => `- ${attachment.name} (${attachment.mimeType}, ${attachment.size} bytes)`);
+  return `${message}\n\n[Attached files]\n${attachmentLines.join("\n")}`;
+}
+
 export function loadSavedAttachments(uploadDir: string, turnId: string): SavedAttachment[] {
   const targetDir = resolve(uploadDir, safePathSegment(turnId));
   const manifest = resolve(targetDir, "attachments.json");

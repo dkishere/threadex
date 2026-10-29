@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { CLIENT_EVENT_TYPES, EVENT_STATE_FIELDS, encodeEventStateVersions, type EventStateVersions } from "../eventProtocol";
+import { CLIENT_EVENT_TYPES, EVENT_STATE_FIELDS, encodeEventStateVersions, normalizeSubagentActivity, type EventStateVersions } from "../eventProtocol";
 import type { RingEvent } from "./eventRingLog";
 
 const clientTypes = new Set<string>(CLIENT_EVENT_TYPES);
@@ -31,15 +31,27 @@ export function clientEvent(event: RingEvent): RingEvent | null {
   let payload: unknown = null;
   switch (event.type) {
     // These are displayed directly; do not truncate approval questions,
-    // instructions or Todo state. All other types only invalidate local state.
+    // instructions or Todo state. Resolutions retain the final decision for
+    // transcript cards; the remaining types only invalidate local state.
     case "runner.approval.requested":
     case "runner.developer_instructions":
     case "todo.changed":
       payload = event.payload;
       break;
-    case "runner.approval.resolved": payload = { approvalId: data.approvalId }; break;
+    case "runner.approval.resolved": payload = { approvalId: data.approvalId,
+      ...(data.decision !== undefined ? { decision: data.decision } : {}),
+      ...(data.expired === true ? { expired: true } : {}),
+      ...(typeof data.error === "string" ? { error: data.error } : {}) }; break;
     case "runner.runner.callback_error": payload = { event: data.event }; break;
     case "session.title.updated": payload = { title: data.title }; break;
+    case "runner.subagent_activity": {
+      // Liveness for list/status views; text and tool detail stay on runner SSE.
+      const activity = normalizeSubagentActivity(event.payload, event.timestamp);
+      if (activity) payload = Object.fromEntries(Object.entries({ agentId: activity.agentId, kind: activity.kind, seq: activity.seq, at: activity.at,
+        status: activity.status, elapsedMs: activity.elapsedMs, lastActivityAt: activity.lastActivityAt,
+        processAlive: activity.processAlive, waiting: activity.waiting }).filter(([, value]) => value !== undefined));
+      break;
+    }
   }
   return { ...event, payload };
 }
