@@ -59,12 +59,25 @@ export function resolveApprovalSettings(approvalPolicy = defaultThreadOptions.ap
   };
 }
 
-export function buildSandboxPolicy(cwd: string): AppServerSandboxPolicy {
-  if (defaultThreadOptions.sandbox === "danger-full-access") {
+/**
+ * "Full access" (approval never) means no approval prompts and no sandbox, as in the Codex CLI:
+ * a sandboxed turn that can never ask cannot reach Docker, the network or paths outside cwd.
+ * An operator-configured read-only sandbox still wins.
+ */
+export function sandboxModeForApprovalPolicy(
+  approvalPolicy: string | undefined = defaultThreadOptions.approvalPolicy,
+  configuredSandbox: AppServerThreadOptions["sandbox"] = defaultThreadOptions.sandbox
+): AppServerThreadOptions["sandbox"] {
+  if (configuredSandbox === "read-only") return "read-only";
+  return approvalPolicy === "never" ? "danger-full-access" : configuredSandbox;
+}
+
+export function buildSandboxPolicy(cwd: string, sandbox: AppServerThreadOptions["sandbox"] = defaultThreadOptions.sandbox): AppServerSandboxPolicy {
+  if (sandbox === "danger-full-access") {
     return { type: "dangerFullAccess" };
   }
 
-  if (defaultThreadOptions.sandbox === "read-only") {
+  if (sandbox === "read-only") {
     return { type: "readOnly", networkAccess: false };
   }
 

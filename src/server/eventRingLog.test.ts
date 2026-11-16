@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import fs, { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
@@ -112,6 +113,68 @@ test("keeps only the latest replay state for progressive runner items", async ()
     assert.equal((log.entries[0]?.payload as { aggregatedOutput?: string }).aggregatedOutput, "output-299");
     assert.equal(loadEventRing(target.path, 128).length, 1);
     assert.ok(statSync(target.path).size < 10_000);
+  } finally {
+    target.cleanup();
+  }
+});
+
+test("large rings compact and reload when whole-log string I/O exceeds the engine limit", async t => {
+  const target = fixture();
+  const read = fs.readFileSync;
+  const write = fs.writeFileSync;
+  // Scale down the string limit so this regression does not need a 512 MiB fixture.
+  const stringLimit = 32 * 1024;
+  const readMock = t.mock.method(fs, "readFileSync", (...args: Parameters<typeof read>) => {
+    if (args[0] === target.path && args[1] === "utf8" && statSync(target.path).size > stringLimit) {
+      throw new RangeError("Invalid string length");
+    }
+    return read(...args);
+  });
+  const writeMock = t.mock.method(fs, "writeFileSync", (...args: Parameters<typeof write>) => {
+    if (typeof args[1] === "string" && args[1].length > stringLimit) {
+      throw new RangeError("Invalid string length");
+    }
+    return write(...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    const log = new EventRingLog(target.path, 8);
+    for (let index = 0; index < 12; index++) {
+      await log.append({ ...event(index), payload: { padding: "x".repeat(8 * 1024) } });
+    }
+    assert.ok(statSync(target.path).size > stringLimit);
+    assert.deepEqual(log.entries.map(entry => entry.pos), [5, 6, 7, 8, 9, 10, 11, 12]);
+
+    const reloaded = new EventRingLog(target.path, 8);
+    assert.deepEqual(reloaded.entries, log.entries, "reloading must preserve payloads and replay positions");
+    assert.equal(await reloaded.append(event(11)), false, "reloading must preserve deduplication");
+    await reloaded.append(event(12));
+    await reloaded.append(event(13));
+    assert.equal(reloaded.latestPosition, 14, "compaction must allow subsequent publication");
+    assert.deepEqual(loadEventRing(target.path, 8), reloaded.entries);
+    assert.equal(statSync(target.path).mode & 0o777, 0o600);
+  } finally {
+    readMock.mock.restore();
+    writeMock.mock.restore();
+    syncBuiltinESMExports();
+    target.cleanup();
+  }
+});
+
+test("chunked reads preserve UTF-8, multi-chunk records and valid entries around malformed lines", () => {
+  const target = fixture();
+  try {
+    const first = { ...event(1), pos: 1, payload: { text: "🧵香港".repeat(20_000) } };
+    const second = { ...event(2), pos: 2 };
+    // Align a multi-byte character across the 64 KiB read boundary.
+    const prefix = JSON.stringify(first).indexOf("🧵");
+    const padding = " ".repeat(64 * 1024 - prefix - 1);
+    writeFileSync(target.path, `${padding}${JSON.stringify(first)}\n{broken}\n${JSON.stringify(second)}`, "utf8");
+
+    const log = new EventRingLog(target.path, 8);
+    assert.deepEqual(log.entries, [first, second]);
+    assert.deepEqual(loadEventRing(target.path, 8), [first, second]);
+    assert.ok(readFileSync(target.path, "utf8").endsWith("\n"), "startup must repair a missing final newline");
   } finally {
     target.cleanup();
   }

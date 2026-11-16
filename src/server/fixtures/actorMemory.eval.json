@@ -98,5 +98,79 @@
       "Memory is returned unchanged.",
       "No filler such as 'no impact on this actor' is added."
     ]
+  },
+  {
+    "id": "digest-supersede",
+    "description": "Collective digest: an ordinary session changed a rule this actor recorded, without any actor event.",
+    "memory": {
+      "rolePrompt": "Owns the session list and its sorting.", "roleSummary": "Session list and sorting.",
+      "longTerm": "{\"standingDecisions\":[\"The session list sorts by creation time, newest first (tx_a).\",\"Archived sessions are hidden from the session list (tx_b).\"]}",
+      "rolling": ""
+    },
+    "summaries": [
+      { "sessionId": "s_plain1", "turnId": "t4", "completedAt": "2026-11-01T10:00:00.000Z", "changedFiles": ["src/client/SessionList.tsx"],
+        "summary": "The user decided the session list must sort by last activity instead of creation time; the sort was changed in SessionList.tsx and verified in the browser. Nothing is left open." }
+    ],
+    "context": { "relation": "digest", "tree": { "parent": null, "subActors": [] }, "projectId": "p1" },
+    "rubric": [
+      "standingDecisions says the session list sorts by last activity, citing s_plain1; the creation-time entry is removed or rewritten, never kept beside it.",
+      "The archived-sessions decision is unchanged."
+    ]
+  },
+  {
+    "id": "digest-rolling-completed",
+    "description": "Collective digest: a summary shows a rolling todo was finished in another session.",
+    "memory": {
+      "rolePrompt": "Owns export and upload flows.", "roleSummary": "Export and upload flows.",
+      "longTerm": "",
+      "rolling": "Unfinished: add retry with backoff to the export upload (tx_c)."
+    },
+    "summaries": [
+      { "sessionId": "s_plain2", "turnId": "t9", "completedAt": "2026-11-01T11:00:00.000Z", "changedFiles": ["src/server/exportUpload.ts", "src/server/exportUpload.test.ts"],
+        "summary": "Added retry with exponential backoff to the export upload and a unit test for it; tests passed. Nothing is left unfinished." }
+    ],
+    "context": { "relation": "digest", "tree": { "parent": null, "subActors": [] }, "projectId": "p1" },
+    "rubric": [
+      "The export upload retry todo is removed from rolling, or compressed into one sentence saying it is done.",
+      "No per-run test counts are added."
+    ]
+  },
+  {
+    "id": "digest-rolling-open",
+    "description": "Collective digest: unrelated summaries must not clear a still-open rolling todo.",
+    "memory": {
+      "rolePrompt": "Owns the public REST API.", "roleSummary": "Public REST API.",
+      "longTerm": "{\"standingDecisions\":[\"List endpoints return at most 100 items (tx_d).\"]}",
+      "rolling": "Waiting for the user to choose cursor or offset pagination for /api/sessions (tx_d)."
+    },
+    "summaries": [
+      { "sessionId": "s_plain3", "turnId": "t2", "completedAt": "2026-11-01T12:00:00.000Z", "changedFiles": ["src/client/Theme.css"],
+        "summary": "Adjusted dark-mode colours of the sidebar. Nothing is left open." },
+      { "sessionId": "s_plain4", "turnId": "t5", "completedAt": "2026-11-01T12:30:00.000Z", "changedFiles": ["docs/setup.md"],
+        "summary": "Rewrote the local setup guide for the new Node version." }
+    ],
+    "context": { "relation": "digest", "tree": { "parent": null, "subActors": [] }, "projectId": "p1" },
+    "rubric": [
+      "longTerm and rolling are returned exactly as given; the pagination todo stays.",
+      "No filler such as 'no impact on this actor' is added."
+    ]
+  },
+  {
+    "id": "digest-foreign-details",
+    "description": "Collective digest: another actor's task carries one fact this actor needs among details it must not copy.",
+    "memory": {
+      "rolePrompt": "Owns the transcript UI.", "roleSummary": "Transcript UI.",
+      "longTerm": "{\"methods\":[\"Transcript items read turn.agentResponse from GET /api/sessions/:id/turns (tx_e).\"]}",
+      "rolling": ""
+    },
+    "summaries": [
+      { "sessionId": "tx_backend", "turnId": "t1", "completedAt": "2026-11-01T13:00:00.000Z", "changedFiles": ["src/server/sessionStore.ts", "migrations/0042_rename.sql"],
+        "summary": "The backend actor ran migration 0042 in three steps (add column, backfill, drop old column) and renamed the turns API field agentResponse to responseText; the old field is no longer returned. Load test of 5000 turns passed." }
+    ],
+    "context": { "relation": "digest", "tree": { "parent": null, "subActors": [] }, "projectId": "p1" },
+    "rubric": [
+      "longTerm records that the turns API field is now responseText (agentResponse removed), citing tx_backend, and updates the methods entry instead of keeping the old field name.",
+      "The migration steps and load-test numbers are not copied."
+    ]
   }
 ]

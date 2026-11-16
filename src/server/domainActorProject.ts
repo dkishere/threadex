@@ -58,11 +58,22 @@ export function resolveActorTaskBinding(workspace: { id: string; cwd: string }, 
   }));
   const matches = [...pathMatches, ...named, ...repositories];
   const unique = [...new Map(matches.map(entry => [JSON.stringify([entry.project.id, entry.cwd]), entry])).values()];
-  if (unique.length > 1) throw new Error("This message refers to multiple project roots. Select the project for the actor task before sending.");
   if (unique.length === 1) return binding(unique[0], "message");
   // Membership is a default only for an individual actor; never choose an
   // arbitrary project from a worker that belongs to several project chats.
   const defaults = [...new Set(defaultProjectIds)];
+  if (unique.length > 1) {
+    // Several referenced roots are ordinary message content for an actor that
+    // knows its own project; its references only choose among that project's roots.
+    const actorProjects = defaults.filter(id => entries.some(entry => entry.project.id === id));
+    const referenced = unique.filter(entry => actorProjects.includes(entry.project.id));
+    if (referenced.length === 1) return binding(referenced[0], "message");
+    const referencedProjects = [...new Set(referenced.map(entry => entry.project.id))];
+    const projectId = actorProjects.length === 1 ? actorProjects[0] : referencedProjects.length === 1 ? referencedProjects[0] : undefined;
+    if (projectId) return binding(entries.find(entry => entry.project.id === projectId)!, "actor");
+    if (actorProjects.length > 1) throw new Error("This actor belongs to multiple projects. Select the project for the actor task before sending.");
+    throw new Error("This message refers to multiple project roots. Select the project for the actor task before sending.");
+  }
   if (defaults.length > 1) throw new Error("This actor belongs to multiple projects. Select the project for the actor task before sending.");
   if (defaults.length === 1) {
     const entry = entries.find(entry => entry.project.id === defaults[0]);

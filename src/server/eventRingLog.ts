@@ -1,9 +1,12 @@
 import {
   appendFileSync,
+  closeSync,
   existsSync,
   mkdirSync,
-  readFileSync,
+  openSync,
+  readSync,
   renameSync,
+  rmSync,
   statSync,
   writeFileSync
 } from "node:fs";
@@ -117,8 +120,16 @@ export class EventRingLog {
         this.compact();
         return;
       }
-      const contents = readFileSync(this.path, "utf8");
-      if (contents.length > 0 && !contents.endsWith("\n")) this.compact();
+      if (fileBytes > 0) {
+        const descriptor = openSync(this.path, "r");
+        const lastByte = Buffer.allocUnsafe(1);
+        try {
+          readSync(descriptor, lastByte, 0, 1, fileBytes - 1);
+        } finally {
+          closeSync(descriptor);
+        }
+        if (lastByte[0] !== 0x0a) this.compact();
+      }
     } catch {
       // A later append will surface any real filesystem error.
     }
@@ -127,11 +138,20 @@ export class EventRingLog {
   private compact() {
     mkdirSync(dirname(this.path), { recursive: true });
     const temporaryPath = `${this.path}.${process.pid}.tmp`;
-    const contents = this.entriesValue.length > 0
-      ? `${this.entriesValue.map((entry) => JSON.stringify(entry)).join("\n")}\n`
-      : "";
-    writeFileSync(temporaryPath, contents, { encoding: "utf8", mode: 0o600 });
-    renameSync(temporaryPath, this.path);
+    try {
+      const descriptor = openSync(temporaryPath, "w", 0o600);
+      try {
+        // The retained ring can exceed V8's string limit even when each event is small.
+        for (const entry of this.entriesValue) {
+          writeFileSync(descriptor, `${JSON.stringify(entry)}\n`, "utf8");
+        }
+      } finally {
+        closeSync(descriptor);
+      }
+      renameSync(temporaryPath, this.path);
+    } finally {
+      rmSync(temporaryPath, { force: true });
+    }
     this.staleWritesSinceCompaction = 0;
   }
 }
@@ -140,41 +160,40 @@ export function loadEventRing(path: string, capacity: number): RingEvent[] {
   if (!existsSync(path)) return [];
 
   try {
-    const parsed = readFileSync(path, "utf8")
-      .split("\n")
-      .filter(Boolean)
-      .flatMap((line) => {
-        try {
-          const event = JSON.parse(line) as Partial<RingEvent> & {
-            id?: unknown;
-            data?: unknown;
-            createdAt?: unknown;
-          };
-          const pos = typeof event.pos === "number" && Number.isSafeInteger(event.pos) && event.pos > 0
-            ? event.pos
-            : null;
-          const eventId = typeof event.eventId === "string"
-            ? event.eventId
-            : typeof event.id === "string" ? event.id : null;
-          const timestamp = typeof event.timestamp === "string"
-            ? event.timestamp
-            : typeof event.createdAt === "string" ? event.createdAt : null;
-          if (pos === null || !eventId || typeof event.type !== "string" || !timestamp) return [];
-          return [{
-            pos,
-            eventId,
-            type: event.type,
-            workspaceId: typeof event.workspaceId === "string" ? event.workspaceId : null,
-            sessionId: typeof event.sessionId === "string" ? event.sessionId : null,
-            turnId: typeof event.turnId === "string" ? event.turnId : null,
-            payload: "payload" in event ? event.payload : event.data ?? null,
-            timestamp
-          } satisfies RingEvent];
-        } catch {
-          return [];
-        }
-      })
-      .sort((left, right) => left.pos - right.pos);
+    const parsed: RingEvent[] = [];
+    for (const line of eventRingLines(path)) {
+      if (!line) continue;
+      try {
+        const event = JSON.parse(line) as Partial<RingEvent> & {
+          id?: unknown;
+          data?: unknown;
+          createdAt?: unknown;
+        };
+        const pos = typeof event.pos === "number" && Number.isSafeInteger(event.pos) && event.pos > 0
+          ? event.pos
+          : null;
+        const eventId = typeof event.eventId === "string"
+          ? event.eventId
+          : typeof event.id === "string" ? event.id : null;
+        const timestamp = typeof event.timestamp === "string"
+          ? event.timestamp
+          : typeof event.createdAt === "string" ? event.createdAt : null;
+        if (pos === null || !eventId || typeof event.type !== "string" || !timestamp) continue;
+        parsed.push({
+          pos,
+          eventId,
+          type: event.type,
+          workspaceId: typeof event.workspaceId === "string" ? event.workspaceId : null,
+          sessionId: typeof event.sessionId === "string" ? event.sessionId : null,
+          turnId: typeof event.turnId === "string" ? event.turnId : null,
+          payload: "payload" in event ? event.payload : event.data ?? null,
+          timestamp
+        });
+      } catch {
+        // Ignore a malformed record without losing the rest of the replay log.
+      }
+    }
+    parsed.sort((left, right) => left.pos - right.pos);
     const seenEventIds = new Set<string>();
     const seenPositions = new Set<number>();
     const unique = parsed
@@ -196,6 +215,39 @@ export function loadEventRing(path: string, capacity: number): RingEvent[] {
       .slice(-capacity);
   } catch {
     return [];
+  }
+}
+
+/** Decode one JSONL record at a time, including UTF-8 split across read boundaries. */
+function* eventRingLines(path: string): Generator<string> {
+  const descriptor = openSync(path, "r");
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  let fragments: Buffer[] = [];
+  let fragmentBytes = 0;
+  try {
+    let bytesRead: number;
+    while ((bytesRead = readSync(descriptor, buffer, 0, buffer.length, null)) > 0) {
+      const chunk = buffer.subarray(0, bytesRead);
+      let start = 0;
+      let end: number;
+      while ((end = chunk.indexOf(0x0a, start)) >= 0) {
+        const fragment = chunk.subarray(start, end);
+        yield fragments.length > 0
+          ? Buffer.concat([...fragments, fragment], fragmentBytes + fragment.length).toString("utf8")
+          : fragment.toString("utf8");
+        fragments = [];
+        fragmentBytes = 0;
+        start = end + 1;
+      }
+      if (start < bytesRead) {
+        const fragment = Buffer.from(chunk.subarray(start));
+        fragments.push(fragment);
+        fragmentBytes += fragment.length;
+      }
+    }
+    if (fragments.length > 0) yield Buffer.concat(fragments, fragmentBytes).toString("utf8");
+  } finally {
+    closeSync(descriptor);
   }
 }
 

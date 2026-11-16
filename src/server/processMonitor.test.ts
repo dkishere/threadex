@@ -136,7 +136,7 @@ test("parameterized commands persist definitions and run values, with literal ar
 test("temporary PID monitors disappear after the process exits", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "process-monitor-test-"));
   const store = new SessionStore(resolve(root, "sessions.postgres"));
-  const service = new ProcessMonitorService(store);
+  const service = new ProcessMonitorService(store, { completedRetentionMs: 0 });
   try {
     await store.ready();
     const workspace = await store.getActiveWorkspace();
@@ -692,6 +692,7 @@ test("every completed process publishes the exit hook without requiring a wake p
   const store = new SessionStore(resolve(root, "sessions.postgres"));
   let exitedMonitorId: string | null = null;
   const service = new ProcessMonitorService(store, {
+    completedRetentionMs: 0,
     onExit: async (monitor) => {
       exitedMonitorId = monitor.id;
       assert.equal(monitor.status, "exited");
@@ -720,6 +721,7 @@ for (const mode of ["managed", "attached", "wake"] as const) {
     const store = new SessionStore(resolve(root, "sessions.postgres"));
     let woke = false;
     const service = new ProcessMonitorService(store, {
+      completedRetentionMs: 0,
       onWake: async ({ monitor }) => {
         assert.ok(await store.getProcessMonitor(monitor.id));
         woke = true;
@@ -753,6 +755,97 @@ for (const mode of ["managed", "attached", "wake"] as const) {
     }
   });
 }
+
+test("finished one-off monitors stay inspectable briefly, then expire with their log while services persist", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "process-monitor-retention-test-"));
+  const store = new SessionStore(resolve(root, "sessions.postgres"));
+  const logDir = resolve(root, "logs");
+  const completedRetentionMs = 400;
+  const service = new ProcessMonitorService(store, { logDir, completedRetentionMs });
+  try {
+    await store.ready();
+    const workspace = await store.getActiveWorkspace();
+    const oneOff = await service.monitor(workspace, {
+      label: "one-off verification",
+      exe: process.execPath,
+      args: ["-e", "console.log('verification-output'); process.exitCode = 3"]
+    });
+    const longRunningService = await service.monitor(workspace, {
+      label: "long-running service",
+      removeOnExit: false,
+      exe: process.execPath,
+      args: ["-e", "setTimeout(() => {}, 25)"]
+    });
+    const stoppedOneOff = await service.monitor(workspace, {
+      label: "stopped one-off",
+      exe: process.execPath,
+      args: ["-e", "setTimeout(() => {}, 60000)"]
+    });
+    await service.stopProcess(workspace.id, stoppedOneOff.id);
+    await waitFor(async () => (await store.getProcessMonitor(oneOff.id))?.status === "exited", 2_000);
+    await waitFor(async () => (await store.getProcessMonitor(longRunningService.id))?.status === "exited", 2_000);
+
+    const finished = (await service.list(workspace.id)).find((record) => record.id === oneOff.id);
+    assert.equal(finished?.lastExitCode, 3);
+    assert.match((await service.readLog(workspace.id, oneOff.id)).content, /verification-output/);
+    assert.ok(existsSync(resolve(logDir, `${encodeURIComponent(oneOff.id)}.log`)));
+
+    await new Promise((resolveWait) => setTimeout(resolveWait, completedRetentionMs + 50));
+    const remaining = (await service.list(workspace.id)).map((record) => record.id);
+    assert.deepEqual(remaining, [longRunningService.id]);
+    assert.equal(await store.getProcessMonitor(oneOff.id), null);
+    assert.equal(await store.getProcessMonitor(stoppedOneOff.id), null);
+    assert.equal(existsSync(resolve(logDir, `${encodeURIComponent(oneOff.id)}.log`)), false);
+    assert.equal((await service.restart(workspace, longRunningService.id)).status, "running");
+    await waitFor(async () => (await store.getProcessMonitor(longRunningService.id))?.status === "exited", 2_000);
+  } finally {
+    service.stop();
+    await store.close();
+  }
+});
+
+test("a relaunched service replaces only finished service monitors for the same endpoint in its workspace", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "process-monitor-supersede-test-"));
+  const store = new SessionStore(resolve(root, "sessions.postgres"));
+  const service = new ProcessMonitorService(store, { logDir: resolve(root, "logs") });
+  const longLivedArgs = ["-e", "setTimeout(() => {}, 60000)"];
+  try {
+    await store.ready();
+    const workspace = await store.getActiveWorkspace();
+    const otherWorkspace = await store.upsertWorkspace({ id: "other-workspace", name: "Other workspace", codexHome: resolve(root, "codex-other"), cwd: workspace.cwd });
+    const launchService = (target: typeof workspace, label: string, entryPoints: string[], removeOnExit = false) => service.monitor(target, {
+      label, removeOnExit, exe: process.execPath, args: longLivedArgs, entryPoints
+    });
+    const runningSameEndpoint = await launchService(workspace, "Workbench still running", ["http://localhost:8084/other"]);
+    const staleWorkbench = await launchService(workspace, "Workbench old session", ["http://127.0.0.1:8084/__bdd/"]);
+    await service.stopProcess(workspace.id, staleWorkbench.id);
+    const staleFrontend = await launchService(workspace, "Frontend 8085", ["http://127.0.0.1:8085/"]);
+    await service.stopProcess(workspace.id, staleFrontend.id);
+    const otherWorkspaceWorkbench = await launchService(otherWorkspace, "Workbench other workspace", ["http://127.0.0.1:8084/__bdd/"]);
+    await service.stopProcess(otherWorkspace.id, otherWorkspaceWorkbench.id);
+    const registeredCommand = await service.monitor(workspace, {
+      label: "Registered workbench", registerOnly: true, exe: process.execPath, args: longLivedArgs, entryPoints: ["http://127.0.0.1:8084/"]
+    });
+
+    // A one-off verification that links to the endpoint does not replace the service.
+    const oneOff = await launchService(workspace, "Verification against 8084", ["http://127.0.0.1:8084/__bdd/"], true);
+    assert.ok(await store.getProcessMonitor(staleWorkbench.id));
+
+    const relaunched = await launchService(workspace, "Workbench new session", ["http://127.0.0.1:8084/__bdd/#scenario=demo"]);
+    assert.equal(await store.getProcessMonitor(staleWorkbench.id), null);
+    assert.equal((await store.getProcessMonitor(runningSameEndpoint.id))?.status, "running");
+    assert.equal((await store.getProcessMonitor(staleFrontend.id))?.status, "stopped");
+    assert.equal((await store.getProcessMonitor(otherWorkspaceWorkbench.id))?.status, "stopped");
+    assert.equal((await store.getProcessMonitor(registeredCommand.id))?.status, "available");
+
+    // Restarting the retained frontend monitor keeps it, rather than creating another.
+    assert.equal((await service.restart(workspace, staleFrontend.id)).status, "running");
+    for (const monitor of [runningSameEndpoint, staleFrontend, oneOff, relaunched]) await service.remove(workspace.id, monitor.id);
+  } finally {
+    service.stop();
+    await store.close();
+  }
+});
 
 async function waitFor(predicate: () => Promise<boolean>, timeoutMs: number) {
   const deadline = Date.now() + timeoutMs;

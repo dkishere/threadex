@@ -109,20 +109,50 @@ export const claudeCredentialStore: ClaudeCredentialStore = {
   }
 };
 
+// A one-way fingerprint of the source login a home was seeded from; never a usable credential.
+function fingerprint(credentials: Credentials | null) {
+  return credentials ? createHash("sha256")
+    .update(JSON.stringify([credentials.claudeAiOauth.accessToken, credentials.claudeAiOauth.refreshToken ?? ""])).digest("hex") : "";
+}
+
+function readSeed(home: string) {
+  try { return readFileSync(resolve(home, ".threadex-auth-seed"), "utf8"); }
+  catch { return null; }
+}
+
+function writeSeed(home: string, credentials: Credentials | null) {
+  writeFileSync(resolve(home, ".threadex-auth-seed"), fingerprint(credentials), { mode: 0o600 });
+}
+
+function isRefreshOf(next: Credentials, previous: Credentials) {
+  return fingerprint(next) !== fingerprint(previous) &&
+    (next.claudeAiOauth.expiresAt ?? 0) >= (previous.claudeAiOauth.expiresAt ?? 0);
+}
+
 /** Call inside the runner, so no credentials enter job files or runner events. */
 export function prepareClaudeHome(home: string, sourceHome: string, store = claudeCredentialStore) {
   if (resolve(home) === resolve(sourceHome)) throw new Error("Claude execution home must be separate from its authentication home.");
   mkdirSync(home, { recursive: true, mode: 0o700 });
-  const initial = store.read(sourceHome);
-  store.write(home, initial);
+  const source = store.read(sourceHome);
+  const local = store.read(home);
+  // Refresh tokens rotate. A home is shared by a workspace's overlapping turns and a killed
+  // runner never syncs, so the home can hold the only valid token. Seeding the older source
+  // over it would revoke the login; promote it instead while the source is still its seed.
+  if (source && local && readSeed(home) === fingerprint(source) && isRefreshOf(local, source)) {
+    store.write(sourceHome, local);
+    writeSeed(home, local);
+  } else {
+    store.write(home, source);
+    writeSeed(home, source);
+  }
   return {
     syncAuth() {
       const refreshed = store.read(home);
       const current = store.read(sourceHome);
-      // A logout, relogin or another runner's refresh wins over this old turn.
-      if (!initial || JSON.stringify(current) !== JSON.stringify(initial) || !refreshed) return;
-      if (JSON.stringify(refreshed) !== JSON.stringify(initial) &&
-        (refreshed.claudeAiOauth.expiresAt ?? 0) >= (initial.claudeAiOauth.expiresAt ?? 0)) store.write(sourceHome, refreshed);
+      // A logout, relogin or another home's refresh wins over this home's lineage.
+      if (!current || !refreshed || readSeed(home) !== fingerprint(current) || !isRefreshOf(refreshed, current)) return;
+      store.write(sourceHome, refreshed);
+      writeSeed(home, refreshed);
     }
   };
 }

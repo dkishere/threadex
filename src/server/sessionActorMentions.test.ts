@@ -8,9 +8,9 @@ import { createDecisionPolicy } from "./decision/policy";
 import { durableDecision } from "./decision/service";
 import { fakeBackend } from "./decision/fake";
 import type { DecisionRequest, DecisionResult } from "./decision/types";
-import { actorSessionWork } from "./actorNativeAgents";
+import { actorSessionWork, actorSplitHostContext } from "./actorNativeAgents";
 import { orderedMentionedActors, sessionActorMentionFailure, sessionActorMentionPayload, type SessionActorMentionResponse, type SessionMentionCandidatesResponse } from "../client/sessionActorMentions";
-import { resolveSessionMentionScope, SessionMentionError, sessionMentionCandidates, sessionMentionProject, sessionMentionRequest, sessionMentionResult } from "./sessionActorMentions";
+import { resolveSessionMentionScope, SessionMentionError, sessionMentionCandidates, sessionMentionComposerModel, sessionMentionProject, sessionMentionRequest, sessionMentionResult, sessionMentionUserPrompt } from "./sessionActorMentions";
 
 // Routing and validation of Composer @mentions in an ordinary session (docs/session-actor-mentions.md).
 const memory = { rolePrompt: "Build products", roleSummary: "Product", longTerm: "Promise", rolling: "Recent" };
@@ -56,6 +56,30 @@ function harness(respond?: DomainActorDependencies["respond"], planClaims?: Doma
   };
   return { service, purposes, speakers, starts, create };
 }
+test("a turn dispatched by a Composer @mention in this session counts as the user's own message", () => {
+  const room = { rounds: [{ id: "r1", userPrompt: "@Maomao restore them", sessionTarget: { sessionId: "tx_s" } }, { id: "r2", userPrompt: "Actors room request" },
+    { id: "r3", userPrompt: "@Kurumi check it", sessionTarget: { sessionId: "tx_s", hostWorkItemId: "bound" } }],
+  workItems: [{ id: "host", roundId: "r3", taskSessionId: "tx_s", taskTurnId: "host-turn", sessionScope: "turn", allocationId: "session-host" },
+    { id: "bound", roundId: "r2", taskSessionId: "tx_s", taskTurnId: "task-turn" }] } as never;
+  const turn = (sourceRoundId: string, trigger = "decision-dispatch") => ({ requestMetadata: { promptOrigin: { kind: "inter-actor", trigger, sourceRoundId } } });
+  assert.equal(sessionMentionUserPrompt(room, "tx_s", turn("r1")), "@Maomao restore them");
+  assert.equal(sessionMentionUserPrompt(room, "tx_other", turn("r1")), undefined, "only a mention made in this session");
+  assert.equal(sessionMentionUserPrompt(room, "tx_s", turn("r2")), undefined, "a round without a session target is not a mention here");
+  assert.equal(sessionMentionUserPrompt(room, "tx_s", turn("r1", "handoff")), undefined, "actor-written prompts never qualify");
+  assert.equal(sessionMentionUserPrompt(room, "tx_s", { id: "host-turn", requestMetadata: { backgroundTask: true } }), "@Kurumi check it",
+    "an in-place mention host turn has no origin and is found by its reserved turn");
+  assert.equal(sessionMentionUserPrompt(room, "tx_other", { id: "host-turn" }), undefined);
+  assert.equal(sessionMentionUserPrompt(room, "tx_s", { id: "task-turn" }), undefined, "the task's own turns are not mention turns");
+});
+
+test("a mention send uses the Composer's gear, else the session's saved selection", () => {
+  const saved = { model: MODEL_CATALOG.luna.id, effort: "high" };
+  assert.deepEqual(sessionMentionComposerModel({ model: MODEL_CATALOG.sol.id, modelReasoningEffort: "low" }, saved), { model: MODEL_CATALOG.sol.id, effort: "low" });
+  assert.deepEqual(sessionMentionComposerModel({ model: MODEL_CATALOG.sol.id }, saved), { model: MODEL_CATALOG.sol.id });
+  assert.deepEqual(sessionMentionComposerModel({ model: "auto", modelReasoningEffort: "low" }, saved), saved, "Auto or an unknown model keeps the saved selection");
+  assert.deepEqual(sessionMentionComposerModel(undefined, saved), saved);
+});
+
 const scopeOf = async (service: DomainActorService, session = { id: "tx_user", workspaceId: "ws", cwd: "/repo/web-ui" }) =>
   resolveSessionMentionScope({ session, projects, room: await service.getRoom("ws"), model: MODEL_CATALOG.luna.id });
 const body = (mentionedActorIds: unknown, extra: Record<string, unknown> = {}) => ({ requestId: "req-1", message: "@a @b fix the API and UI", mentionedActorIds, ...extra });
@@ -103,13 +127,142 @@ test("invalid mentions fail with a clear error and never fall back", async () =>
   rejects(() => resolveSessionMentionScope({ session: null, projects, room: scope.room, model: "" }), 404, "session_not_found");
 });
 
-test("a session already bound to an actor task cannot take mentions", async () => {
+test("an actor task session takes mentions of other workers; its own actor stays the host", async () => {
   const h = harness();
-  await h.create("a");
+  await h.create("a"); await h.create("b");
   await h.service.submit({ workspaceId: "ws", requestId: "group", userPrompt: "Fix it", namedActorIds: ["a"] }, binding);
-  const taskSession = (await h.service.getRoom("ws")).workItems[0].taskSessionId;
-  await assert.rejects(scopeOf(h.service, { id: taskSession, workspaceId: "ws", cwd: "/repo" }), (error: unknown) =>
-    error instanceof SessionMentionError && error.code === "session_actor_bound");
+  const bound = (await h.service.getRoom("ws")).workItems[0];
+  const scope = await scopeOf(h.service, { id: bound.taskSessionId, workspaceId: "ws", cwd: "/repo" });
+  assert.deepEqual(scope.host, { workItemId: bound.id, actorId: "a" });
+  assert.deepEqual(sessionMentionCandidates(scope).map(actor => actor.id), ["b"], "the session's own actor is not a candidate");
+  rejects(() => sessionMentionRequest(scope, body(["a"])), 400, "mention_invalid");
+  assert.equal(sessionMentionRequest(scope, body(["b"])).request.sessionTarget?.hostWorkItemId, bound.id);
+});
+
+test("a mention in an actor task session runs the mentioned actor as the session actor's native sub-agent", async () => {
+  const h = harness();
+  await h.create("a"); await h.create("b");
+  await h.service.submit({ workspaceId: "ws", requestId: "group", userPrompt: "Fix it", namedActorIds: ["a"] }, binding);
+  const bound = (await h.service.getRoom("ws")).workItems[0];
+  const scope = await scopeOf(h.service, { id: bound.taskSessionId, workspaceId: "ws", cwd: "/repo" });
+  const { request } = sessionMentionRequest(scope, body(["b"], { requestId: "in-task", message: "@b check the API" }));
+  const before = { speakers: h.speakers.length, purposes: h.purposes.length };
+  const round = await h.service.submit(request, binding);
+  assert.equal(h.speakers.length, before.speakers, "the named actor is not asked to reply or claim");
+  assert.equal(h.purposes.length, before.purposes, "no Decision runs");
+  assert.equal(round.status, "awaiting_pickup");
+  assert.equal(h.starts.length, 2);
+  const start = h.starts[1];
+  assert.equal(start.executor.id, "a", "the session's actor runs the mention turn");
+  assert.equal(start.sessionId, bound.taskSessionId);
+  assert.equal(start.workItem.sessionScope, "turn");
+  const room = await h.service.getRoom("ws");
+  const host = room.workItems.find(work => work.roundId === round.id && !work.hostWorkItemId)!;
+  const child = room.workItems.find(work => work.roundId === round.id && work.hostWorkItemId)!;
+  assert.equal(host.id, start.workItem.id);
+  assert.equal(child.hostWorkItemId, host.id);
+  assert.equal(child.executorActorId, "b");
+  assert.equal(child.model, MODEL_CATALOG.luna.id);
+  assert.equal(child.taskSessionId, bound.taskSessionId, "the mentioned actor never gets its own session");
+  assert.equal((await h.service.submit(request, binding)).id, round.id, "a retry of the same request reuses its round");
+  assert.equal(h.starts.length, 2);
+  assert.equal(actorSessionWork(room, bound.taskSessionId, host.taskTurnId)?.id, host.id, "the mention turn binds its host");
+  assert.equal(actorSessionWork(room, bound.taskSessionId, bound.taskTurnId)?.id, bound.id, "other turns keep the task binding");
+  assert.equal(actorSessionWork(room, bound.taskSessionId)?.id, bound.id);
+  assert.deepEqual(sessionMentionResult(room, round, bound.taskSessionId).turnIds, [host.taskTurnId]);
+  const split = await actorSplitHostContext({ room, host, hostActor: { name: "Name a" }, turnId: host.taskTurnId, runningSessions: [],
+    contextWindow: async () => 100_000, issue: async () => "token" });
+  assert.match(split?.instructions ?? "", /@mention host/);
+  assert.match(split?.instructions ?? "", /never actor_handoff/, "the actor context, not the message, tells the host to start them");
+  const listed = JSON.parse(split!.instructions.split("Split children (system data): ")[1]).children as { workItemId: string; name: string }[];
+  assert.deepEqual(listed.map(item => [item.workItemId, item.name]), [[child.id, child.nativeAgent!.name]]);
+  // In place: the host turn is the user's own message, verbatim, with no server-written brief or inter-actor origin.
+  assert.equal(start.userPrompt, "@b check the API");
+  assert.equal(host.preparedPrompt, "", "no template brief is generated for the host turn");
+  assert.equal(start.promptOrigin, undefined, "the host turn keeps the user's prompt identity");
+});
+
+test("a mention host turn runs with the session's selected effort; the mentioned sub-agent keeps its actor effort", async () => {
+  const h = harness();
+  await h.create("a"); await h.create("b");
+  await h.service.submit({ workspaceId: "ws", requestId: "group", userPrompt: "Fix it", namedActorIds: ["a"] }, binding);
+  const bound = (await h.service.getRoom("ws")).workItems[0];
+  const scope = resolveSessionMentionScope({ session: { id: bound.taskSessionId, workspaceId: "ws", cwd: "/repo" }, projects,
+    room: await h.service.getRoom("ws"), model: MODEL_CATALOG.luna.id, effort: "xhigh" });
+  const { request } = sessionMentionRequest(scope, body(["b"], { requestId: "gear", message: "@b verify it" }));
+  assert.equal(request.sessionTarget?.effort, "xhigh");
+  const round = await h.service.submit(request, binding);
+  const room = await h.service.getRoom("ws");
+  const host = room.workItems.find(work => work.roundId === round.id && !work.hostWorkItemId)!;
+  const child = room.workItems.find(work => work.roundId === round.id && work.hostWorkItemId)!;
+  assert.equal(host.executionEffort, "xhigh", "the user's session gear, not the actor's effort rule");
+  assert.notEqual(child.executionEffort, "xhigh");
+});
+
+test("a mention host hands off to its mentioned actor without an authorization judgment, and keeps it for other actors", async () => {
+  const h = harness();
+  await h.create("a"); await h.create("b"); await h.create("c");
+  await h.service.submit({ workspaceId: "ws", requestId: "group", userPrompt: "Fix it", namedActorIds: ["a"] }, binding);
+  const bound = (await h.service.getRoom("ws")).workItems[0];
+  const scope = await scopeOf(h.service, { id: bound.taskSessionId, workspaceId: "ws", cwd: "/repo" });
+  const round = await h.service.submit(sessionMentionRequest(scope, body(["b"], { requestId: "in-task", message: "@b restore the stash" })).request, binding);
+  const host = (await h.service.getRoom("ws")).workItems.find(work => work.roundId === round.id && !work.hostWorkItemId)!;
+  assert.equal(host.sessionScope, "turn");
+  const handoff = (executorActorId: string, requestId: string) => h.service.delegateParallel({ workspaceId: "ws", workItemId: host.id, sourceActorId: "a",
+    sourceSessionId: bound.taskSessionId, priorUserPrompts: ["Earlier follow-up"], requestId, kind: "handoff", tasks: [{ executorActorId, task: "Restore the stash" }] });
+  // The harness Decision answers "deny" to every authorization question; a hosted handoff to the mentioned actor never asks one.
+  const result = await handoff("b", "to-mentioned");
+  assert.match(String(result.note), /native sub-agent of this session/, "a mention host hosts the handoff in this session");
+  const room = await h.service.getRoom("ws");
+  const saved = room.workItems.find(work => work.id === host.id)!.parallelRequests![0];
+  assert.equal(saved.userNamedExecutors, true);
+  assert.equal(saved.decision?.ok && saved.decision.answers.authorization, undefined, "no authorization question was asked");
+  assert.deepEqual(saved.userMessages, ["Fix it", "Earlier follow-up", "@b restore the stash"], "oldest first: the mention is the latest message");
+  const child = room.workItems.find(work => work.id === result.workItems[0].id)!;
+  assert.equal(child.hostWorkItemId, host.id); assert.equal(child.taskSessionId, bound.taskSessionId);
+  await assert.rejects(handoff("c", "to-other"), /Handoff was not authorized/, "an actor the user did not name still needs the request-scope judgment");
+  const parallel = (executorActorId: string, requestId: string) => h.service.delegateParallel({ workspaceId: "ws", workItemId: host.id, sourceActorId: "a",
+    sourceSessionId: bound.taskSessionId, requestId, tasks: [{ executorActorId, task: "Check the stash in parallel" }] });
+  assert.equal((await parallel("b", "parallel-mentioned")).status, "assigned", "concurrent work for the mentioned actor needs no authorization judgment either");
+  await assert.rejects(parallel("c", "parallel-other"), /Parallel delegation was not authorized/);
+});
+
+test("several mentions in an actor task session run directly as the session actor's sub-agents, without claims or allocation", async () => {
+  const h = harness();
+  await h.create("host"); await h.create("a"); await h.create("b");
+  await h.service.submit({ workspaceId: "ws", requestId: "group", userPrompt: "Fix it", namedActorIds: ["host"] }, binding);
+  const bound = (await h.service.getRoom("ws")).workItems[0];
+  const scope = await scopeOf(h.service, { id: bound.taskSessionId, workspaceId: "ws", cwd: "/repo" });
+  const round = await h.service.submit(sessionMentionRequest(scope, body(["a", "b"], { requestId: "in-task-multi" })).request, binding);
+  assert.deepEqual(h.speakers, ["host"], "only the earlier group round asked an actor to reply");
+  assert.equal(round.allocation, undefined);
+  assert.deepEqual(h.starts.slice(1).map(start => start.executor.id), ["host"], "only the session actor's turn is queued");
+  const room = await h.service.getRoom("ws");
+  const host = room.workItems.find(work => work.roundId === round.id && !work.hostWorkItemId)!;
+  assert.equal(host.executorActorId, "host");
+  assert.deepEqual(room.workItems.filter(work => work.hostWorkItemId === host.id).map(work => work.executorActorId), ["a", "b"]);
+});
+
+test("a hosted mention refuses the session's own actor and a stale host", async () => {
+  const h = harness();
+  await h.create("a"); await h.create("b");
+  await h.service.submit({ workspaceId: "ws", requestId: "group", userPrompt: "Fix it", namedActorIds: ["a"] }, binding);
+  const bound = (await h.service.getRoom("ws")).workItems[0];
+  const hosted = (requestId: string, namedActorIds: string[], hostWorkItemId = bound.id) => h.service.submit({ workspaceId: "ws", requestId, userPrompt: "@x do it", namedActorIds,
+    sessionTarget: { sessionId: bound.taskSessionId, projectId: "web", model: MODEL_CATALOG.luna.id, hostWorkItemId } }, binding);
+  await assert.rejects(hosted("self", ["a"]), /already runs this session/);
+  await assert.rejects(hosted("stale", ["b"], "actor_work_missing"), /no longer hosts its task/);
+  assert.equal(h.starts.length, 1);
+});
+
+test("a mention in a session the actor task has moved away from is refused", async () => {
+  const h = harness();
+  await h.create("a"); await h.create("b");
+  await h.service.submit({ workspaceId: "ws", requestId: "group", userPrompt: "Fix it", namedActorIds: ["a"] }, binding);
+  const room = await h.service.getRoom("ws");
+  const moved = { ...room, workItems: room.workItems.map(work => ({ ...work, taskSessionId: "tx_new", executionHistory: [{ ...work, taskSessionId: "tx_old" }] as never })) };
+  await assert.rejects(Promise.resolve().then(() => resolveSessionMentionScope({ session: { id: "tx_old", workspaceId: "ws", cwd: "/repo" }, projects, room: moved, model: MODEL_CATALOG.luna.id })),
+    (error: unknown) => error instanceof SessionMentionError && error.code === "session_actor_bound");
 });
 
 test("a single @mention skips picking, fixes the executor and still produces an execution brief", async () => {

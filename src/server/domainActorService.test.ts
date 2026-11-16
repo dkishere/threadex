@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { actorPublishableConclusions, actorRoomForChat, emptyActorRoom, type ActorRoom, type ActorRound, type CreateDomainActor, type SubmitActorRequest } from "../domainActors";
+import { actorPublishableConclusions, actorRoomForChat, actorRoundChatKey, emptyActorRoom, type ActorRoom, type ActorRound, type CreateDomainActor, type SubmitActorRequest } from "../domainActors";
 import { MODEL_CATALOG } from "../modelCatalog";
 import { DomainActorStore, ActorMemoryConflict, type ActorPersistence } from "./domainActorStore";
-import { DomainActorService, acceptedRoleChange, type DomainActorDependencies, type ActorTaskStart } from "./domainActorService";
+import { DomainActorService, acceptedRoleChange, rejectedMemoryField, type DomainActorDependencies, type ActorTaskStart } from "./domainActorService";
 import { createDecisionPolicy, type DecisionAudit } from "./decision/policy";
 import { durableDecision } from "./decision/service";
 import { fakeBackend } from "./decision/fake";
@@ -17,7 +17,9 @@ import { join } from "node:path";
 import { saveActorAttachments } from "./domainActorAttachments";
 import { actorModelHooks } from "./domainActorRunner";
 import { actorFollowupTurnId } from "./domainActorContext";
+import { actorNativeAgentName, actorNativeSignals, actorSplitHostContext } from "./actorNativeAgents";
 import { actorSummary } from "./domainActorSummary";
+import { resolveActorTaskBinding } from "./domainActorProject";
 import type { SessionStore } from "./sessionStore";
 import type { SessionSummarizer } from "./sessionSummarizer";
 
@@ -55,12 +57,12 @@ function harness(overrides: Partial<DomainActorDependencies> = {}) {
   const persistence: ActorPersistence = {
     getWorkspace: async id => id === "ws" || id === "other" ? { id } as Awaited<ReturnType<ActorPersistence["getWorkspace"]>> : null,
     getDomainActorRoom: async id => structuredClone(rooms.get(id) ?? emptyActorRoom(id)),
-    changeDomainActorRoom: async (id, mutate) => {
+    changeDomainActorRoom: async (id, mutate, options) => {
       const room = structuredClone(rooms.get(id) ?? emptyActorRoom(id));
-      const result = mutate(room); room.revision++; rooms.set(id, room); return result;
+      const result = mutate(room, options?.actorLifecycleLock ? await persistence.getDomainActorRunningSessions(id) : undefined); room.revision++; rooms.set(id, room); return result;
     },
     captureActorCostBaseline: async () => { captures++; return { capturedAt: "2026-10-22T00:00:00Z", usage: [{ model: MODEL_CATALOG.luna.id, input_tokens: 10, model_context_window: 100_000 }] }; },
-    getDomainActorRunningSessions: async () => [],
+    getDomainActorRunningSessions: async id => deps.runningSessions ? deps.runningSessions(id) : [],
     getSessionTurn: async () => null
   };
   const store = new DomainActorStore(persistence);
@@ -107,6 +109,31 @@ test("deleting workers archives their full identity, reserves IDs and preserves 
   await assert.rejects(h.service.deleteActor("ws", "a"), /not found/);
   await assert.rejects(h.service.deleteActor("missing", "a"), /workspace not found/);
   await assert.rejects(h.service.deleteActor("other", "a"), /not found/);
+});
+
+test("actor chat opens the task the user insisted on without owner Decision; group chat still rejects an out-of-role claim", async () => {
+  const insisted = { intent: "work" as const, inRole: false, text: "你堅持要我做，我開 task。", claim: true, model: MODEL_CATALOG.luna.id, preparedPrompt: "Do the requested change and verify it." };
+  const h = harness({ respond: async () => insisted }); await h.create("a");
+  await h.service.submit({ ...request, namedActorIds: ["a"] });
+  await h.service.settled();
+  const direct = (await h.service.getRoom("ws")).rounds[0];
+  assert.equal(direct.replies[0].status, "claimed"); assert.equal(direct.replies[0].claimKind, "full");
+  assert.equal(direct.status, "awaiting_pickup"); assert.equal(h.starts.length, 1);
+  assert.deepEqual(h.decisions.map(item => item.purpose), [], "actor chat opens its task without owner, coverage or model Decision");
+  assert.equal(direct.routingDecisions.owner, undefined); assert.equal(direct.routingDecisions.coverage, undefined);
+
+  const partial = harness({ respond: async () => ({ ...insisted, inRole: true, claimKind: "partial" as const, claimScope: "API only" }) }); await partial.create("a");
+  await partial.service.submit({ ...request, namedActorIds: ["a"] });
+  await partial.service.settled();
+  const partialReply = (await partial.service.getRoom("ws")).rounds[0].replies[0];
+  assert.equal(partialReply.claimKind, "full", "actor chat never carries a partial claim"); assert.equal(partialReply.claimScope, undefined);
+  assert.equal(partial.starts[0].workItem.preparedPrompt, insisted.preparedPrompt);
+
+  const group = harness({ respond: async () => insisted }); await group.create("a"); await group.create("b");
+  await group.service.submit({ ...request, namedActorIds: ["a", "b"] });
+  await group.service.settled();
+  assert.ok((await group.service.getRoom("ws")).rounds[0].replies.every(reply => reply.status === "error"));
+  assert.equal(group.starts.length, 0);
 });
 
 test("worker deletion refuses unfinished work including failed and needs-user tasks and live completed follow-ups", async () => {
@@ -166,7 +193,7 @@ test("a Decision dispatch records the owner and round as the inter-actor origin 
   assert.equal(h.starts.length, 1);
   const origin = h.starts[0].promptOrigin;
   assert.equal(origin?.kind, "inter-actor"); assert.equal(origin?.trigger, "decision-dispatch");
-  assert.equal(origin?.sourceActorId, h.starts[0].workItem.ownerActorId); assert.equal(origin?.sourceActorName, "a");
+  assert.equal(origin?.sourceActorId, h.starts[0].workItem.executorActorId); assert.equal(origin?.sourceActorName, "a");
   assert.equal(origin?.sourceRoundId, round.id); assert.equal(origin?.sourceSessionId, undefined);
 });
 
@@ -266,6 +293,42 @@ test("chat reply Retry reruns only the failed speaker, keeps history, guards dup
   await assert.rejects(h.service.retryReply("ws", round.id, "a"), /Only a failed/);
 });
 
+test("reply Retry uses each newly selected gear through the model runner and preserves other replies and chats", async () => {
+  const calls: Array<{ model?: string; effort?: string }> = [];
+  let fail = true;
+  const hooks = actorModelHooks({ getDomainActorRoom: async () => null } as unknown as SessionStore, {
+    runBackgroundJsonTask: async (_workspace: string, _task: string, _prompt: string, options: { model?: string; effort?: string }) => {
+      calls.push({ model: options.model, effort: options.effort });
+      if (fail) throw new Error("provider unavailable");
+      return JSON.stringify({ text: "I can do it", claim: true, preparedPrompt: "Implement it", model: options.model });
+    }
+  } as unknown as SessionSummarizer, "http://localhost");
+  const h = harness({ respond: input => input.actor.id === "b" ? Promise.resolve({ text: "B opinion", claim: false }) : hooks.respond(input) });
+  const original = { model: MODEL_CATALOG.claudeSonnet.id, effort: "medium" };
+  const second = { model: MODEL_CATALOG.sol61.id, effort: "high" };
+  const latest = { model: MODEL_CATALOG.luna.id, effort: "low" };
+  await h.create("a", { model: original.model, allowedModels: [original.model, second.model, latest.model] });
+  await h.create("b");
+  const round = await h.service.submit({ ...request, requestId: "gear-retry", chatProjectId: null, namedActorIds: ["a", "b"], responseProfile: original });
+  const other = await h.service.submit({ ...request, requestId: "other-chat", chatProjectId: null, namedActorIds: ["b"], responseProfile: original });
+  // A distinct project chat remains untouched, even with the same speaker.
+  await h.store.change("ws", room => { room.rounds.find(item => item.id === other.id)!.chatProjectId = "other-project"; });
+  const otherBefore = structuredClone((await h.store.getRoom("ws")).rounds.find(item => item.id === other.id));
+  const failedAgain = await h.service.retryReply("ws", round.id, "a", second);
+  assert.equal(failedAgain.replies.find(reply => reply.actorId === "a")!.status, "error");
+  await assert.rejects(h.service.retryReply("ws", round.id, "a", { model: "unknown", effort: "high" }), /Invalid actor response gear/);
+  await assert.rejects(h.service.retryReply("ws", round.id, "a", { model: second.model, effort: "invalid" }), /Invalid actor response gear/);
+  fail = false;
+  const retried = await h.service.retryReply("ws", round.id, "a", latest);
+  assert.deepEqual(calls, [original, second, latest]);
+  assert.deepEqual(retried.responseProfile, original, "the original request gear is history");
+  assert.deepEqual(retried.replyResponseProfiles, { a: latest });
+  assert.deepEqual(retried.replies.find(reply => reply.actorId === "b"), round.replies.find(reply => reply.actorId === "b"));
+  assert.deepEqual((await h.store.getRoom("ws")).rounds.find(item => item.id === other.id), otherBefore);
+  assert.equal(h.starts[0].workItem.model, latest.model, "execution model checks use the retried speaker's provider");
+  assert.equal((await h.store.getRoom("ws")).actors.find(actor => actor.id === "a")!.model, original.model);
+});
+
 test("an interrupted chat reply Retry restores a retryable failed reply", async () => {
   const h = harness({ respond: async () => { throw new Error("boom"); } });
   await h.create("a");
@@ -323,6 +386,8 @@ test("group fast track queues same-context work before picking and keeps only th
   h.deps.decide = async req => {
     fastCalls++;
     assert.equal(req.purpose, "sh_pick"); assert.equal(req.questions[0].id, "fastTrack");
+    assert.match(req.questions[0].instructions, /positive evidence of the same objective, relevant context and work continuity/);
+    assert.match(req.questions[0].instructions, /same actor, project, visible history or running status alone is not/);
     assert.deepEqual(JSON.parse(req.state), { userPrompt: fastCalls === 1 ? "Also remove the adjacent Composer hint" : "One more Composer edit",
       recentTaskUserPrompts: ["Composer edit 1", "Composer edit 2", fastCalls === 1 ? "Composer edit 3" : "Also remove the adjacent Composer hint"] });
     const result = await decide(req);
@@ -438,6 +503,57 @@ test("a legacy round shown in a project chat is retried as saved, without rebind
   await assert.rejects(h.service.submit({ ...request, requestId: "legacy", userPrompt: "fix dev", chatProjectId: null }), /different input/);
 });
 
+test("single-actor requests retain the source project for new task binding", async () => {
+  const projects = [{ id: "dev", name: "dev", roots: ["/work"] }, { id: "hub", name: "fairshot-hub", roots: ["/work/fairshot-hub"] }];
+  const h = harness({ listProjects: async () => projects, resolveTaskBinding: async input => resolveActorTaskBinding(
+    { id: "ws", cwd: "/workspace" }, projects, input, path => path === "/work/fairshot-hub-backend") });
+  await h.create("a");
+  const prompt = "Add HMS signup_domain in fairshot-hub-backend/HMS; use fairshot-hub BDD as background.";
+  const input = { ...request, requestId: "source", namedActorIds: ["a"], chatProjectId: "dev", userPrompt: prompt };
+  const round = await h.service.submit(input);
+  assert.equal(round.chatProjectId, undefined);
+  assert.equal(round.userPrompt, prompt);
+  assert.deepEqual(round.taskSelection, { newSessionProjectId: "dev" });
+  assert.deepEqual(round.taskBinding, { workspaceId: "ws", cwd: "/work", projectId: "dev", source: "explicit" });
+  assert.equal((await h.service.submit(input)).id, round.id);
+  assert.equal((await h.service.submit({ ...input, ...round.taskSelection, chatProjectId: actorRoundChatKey(round) })).id, round.id);
+  assert.equal(h.starts.length, 1);
+  await assert.rejects(h.service.submit({ ...input, requestId: "conflict", newSessionProjectId: "hub" }), /its own project/);
+  await assert.rejects(h.service.submit({ ...input, requestId: "unknown", chatProjectId: "missing" }), /not registered/);
+  const beforeAmbiguous = await h.service.getRoom("ws");
+  await assert.rejects(h.service.submit({ ...input, requestId: "ambiguous", chatProjectId: undefined }), /multiple project roots/);
+  const afterAmbiguous = await h.service.getRoom("ws");
+  assert.equal(afterAmbiguous.rounds.length, beforeAmbiguous.rounds.length);
+  assert.equal(afterAmbiguous.workItems.length, beforeAmbiguous.workItems.length);
+  const updates: string[] = [];
+  h.deps.updateTask = async ({ workItem }) => { updates.push(workItem.id); };
+  await h.service.submit({ ...request, requestId: "reference-other-chat", taskReference: round.workItemId!, chatProjectId: "hub" });
+  assert.deepEqual(updates, [round.workItemId]);
+  assert.deepEqual((await h.service.getRoom("ws")).rounds.find(saved => saved.id === round.id)?.taskBinding, round.taskBinding);
+  assert.equal(h.starts.length, 1);
+  const inferred = await h.service.submit({ ...input, requestId: "inferred", chatProjectId: undefined, userPrompt: "fix fairshot-hub" });
+  assert.equal(inferred.taskBinding?.projectId, "hub"); assert.equal(inferred.taskBinding?.source, "message");
+  const fallback = await h.service.submit({ ...input, requestId: "fallback", chatProjectId: undefined, userPrompt: "fix this" });
+  assert.equal(fallback.taskBinding?.source, "workspace");
+  const explicit = await h.service.submit({ ...input, requestId: "explicit", chatProjectId: undefined, newSessionProjectId: "dev" });
+  assert.equal(explicit.taskBinding?.projectId, "dev");
+  const duplicateProjects = [...projects, { id: "duplicate", name: "duplicate", roots: ["/work"] }];
+  h.deps.resolveTaskBinding = async selection => resolveActorTaskBinding({ id: "ws", cwd: "/workspace" }, duplicateProjects, selection, () => false);
+  const duplicate = await h.service.submit({ ...input, requestId: "duplicate", userPrompt: "read /work/file and fairshot-hub for background" });
+  assert.equal(duplicate.taskBinding?.projectId, "dev"); assert.equal(duplicate.taskBinding?.source, "explicit");
+});
+
+test("legacy individual retries retain their saved task selection and binding", async () => {
+  const h = harness({ listProjects: async () => [{ id: "dev", name: "dev" }],
+    resolveTaskBinding: async () => ({ workspaceId: "ws", cwd: "/old", projectId: "old", source: "message" }) });
+  await h.create("a");
+  const input = { ...request, requestId: "legacy-individual", namedActorIds: ["a"] };
+  const original = await h.service.submit(input);
+  const retried = await h.service.submit({ ...input, chatProjectId: "dev" });
+  assert.equal(retried.id, original.id); assert.deepEqual(retried.taskBinding, original.taskBinding);
+  assert.deepEqual(retried.taskSelection, original.taskSelection); assert.equal(h.starts.length, 1);
+});
+
 test("fast track never continues a task from another project's chat", async () => {
   const h = harness({ listProjects: async () => [{ id: "p1", name: "One" }, { id: "p2", name: "Two" }] });
   await h.create("a"); await h.service.updateActor("ws", "a", { projectIds: ["p1", "p2"] });
@@ -545,11 +661,11 @@ test("uncertain fast-track delivery retries the same reference without new work 
 
 test("workflow Decision is persisted with assigned scope and survives retries without changing permissions", async () => {
   for (const assessment of ["small_direct", "substantial_managed", "substantial_direct"] as const) {
-    const h = harness(); await h.create("a");
+    const h = harness(); await h.create("a"); await h.create("b");
     const decide = h.deps.decide;
     h.deps.decide = async req => {
       const result = await decide(req);
-      if (!result.ok) return result;
+      if (!result.ok || req.purpose !== "model_select") return result;
       assert.ok(req.questions.some(question => question.id === "workflow"));
       const state = JSON.parse(req.state);
       assert.equal(state.userPrompt, "做");
@@ -557,7 +673,7 @@ test("workflow Decision is persisted with assigned scope and survives retries wi
       assert.equal(state.assignedScope, "Entire canonical request, including any scope beyond a partial claim");
       return { ...result, answers: { ...result.answers, workflow: { kind: "choice", choice: assessment, confidence: 0.99 } } };
     };
-    const input = { ...request, userPrompt: "做", namedActorIds: ["a"], approvalPolicy: "never" as const };
+    const input = { ...request, userPrompt: "做", namedActorIds: ["a", "b"], approvalPolicy: "never" as const };
     const round = await h.service.submit(input);
     const work = h.starts[0].workItem;
     assert.equal(work.workflowAssessment, assessment);
@@ -645,7 +761,7 @@ test("a matching continuation reuses task identity with the newly selected model
   await h.create("a");
   const first = await h.service.submit({ ...request, namedActorIds: ["a"] });
   await h.store.change("ws", room => { room.workItems[0].status = "completed"; });
-  h.deps.respond = async () => ({ text: "Continue UI", claim: true, preparedPrompt: "Restore the full composer", contextRoundIds: [first.id] });
+  h.deps.respond = async () => ({ text: "Continue UI", claim: true, preparedPrompt: "Restore the full composer", model: MODEL_CATALOG.astra.id, contextRoundIds: [first.id] });
   const decide = h.deps.decide;
   h.deps.decide = async req => {
     const result = await decide(req);
@@ -661,7 +777,7 @@ test("a matching continuation reuses task identity with the newly selected model
   assert.equal(updates[0].promptOrigin?.sourceActorId, "a");
   assert.equal(updates[0].workItem.model, MODEL_CATALOG.astra.id); assert.equal(updates[0].idleOnly, false);
   assert.equal(updates[0].workflowGuidance, true, "a routed session reuse keeps its workflow guidance");
-  assert.equal(updates[0].workItem.workflowAssessment, "substantial_managed");
+  assert.equal(updates[0].workItem.workflowDecisionSkipped, true);
   assert.match(updates[0].userPrompt, /Use Astra and restore the full composer/);
   assert.match(updates[0].userPrompt, /Restore the full composer/);
   assert.match(updates[0].sourceNote ?? "", /^\[Threadex Actors room message\] Source: Actors individual chat with \S/);
@@ -669,24 +785,51 @@ test("a matching continuation reuses task identity with the newly selected model
   await h.service.submit(input);
   assert.equal(updates.length, 1); assert.equal(h.starts.length, 1);
   assert.equal((await h.service.getRoom("ws")).workItems.length, 1);
-  assert.equal((await h.service.getRoom("ws")).workItems[0].workflowAssessment, "substantial_managed");
+  assert.equal((await h.service.getRoom("ws")).workItems[0].workflowDecisionSkipped, true);
   assert.ok(continued.continuation?.decision.ok);
 });
 
-test("session selection keeps independent context separate even when a prior round supplies background", async () => {
-  const h = harness({ updateTask: async () => { assert.fail("unrelated work must not reuse"); } });
-  await h.create("a");
+test("session selection keeps independent actor organization separate from idle or busy implementation work", async () => {
+  for (const status of ["completed", "started"] as const) {
+    const h = harness({ updateTask: async () => { assert.fail("unrelated work must not reuse"); } });
+    await h.create("a");
+    const first = await h.service.submit({ ...request, namedActorIds: ["a"] });
+    await h.store.change("ws", room => { room.workItems[0].status = status; });
+    h.deps.respond = async () => ({ text: "Organize actors", claim: true, preparedPrompt: "Create actor responsibilities", contextRoundIds: [first.id] });
+    const decide = h.deps.decide;
+    h.deps.decide = async req => {
+      const result = await decide(req);
+      if (req.questions[0].id === "session") {
+        assert.match(req.questions[0].instructions, /positive evidence.*same objective, relevant context and work continuity/);
+        assert.match(req.questions[0].instructions, /same actor, project, visible history or running status alone is not/);
+        assert.match(req.questions[0].instructions, /Actor organization or creating divisions of responsibility is an independent objective/);
+      }
+      return result.ok && req.questions[0].id === "session" ? { ...result, answers: { session: { kind: "choice", choice: "new", confidence: 0.99 } } } : result;
+    };
+    const round = await h.service.submit({ ...request, requestId: "independent", userPrompt: "Organize actors and their responsibilities", namedActorIds: ["a"] });
+    assert.notEqual(round.workItemId, first.workItemId); assert.equal(h.starts.length, 2);
+    assert.ok(round.continuation?.decision.ok); assert.equal(round.continuation?.workItem, undefined);
+  }
+});
+
+test("low-confidence session reuse creates one separate task while explicit references still update their target", async () => {
+  const updates: string[] = [];
+  const h = harness({ updateTask: async input => { updates.push(input.workItem.id); } }); await h.create("a");
   const first = await h.service.submit({ ...request, namedActorIds: ["a"] });
-  await h.store.change("ws", room => { room.workItems[0].status = "completed"; });
-  h.deps.respond = async () => ({ text: "Independent feature", claim: true, preparedPrompt: "Implement unrelated feature", contextRoundIds: [first.id] });
   const decide = h.deps.decide;
   h.deps.decide = async req => {
     const result = await decide(req);
-    return result.ok && req.questions[0].id === "session" ? { ...result, answers: { session: { kind: "choice", choice: "new", confidence: 0.99 } } } : result;
+    return result.ok && req.questions[0].id === "session" ? { ...result, answers: { session: { kind: "choice", choice: first.workItemId!, confidence: 0.89 } } } : result;
   };
-  const round = await h.service.submit({ ...request, requestId: "independent", userPrompt: "Build a different feature", namedActorIds: ["a"] });
-  assert.notEqual(round.workItemId, first.workItemId); assert.equal(h.starts.length, 2);
-  assert.ok(round.continuation?.decision.ok); assert.equal(round.continuation?.workItem, undefined);
+  const input = { ...request, requestId: "uncertain-session", userPrompt: "A potentially separate task", namedActorIds: ["a"] };
+  const round = await h.service.submit(input);
+  assert.notEqual(round.workItemId, first.workItemId); assert.equal(round.status, "awaiting_pickup");
+  assert.equal(round.continuation?.workItem, undefined); assert.equal(h.starts.length, 2); assert.deepEqual(updates, []);
+  await h.service.submit(input);
+  assert.equal(h.starts.length, 2); assert.deepEqual(updates, []);
+  const explicit = { ...request, requestId: "explicit-update", taskReference: first.workItemId!, userPrompt: "Continue this task" };
+  await h.service.submit(explicit); await h.service.submit(explicit);
+  assert.deepEqual(updates, [first.workItemId]); assert.equal(h.starts.length, 2);
 });
 
 test("a running matching session queues the continuation once without a duplicate launch", async () => {
@@ -748,21 +891,53 @@ test("continuation permission changes and uncertain receipts never fall back to 
   assert.equal(calls, 2); assert.equal(h.starts.length, 1);
 });
 
-test("failed or invalid session Decisions preserve existing work without automatic new-session fallback", async () => {
-  for (const invalid of [false, true]) {
+test("failed, thrown or invalid session Decisions dispatch a valid claim to a new task session", async () => {
+  for (const failure of ["timeout", "throw", "invalid"] as const) {
     const h = harness({ updateTask: async () => { assert.fail("no valid session decision"); } }); await h.create("a");
     const first = await h.service.submit({ ...request, namedActorIds: ["a"] });
     await h.store.change("ws", room => { room.workItems[0].status = "completed"; });
     h.deps.respond = async () => ({ text: "Continue", claim: true, preparedPrompt: "Continue", contextRoundIds: [first.id] });
     const decide = h.deps.decide;
-    h.deps.decide = async req => req.questions[0].id !== "session" ? decide(req) : invalid
-      ? { ok: true, backend: "fake", model: "fake", calibrated: false, latencyMs: 0, answers: { session: { kind: "choice", choice: "foreign-work", confidence: 1 } } }
-      : { ok: false, attempts: [{ backend: "fake", reason: "timeout" }] };
+    h.deps.decide = async req => {
+      if (req.questions[0].id !== "session") return decide(req);
+      if (failure === "throw") throw new Error("Decision backend crashed");
+      return failure === "invalid"
+        ? { ok: true, backend: "fake", model: "fake", calibrated: false, latencyMs: 0, answers: { session: { kind: "choice", choice: "foreign-work", confidence: 1 } } }
+        : { ok: false, attempts: [{ backend: "fake", reason: "timeout" }] };
+    };
     const input = { ...request, requestId: "selection-failure", namedActorIds: ["a"] };
-    assert.match((await h.service.submit(input)).error!, /Session selection failed/);
+    const round = await h.service.submit(input);
+    assert.notEqual(round.status, "routing_failed", round.error ?? undefined);
+    assert.equal(round.continuation?.newSessionFallback, failure === "invalid" ? "invalid_choice" : "decision_failed", failure);
+    assert.equal(round.continuation?.workItem, undefined);
     await h.service.submit(input);
-    assert.equal(h.starts.length, 1); assert.equal((await h.service.getRoom("ws")).workItems.length, 1);
+    const room = await h.service.getRoom("ws");
+    assert.equal(h.starts.length, 2, failure); assert.equal(room.workItems.length, 2);
+    assert.notEqual(room.workItems[1].taskSessionId, room.workItems[0].taskSessionId);
+    await h.service.settled();
   }
+});
+
+test("a task turn that ended without a delivered end event is reconciled from the saved turn once, after a grace period", async () => {
+  let now = Date.parse("2026-10-22T23:00:00Z");
+  const h = harness({ now: () => now });
+  await h.create("a");
+  await h.service.submit({ ...request, namedActorIds: ["a"] }); await h.service.settled();
+  const work = (await h.service.getRoom("ws")).workItems[0];
+  await h.service.observe(event("runner.runner.started", work.taskSessionId, work.taskTurnId));
+  let status = "running";
+  h.store.persistence.getSessionTurn = async id => ({ id, sessionId: work.taskSessionId, userInput: request.userPrompt,
+    agentResponse: "Waiting for your choice", status, runnerExitCode: 0 }) as Awaited<ReturnType<ActorPersistence["getSessionTurn"]>>;
+  assert.equal(await h.service.reconcileEndedTurns("ws"), 0, "a running turn is left alone");
+  status = "done";
+  assert.equal(await h.service.reconcileEndedTurns("ws", 60_000), 0, "a first sighting waits for a delivery still in flight");
+  now += 60_000;
+  assert.equal(await h.service.reconcileEndedTurns("ws", 60_000), 1);
+  await h.service.settled();
+  const current = (await h.service.getRoom("ws")).workItems[0];
+  assert.equal(current.status, "completed");
+  assert.ok(current.completionReviews?.length, "the reconciled end is reviewed like a delivered result");
+  assert.equal(await h.service.reconcileEndedTurns("ws"), 0, "an ended task is never replayed again");
 });
 
 test("completion review gates publication, links the executor, and deduplicates concurrent result deliveries", async () => {
@@ -819,6 +994,25 @@ test("interrupted persisted reviews become explicit errors and cannot release a 
   assert.equal(current.completionReviews![0].status, "error");
   assert.match(current.completionReviews![0].error!, /interrupted/);
   assert.deepEqual(actorPublishableConclusions(current), []);
+});
+
+test("a passed review still publishes while its task has a pending user decision, which is a reminder only", async () => {
+  let release!: () => void, entered!: () => void;
+  const wait = new Promise<void>(resolve => { release = resolve; });
+  const reviewing = new Promise<void>(resolve => { entered = resolve; });
+  const h = harness({ reviewTask: async () => { entered(); await wait; return { verdict: "passed", issues: [] }; } });
+  await h.create("a"); await h.service.submit(request);
+  const work = (await h.service.getRoom("ws")).workItems[0];
+  h.store.persistence.getSessionTurn = async id => ({ id, sessionId: work.taskSessionId, userInput: request.userPrompt,
+    agentResponse: "Reported done", status: "done", runnerExitCode: 0 }) as Awaited<ReturnType<ActorPersistence["getSessionTurn"]>>;
+  await h.service.observe(event("runner.result", work.taskSessionId, work.taskTurnId, "review-before-choice")); await reviewing;
+  const { blocker } = await h.service.reportBlocker({ workspaceId: "ws", sessionId: work.taskSessionId, actorId: "a", kind: "other", description: "User must choose retained version" });
+  await h.service.updateBlocker({ workspaceId: "ws", blockerId: blocker.id, actorId: "a", action: "needs_user", text: "Both edits intentional", question: "Which version?",
+    options: [{ label: "Local", description: "Keep local" }, { label: "Incoming", description: "Keep incoming" }] });
+  release(); await h.service.settled();
+  const current = (await h.service.getRoom("ws")).workItems[0];
+  assert.equal(current.status, "completed"); assert.equal(current.completionReviews![0].status, "passed");
+  assert.equal(actorPublishableConclusions(current).length, 1);
 });
 
 test("review issues, invalid verdicts, helper failure and unavailable outcomes all fail closed", async () => {
@@ -1009,14 +1203,313 @@ const partialReply = { text: "I can own a portion", claim: true, claimKind: "par
   };
 }
 
-test("a sole partial claimant owns the entire canonical request, not just its original offer", async () => {
+test("repicking stakeholders retains the first partial claimant in owner arbitration", async () => {
+  const h = harness({ respond: async () => partialReply,
+    planClaims: async () => { throw new Error("Must not force a split"); } });
+  await h.create("a"); await h.create("b");
+  const decide = h.deps.decide;
+  let arbitration = 0;
+  h.deps.decide = async req => {
+    const result = await decide(req);
+    if (!result.ok) return result;
+    if (req.purpose === "sh_pick") {
+      const ids = JSON.parse(req.state).actors.map((a: { id: string }) => a.id);
+      if (ids.length === 2) return { ...result, answers: {
+        a: { kind: "predicate", probability: 1 }, b: { kind: "predicate", probability: 0 }
+      } };
+      assert.deepEqual(ids, ["b"], "repicking still excludes prior speakers");
+    }
+    if (req.questions.some(q => q.id === "coverage")) return { ...result, answers: {
+      coverage: { kind: "choice", choice: "gaps", confidence: 1 }
+    } };
+    if (req.purpose === "claim_tiebreak") {
+      arbitration++;
+      assert.deepEqual(JSON.parse(req.state).actors.map((a: { id: string }) => a.id), ["a", "b"]);
+      return { ...result, answers: { owner: { kind: "choice", choice: "a", confidence: 1 } } };
+    }
+    return result;
+  };
+  const round = await h.service.submit(request);
+  assert.equal(arbitration, 1);
+  assert.equal(round.ownerActorId, "a");
+  assert.equal(round.status, "awaiting_pickup");
+  assert.equal(h.starts.length, 1);
+  assert.equal(h.starts[0].workItem.ownerLed, true);
+  await new DomainActorService(h.store, h.deps).submit(request);
+  assert.equal(h.starts.length, 1);
+  assert.equal(arbitration, 1);
+  await h.service.settled();
+});
+
+test("owner-led honors explicit Astra XH and may delegate in-scope work while retaining integration", async () => {
+  const h = harness({ respond: async () => ({ ...partialReply, model: MODEL_CATALOG.astra.id }) });
+  await h.create("a"); await h.create("b");
+  const decide = h.deps.decide;
+  h.deps.decide = async req => {
+    if (req.purpose === "model_select" && !req.questions.some(q => q.id === "authorization")) throw new Error("User profile must not be downgraded by model selection");
+    const result = await decide(req);
+    if (result.ok && req.questions.some(q => q.id === "authorization")) {
+      assert.match(req.questions.find(q => q.id === "authorization")!.instructions, /No additional request for parallelism is needed/);
+      return { ...result, answers: { ...result.answers, authorization: { kind: "choice", choice: "allow", confidence: 1 } } };
+    }
+    return result;
+  };
+  await h.service.submit({ ...request, userPrompt: "Continue migrating HMS into Hub, with astra XH managed" });
+  const work = h.starts[0].workItem;
+  assert.equal(work.model, MODEL_CATALOG.astra.id);
+  assert.equal(work.executionEffort, "xhigh");
+  assert.equal(work.ownerLed, true);
+  const result = await h.service.delegateParallel({ workspaceId: "ws", workItemId: work.id, sourceActorId: "a", sourceSessionId: work.taskSessionId,
+    requestId: "bounded-work", tasks: [{ executorActorId: "b", task: "Implement the migration API within the canonical scope" }] });
+  assert.equal(result.workItems.length, 1);
+  const child = (await h.service.getRoom("ws")).workItems.find(w => w.id === result.workItems[0].id)!;
+  assert.equal(child.ownerLed, undefined, "delegation does not pass whole-request authority to children");
+  await h.service.settled();
+});
+
+test("forbidden explicit Astra never silently falls back to Sol", async () => {
+  const h = harness(); await h.create("a", { model: MODEL_CATALOG.sol61.id, allowedModels: [MODEL_CATALOG.sol61.id] });
+  const round = await h.service.submit({ ...request, namedActorIds: ["a"], userPrompt: "Implement with astra XH managed" });
+  assert.equal(round.status, "routing_failed");
+  assert.match(round.error!, /Requested execution profile.*no silent downgrade/);
+  assert.equal(h.starts.length, 0);
+  await h.service.settled();
+});
+
+test("a user-named Astra from an earlier round still runs when the follow-up is sent with a Claude gear", async () => {
+  const claudeModels: string[] = [MODEL_CATALOG.claudeHaiku.id, MODEL_CATALOG.claudeSonnet.id, MODEL_CATALOG.claudeOpus.id];
+  const h = harness(); await h.create("a", { model: MODEL_CATALOG.astra.id, allowedModels: [MODEL_CATALOG.astra.id, ...claudeModels] });
+  const first = await h.service.submit({ ...request, namedActorIds: ["a"], userPrompt: "用astra 執下呢個ui",
+    responseProfile: { model: MODEL_CATALOG.astra.id, effort: "high" } });
+  assert.equal(h.starts[0].workItem.model, MODEL_CATALOG.astra.id);
+  await h.store.change("ws", room => { room.workItems[0].status = "completed"; });
+  h.deps.respond = async () => ({ text: "Fix the layout", claim: true, preparedPrompt: "Remove the wasted wrapping", contextRoundIds: [first.id] });
+  const followUp = await h.service.submit({ ...request, requestId: "follow-up", namedActorIds: ["a"], userPrompt: "右邊無必要換行浪費好多空間",
+    responseProfile: { model: MODEL_CATALOG.claudeOpus.id, effort: "high" } });
+  assert.notEqual(followUp.status, "routing_failed", followUp.error ?? undefined);
+  assert.equal(h.starts.length, 2);
+  assert.equal(h.starts[1].workItem.model, MODEL_CATALOG.astra.id, "the user's named model is used, not swapped for the gear's provider");
+  const current = await h.service.submit({ ...request, requestId: "current", namedActorIds: ["a"], userPrompt: "用astra 再執一次",
+    responseProfile: { model: MODEL_CATALOG.claudeOpus.id, effort: "high" } });
+  assert.notEqual(current.status, "routing_failed", current.error ?? undefined);
+  assert.equal(h.starts.at(-1)!.workItem.model, MODEL_CATALOG.astra.id, "a current-message request crosses the gear's provider too");
+  await h.service.settled();
+});
+
+test("an earlier-round model the actor does not allow lets Decision select instead of blocking", async () => {
+  const claudeModels: string[] = [MODEL_CATALOG.claudeHaiku.id, MODEL_CATALOG.claudeSonnet.id, MODEL_CATALOG.claudeOpus.id];
+  const h = harness(); await h.create("a", { model: MODEL_CATALOG.claudeOpus.id, allowedModels: claudeModels });
+  const first = await h.service.submit({ ...request, namedActorIds: ["a"], userPrompt: "Fix this UI",
+    responseProfile: { model: MODEL_CATALOG.claudeOpus.id, effort: "high" } });
+  await h.store.change("ws", room => { room.rounds[0].userPrompt = "用astra 執下呢個ui"; room.workItems[0].status = "completed"; });
+  h.deps.respond = async () => ({ text: "Fix the layout", claim: true, preparedPrompt: "Remove the wasted wrapping", contextRoundIds: [first.id] });
+  const followUp = await h.service.submit({ ...request, requestId: "follow-up", namedActorIds: ["a"], userPrompt: "右邊無必要換行浪費好多空間",
+    responseProfile: { model: MODEL_CATALOG.claudeOpus.id, effort: "high" } });
+  assert.notEqual(followUp.status, "routing_failed", followUp.error ?? undefined);
+  assert.ok(claudeModels.includes(h.starts.at(-1)!.workItem.model!), h.starts.at(-1)!.workItem.model);
+  assert.match(followUp.replies[0].inheritedExecutionIgnored!, /gpt-6-astra/);
+  await h.service.settled();
+});
+
+test("automatic partial claims choose one owner, preserve all briefs and notify stakeholders without children", async () => {
+  const feedback: string[] = [];
+  const h = harness({ respond: async ({ actor }) => ({ ...partialReply, claimScope: `${actor.id} scope`, preparedPrompt: `${actor.id} implementation advice` }),
+    planClaims: async () => { throw new Error("Automatic claims must not force a split"); },
+    maintain: async ({ actor, event }) => { if (event.type === "task.turn_completed") feedback.push(actor.id); return actor.memory; } });
+  await h.create("a"); await h.create("b");
+  const input = { ...request, userPrompt: "Implement API and UI" };
+  const round = await h.service.submit(input);
+  assert.equal(round.ownerActorId, "a"); assert.equal(round.allocation, undefined);
+  assert.equal(h.starts.length, 1);
+  const work = h.starts[0].workItem;
+  assert.match(work.preparedPrompt!, /own the ENTIRE canonical request/);
+  assert.equal(work.ownerLed, true);
+  assert.match(work.preparedPrompt!, /claims' overlap and the workload/);
+  assert.match(work.preparedPrompt!, /State in your result whether you delegated/);
+  assert.match(work.preparedPrompt!, /a implementation advice/);
+  assert.match(work.preparedPrompt!, /b implementation advice/);
+  assert.equal(work.nativeAgent, undefined);
+  assert.equal((await h.service.getRoom("ws")).workItems.length, 1);
+  await new DomainActorService(h.store, h.deps).submit(input);
+  assert.equal(h.starts.length, 1, "restart cannot create another execution");
+  h.store.taskOutcome = async () => ({ userPrompt: input.userPrompt, result: "Implemented API and UI; verification evidence.", status: "done", runnerExitCode: 0 });
+  await h.service.observe(event("runner.result", work.taskSessionId, work.taskTurnId, "owner-completed"));
+  await h.service.settled();
+  assert.deepEqual(feedback.sort(), ["a", "b"]);
+});
+
+test("an automatic full-claim winner receives the other claims and may delegate their portions", async () => {
+  const h = harness({ respond: async ({ actor }) => actor.id === "a"
+    ? { text: "Own the whole change", claim: true, claimKind: "full" as const, title: "Whole change", preparedPrompt: "a whole-request brief" }
+    : { ...partialReply, claimScope: "b UI scope", preparedPrompt: "b UI advice" } });
+  await h.create("a"); await h.create("b");
+  const decide = h.deps.decide;
+  h.deps.decide = async req => {
+    const result = await decide(req);
+    if (result.ok && req.questions.some(q => q.id === "authorization")) {
+      assert.match(req.questions.find(q => q.id === "authorization")!.instructions, /No additional request for parallelism is needed/);
+      return { ...result, answers: { ...result.answers, authorization: { kind: "choice", choice: "allow", confidence: 1 } } };
+    }
+    return result;
+  };
+  const round = await h.service.submit({ ...request, userPrompt: "Implement API and UI" });
+  assert.equal(round.ownerActorId, "a"); assert.equal(round.allocation, undefined);
+  assert.equal(h.starts.length, 1);
+  const work = h.starts[0].workItem;
+  assert.equal(work.ownerLed, true);
+  assert.equal(work.title, "Whole change", "the full claim keeps its own title");
+  assert.match(work.preparedPrompt!, /^a whole-request brief/);
+  assert.match(work.preparedPrompt!, /Other actors also claimed this request/);
+  assert.match(work.preparedPrompt!, /b UI scope/);
+  const result = await h.service.delegateParallel({ workspaceId: "ws", workItemId: work.id, sourceActorId: "a", sourceSessionId: work.taskSessionId,
+    requestId: "ui-portion", tasks: [{ executorActorId: "b", task: "Implement the UI portion within the canonical scope" }] });
+  assert.equal(result.workItems.length, 1);
+  await h.service.settled();
+});
+
+test("a sole full claim keeps its brief without owner-led delegation", async () => {
+  const h = harness({ respond: async ({ actor }) => actor.id === "a"
+    ? { text: "Own the whole change", claim: true, claimKind: "full" as const, preparedPrompt: "a whole-request brief" }
+    : { text: "Not mine", claim: false } });
+  await h.create("a"); await h.create("b");
+  await h.service.submit({ ...request, userPrompt: "Implement API and UI" });
+  const work = h.starts[0].workItem;
+  assert.equal(work.ownerLed, undefined);
+  assert.equal(work.preparedPrompt, "a whole-request brief");
+  await h.service.settled();
+});
+
+test("single selected SH full claim opens from its brief without post-claim Decisions", async () => {
+  const h = harness({ respond: async () => ({ text: "Own the change", claim: true, claimKind: "full", preparedPrompt: "Implement and verify the title interaction.", model: MODEL_CATALOG.luna.id }) });
+  await h.create("a");
+  const decide = h.deps.decide;
+  h.deps.decide = async req => { assert.equal(req.purpose, "sh_pick"); return decide(req); };
+  const round = await h.service.submit(request);
+  assert.equal(round.ownerActorId, "a");
+  assert.equal(h.starts[0].workItem.preparedPrompt, "Implement and verify the title interaction.");
+  assert.equal(h.starts[0].workItem.workflowAssessment, undefined);
+  assert.equal(h.starts[0].workItem.model, MODEL_CATALOG.luna.id);
+  await new DomainActorService(h.store, h.deps).submit(request);
+  assert.equal(h.starts.length, 1);
+  await h.service.settled();
+});
+
+test("completed unrelated tasks do not restore model/workflow Decisions for full claims", async () => {
+  const h = harness({ updateTask: async () => { throw new Error("Independent objective must not continue"); } });
+  await h.create("a");
+  await h.service.submit({ ...request, namedActorIds: ["a"] });
+  await h.store.change("ws", room => { room.workItems[0].status = "completed"; });
+  h.decisions.length = 0;
+  const decide = h.deps.decide;
+  h.deps.decide = async req => {
+    assert.deepEqual(req.questions.map(q => q.id), ["session"]);
+    const result = await decide(req);
+    return result.ok ? { ...result, answers: { session: { kind: "choice", choice: "new", confidence: 1 } } } : result;
+  };
+  const input = { ...request, requestId: "unrelated", userPrompt: "Implement a different feature", namedActorIds: ["a"] };
+  await h.service.submit(input);
+  assert.equal(h.starts.length, 2);
+  assert.equal(h.starts[1].workItem.workflowDecisionSkipped, true);
+  await new DomainActorService(h.store, h.deps).submit(input);
+  assert.equal(h.starts.length, 2);
+  assert.equal(h.decisions.length, 1);
+  await h.service.settled();
+});
+
+test("owner-led model selection assesses all claims instead of trusting partial models and titles", async () => {
+  const h = harness({ respond: async ({ actor }) => ({ ...partialReply, title: `${actor.id} only`, model: MODEL_CATALOG.luna.id }) });
+  await h.create("a"); await h.create("b");
+  const decide = h.deps.decide;
+  h.deps.decide = async req => {
+    const result = await decide(req);
+    if (req.purpose !== "model_select" || !result.ok) return result;
+    assert.deepEqual(req.questions.map(q => q.id), ["model", "workflow", "workload_kind"]);
+    const state = JSON.parse(req.state);
+    assert.equal(state.stakeholderClaims.length, 2);
+    assert.match(state.ownership, /Whole canonical request/);
+    assert.equal(state.proposedModel, undefined);
+    return { ...result, answers: { ...result.answers, model: { kind: "choice", choice: MODEL_CATALOG.astra.id, confidence: 1 } } };
+  };
+  await h.service.submit({ ...request, userPrompt: "API, migration and UI" });
+  assert.equal(h.starts[0].workItem.model, MODEL_CATALOG.astra.id);
+  assert.equal(h.starts[0].workItem.title, undefined);
+  await h.service.settled();
+});
+
+test("a failed owner-led arbitration still dispatches one whole-request owner", async () => {
+  const h = harness({ respond: async () => partialReply });
+  await h.create("a"); await h.create("b");
+  const decide = h.deps.decide;
+  h.deps.decide = async req => req.purpose === "claim_tiebreak" ? { ok: false, attempts: [] } : decide(req);
+  const round = await h.service.submit(request);
+  assert.notEqual(round.status, "routing_failed");
+  assert.equal(round.ownerFallback, "decision_failed");
+  assert.equal(h.starts.length, 1);
+  assert.equal(h.starts[0].workItem.ownerLed, true);
+  await h.service.settled();
+});
+
+test("low-confidence owner-led arbitration (replay of a near-even split) picks the most probable claimant", async () => {
+  // Replays actor_round_9a8bee5d: two partial claims, owner confidence 0.33 below the threshold.
+  const h = harness({ respond: async ({ actor }) => ({ ...partialReply, claimScope: `${actor.id} scope` }) });
+  await h.create("a"); await h.create("b");
+  const decide = h.deps.decide;
+  h.deps.decide = async req => {
+    if (req.purpose !== "claim_tiebreak") return decide(req);
+    return { ok: true, backend: "fake", model: "fake", calibrated: true, latencyMs: 0,
+      answers: { owner: { kind: "choice", choice: "b", confidence: 0.33, probabilities: { a: 0.45, b: 0.55 } } } };
+  };
+  const round = await h.service.submit({ ...request, userPrompt: "Queue cannot be pushed but the session shows stopped" });
+  assert.equal(round.ownerActorId, "b");
+  assert.equal(round.ownerFallback, "low_confidence");
+  assert.equal(h.starts.length, 1);
+  assert.equal(h.starts[0].workItem.ownerLed, true);
+  await h.service.settled();
+});
+
+test("an incompatible default requires model selection instead of allowed[0]", async () => {
+  const h = harness();
+  await h.create("a", { model: MODEL_CATALOG.claudeOpus.id, allowedModels: [MODEL_CATALOG.claudeOpus.id, MODEL_CATALOG.luna.id, MODEL_CATALOG.astra.id] });
+  const decide = h.deps.decide;
+  h.deps.decide = async req => {
+    assert.deepEqual(req.questions.map(q => q.id), ["model", "workload_kind"]);
+    const result = await decide(req);
+    return result.ok ? { ...result, answers: { model: { kind: "choice", choice: MODEL_CATALOG.astra.id, confidence: 1 } } } : result;
+  };
+  await h.service.submit({ ...request, namedActorIds: ["a"], responseProfile: { model: MODEL_CATALOG.luna.id, effort: "low" } });
+  assert.equal(h.starts[0].workItem.model, MODEL_CATALOG.astra.id);
+  await h.service.settled();
+});
+
+test("task effort follows the selected tier and Decision's workload kind without changing the actor's setting", async () => {
+  const cases: Array<[string, string, string]> = [[MODEL_CATALOG.luna.id, "reasoning", "high"], [MODEL_CATALOG.luna.id, "mechanical", "medium"], [MODEL_CATALOG.sol61.id, "reasoning", "medium"]];
+  for (const [model, workloadKind, expected] of cases) {
+    const h = harness();
+    await h.create("a", { model: MODEL_CATALOG.claudeOpus.id, effort: "medium", allowedModels: [MODEL_CATALOG.claudeOpus.id, MODEL_CATALOG.luna.id, MODEL_CATALOG.sol61.id] });
+    const decide = h.deps.decide;
+    h.deps.decide = async req => {
+      const result = await decide(req);
+      return result.ok && req.purpose === "model_select" ? { ...result, answers: { model: { kind: "choice", choice: model, confidence: 1 },
+        workload_kind: { kind: "choice", choice: workloadKind, confidence: 1 } } } : result;
+    };
+    // The Codex response gear makes the Claude default incompatible, so Decision selects the model and workload kind.
+    await h.service.submit({ ...request, namedActorIds: ["a"], responseProfile: { model: MODEL_CATALOG.luna.id, effort: "low" } });
+    assert.equal(h.starts[0].workItem.model, model);
+    assert.equal(h.starts[0].workItem.executionEffort, expected, `${model} ${workloadKind}`);
+    assert.equal((await h.service.listActors("ws"))[0].effort, "medium");
+    await h.service.settled();
+  }
+});
+
+test("actor chat treats a stray partial claim as a task for the entire canonical request", async () => {
   const h = harness({ respond: async () => partialReply, planClaims: async () => { throw new Error("must not split"); } });
   await h.create("a");
   const round = await h.service.submit({ ...request, userPrompt: "API and UI", namedActorIds: ["a"] });
   const work = h.starts[0].workItem;
   assert.equal(round.status, "awaiting_pickup");
   assert.equal(work.delegatedTask, undefined);
-  assert.match(work.preparedPrompt!, /ENTIRE canonical request/);
+  assert.equal(round.replies[0].claimKind, "full"); assert.equal(round.replies[0].claimScope, undefined);
+  assert.equal(work.preparedPrompt, partialReply.preparedPrompt);
   assert.deepEqual(work.canonicalUserMessages, ["API and UI"]);
   assert.deepEqual(work.requirementIds, ["whole-request"]);
   assert.equal(h.decisions.filter(d => d.purpose === "claim_tiebreak").length, 0);
@@ -1302,7 +1795,23 @@ test("legacy dependent work waits for every blocker and recovers an end event no
   await h.service.settled();
 });
 
-test("invalid partial partitions never dispatch: missing scope, duplicate ownership, conflicts and dependencies", async () => {
+test("a pending user choice does not hold back a dependent once its task ends", async () => {
+  const h = harness({ respond: async () => partialReply, planClaims: async () => ({ ...partialPlan(), integrationAssignmentId: "api-work" }) });
+  await h.create("a"); await h.create("b");
+  await h.service.submit({ ...request, userPrompt: "API and UI all!", namedActorIds: ["a", "b"] });
+  await legacySplit(h); await h.service.resumeBlockedWork("ws");
+  const [api] = (await h.service.getRoom("ws")).workItems;
+  const { blocker } = await h.service.reportBlocker({ workspaceId: "ws", sessionId: api.taskSessionId, actorId: api.executorActorId, kind: "other", description: "Choose behavior" });
+  await h.service.updateBlocker({ workspaceId: "ws", blockerId: blocker.id, actorId: api.executorActorId, action: "needs_user", text: "Both implementations intentional", question: "Which behavior?",
+    options: [{ label: "A", description: "Keep A" }, { label: "B", description: "Keep B" }] });
+  await h.service.observe(event("runner.result", api.taskSessionId, api.taskTurnId, "waiting-result", "2026-10-22T22:05:00Z"));
+  await h.service.observe({ ...event("runner.pending", api.taskSessionId, api.taskTurnId, "waiting-stop", "2026-10-22T22:06:00Z"), payload: { stopped: true } });
+  await h.service.resumeBlockedWork("ws"); await h.service.settled();
+  assert.equal(h.starts.length, 2);
+  assert.equal((await h.service.getRoom("ws")).workItems[1].dispatched, true);
+});
+
+test("invalid partial partitions never split; the claims route owner-led instead: missing scope, duplicate ownership, conflicts and dependencies", async () => {
   const mutations = [
     (p: ReturnType<typeof partialPlan>) => { p.requirements[1].end--; },
     (p: ReturnType<typeof partialPlan>) => { p.assignments[1].requirementIds = []; },
@@ -1316,8 +1825,10 @@ test("invalid partial partitions never dispatch: missing scope, duplicate owners
     const h = harness({ respond: async () => partialReply, planClaims: async () => { const plan = partialPlan(); mutate(plan); return plan; } });
     await h.create("a"); await h.create("b");
     const round = await h.service.submit({ ...request, userPrompt: "API and UI all!", namedActorIds: ["a", "b"] });
-    assert.equal(round.status, "routing_failed"); assert.match(round.error!, /all work remains unpicked/);
-    assert.equal(h.starts.length, 0); assert.equal((await h.service.getRoom("ws")).workItems.length, 0);
+    assert.notEqual(round.status, "routing_failed", round.error ?? undefined);
+    assert.ok(round.allocationFallback); assert.equal(round.allocation, undefined);
+    const works = (await h.service.getRoom("ws")).workItems;
+    assert.equal(h.starts.length, 1); assert.equal(works.length, 1); assert.equal(works[0].ownerLed, true);
     await h.service.settled();
   }
 });
@@ -2078,16 +2589,59 @@ test("a partial split preserves repeated canonical corrections in order across e
   await h.service.settled();
 });
 
-test("private actor requirements block a split rather than leaking context or dropping requirements", async () => {
+test("private actor requirements never split: the tree that may read them owns the whole request", async () => {
   const h = harness({ respond: async () => ({ text: "Advice", claim: false }) });
   await h.create("a"); await h.create("b");
   const prior = await h.service.submit({ ...request, requestId: "private", userPrompt: "Private constraint", namedActorIds: ["a"] });
-  h.deps.respond = async ({ actor }) => ({ ...partialReply, contextRoundIds: actor.id === "a" ? [prior.id] : [] });
+  h.deps.respond = async ({ actor }) => ({ ...partialReply, preparedPrompt: `brief-${actor.id}`, contextRoundIds: actor.id === "a" ? [prior.id] : [] });
   let plans = 0;
   h.deps.planClaims = async () => { plans++; return partialPlan(); };
   const round = await h.service.submit({ ...request, userPrompt: "API and UI all!", namedActorIds: ["a", "b"] });
-  assert.equal(round.status, "routing_failed"); assert.match(round.error!, /private.*group follow-up/);
-  assert.equal(plans, 0); assert.equal(h.starts.length, 0);
+  assert.notEqual(round.status, "routing_failed", round.error ?? undefined);
+  assert.equal(plans, 0); assert.match(round.allocationFallback!, /private to one actor tree/);
+  assert.deepEqual(round.privateContextRouting, { eligibleOwnerIds: ["a"], excludedRoundIds: [], withheldBriefActorIds: [] });
+  const works = (await h.service.getRoom("ws")).workItems.filter(work => work.roundId === round.id);
+  assert.equal(works.length, 1); assert.equal(works[0].ownerActorId, "a"); assert.equal(works[0].ownerLed, true);
+  assert.deepEqual(works[0].canonicalUserMessages, ["Private constraint", "API and UI all!"]);
+  assert.equal(h.starts.length, 1);
+  await h.service.settled();
+});
+
+test("automatic owner-led claims with one tree's private context route to that tree instead of failing", async () => {
+  const h = harness({ respond: async () => ({ text: "Advice", claim: false }) });
+  await h.create("a"); await h.create("b");
+  const prior = await h.service.submit({ ...request, requestId: "private", userPrompt: "Private constraint of a", namedActorIds: ["a"] });
+  h.deps.respond = async ({ actor }) => ({ ...partialReply, preparedPrompt: `brief-${actor.id}`, contextRoundIds: actor.id === "a" ? [prior.id] : [] });
+  const round = await h.service.submit({ ...request, requestId: "group", userPrompt: "API and UI all!" });
+  assert.notEqual(round.status, "routing_failed", round.error ?? undefined);
+  assert.deepEqual(round.replies.map(reply => reply.status), ["claimed", "claimed"]);
+  assert.equal(round.ownerActorId, "a"); assert.equal(round.routingDecisions.owner, undefined, "only one claimant could own it");
+  assert.deepEqual(round.privateContextRouting, { eligibleOwnerIds: ["a"], excludedRoundIds: [], withheldBriefActorIds: [] });
+  const work = (await h.service.getRoom("ws")).workItems.find(work => work.roundId === round.id)!;
+  assert.deepEqual(work.canonicalUserMessages, ["Private constraint of a", "API and UI all!"]);
+  assert.match(work.preparedPrompt!, /brief-b/, "b's brief came from shared context only");
+  await h.service.settled();
+});
+
+test("when no claimant may read every private context, the owner runs without the rounds and briefs it may not read", async () => {
+  const h = harness({ respond: async () => ({ text: "Advice", claim: false }) });
+  await h.create("a"); await h.create("b");
+  const privateA = await h.service.submit({ ...request, requestId: "private-a", userPrompt: "Secret of a", namedActorIds: ["a"] });
+  const privateB = await h.service.submit({ ...request, requestId: "private-b", userPrompt: "Secret of b", namedActorIds: ["b"] });
+  h.deps.respond = async ({ actor }) => ({ ...partialReply, preparedPrompt: `brief-${actor.id}`, contextRoundIds: [actor.id === "a" ? privateA.id : privateB.id] });
+  const round = await h.service.submit({ ...request, requestId: "group", userPrompt: "API and UI all!" });
+  assert.notEqual(round.status, "routing_failed", round.error ?? undefined);
+  const owner = round.ownerActorId!, other = owner === "a" ? "b" : "a";
+  assert.deepEqual(round.privateContextRouting, { eligibleOwnerIds: [], excludedRoundIds: [other === "a" ? privateA.id : privateB.id], withheldBriefActorIds: [other] });
+  const work = (await h.service.getRoom("ws")).workItems.find(work => work.roundId === round.id)!;
+  assert.deepEqual(work.canonicalUserMessages, [`Secret of ${owner}`, "API and UI all!"]);
+  assert.doesNotMatch(JSON.stringify(work), new RegExp(`Secret of ${other}|brief-${other}`));
+  for (const decision of h.decisions.filter(decision => decision.audit.roundId === round.id && decision.purpose === "model_select")) {
+    assert.doesNotMatch(decision.state, new RegExp(`Secret of ${other}|brief-${other}`));
+  }
+  h.deps.respond = async () => ({ text: "Not mine", claim: false });
+  const unclaimed = await h.service.submit({ ...request, requestId: "unclaimed", userPrompt: "Anything" });
+  assert.equal(unclaimed.privateContextRouting, undefined); assert.notEqual(unclaimed.status, "awaiting_pickup");
   await h.service.settled();
 });
 
@@ -2230,7 +2784,7 @@ test("a response gear does not change actor task permissions or execution model 
   const round = await h.service.submit({ ...request, namedActorIds: ["actor"], responseProfile: { model: MODEL_CATALOG.sol.id, effort: "high" } });
   assert.equal(round.status, "awaiting_pickup");
   assert.equal(h.starts[0].workItem.model, MODEL_CATALOG.luna.id);
-  assert.equal(h.starts[0].workItem.executionEffort, "medium");
+  assert.equal(h.starts[0].workItem.executionEffort, "high", "a lighter model is raised to the light-tier floor, not to the response gear");
   assert.deepEqual((await h.service.listActors("ws"))[0].allowedModels, [MODEL_CATALOG.luna.id]);
   await h.service.settled();
 });
@@ -2296,16 +2850,17 @@ test("parallel snapshots retain A then B then A user corrections in order and re
     return result;
   };
   const input = { workspaceId: "ws", workItemId: parent.id, sourceActorId: "root", sourceSessionId: parent.taskSessionId,
-    currentUserPrompt: "A", requestId: "correction-snapshot", tasks: [{ executorActorId: "peer", task: "Execute the latest requirement" }] };
+    currentUserPrompt: "A", currentTurnUserMessages: ["A2 steer"], requestId: "correction-snapshot", tasks: [{ executorActorId: "peer", task: "Execute the latest requirement" }] };
   const first = await h.service.delegateParallel(input);
-  assert.deepEqual(first.workItems[0].canonicalUserMessages, ["A", "B", "A"]);
-  assert.deepEqual(JSON.parse(h.decisions.at(-1)!.state).userMessages, ["A", "B", "A"]);
+  assert.deepEqual(first.workItems[0].canonicalUserMessages, ["A", "B", "A", "A2 steer"]);
+  assert.deepEqual(JSON.parse(h.decisions.at(-1)!.state).userMessages, ["A", "B", "A", "A2 steer"],
+    "the user's mid-turn steers and answers reach the authorization Decision after the turn prompt");
   await h.store.change("ws", room => {
     room.taskUpdates!.push({ requestId: "later-C", workItemId: parent.id, workItem: structuredClone(parent),
       userPrompt: "C", namedActorIds: [], status: "delivered", lease: null });
   });
   const retry = await new DomainActorService(h.store, h.deps).delegateParallel({ ...input, currentUserPrompt: "D" });
-  assert.deepEqual(retry.workItems[0].canonicalUserMessages, ["A", "B", "A"]);
+  assert.deepEqual(retry.workItems[0].canonicalUserMessages, ["A", "B", "A", "A2 steer"]);
   assert.equal(retry.workItems[0].id, first.workItems[0].id);
   await h.service.settled();
 });
@@ -2329,8 +2884,8 @@ test("parallel delegation rejects missing intent, failed Decisions, foreign acto
   await h.service.settled();
 });
 
-async function handoffSetup(allow = true) {
-  const h = harness(); await h.create("root"); await h.create("peer");
+async function handoffSetup(allow = true, overrides: Partial<DomainActorDependencies> = {}) {
+  const h = harness(overrides); await h.create("root"); await h.create("peer");
   await h.service.submit({ ...request, userPrompt: "Build the feature including its UI", namedActorIds: ["root"] });
   const parent = (await h.service.getRoom("ws")).workItems[0];
   if (allow) {
@@ -2342,7 +2897,7 @@ async function handoffSetup(allow = true) {
     };
   }
   const input = { workspaceId: "ws", workItemId: parent.id, sourceActorId: "root", sourceSessionId: parent.taskSessionId,
-    requestId: "handoff", kind: "handoff" as const, tasks: [{ executorActorId: "peer", task: "Build the settings UI" }] };
+    requestId: "handoff", kind: "handoff" as const, mode: "session" as const, tasks: [{ executorActorId: "peer", task: "Build the settings UI" }] };
   return { h, parent, input };
 }
 
@@ -2394,11 +2949,139 @@ test("actor handoff accepts exactly one task and rejects self-handoff", async ()
   await h.service.settled();
 });
 
+test("handoff authorization treats operation answers as additions and a named collaborator's goal as scope", async () => {
+  const { h, input } = await handoffSetup();
+  await h.service.delegateParallel(input);
+  const instructions = h.decisions.at(-1)!.questions.find(question => question.id === "authorization")!.instructions;
+  // A Decision once read "Answer to ..." approvals as the scope limit and denied a repair the original request covered.
+  assert.match(instructions, /an approval adds that operation to the request, a refusal excludes it, and neither narrows the rest of the original request/);
+  assert.match(instructions, /follow-ups in that actor's domain that serve that goal are covered/);
+  assert.match(instructions, /only narrow it; they are not evidence of risk/);
+  assert.match(instructions, /risky or irreversible actions the user did not request are not covered\. Return deny if uncertain\.$/, "the scope guard is unchanged");
+  await h.service.settled();
+});
+
 test("a parallel request ID cannot be reused as a handoff with identical tasks", async () => {
   const { h, input } = await handoffSetup();
-  const { kind: _kind, ...parallel } = input;
+  const { kind: _kind, mode: _mode, ...parallel } = input;
   await h.service.delegateParallel(parallel);
   await assert.rejects(h.service.delegateParallel(input), /reused/);
+  await h.service.settled();
+});
+
+test("a Codex host starts a hosted handoff in place in its calling turn, without a queued follow-up turn", async () => {
+  const updates: unknown[] = [];
+  const { h, parent, input } = await handoffSetup(true, { updateTask: async update => { updates.push(update); } });
+  const { mode: _mode, ...hosted } = input;
+  const result = await h.service.delegateParallel({ ...hosted, sourceTurnId: parent.taskTurnId });
+  assert.equal(result.inPlaceTurnId, parent.taskTurnId); assert.match(String(result.note), /in this turn, with spawn_agent/);
+  assert.equal(updates.length, 0, "no follow-up host turn is queued");
+  const room = await h.service.getRoom("ws");
+  const child = room.workItems.find(work => work.id === result.workItems[0].id)!;
+  assert.deepEqual([child.taskTurnId, child.dispatched, child.status, child.nativeAgent?.recovery], [parent.taskTurnId, true, "assigned", undefined]);
+  const split = await actorSplitHostContext({ room, host: room.workItems.find(work => work.id === parent.id)!, hostActor: room.actors.find(actor => actor.id === "root")!,
+    turnId: parent.taskTurnId, runningSessions: [], contextWindow: async () => null, issue: async () => "c".repeat(64) });
+  const brief = JSON.parse(split!.instructions.split("Split children (system data): ")[1]).children[0];
+  assert.equal(brief.name, child.nativeAgent!.name); assert.match(brief.brief, /threadex-actor-assignment:actor_handoff_/, "the calling turn has the child's spawn brief");
+  // The calling turn ends: a child it never started cannot still be running.
+  await h.service.observe(event("runner.result", parent.taskSessionId, parent.taskTurnId, "turn-done", "2026-10-22T22:08:00Z"));
+  assert.equal((await h.service.getRoom("ws")).workItems.find(work => work.id === child.id)!.status, "failed");
+  await h.service.settled();
+});
+
+test("a Claude host starts a hosted handoff in place with the Agent tool, and the marked Agent card runs the child", async () => {
+  const updates: unknown[] = [];
+  const { h, parent, input } = await handoffSetup(true, { updateTask: async update => { updates.push(update); } });
+  await h.store.change("ws", room => {
+    room.workItems[0].model = MODEL_CATALOG.claudeOpus.id;
+    for (const actor of room.actors) actor.allowedModels = [MODEL_CATALOG.claudeOpus.id];
+  });
+  const { mode: _mode, ...hosted } = input;
+  const result = await h.service.delegateParallel({ ...hosted, sourceTurnId: parent.taskTurnId });
+  const child = (await h.service.getRoom("ws")).workItems.find(work => work.id === result.workItems[0].id)!;
+  assert.deepEqual([child.model, child.nativeAgent!.provider], [MODEL_CATALOG.claudeOpus.id, "claude"]);
+  assert.equal(result.inPlaceTurnId, parent.taskTurnId); assert.match(String(result.note), /in this turn, with the Agent tool/);
+  assert.equal(updates.length, 0, "no follow-up host turn is queued");
+  assert.deepEqual([child.taskTurnId, child.dispatched, child.status, child.nativeAgent?.recovery], [parent.taskTurnId, true, "assigned", undefined]);
+  // The general-purpose Agent card carrying the brief's marker runs and completes the child in the calling turn.
+  const card = (eventType: string, status: string, message?: string) => ({ id: "toolu_docs", eventType, itemType: "subagent", tool: "spawn_agent", status, model: "opus",
+    prompt: `[threadex-actor-assignment:${child.nativeAgent!.name}]\nbrief`, agents: [{ id: "toolu_docs", name: "general-purpose", status, ...(message ? { message } : {}) }] });
+  for (const [signal, timestamp] of [[actorNativeSignals(card("item.started", "inProgress"))[0], "2026-10-22T22:07:00Z"],
+    [actorNativeSignals(card("item.completed", "completed", "UI built"))[0], "2026-10-22T22:07:30Z"]] as const)
+    await h.service.observeNativeAgent({ workspaceId: "ws", sessionId: parent.taskSessionId, turnId: parent.taskTurnId, timestamp, signal });
+  const done = (await h.service.getRoom("ws")).workItems.find(work => work.id === child.id)!;
+  assert.deepEqual([done.nativeAgent!.runSeq, done.nativeAgent!.result, done.nativeAgent!.model], [1, "UI built", MODEL_CATALOG.claudeOpus.id]);
+  // The calling turn ends after the result: nothing is settled as unstarted and no follow-up turn is queued.
+  await h.service.observe(event("runner.result", parent.taskSessionId, parent.taskTurnId, "turn-done", "2026-10-22T22:08:00Z"));
+  assert.equal((await h.service.getRoom("ws")).workItems.find(work => work.id === child.id)!.status, "completed"); assert.equal(updates.length, 0);
+  await h.service.settled();
+});
+
+test("actor handoff defaults to hosted: a native child of the caller's host launched in a queued host follow-up turn", async () => {
+  const queue = recoveryQueue();
+  const updates: Array<Parameters<NonNullable<DomainActorDependencies["updateTask"]>>[0]> = [];
+  const { h, parent, input } = await handoffSetup(true, { updateTask: async update => { updates.push(update); await queue.updateTask(update); } });
+  const { mode: _mode, ...hosted } = input;
+  const result = await h.service.delegateParallel(hosted);
+  assert.match(String(result.note), /native sub-agent of this session/);
+  const room = await h.service.getRoom("ws");
+  const child = room.workItems.find(work => work.id === result.workItems[0].id)!;
+  assert.equal(child.hostWorkItemId, parent.id); assert.equal(child.parentWorkItemId, parent.id);
+  assert.deepEqual(child.handoff, { sourceActorId: "root", sourceSessionId: parent.taskSessionId }, "the UI shows Delegated by the source actor");
+  assert.deepEqual([child.taskSessionId, child.taskTurnId], [parent.taskSessionId, parent.taskTurnId], "it shares the host session");
+  assert.deepEqual({ name: child.nativeAgent!.name, provider: child.nativeAgent!.provider }, { name: actorNativeAgentName("handoff", child.id), provider: "codex" });
+  assert.equal(child.model, MODEL_CATALOG.luna.id); assert.equal(child.delegatedTask, "Build the settings UI");
+  assert.equal(h.starts.length, 1, "no separate task session is started");
+  assert.ok(h.decisions.at(-1)!.questions.find(question => question.id === "authorization")!.instructions.includes("hands one follow-up task"), "the same handoff authorization check");
+  const recovery = child.nativeAgent!.recovery!;
+  assert.match(recovery.requestId, /^native-handoff:/); assert.equal(recovery.status, "queued"); assert.equal(child.dispatched, true);
+  assert.equal(recovery.turnId, actorFollowupTurnId("ws", parent.id, recovery.requestId), "the follow-up is updateTask's idempotent host turn");
+  assert.equal(updates.length, 1); assert.equal(updates[0].workItem.id, parent.id);
+  assert.match(updates[0].userPrompt, new RegExp(`^\\[Threadex hosted handoff\\] Start sub-agent ${child.nativeAgent!.name} for peer`));
+  assert.deepEqual({ trigger: updates[0].promptOrigin?.trigger, source: updates[0].promptOrigin?.sourceActorId }, { trigger: "handoff", source: "root" });
+  // The caller's current turn ends first and never settles the child; only its own follow-up turn defines it.
+  await h.service.observe(event("runner.result", parent.taskSessionId, parent.taskTurnId, "current-done", "2026-10-22T22:08:00Z"));
+  assert.equal((await h.service.getRoom("ws")).workItems.find(work => work.id === child.id)!.status, "assigned");
+  const context = (turnId: string) => h.service.getRoom("ws").then(room => actorSplitHostContext({ room, host: room.workItems.find(work => work.id === parent.id)!,
+    hostActor: room.actors.find(actor => actor.id === "root")!, turnId, runningSessions: [], contextWindow: async () => null, issue: async () => "c".repeat(64) }));
+  assert.match((await context(parent.taskTurnId))!.instructions, /Queued for its own recovery turn/);
+  const next = (await context(recovery.turnId))!;
+  assert.match(next.instructions, /Hosted handoff host/); assert.match(next.instructions, /threadex-actor-assignment:actor_handoff_/);
+  assert.match(next.instructions, /follow-up work that root handed off to you/);
+  assert.match(next.instructions, /Never call actor_handoff or actor_assign_many/);
+  // A retry returns the same child and never queues a second turn.
+  const retry = await h.service.delegateParallel(hosted);
+  assert.deepEqual(retry.workItems.map(work => work.id), [child.id]); assert.equal(queue.turns.size, 1);
+  await h.service.settled();
+});
+
+test("hosted handoff refuses a target without a model of the host's provider and an unsuitable host, suggesting mode session", async () => {
+  const { h, input } = await handoffSetup();
+  await h.create("claude-only", { model: MODEL_CATALOG.claudeSonnet.id, allowedModels: [MODEL_CATALOG.claudeSonnet.id] });
+  const { mode: _mode, ...hosted } = input;
+  await assert.rejects(h.service.delegateParallel({ ...hosted, requestId: "cross", tasks: [{ executorActorId: "claude-only", task: "Build it" }] }),
+    /claude-only has no allowed Codex model.*mode "session"/);
+  await assert.rejects(h.service.delegateParallel({ ...input, mode: "other" as never }), /mode must be/);
+  await assert.rejects(h.service.delegateParallel({ ...hosted, sourceSessionId: "tx_elsewhere" }), /bound work item/);
+  await h.store.change("ws", room => { room.workItems[0].dispatched = false; });
+  await assert.rejects(h.service.delegateParallel(hosted), /cannot host the handoff.*mode "session"/);
+  const room = await h.service.getRoom("ws");
+  assert.equal(room.workItems.length, 1); assert.equal(room.workItems[0].parallelRequests, undefined, "a refused hosted handoff records nothing");
+  await h.service.settled();
+});
+
+test("a native sub-agent caller cannot hand off or assign work; it reports the need to its host", async () => {
+  const { h, parent, input } = await handoffSetup(true, { updateTask: recoveryQueue().updateTask });
+  await h.create("third");
+  const { mode: _mode, ...hosted } = input;
+  const child = (await h.service.delegateParallel(hosted)).workItems[0];
+  const caller = { workspaceId: "ws", workItemId: child.id, sourceActorId: "peer", sourceSessionId: parent.taskSessionId };
+  for (const request of [{ ...caller, requestId: "nested-handoff", kind: "handoff" as const, tasks: [{ executorActorId: "third", task: "More" }] },
+    { ...caller, requestId: "nested-session", kind: "handoff" as const, mode: "session" as const, tasks: [{ executorActorId: "third", task: "More" }] },
+    { ...caller, requestId: "nested-many", tasks: [{ executorActorId: "third", task: "More" }] }]) {
+    await assert.rejects(h.service.delegateParallel(request), /Sub-agents cannot call actor_handoff or actor_assign_many.*host session decides/);
+  }
+  assert.equal((await h.service.getRoom("ws")).workItems.length, 2);
   await h.service.settled();
 });
 
@@ -2445,8 +3128,10 @@ test("automatic routing uses roots, freezes role versions, captures baseline bef
   assert.deepEqual(h.decisions.map(req => req.purpose), ["sh_pick", "claim_tiebreak", "model_select"]);
   assert.equal(h.starts.length, 1);
   assert.equal(h.starts[0].userPrompt, request.userPrompt);
-  assert.equal(h.starts[0].workItem.preparedPrompt, round.replies.find(reply => reply.actorId === "a")?.preparedPrompt);
-  assert.equal(JSON.parse(h.decisions.find(decision => decision.purpose === "model_select")!.state).preparedPrompt, h.starts[0].workItem.preparedPrompt,
+  const winnerBrief = round.replies.find(reply => reply.actorId === "a")!.preparedPrompt!;
+  assert.ok(h.starts[0].workItem.preparedPrompt!.startsWith(`${winnerBrief}\n\nOther actors also claimed this request.`), "the losing full claim is listed for the owner");
+  assert.equal(h.starts[0].workItem.ownerLed, true);
+  assert.equal(JSON.parse(h.decisions.find(decision => decision.purpose === "model_select")!.state).preparedPrompt, winnerBrief,
     "execution model selection evaluates the prepared workload, even for a short original request");
   assert.deepEqual(h.starts[0].advisories, [
     { actorId: "a", text: "I can do this", untrusted: true },
@@ -2469,10 +3154,10 @@ test("single named sub bypasses selection, opinion never dispatches; multiple na
   assert.equal(opinion.status, "no_claims"); assert.equal(h.starts.length, 0); assert.equal(h.decisions.length, 0);
   h.deps.respond = async () => ({ text: "Claim", claim: true, preparedPrompt: "Implement the requested change." });
   const single = await h.service.submit({ ...request, requestId: "single", namedActorIds: ["sub"] });
-  assert.equal(single.ownerActorId, "sub"); assert.equal(h.decisions.length, 1);
+  assert.equal(single.ownerActorId, "sub"); assert.equal(h.decisions.length, 0);
   const multiple = await h.service.submit({ ...request, requestId: "multi", namedActorIds: ["root", "sub"] });
   assert.equal(multiple.status, "awaiting_pickup");
-  assert.deepEqual(h.decisions.map(req => req.purpose), ["model_select", "claim_tiebreak", "model_select"]);
+  assert.deepEqual(h.decisions.map(req => req.purpose), ["claim_tiebreak", "model_select"]);
   await h.service.settled();
 });
 
@@ -2502,7 +3187,7 @@ test("stakeholder routing failures identify backend remedies without dispatching
     assert.ok(round.error?.includes(`LLM simulation: ${explanation}`));
     assert.match(round.error!, /Actor selection in Decision backends settings/);
     assert.match(round.error!, /send a new request/);
-    assert.match(round.error!, /execution model selection still requires a working Decision backend/);
+    assert.match(round.error!, /Naming an actor bypasses stakeholder selection\.$/);
     assert.deepEqual(round.routingDecisions.selection, failure);
     assert.deepEqual(round.replies, []);
     assert.equal(h.starts.length, 0);
@@ -2687,8 +3372,7 @@ test("a selected sub executor starts directly and retries never launch its paren
   const first = await h.service.submit(input);
   await new DomainActorService(h.store, h.deps).submit(input);
   assert.equal(responses, 1);
-  assert.deepEqual(h.decisions.map(req => req.purpose), ["model_select"]);
-  assert.equal(JSON.parse(h.decisions[0].state).executor.id, "sub");
+  assert.deepEqual(h.decisions, []);
   assert.equal(h.starts.length, 1); assert.equal(h.starts[0].executor.id, "sub");
   const work = (await h.service.getRoom("ws")).workItems[0];
   assert.equal(work.id, first.workItemId); assert.equal(work.executionHistory.length, 0);
@@ -2725,19 +3409,20 @@ test("a losing claim needs no model decision and cannot block the selected execu
   await h.service.settled();
 });
 
-test("failed ownership arbitration spends no execution model calls and starts no executor", async () => {
+test("failed ownership arbitration still selects one deterministic owner and starts only that executor", async () => {
   const h = harness(); await h.create("a"); await h.create("b");
   const purposes: string[] = [];
+  const decide = h.deps.decide;
   h.deps.decide = async req => {
     purposes.push(req.purpose);
-    assert.equal(req.purpose, "claim_tiebreak");
-    return { ok: false, attempts: [{ backend: "fake", reason: "timeout" }] };
+    return req.purpose === "claim_tiebreak" ? { ok: false, attempts: [{ backend: "fake", reason: "timeout" }] } : decide(req);
   };
   const round = await h.service.submit({ ...request, namedActorIds: ["a", "b"] });
-  assert.equal(round.status, "routing_failed"); assert.match(round.error!, /arbitration failed/);
-  assert.deepEqual(purposes, ["claim_tiebreak"]); assert.equal(h.starts.length, 0);
-  assert.equal(round.replies.length, 2); assert.equal(round.routingDecisions.owner?.ok, false);
-  assert.ok(round.replies.every(reply => reply.modelDecision === undefined));
+  assert.notEqual(round.status, "routing_failed");
+  assert.equal(round.ownerActorId, "a"); assert.equal(round.ownerFallback, "decision_failed");
+  assert.equal(purposes[0], "claim_tiebreak"); assert.equal(h.starts.length, 1);
+  assert.equal(round.routingDecisions.owner?.ok, false);
+  assert.equal(round.replies.find(reply => reply.actorId === "b")!.modelDecision, undefined);
   await h.service.settled();
 });
 
@@ -3034,6 +3719,29 @@ test("memory maintenance receives tree and relation, and task results cannot rew
   }
 });
 
+test("memory maintenance keeps a field the model replaced with a placeholder, a collapse or another language", async () => {
+  const knowledge = "standingDecisions\n- Group chat 取消須逐個 response 處理，只停止指定回覆，唔影響其他 actors。".repeat(12);
+  assert.equal(rejectedMemoryField("longTerm", knowledge, knowledge + "\n- 新決定"), null);
+  assert.equal(rejectedMemoryField("rolling", "Pending: verify retry", ""), null, "rolling may be cleared");
+  assert.equal(rejectedMemoryField("longTerm", "", "不變。"), null, "nothing to protect");
+  for (const placeholder of ["不變。", "保持不變", "（不變）", "Unchanged.", "no changes", "同上"])
+    assert.match(rejectedMemoryField("longTerm", knowledge, placeholder) ?? "", /placeholder/, placeholder);
+  assert.match(rejectedMemoryField("rolling", "Pending: verify retry", "不變") ?? "", /placeholder/);
+  assert.match(rejectedMemoryField("longTerm", knowledge, knowledge.slice(0, 60)) ?? "", /collapsed/);
+  assert.equal(rejectedMemoryField("rolling", knowledge, knowledge.slice(0, 60)), null, "rolling is compressed by design");
+  const bashkir = "Group chat-ты ғәмәлдән сығарыу һәр response өсөн айырым башҡарылырға тейеш, башҡа actors-ҡа йоғонто яһамай.";
+  assert.match(rejectedMemoryField("longTerm", knowledge, bashkir.repeat(3)) ?? "", /switched language.*Cyrillic/);
+  assert.equal(rejectedMemoryField("longTerm", bashkir.repeat(3), bashkir.repeat(3) + " ещё"), null, "an existing script is not new");
+
+  const h = harness({ maintain: async ({ actor, event }) => ({ ...actor.memory, longTerm: "不變。", rolling: event.type }) });
+  await h.create("a");
+  await h.service.updateMemory({ workspaceId: "ws", actorId: "a", sourceEventId: "seed", baseVersion: 0, memory: { ...memory, longTerm: knowledge } });
+  await h.service.submit({ ...request, namedActorIds: ["a"] }); await h.service.settled();
+  const actor = (await h.service.getRoom("ws")).actors[0];
+  assert.equal(actor.memory.longTerm, knowledge, "the placeholder never replaces saved knowledge");
+  assert.notEqual(actor.memory.rolling, memory.rolling, "the other fields of the same update still apply");
+});
+
 test("role changes need a verbatim request quote and no progress references", () => {
   const previous = { rolePrompt: "Build products", roleSummary: "Product" };
   const userPrompt = "從今以後\n  billing   交俾你負責，順手修 checkout";
@@ -3101,7 +3809,7 @@ test("out-of-role stakeholders skip task results and their own reply, live and i
   await h.service.observe(event("runner.result", work.taskSessionId, work.taskTurnId, "done")); await h.service.settled();
   const room = await h.service.getRoom("ws");
   const task = room.events.find(item => item.type === "task.turn_completed")!;
-  assert.deepEqual([...task.actorIds].sort(), ["advisor", "outsider", "owner"], "the event still notifies every original stakeholder");
+  assert.deepEqual([...task.actorIds].sort(), ["advisor", "owner"], "only engaged stakeholders receive the task on their timeline");
   assert.deepEqual(maintained.sort(), ["advisor:sh.completed", "advisor:task.turn_completed", "owner:sh.completed", "owner:task.turn_completed"]);
   assert.equal(room.memoryErrors.length, 0, "skipped events are not failures");
   const byId = (id: string) => room.actors.find(actor => actor.id === id)!.memory;
@@ -3146,7 +3854,7 @@ test("uncertain explicit updates retain their original task target across later 
   assert.notEqual(targets[0], (await h.service.getRoom("ws")).workItems[0].taskSessionId);
 });
 
-test("named single claim uses durable model Decision rather than the stakeholder's literal proposal", async () => {
+test("single full claim uses model-only Decision for a forbidden proposal", async () => {
   const h = harness({ respond: async () => ({ text: "I recommend Astra", claim: true, preparedPrompt: "Implement the requested change.", model: MODEL_CATALOG.astra.id }) });
   await h.create("a", { allowedModels: [MODEL_CATALOG.luna.id, MODEL_CATALOG.sol61.id] });
   const round = await h.service.submit({ ...request, namedActorIds: ["a"] });
@@ -3154,21 +3862,17 @@ test("named single claim uses durable model Decision rather than the stakeholder
   assert.equal(round.replies[0].proposedModel, MODEL_CATALOG.astra.id);
   assert.equal(round.replies[0].model, MODEL_CATALOG.luna.id);
   assert.equal(round.replies[0].modelDecision?.ok, true);
-  assert.deepEqual(h.decisions.map(req => req.purpose), ["model_select"]);
-  assert.equal(round.replies[0].modelDecisionAudit?.workItemId, `${round.id}:claim:a`);
-  const question = h.decisions[0].questions[0];
-  assert.ok(question.kind === "choice");
-  assert.deepEqual(Object.keys(question.options), [MODEL_CATALOG.luna.id, MODEL_CATALOG.sol61.id]);
+  assert.deepEqual(h.decisions.map(req => req.questions.map(q => q.id)), [["model", "workload_kind"]]);
   await h.service.settled();
 });
 
-test("a claiming actor's explicit allowed model is final and Decision only assesses workflow", async () => {
+test("single full claim uses the actor's explicit allowed model without workflow Decision", async () => {
   const h = harness({ respond: async () => ({ text: "Apply the stated mapping", claim: true, preparedPrompt: "Apply the stated project mapping.", model: MODEL_CATALOG.sol61.id }) });
   await h.create("a", { allowedModels: [MODEL_CATALOG.luna.id, MODEL_CATALOG.sol61.id, MODEL_CATALOG.astra.id] });
   const round = await h.service.submit({ ...request, namedActorIds: ["a"] });
   assert.equal(h.starts[0].workItem.model, MODEL_CATALOG.sol61.id);
   assert.equal(round.replies[0].modelSource, "actor");
-  assert.deepEqual(h.decisions.map(req => req.questions.map(question => question.id)), [["workflow"]]);
+  assert.deepEqual(h.decisions, []);
   await h.service.settled();
 });
 
@@ -3181,12 +3885,12 @@ test("a failed workflow Decision does not block an actor-chosen model", async ()
   await h.service.settled();
 });
 
-test("an actor that omits model falls back to the Decision with tier options", async () => {
+test("single full claim without a model uses its permitted default without Decision", async () => {
   const h = harness();
   await h.create("a", { allowedModels: [MODEL_CATALOG.luna.id, MODEL_CATALOG.sol61.id] });
   const round = await h.service.submit({ ...request, namedActorIds: ["a"] });
-  assert.equal(round.replies[0].modelSource, "decision");
-  assert.deepEqual(h.decisions[0].questions.map(question => question.id), ["model", "workflow"]);
+  assert.equal(round.replies[0].model, MODEL_CATALOG.luna.id);
+  assert.deepEqual(h.decisions, []);
   await h.service.settled();
 });
 
@@ -3198,32 +3902,51 @@ test("an assigning actor's explicit allowed model is final", async () => {
   const before = h.decisions.length;
   const work = await h.service.assign({ workspaceId: "ws", workItemId: round.workItemId!, executorActorId: "sub", model: MODEL_CATALOG.sol61.id, requestId: "delegate" });
   assert.equal(work.model, MODEL_CATALOG.sol61.id);
-  assert.deepEqual(h.decisions.slice(before).map(req => req.questions.map(question => question.id)), [["workflow"]]);
+  assert.deepEqual(h.decisions.slice(before).map(req => req.questions.map(question => question.id)), [["workflow", "workload_kind"]]);
   await h.service.settled();
 });
 
-test("a failed winning claim model Decision retains every SH reply without selecting a loser's model", async () => {
+test("a failed winning claim model Decision dispatches the winner with a permitted fallback model, never a loser's", async () => {
   const h = harness(); await h.create("a"); await h.create("b");
   const decide = h.deps.decide;
   let failedCalls = 0;
   h.deps.decide = async req => {
-    if (req.purpose === "model_select" && JSON.parse(req.state).owner.id === "a") {
+    if (req.purpose === "model_select" && JSON.parse(req.state).owner?.id === "a") {
       failedCalls++; return { ok: false, attempts: [{ backend: "fake", reason: "timeout" }] };
     }
     return decide(req);
   };
   const round = await h.service.submit({ ...request, namedActorIds: ["a", "b"] });
-  assert.equal(round.status, "routing_failed"); assert.equal(round.ownerActorId, null);
+  assert.notEqual(round.status, "routing_failed", round.error ?? undefined); assert.equal(round.ownerActorId, "a");
   assert.deepEqual(round.replies.map(reply => reply.text), ["I can do this", "I can do this"]);
   assert.equal(round.routingDecisions.models?.a.ok, false); assert.equal(round.routingDecisions.models?.b, undefined);
-  assert.equal(h.starts.length, 0); assert.ok(h.decisions.some(req => req.purpose === "claim_tiebreak"));
+  const winner = round.replies.find(reply => reply.actorId === "a")!;
+  assert.equal(winner.modelFallback, "decision_failed");
+  const actor = (await h.service.getRoom("ws")).actors.find(actor => actor.id === "a")!;
+  assert.ok(actor.allowedModels.includes(winner.model!));
+  assert.equal(h.starts.length, 1); assert.equal(h.starts[0].workItem.model, winner.model);
+  assert.ok(h.decisions.some(req => req.purpose === "claim_tiebreak"));
   await new DomainActorService(h.store, h.deps).submit({ ...request, namedActorIds: ["a", "b"] });
-  assert.equal(failedCalls, 1); assert.equal(h.starts.length, 0);
+  assert.equal(failedCalls, 1); assert.equal(h.starts.length, 1);
+  await h.service.settled();
+});
+
+test("a failed sole-partial coverage check treats the claim as gaps instead of blocking it", async () => {
+  const h = harness({ respond: async () => ({ text: "API only", claim: true, claimKind: "partial", claimScope: "API", preparedPrompt: "Build the API" }) });
+  await h.create("a");
+  const decide = h.deps.decide;
+  h.deps.decide = async req => req.questions.some(q => q.id === "coverage") ? { ok: false, attempts: [{ backend: "fake", reason: "timeout" }] } : decide(req);
+  const round = await h.service.submit(request);
+  assert.notEqual(round.status, "routing_failed", round.error ?? undefined);
+  assert.equal(round.routingDecisions.coverage?.ok, false);
+  assert.equal(round.coverageGap?.uncovered, true);
+  assert.equal(h.starts.length, 1); assert.match(h.starts[0].workItem.preparedPrompt!, /Execute ONLY your claimed scope/);
   await h.service.settled();
 });
 
 test("crash after durable model Decision reuses its result without collecting SH replies again", async () => {
   const h = harness(); await h.create("a", { allowedModels: [MODEL_CATALOG.luna.id] });
+  await h.create("b");
   const decide = h.deps.decide;
   let crash = true;
   h.deps.decide = async req => {
@@ -3231,9 +3954,9 @@ test("crash after durable model Decision reuses its result without collecting SH
     if (req.purpose === "model_select" && crash) { crash = false; throw new Error("Crash after durable model result"); }
     return result;
   };
-  await assert.rejects(h.service.submit({ ...request, namedActorIds: ["a"] }), /Crash after durable/);
+  await assert.rejects(h.service.submit({ ...request, namedActorIds: ["a", "b"] }), /Crash after durable/);
   h.deps.respond = async () => { throw new Error("Saved SH response must be reused"); };
-  const resumed = await new DomainActorService(h.store, h.deps).submit({ ...request, namedActorIds: ["a"] });
+  const resumed = await new DomainActorService(h.store, h.deps).submit({ ...request, namedActorIds: ["a", "b"] });
   assert.equal(resumed.replies[0].text, "I can do this"); assert.equal(resumed.replies[0].model, MODEL_CATALOG.luna.id);
   assert.equal(h.decisions.filter(req => req.purpose === "model_select").length, 1); assert.equal(h.starts.length, 1);
 });
@@ -3244,8 +3967,7 @@ test("claim model choices use owner/executor permission intersection and an empt
   await h.create("sub", { parentActorId: "root", model: MODEL_CATALOG.sol61.id, allowedModels: [MODEL_CATALOG.sol61.id, MODEL_CATALOG.claudeHaiku.id] });
   const round = await h.service.submit({ ...request, namedActorIds: ["root"] });
   assert.equal(round.replies[0].model, MODEL_CATALOG.sol61.id);
-  const question = h.decisions.find(req => req.purpose === "model_select")!.questions[0];
-  assert.ok(question.kind === "choice"); assert.deepEqual(Object.keys(question.options), [MODEL_CATALOG.sol61.id]);
+  assert.deepEqual(h.decisions.map(req => req.questions.map(q => q.id)), [["model", "workload_kind"]]);
   await h.service.updateActor("ws", "root", { allowedModels: [MODEL_CATALOG.luna.id] });
   const empty = await h.service.submit({ ...request, requestId: "empty-intersection", namedActorIds: ["root"] });
   assert.equal(empty.status, "routing_failed"); assert.equal(empty.replies[0].text, "Sub should execute"); assert.equal(h.starts.length, 1);
@@ -3299,6 +4021,26 @@ test("a cancelled approval clears needs_user, but another pending approval keeps
   assert.deepEqual((await h.service.getRoom("ws")).workItems[0].pendingApprovalIds, []);
 });
 
+test("an approval request arriving after its turn's result neither revives needs_user nor reverts the result to started", async () => {
+  const h = harness(); await h.create("a"); await h.service.submit(request);
+  const work = (await h.service.getRoom("ws")).workItems[0];
+  let n = 0;
+  const emit = (type: string, payload: object = {}) => h.service.observe({ eventId: `e${++n}`, type, workspaceId: "ws",
+    sessionId: work.taskSessionId, turnId: work.taskTurnId, payload, timestamp: new Date(Date.now() + n * 1000).toISOString() } as never);
+  await emit("runner.runner.started");
+  await emit("runner.result");
+  assert.equal((await h.service.getRoom("ws")).workItems[0].status, "completed");
+  await emit("runner.approval.requested", { approvalId: "late" });
+  let current = (await h.service.getRoom("ws")).workItems[0];
+  assert.equal(current.status, "completed", "a late or replayed request of an ended turn is not waiting on the user");
+  assert.deepEqual(current.pendingApprovalIds ?? [], []);
+  assert.equal(actorSummary(await h.service.getRoom("ws"), []).actors[0].counts.attention, 0);
+  await emit("runner.approval.resolved", { approvalId: "late", decision: "cancel" });
+  current = (await h.service.getRoom("ws")).workItems[0];
+  assert.equal(current.status, "completed", "resolving the late request does not invent progress");
+  await h.service.settled();
+});
+
 test("Cancel ends only the targeted failed launch: retry, restart recovery and references never relaunch it", async () => {
   let fail = true;
   const stops: string[] = [], updates: string[] = [];
@@ -3343,10 +4085,12 @@ test("Cancel of a runner-failed task stops its session turns, survives later eve
   await h.service.submit({ ...request, namedActorIds: ["a"] });
   let work = (await h.service.getRoom("ws")).workItems[0];
   await h.service.observe(event("runner.runner.started", work.taskSessionId, work.taskTurnId, "started"));
-  await assert.rejects(h.service.cancelWork("ws", work.id), /Only a failed task/, "a running task is stopped, not cancelled");
+  h.store.persistence.getDomainActorRunningSessions = async () => [{ actorId: "a", workItemId: work.id, sessionId: work.taskSessionId, turnId: work.taskTurnId, status: "running" }];
+  await assert.rejects(h.service.cancelWork("ws", work.id), /running, queued or loop/, "a running task is stopped, not cancelled");
   assert.deepEqual(stops, []);
   await h.service.observe(event("runner.error", work.taskSessionId, work.taskTurnId, "failed", "2026-10-22T22:01:00Z"));
   assert.equal((await h.service.getRoom("ws")).workItems[0].status, "failed");
+  await h.store.change("ws", room => { delete room.workItems[0].pickedUpAt; });
   await h.service.cancelWork("ws", work.id);
   assert.deepEqual(stops, [work.taskSessionId]);
   // A leftover retry of the same turn reports in later; history records it but the task stays cancelled.
@@ -3354,8 +4098,59 @@ test("Cancel of a runner-failed task stops its session turns, survives later eve
   const room = await h.service.getRoom("ws");
   work = room.workItems[0];
   assert.ok(work.cancelledAt); assert.ok(room.events.some(event => event.id === "task:late-retry"));
+  assert.equal(room.rounds[0].status, "assigned", "late retry cannot reopen cancelled pickup");
   assert.deepEqual(actorSummary(room, []).actors[0].counts, { open: 0, attention: 0 });
   await h.service.submit({ ...request, requestId: "follow-up", userPrompt: "Remove another Composer hint", namedActorIds: ["a"] });
   assert.deepEqual(deliveries, [], "a cancelled task is never continued");
   assert.equal(h.starts.length, 2, "the follow-up starts a new task");
+});
+
+test("a cross-workspace handoff runs as the target workspace's own individual round, binding and approval", async () => {
+  const h = harness({ resolveTaskBinding: async input => ({ workspaceId: input.workspaceId, cwd: `/cwd/${input.workspaceId}`, projectId: `project-${input.workspaceId}`, source: "workspace" }) });
+  await h.create("a");
+  await h.service.createActor("other", { id: "dev", name: "貓貓 · dev-env", model: MODEL_CATALOG.luna.id, memory });
+  await h.service.submit({ ...request, namedActorIds: ["a"], approvalPolicy: "never" });
+  const source = (await h.service.getRoom("ws")).workItems[0];
+  const input = { workspaceId: "ws", workspaceName: "Threadex", workItemId: source.id, sourceActorId: "a", sourceSessionId: source.taskSessionId, sourceTurnId: "turn-2",
+    userMessages: [request.userPrompt, "請叫貓貓補 dev-env 嘅 bucket", "係"], requestId: "xws-1", targetWorkspaceId: "other", targetActorId: "dev", task: "Create bucket local-staging" };
+  const record = async () => (await h.service.getRoom("ws")).workItems[0].crossWorkspaceHandoffs?.find(item => item.requestId === input.requestId);
+  const settle = async () => { for (let i = 0; i < 200 && (await record())?.status === "pending"; i++) await new Promise(resolve => setTimeout(resolve, 5)); };
+
+  await assert.rejects(h.service.handoffAcrossWorkspaces(input), /not authorized/, "the handoff authorization check still applies");
+  assert.equal((await h.service.getRoom("other")).rounds.length, 0, "a denied handoff creates no target round");
+  assert.match(h.decisions.at(-1)!.questions[0].instructions, /another workspace/);
+  assert.match(h.decisions.at(-1)!.questions[0].instructions, /including earlier ones/, "earlier user messages of the task count");
+  assert.match(String(h.decisions.at(-1)!.state), /"targetWorkspaceId":"other"/);
+
+  const decide = h.deps.decide;
+  h.deps.decide = async request => {
+    const result = await decide(request);
+    if (result.ok && result.answers.authorization) result.answers.authorization = { kind: "choice", choice: "allow", confidence: 1 };
+    return result;
+  };
+  const allowed = { ...input, requestId: "xws-2" };
+  const result = await h.service.handoffAcrossWorkspaces(allowed);
+  assert.equal(result.status, "submitted"); assert.equal(result.crossWorkspace, true); assert.equal(result.targetWorkspaceId, "other");
+  input.requestId = allowed.requestId; await settle();
+  const target = await h.service.getRoom("other");
+  assert.equal(target.rounds.length, 1);
+  const round = target.rounds[0];
+  assert.equal(round.userPrompt, input.userMessages.join("\n\n"), "the user's own words, oldest first, stay the canonical request");  assert.deepEqual(round.namedActorIds, ["dev"]);
+  assert.deepEqual(round.crossWorkspaceOrigin, { sourceWorkspaceId: "ws", sourceWorkspaceName: "Threadex", sourceSessionId: source.taskSessionId, sourceTurnId: "turn-2",
+    sourceActorId: "a", sourceActorName: "a", sourceRequestId: "xws-2", task: input.task });
+  assert.equal(round.approvalPolicy, undefined, "the source session's approval policy is never inherited");
+  const start = h.starts.find(start => start.workspaceId === "other")!;
+  assert.equal(start.executor.id, "dev");
+  assert.deepEqual(start.taskBinding, { workspaceId: "other", cwd: "/cwd/other", projectId: "project-other", source: "workspace" });
+  assert.equal(start.approvalPolicy, undefined);
+  assert.equal(h.starts.find(start => start.workspaceId === "ws")!.approvalPolicy, "never");
+  const saved = (await record())!;
+  assert.equal(saved.status, "submitted"); assert.equal(saved.targetRoundId, round.id);
+  assert.equal(saved.sourceActorId, "a"); assert.equal(saved.targetActorId, "dev"); assert.equal(saved.targetActorName, "貓貓 · dev-env"); assert.equal(saved.targetWorkspaceId, "other");
+
+  const retried = await h.service.handoffAcrossWorkspaces(allowed);
+  assert.equal(retried.targetRoundId, round.id); assert.equal((await h.service.getRoom("other")).rounds.length, 1, "a retry never creates a second round");
+  await assert.rejects(h.service.handoffAcrossWorkspaces({ ...allowed, task: "Something else" }), /reused/);
+  await assert.rejects(h.service.handoffAcrossWorkspaces({ ...allowed, requestId: "same-ws", targetWorkspaceId: "ws", targetActorId: "a" }), /Choose one actor/);
+  await assert.rejects(h.service.handoffAcrossWorkspaces({ ...allowed, requestId: "forged", sourceActorId: "dev" }), /bound work item/);
 });

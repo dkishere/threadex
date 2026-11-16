@@ -184,6 +184,8 @@ export async function actorModelContextWindow(store: Partial<Pick<SessionStore, 
 }
 
 export const ACTOR_UNKNOWN_WINDOW_ADMISSION_TOKENS = 64_000;
+/** Most UTF-8 bytes of each memory field injected into an actor's context; longer fields need actor_read_memory. */
+export const ACTOR_MEMORY_FIELD_EXCERPT_BYTES = 4096;
 export function actorInputBudget(modelContextWindow?: number | null) {
   const window = modelContextWindow && Number.isFinite(modelContextWindow) && modelContextWindow > 0
     ? Math.floor(modelContextWindow) : ACTOR_UNKNOWN_WINDOW_ADMISSION_TOKENS;
@@ -225,7 +227,7 @@ export function boundedActorContext(input: {
   // Optional content leaves the reserve free; with a tiny budget it simply gets less.
   const fits = () => Buffer.byteLength(JSON.stringify(result)) <= optionalBudget();
   // Reserve balanced excerpts; actors can explicitly read another memory range.
-  const fieldBytes = Math.max(0, Math.min(4096, Math.floor((optionalBudget() - Buffer.byteLength(JSON.stringify(result))) / 8)));
+  const fieldBytes = Math.max(0, Math.min(ACTOR_MEMORY_FIELD_EXCERPT_BYTES, Math.floor((optionalBudget() - Buffer.byteLength(JSON.stringify(result))) / 8)));
   for (const key of ["rolePrompt", "roleSummary", "longTerm", "rolling"] as const) {
     result.memory[key] = actorMemorySlice(input.memory[key], 0, fieldBytes).text;
   }

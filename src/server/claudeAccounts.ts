@@ -217,7 +217,9 @@ export async function fetchClaudeUsage(configDir: string): Promise<{ quota: Clau
     resolveDone();
     try { query.close?.(); } catch { /* ignore */ }
   }
-  const windows = quotaFromUsageReport(report);
+  const reported = quotaFromUsageReport(report);
+  // The text stays the canonical fallback when the CLI attaches no structured report.
+  const windows = reported.fiveHour || reported.weekly ? reported : quotaFromUsageText(text);
   return {
     quota: { ...windows, ...(text ? { reportText: text.slice(0, 2000) } : {}), source: "usage" },
     email: findString(account, ["email", "emailAddress"]),
@@ -226,9 +228,27 @@ export async function fetchClaudeUsage(configDir: string): Promise<{ quota: Clau
   };
 }
 
-/** Best-effort parse of SDKUsageReport; the exact shape is not documented, so search by name. */
+/**
+ * Parses SDKUsageReport. Its `rate_limits.limits[]` rows are classified by `kind`
+ * ("session", "weekly_all", "weekly_scoped") with a 0-100 `percent`; other shapes
+ * are searched by window name.
+ */
 export function quotaFromUsageReport(report: unknown): Pick<ClaudeQuotaSnapshot, "fiveHour" | "weekly"> {
   const result: Pick<ClaudeQuotaSnapshot, "fiveHour" | "weekly"> = {};
+  const rows = toRecord(toRecord(report)?.rate_limits)?.limits;
+  if (Array.isArray(rows)) {
+    for (const row of rows) {
+      const record = toRecord(row);
+      const kind = typeof record?.kind === "string" ? record.kind.toLowerCase() : "";
+      const usedPercent = typeof record?.percent === "number" && Number.isFinite(record.percent)
+        ? Math.round(record.percent * 10) / 10 : null;
+      const resetsAt = epochMs(record?.resets_at);
+      if (usedPercent === null && resetsAt === null) continue;
+      if (kind === "session" && !result.fiveHour) result.fiveHour = { usedPercent, resetsAt };
+      else if (kind === "weekly_all" && !result.weekly) result.weekly = { usedPercent, resetsAt };
+    }
+    if (result.fiveHour || result.weekly) return result;
+  }
   visit(report, (key, value) => {
     const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
     const window = quotaWindow(value);
@@ -237,6 +257,73 @@ export function quotaFromUsageReport(report: unknown): Pick<ClaudeQuotaSnapshot,
     else if (!result.weekly && /sevenday|weekly|week|7d/.test(normalized) && !/opus|sonnet|fable/.test(normalized)) result.weekly = window;
   });
   return result;
+}
+
+/**
+ * Parses the plain /usage text, e.g.
+ * "Current session: 18% used · resets Nov 3 at 12:39pm (Europe/London)".
+ * Per-model weekly rows ("Current week (Fable)") are not the account's weekly window.
+ */
+export function quotaFromUsageText(text: string, now = Date.now()): Pick<ClaudeQuotaSnapshot, "fiveHour" | "weekly"> {
+  const result: Pick<ClaudeQuotaSnapshot, "fiveHour" | "weekly"> = {};
+  for (const line of text.split(/\r?\n/)) {
+    const match = /^\s*Current (session|week(?: \(all models\))?)\s*:\s*(\d+(?:\.\d+)?)%\s*used(?:\s*[·•-]\s*resets\s+(.+?))?\s*$/i.exec(line);
+    if (!match) continue;
+    const window = { usedPercent: Number(match[2]), resetsAt: match[3] ? parseUsageReset(match[3], now) : null };
+    if (match[1].toLowerCase() === "session") result.fiveHour ??= window;
+    else result.weekly ??= window;
+  }
+  return result;
+}
+
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+
+/** "Nov 3 at 12:39pm (Europe/London)" or "12:39pm (Europe/London)" → the next matching epoch ms. */
+function parseUsageReset(value: string, now: number) {
+  const match = /^(?:([a-z]{3})[a-z]*\.?\s+(\d{1,2})(?:,?\s+(\d{4}))?\s+at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*(?:\(([^)]+)\))?/i.exec(value.trim());
+  if (!match) return null;
+  const month = match[1] ? MONTHS.indexOf(match[1].toLowerCase()) : null;
+  if (month === -1) return null;
+  const hour = Number(match[4]) % 12 + (match[6].toLowerCase() === "pm" ? 12 : 0);
+  const minute = Number(match[5] ?? 0);
+  const timeZone = match[7]?.trim();
+  const today = zonedParts(now, timeZone);
+  if (!today) return null;
+  const at = (year: number, monthIndex: number, day: number) => zonedTime(year, monthIndex, day, hour, minute, timeZone);
+  if (month === null) {
+    const sameDay = at(today.year, today.month, today.day);
+    return sameDay !== null && sameDay < now ? at(today.year, today.month, today.day + 1) : sameDay;
+  }
+  const day = Number(match[2]);
+  if (match[3]) return at(Number(match[3]), month, day);
+  const thisYear = at(today.year, month, day);
+  // A reset never lies in the past; "Jan 2" seen in late December is next year.
+  return thisYear !== null && thisYear < now - 86_400_000 ? at(today.year + 1, month, day) : thisYear;
+}
+
+function zonedParts(epoch: number, timeZone: string | undefined) {
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone, hourCycle: "h23", year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", second: "numeric"
+    }).formatToParts(new Date(epoch));
+    const part = (type: string) => Number(parts.find((entry) => entry.type === type)?.value);
+    return { year: part("year"), month: part("month") - 1, day: part("day"), hour: part("hour"), minute: part("minute"), second: part("second") };
+  } catch {
+    return null;
+  }
+}
+
+/** Epoch ms of a wall-clock time in `timeZone` (the server's zone when absent). */
+function zonedTime(year: number, month: number, day: number, hour: number, minute: number, timeZone: string | undefined) {
+  const wall = Date.UTC(year, month, day, hour, minute);
+  let guess = wall;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const parts = zonedParts(guess, timeZone);
+    if (!parts) return null;
+    const offset = Date.UTC(parts.year, parts.month, parts.day, parts.hour, parts.minute, parts.second) - guess;
+    guess = wall - offset;
+  }
+  return guess;
 }
 
 /** Turns an SDK rate_limit_event's rate_limit_info into a quota patch. */

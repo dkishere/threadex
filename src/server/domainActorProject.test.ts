@@ -68,6 +68,25 @@ test("an actor's sole project is a default after explicit and message project se
   assert.equal(resolve({ userPrompt: "fix this" }, ["dev", "dev"]).projectId, "dev");
 });
 
+test("a message referring to multiple project roots uses the actor's own project instead of asking", () => {
+  const prompt = "compare /work/e2e-test/a.ts and /work/tools/threadex/b.ts";
+  assert.throws(() => resolveActorTaskBinding(workspace, projects, { userPrompt: prompt }, noRepo), /multiple project roots/);
+  assert.deepEqual(resolveActorTaskBinding(workspace, projects, { userPrompt: prompt }, noRepo, ["backend"]),
+    { workspaceId: "default", cwd: "/work/hub-backend", projectId: "backend", source: "actor" });
+  // References choose among the actor's own roots; ambiguous ones use its primary root.
+  assert.equal(resolveActorTaskBinding(workspace, projects, { userPrompt: `${prompt} /work/backend-secondary/x.ts` }, noRepo, ["backend"]).cwd, "/work/backend-secondary");
+  assert.equal(resolveActorTaskBinding(workspace, projects, { userPrompt: "diff /work/hub-backend/a /work/backend-secondary/b" }, noRepo, ["backend"]).cwd, "/work/hub-backend");
+  // An actor without a usable project keeps the explicit choice.
+  for (const defaults of [[], ["missing"]]) assert.throws(() => resolveActorTaskBinding(workspace, projects, { userPrompt: prompt }, noRepo, defaults), /multiple project roots/);
+});
+
+test("an actor in several projects uses the one its ambiguous message references, otherwise asks", () => {
+  const defaults = ["threadex", "backend"];
+  assert.equal(resolveActorTaskBinding(workspace, projects, { userPrompt: "compare /work/e2e-test/a.ts and /work/tools/threadex/b.ts" }, noRepo, defaults).projectId, "threadex");
+  assert.throws(() => resolveActorTaskBinding(workspace, projects, { userPrompt: "compare threadex and hub-backend" }, noRepo, defaults), /belongs to multiple projects/);
+  assert.throws(() => resolveActorTaskBinding(workspace, projects, { userPrompt: "fix this" }, noRepo, defaults), /belongs to multiple projects/);
+});
+
 test("ambiguous or invalid actor defaults cannot silently fall back to the workspace", () => {
   for (const defaults of [["missing"], ["dev", "backend"], ["rootless"]]) {
     const registry = [...projects, { id: "rootless", name: "Empty", roots: [] }];

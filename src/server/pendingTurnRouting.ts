@@ -28,6 +28,26 @@ export function pendingTurnRunsAutomatically(reason: PendingTurnReason) {
   return reason !== "stopped" && reason !== "auth";
 }
 
+/**
+ * Rate-limit and auth waits retry their prompt by themselves only while the session has not moved on.
+ * Once another turn of the same session has started a runner after this one last started (or was created),
+ * re-running the older prompt would execute it out of order and hold every newer queued prompt behind it,
+ * so it waits for a manual retry instead. A manual retry restarts the wait's own clock.
+ */
+export function supersededRetryWaitTurnIds(
+  waitingTurns: Array<{ id: string; created: string; runnerStarted: string | null; pendingReason: PendingTurnReason }>,
+  sessionTurns: Array<{ id: string; runnerStarted: string | null }>
+) {
+  return waitingTurns
+    .filter((waiting) => waiting.pendingReason === "rate_limit" || waiting.pendingReason === "auth")
+    .filter((waiting) => {
+      const waitingSince = Date.parse(waiting.runnerStarted ?? waiting.created);
+      return sessionTurns.some((turn) => turn.id !== waiting.id && turn.runnerStarted !== null &&
+        Date.parse(turn.runnerStarted) > waitingSince);
+    })
+    .map((waiting) => waiting.id);
+}
+
 export function pendingRetryAt(input: {
   alternateAccountAvailable: boolean;
   resetTimes: number[];

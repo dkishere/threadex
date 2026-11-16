@@ -169,6 +169,22 @@ test("commentary short token cap handles English words", () => {
   assert.equal(comment?.extracts[0]?.shortMsg.endsWith("…"), true);
 });
 
+test("stored commentary shorts in a script absent from the detail fall back to the detail", () => {
+  const comment = normalizeStructuredAgentComment({
+    extracts: [{ type: "action", shortMsg: "Продолжить локальную проверку, пока уточняется маршрутизация." }],
+    detail: "I’ll continue Local verification while resolving that routing detail."
+  });
+  assert.deepEqual(comment?.extracts, [{ type: "action", shortMsg: "continue Local verification while resolving that routing detail." }]);
+});
+
+test("stored commentary shorts in another Latin-script language fall back to the detail", () => {
+  const comment = normalizeStructuredAgentComment({
+    extracts: [{ type: "action", shortMsg: "Core avanzó a UC-HUB-005.email, el séptimo caso." }],
+    detail: "Core has reached UC-HUB-005.email, the seventh case."
+  });
+  assert.deepEqual(comment?.extracts, [{ type: "action", shortMsg: "Core has reached UC-HUB-005.email, the seventh case." }]);
+});
+
 test("normalizes wait commentary as its own type", () => {
   const comment = normalizeStructuredAgentComment({
     extracts: [{ type: "wait", shortMsg: "Waiting for the next step" }],

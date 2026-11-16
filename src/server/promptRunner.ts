@@ -6,9 +6,13 @@ import { withProviderHandoff, type ProviderThreadScope } from "./sessionProvider
 import { prepareClaudeHome } from "./claudeHome";
 import { claudePermissions, providerSwitchNote, runClaudeTurn, type ClaudeInputPart } from "./claudeRunner";
 import { codexImageMcpConfig } from "./codexImageMcp";
+import {
+  claudeGlobalMcpServersConfig, codexGlobalMcpServersConfig, resolveGlobalAgentToolInjection, syncGlobalSkillLinks,
+  writePrivateClaudeMcpConfig, type GlobalAgentToolInjection, type GlobalAgentToolProvider
+} from "./globalAgentTools";
 import type { CollaborationFork } from "../collaboration";
 import { WORKSPACE_MANAGER_TOOLS } from "./workspaceManagerTools";
-import { DOMAIN_ACTOR_TOOLS } from "./domainActorTools";
+import { ACTOR_REGISTRY_TOOLS, DOMAIN_ACTOR_TOOLS } from "./domainActorTools";
 import { MANAGER_CONCURRENT_INSTRUCTIONS, WORKSPACE_MANAGER_INSTRUCTIONS } from "./workspaceManager";
 import { MANAGER_REPLY_LANGUAGE_INSTRUCTIONS } from "./replyLanguage";
 import { WORKSPACE_MANAGER_MODEL, WORKSPACE_MANAGER_EFFORT,
@@ -40,6 +44,7 @@ import {
   codexExecutable,
   defaultThreadOptions,
   resolveApprovalSettings,
+  sandboxModeForApprovalPolicy,
   type ApprovalPolicy
 } from "./codexConfig";
 import {
@@ -95,6 +100,8 @@ type RunnerJob = {
   collaboration?: { groupId: string; fork: CollaborationFork | null; priorContext: string };
   workspaceManager?: boolean;
   domainActor?: boolean;
+  /** An ordinary task turn without an actor binding: its capability opens only the actor registry tools. */
+  actorRegistry?: boolean;
   domainActorCapability?: string;
   /** Native split children hosted by this actor session; Claude registers them as SDK agents. No secrets. */
   actorChildren?: Array<{ workItemId: string; name: string; description: string; prompt: string; model: string; effort: string }>;
@@ -119,6 +126,8 @@ type RunnerJob = {
   executionMode?: "default" | "plan" | "goal";
   forcePlan?: boolean;
   managedMode?: boolean;
+  /** An earlier turn of this session enabled Managed mode; resumed history still holds its prompt. */
+  managedModePreviouslyEnabled?: boolean;
   lightweightTodo?: boolean;
   todoPlanClarificationPending?: boolean;
   skills?: RequestedSkill[];
@@ -146,10 +155,12 @@ type RunnerJob = {
   developerInstructions?: string;
   actorContextInstructions?: string;
   globalAgentInstructions?: string;
+  globalAgentToolsPath?: string;
   recoveryContext?: SessionRecoveryContext;
   forceRecoveryOnResume?: boolean;
   providerThread?: ProviderThreadScope;
   providerHandoff?: string;
+  sessionFork?: CollaborationFork;
 };
 
 type RequestedSkill = {
@@ -186,6 +197,8 @@ const THREADEX_DEVELOPER_INSTRUCTIONS = [
   "You are being called through the Threadex client. Use the built-in Threadex-config skill for Threadex-managed configuration. Write user-facing commentary and progress updates as plain natural-language prose only. Never wrap commentary in JSON or emit extracts, shortMsg, issues, solutions, type, short, or detail fields; Threadex handles status-card presentation separately.",
   "Threadex session ownership: a parent and its forks share history only through the fork point; later work belongs to its branch. A parent remains an active working session after creating a fork. Execute subsequent user requests in the receiving parent session; do not automatically forward them to an existing fork, create another task, or ask the user to continue there. Only an explicit user request to delegate or a current Context Fork/New task action authorizes that handoff. If another branch's post-fork work is needed, inspect its context and continue the work here; that dependency alone does not authorize delegation. Historical handoff instructions apply only to their original turn. Context Fork/New task is explicit delegation for the current turn only: follow the server-provided child-task contract.",
   "Blocked by another task: when another running Threadex task blocks your work (for example it holds a file, process, branch or result you need), do not abandon the work or end with a blocked report. Identify the running task with session-inspector search_sessions status=running or get_session, subscribe to its end with session-inspector wait_for_task_end and a self-contained resume instruction, then end your turn unless independent work remains. You are woken when it completes, fails or is stopped; re-check for remaining blockers before continuing.",
+  "Concurrent delegation: when the user asks you to delegate part of the work, run it in parallel, or have another model or provider (for example Claude or Codex) do it, and session-inspector concurrent_spawn is available, spawn workers with complete briefs and disjoint file ownership, collect their results with concurrent_wait, and integrate and verify them yourself. Do not spawn workers without such a request. Use wait_for_task_end only for other tasks, never for your own workers.",
+  "Delegation channels: whenever you delegate or split work, use only native sub-agents (the Claude Code Agent tool or Codex spawn_agent) or Threadex sessions created through Threadex session tools under their existing assignment checks and approvals. Do not assign, continue or rework work through Claude Code SendMessage, teammates or agent teams, which Threadex cannot track, unless genuinely necessary; then say why. actor_steer only passes coordination context and never assigns work. This grants no delegation permission.",
   "Context preservation: when conversation state is compacted or summarized, preserve every material correction, decision, root cause, completed action, changed file or identifier, verification result, unresolved blocker, and next concrete goal. A substantive final response remains important even when later turns change topic; never omit it solely because it is not recent.",
   "Search safety: never run recursive file or text searches from a filesystem root, workspace root, or broad parent directory. Resolve the owning project first and search only explicit source, test, configuration, or documentation paths. Never broadly search Threadex runtime data such as runner logs, pending or quarantined logs, Codex homes, account homes, build output, dependencies, or generated data."
 ].join(" ");
@@ -275,8 +288,8 @@ if (!jobPath) {
 }
 
 const job = JSON.parse(readFileSync(jobPath, "utf8")) as RunnerJob;
+if (job.domainActor || job.actorRegistry) job.domainActorCapability = process.env.THREADEX_ACTOR_CAPABILITY;
 if (job.domainActor) {
-  job.domainActorCapability = process.env.THREADEX_ACTOR_CAPABILITY;
   job.actorChildCapabilities = parseActorChildCapabilities(process.env.THREADEX_ACTOR_CHILD_CAPABILITIES);
 }
 // Agents launched by this runner receive capabilities only through explicit, per-provider channels.
@@ -343,6 +356,10 @@ async function run() {
   if (previousClaudeThread) {
     job.message = `${providerSwitchNote("Claude")}\n\n${job.message}`;
   }
+  // Skills must be linked before app-server starts; MCP servers join the thread config below.
+  await prepareGlobalAgentTools("codex",
+    planningTurnIsReadOnly(job) || runnerSandboxMode(job) === "read-only",
+    job.codexHome ? resolve(job.codexHome, "skills") : undefined);
 
   let threadId = previousClaudeThread ? undefined : job.threadId?.trim() || undefined;
   let finalResponse = "";
@@ -774,6 +791,27 @@ async function run() {
           reason: message
         }, { waitForCallback: true });
       }
+    } else if (job.sessionFork) {
+      // Message fork: a persistent native copy through the completed source turn.
+      // It only reads the parent's rollout, so a running parent turn is untouched.
+      const source = job.sessionFork;
+      try {
+        const response = await appServer.rpc("thread/fork", {
+          ...buildThreadStartParams(job, threadDeveloperInstructions),
+          threadId: source.threadId, lastTurnId: source.lastTurnId
+        });
+        threadId = readThreadIdFromPayload(response) ?? undefined;
+        if (!threadId || threadId === source.threadId) throw new Error("Session fork did not return an independent native thread.");
+        recoveryContextForTurn = null;
+      } catch (error) {
+        if (!job.recoveryContext) throw error;
+        const response = await appServer.rpc("thread/start", buildThreadStartParams(job, threadDeveloperInstructions));
+        threadId = readThreadIdFromPayload(response) ?? undefined;
+        recoveryContextForTurn = job.recoveryContext;
+      }
+      await emitEvent("session.forked", { sessionId: job.sessionId, turnId: job.turnId,
+        sourceThreadId: source.threadId, sourceTurnId: source.lastTurnId, threadId: threadId ?? null,
+        native: !recoveryContextForTurn });
     } else {
       const response = await appServer.rpc(
         "thread/start",
@@ -1122,12 +1160,16 @@ async function run() {
 async function runClaudeRunnerTurn() {
   const sleepInhibitor = startSleepInhibitor();
   let claudeHome: ReturnType<typeof prepareClaudeHome> | undefined;
+  let privateMcpConfig: ReturnType<typeof writePrivateClaudeMcpConfig> | undefined;
   const syncClaudeAuth = () => {
     try { claudeHome?.syncAuth(); }
     catch { appendInternalLog("claude.auth_sync_failed", { message: "Could not synchronize refreshed Claude login credentials." }); }
   };
   // runClaudeTurn's SIGTERM handler exits immediately after closing the SDK.
   process.once("SIGTERM", syncClaudeAuth);
+  // Long turns refresh mid-run; publish the rotated token before other homes reuse the revoked one.
+  const authSyncTimer = setInterval(syncClaudeAuth, 60_000);
+  authSyncTimer.unref();
   try {
     if (job.claudeConfigDir && job.claudeAuthSourceDir) claudeHome = prepareClaudeHome(job.claudeConfigDir, job.claudeAuthSourceDir);
     if (job.collaboration?.fork) {
@@ -1152,6 +1194,11 @@ async function runClaudeRunnerTurn() {
     const policy = job.approvalPolicy ?? defaultThreadOptions.approvalPolicy;
     const { permissionMode, autoApproveAll } = claudePermissions({ policy, readOnly });
     const cli = buildSessionInspectorCliConfig(job);
+    await prepareGlobalAgentTools("claude", readOnly, job.claudeConfigDir ? resolve(job.claudeConfigDir, "skills") : undefined);
+    const claudeMcpServers = codexImageMcpConfig({ cwd: job.cwd ?? defaultThreadOptions.cwd, readOnly, codexHome: job.codexHome });
+    if (globalAgentToolInjection.mcpServers.length) {
+      privateMcpConfig = writePrivateClaudeMcpConfig({ ...claudeMcpServers, ...claudeGlobalMcpServersConfig(globalAgentToolInjection.mcpServers) });
+    }
     await runClaudeTurn({
       sessionId: job.sessionId,
       turnId: job.turnId,
@@ -1173,9 +1220,9 @@ async function runClaudeRunnerTurn() {
       permissionMode,
       autoApproveAll,
       readOnly,
-      sandboxMode: defaultThreadOptions.sandbox,
-      protectedPaths: [job.claudeConfigDir, job.claudeAuthSourceDir].filter((path): path is string => Boolean(path)),
-      mcpServers: codexImageMcpConfig({ cwd: job.cwd ?? defaultThreadOptions.cwd, readOnly, codexHome: job.codexHome }),
+      sandboxMode: runnerSandboxMode(job),
+      protectedPaths: [job.claudeConfigDir, job.claudeAuthSourceDir, privateMcpConfig?.directory].filter((path): path is string => Boolean(path)),
+      ...(privateMcpConfig ? { mcpServers: {}, mcpConfigPath: privateMcpConfig.path } : { mcpServers: claudeMcpServers }),
       allowedTools: [],
       approvedInspectorCommands: cli.approvedCommands,
       sandboxEscapesApproved: job.sandboxEscapesApproved === true,
@@ -1184,13 +1231,14 @@ async function runClaudeRunnerTurn() {
         children: Object.fromEntries((job.actorChildren ?? []).flatMap(child => job.actorChildCapabilities?.[child.name]
           ? [[child.name, { workItemId: child.workItemId, capability: job.actorChildCapabilities[child.name] }]] : [])),
         toolNames: DOMAIN_ACTOR_TOOLS.map(tool => tool.name)
-      } } : {}),
+      } } : job.actorRegistry ? { actorCredentials: { main: job.domainActorCapability || undefined, children: {},
+        toolNames: ACTOR_REGISTRY_TOOLS.map(tool => tool.name) } } : {}),
       ...(job.actorChildren?.length ? { agents: Object.fromEntries(job.actorChildren.map(child => [child.name,
         { description: child.description, prompt: child.prompt, model: child.model, effort: child.effort }])) } : {}),
       extraEnv: {
         ...cli.env,
         // Claude actor credentials travel only through the PreToolUse hook, never in a sub-agent's environment.
-        ...(job.domainActor ? { THREADEX_ACTOR_CAPABILITY: "" } : {}),
+        ...(job.domainActor || job.actorRegistry ? { THREADEX_ACTOR_CAPABILITY: "" } : {}),
         ...(job.claudeConfigDir ? { CLAUDE_CONFIG_DIR: job.claudeConfigDir } : {}),
         ...(!job.claudeAccountId ? { THREADEX_CLAUDE_DEFAULT_AUTH: "1" } : {}),
         THREADEX_MANAGED_RUNNER: "1",
@@ -1226,6 +1274,8 @@ async function runClaudeRunnerTurn() {
       writeSteerResult
     });
   } finally {
+    privateMcpConfig?.cleanup();
+    clearInterval(authSyncTimer);
     process.removeListener("SIGTERM", syncClaudeAuth);
     syncClaudeAuth();
     await drainCommentaryHeadlineQueue();
@@ -1852,7 +1902,7 @@ function buildThreadStartParams(job: RunnerJob, developerInstructions?: string) 
   const approvalSettings = runnerApprovalSettings(job);
   return {
     cwd: job.cwd ?? defaultThreadOptions.cwd,
-    sandbox: job.workspaceManager ? "read-only" : defaultThreadOptions.sandbox,
+    sandbox: job.workspaceManager ? "read-only" : runnerSandboxMode(job),
     ...approvalSettings,
     config: buildThreadConfig(job),
     ...(!planningTurnIsReadOnly(job) && !job.workspaceManager ? { dynamicTools: [{ type: "function", ...INTENT_APPROVAL_TOOL }] } : {}),
@@ -1873,7 +1923,7 @@ function buildThreadResumeParams(threadId: string, job: RunnerJob, developerInst
     // Resume restores model context; the runner only needs metadata in the reply.
     excludeTurns: true,
     cwd: job.cwd ?? defaultThreadOptions.cwd,
-    sandbox: job.workspaceManager ? "read-only" : defaultThreadOptions.sandbox,
+    sandbox: job.workspaceManager ? "read-only" : runnerSandboxMode(job),
     ...approvalSettings,
     config: buildThreadConfig(job),
     developerInstructions: [
@@ -1920,7 +1970,7 @@ function buildTurnStartParams(
     cwd,
     sandboxPolicy: planningTurnIsReadOnly(job)
       ? { type: "readOnly" as const, networkAccess: false }
-      : buildSandboxPolicy(cwd),
+      : buildSandboxPolicy(cwd, runnerSandboxMode(job)),
     approvalPolicy: approvalSettings.approvalPolicy,
     ...(developerInstructions ? { settings: { developer_instructions: developerInstructions } } : {}),
     ...(job.model ? { model: job.model } : {}),
@@ -1931,6 +1981,11 @@ function buildTurnStartParams(
 
 function runnerApprovalSettings(job: RunnerJob) {
   return resolveApprovalSettings(planningTurnIsReadOnly(job) ? "on-request" : job.approvalPolicy);
+}
+
+/** Planning turns keep their read-only turn policy; "Full access" lifts the sandbox elsewhere. */
+function runnerSandboxMode(job: RunnerJob) {
+  return planningTurnIsReadOnly(job) ? defaultThreadOptions.sandbox : sandboxModeForApprovalPolicy(job.approvalPolicy);
 }
 
 function startSteerControlLoop(
@@ -2140,9 +2195,33 @@ function writeSteerResult(result: RunnerSteerResult) {
   renameSync(tempPath, resultPath);
 }
 
+let globalAgentToolInjection: GlobalAgentToolInjection = { mcpServers: [], skills: [], warnings: [] };
+
+/** Applies the user's Threadex-wide MCP servers and skills; problems become warnings, never a failed turn. */
+async function prepareGlobalAgentTools(provider: GlobalAgentToolProvider, readOnly: boolean, skillsDirectory: string | undefined) {
+  const warnings: string[] = [];
+  try {
+    globalAgentToolInjection = resolveGlobalAgentToolInjection({ path: job.globalAgentToolsPath, provider, readOnly });
+    warnings.push(...globalAgentToolInjection.warnings);
+    if (skillsDirectory) warnings.push(...syncGlobalSkillLinks(skillsDirectory, globalAgentToolInjection.skills).warnings);
+  } catch (error) {
+    globalAgentToolInjection = { mcpServers: [], skills: [], warnings: [] };
+    warnings.push(`Global MCP/skill settings could not be applied: ${errorMessage(error)}`);
+  }
+  // Names only: env and header values are secrets.
+  appendInternalLog("runner.global_agent_tools", { provider, readOnly,
+    mcpServers: globalAgentToolInjection.mcpServers.map(server => server.name),
+    skills: globalAgentToolInjection.skills.map(skill => skill.name), warnings });
+  for (const message of warnings) {
+    await emitEvent("runner.warning", { message, sessionId: job.sessionId, turnId: job.turnId }, { waitForCallback: true });
+  }
+}
+
 function buildThreadConfig(job: RunnerJob) {
   return {
-    mcp_servers: { session_inspector: { command: process.execPath, args: [], enabled: false } },
+    // Same table as Threadex's own entry, so global servers follow its merge behavior with config.toml.
+    mcp_servers: { ...codexGlobalMcpServersConfig(globalAgentToolInjection.mcpServers),
+      session_inspector: { command: process.execPath, args: [], enabled: false } },
     ...(job.workspaceManager ? { features: { shell_tool: true, unified_exec: true, apps: false, multi_agent: false } } : {})
   };
 }
@@ -2162,11 +2241,15 @@ function buildSessionInspectorCliConfig(job: RunnerJob) {
       "recover_current_session", "get_session", "search_sessions",
       ...(!job.workspaceManager && !isClaudeModel(job.model) ? ["record_subagent_prompt"] : []),
       ...(!planningTurnIsReadOnly(job) && !job.workspaceManager && !isClaudeModel(job.model) ? ["request_intent_approval"] : []),
+      ...(!planningTurnIsReadOnly(job) && !job.workspaceManager ? ["post_group_chat"] : []),
       ...(job.workspaceManager || job.managerConcurrent ? WORKSPACE_MANAGER_TOOLS.map(tool => tool.name) : []),
-      ...(job.domainActor ? DOMAIN_ACTOR_TOOLS.map(tool => tool.name) : []),
+      ...(job.domainActor ? DOMAIN_ACTOR_TOOLS.map(tool => tool.name) : job.actorRegistry ? ACTOR_REGISTRY_TOOLS.map(tool => tool.name) : []),
       ...(job.lightweightTodo ? ["outcome_plan_get", "outcome_plan_set"] : []),
       ...(job.autoModelEnabled ? ["upgrade_model"] : []),
       ...(job.contextForkRequest ? ["create_task"] : []),
+      // Concurrent coordination is the session's own delegation; workers keep their own sandbox and approvals.
+      ...(!planningTurnIsReadOnly(job) && !job.workspaceManager && !job.managerConcurrent && !job.domainActor
+        ? ["concurrent_status", "concurrent_send", "concurrent_spawn", "concurrent_wait", "concurrent_stop"] : []),
       ...(todoPlanningRequested(job) ? ["todo_set_plan", "todo_request_clarification"] : [])
     ],
     env: {
@@ -2175,6 +2258,7 @@ function buildSessionInspectorCliConfig(job: RunnerJob) {
       THREADEX_CONCURRENT_ID: job.collaboration?.groupId ?? "",
       THREADEX_WORKSPACE_MANAGER: job.workspaceManager || job.managerConcurrent ? "1" : "0",
       THREADEX_DOMAIN_ACTOR: job.domainActor ? "1" : "0",
+      THREADEX_ACTOR_REGISTRY: job.actorRegistry ? "1" : "0",
       THREADEX_ACTOR_CAPABILITY: job.domainActorCapability ?? "",
       THREADEX_MANAGER_CONCURRENT: job.managerConcurrent ? "1" : "0",
       THREADEX_TURN_ID: job.turnId,
@@ -2282,7 +2366,7 @@ function runnerDeveloperInstructions(job: RunnerJob, includeStartupSnapshot = tr
     sessionInspectorDeveloperInstructions(job),
     autoModelDeveloperInstructions(job),
     serverContextDeveloperInstructions(job, includeStartupSnapshot),
-    !job.workspaceManager ? managedModeTurnInstructions(job.managedMode === true, job.turnId) : undefined
+    !job.workspaceManager ? managedModeTurnInstructions(job.managedMode === true, job.turnId, job.managedModePreviouslyEnabled === true) : undefined
   ];
   if (job.executionMode === "plan") {
     instructions.push(

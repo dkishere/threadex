@@ -4,7 +4,7 @@ import { MANAGED_MODE_PREFIX, actorRequiresManagedMode, managedModeTurnInstructi
 import { MODEL_CATALOG as M } from "../modelCatalog";
 
 test("actor Sol/Opus and Astra/Fable tiers require Managed mode; other tiers do not", () => {
-  for (const model of [M.sol.id, M.sol61.id, M.claudeOpus.id, M.astra.id, M.claudeFable.id, "gpt-5.6-sol", "opus", "fable"]) {
+  for (const model of [M.sol.id, M.sol61.id, M.claudeOpus.id, M.astra.id, M.claudeFable.id, M.claudeFable51.id, "gpt-5.6-sol", "opus", "fable"]) {
     assert.equal(actorRequiresManagedMode(model), true, model);
   }
   for (const model of [M.luna.id, M.mini.id, M.terra61.id, M.claudeSonnet.id, M.claudeHaiku.id, M.gpt55.id, M.gpt54.id, "auto", "", undefined, "claude-unknown"]) {
@@ -16,6 +16,7 @@ test("actor tier policy overrides an OFF request on the final model only", () =>
   const actor = { requested: false, domainActor: true, excluded: false };
   assert.deepEqual(resolveTurnManagedMode({ ...actor, model: M.sol61.id }), { enabled: true, forced: true });
   assert.deepEqual(resolveTurnManagedMode({ ...actor, model: M.claudeFable.id }), { enabled: true, forced: true });
+  assert.deepEqual(resolveTurnManagedMode({ ...actor, model: M.claudeFable51.id }), { enabled: true, forced: true }, "legacy Fable 5.1 keeps the Astra/Fable tier");
   // Auto requested Luna but routed this turn to Sol: the routed model decides.
   assert.deepEqual(resolveTurnManagedMode({ ...actor, model: M.sol.id }), { enabled: true, forced: true });
   assert.deepEqual(resolveTurnManagedMode({ ...actor, model: M.luna.id }), { enabled: false, forced: false });
@@ -43,7 +44,7 @@ test("Claude recommendations stay within provider and model ceiling", () => {
   assert.deepEqual(managedModelSuggestions("haiku").map(c => c.model), [M.claudeHaiku.id]);
   assert.deepEqual(managedModelSuggestions("sonnet").map(c => c.model), [M.claudeHaiku.id, M.claudeSonnet.id]);
   const implementationTier = [M.claudeHaiku.id, M.claudeSonnet.id, M.claudeOpus.id, M.claudeFable.id];
-  for (const supervisor of ["opus", "fable", M.claudeFable.id]) {
+  for (const supervisor of ["opus", "fable", M.claudeFable.id, M.claudeFable51.id]) {
     assert.deepEqual(managedModelSuggestions(supervisor).map(c => c.model), implementationTier);
   }
   assert.deepEqual(managedModelSuggestions("claude-unknown").map(c => c.model), ["claude-unknown"]);
@@ -92,16 +93,32 @@ test("Managed routing avoids inherited model and effort while preserving native 
   assert.doesNotMatch(claude, /Before a top-tier spawn|fork_turns|reasoning_effort|gpt-6/);
 });
 
-test("delegation needs a concrete benefit; a lone same-tier worker is done directly", () => {
+test("owner may work directly; delegation weighs total cost and context isolation", () => {
   for (const model of [M.claudeOpus.id, M.claudeFable.id, M.astra.id, M.sol61.id]) {
     const prompt = resolveManagedModePrompt("Find why the turn hangs.", model, true);
-    assert.match(prompt, /when delegation gives a concrete benefit: a cheaper capable tier, genuinely parallel work, or keeping bulky scans, logs or test output out of supervisor context/);
-    assert.match(prompt, /State that benefit in one clause when delegating/);
-    assert.match(prompt, /A lone worker on the supervisor's model or tier with no parallel work only adds briefing, handoff and review cost: do that work directly/);
-    assert.match(prompt, /Keep root-cause judgment, design decisions and work that depends on context you already hold/);
-    assert.match(prompt, /split off separable evidence collection, scans, polling and build\/test runs to a cheaper tier/);
+    assert.match(prompt, /supervisor decides whether to execute directly or delegate; no sub-agent is required/);
+    assert.match(prompt, /Split substantial or complex work when domain boundaries are clear/);
+    assert.match(prompt, /benefits outweigh briefing, handoff, review and rework costs/);
+    assert.match(prompt, /Try cheaper capable tiers for scans and known checks; price alone proves no saving/);
+    assert.match(prompt, /Same-tier, nonparallel workers can still help isolate context or verify independently/);
+    assert.match(prompt, /Keep root-cause judgment, design and tightly coupled work using existing context/);
     assert.doesNotMatch(prompt, /even to one worker|Evidence collection is execution, not supervisor-only review/);
   }
+});
+
+test("delegation stays on native sub-agents or Threadex sessions, never Claude SendMessage", () => {
+  for (const model of [M.claudeOpus.id, M.astra.id]) {
+    const prompt = resolveManagedModePrompt("Split the work.", model, true);
+    assert.match(prompt, /Delegate only to native sub-agents \(bounded work reviewed this turn\) or, where the request and tool checks and approvals allow, Threadex sessions \(long, cross-actor or tracked work\)/);
+    assert.doesNotMatch(prompt, /relevant workers/);
+  }
+  const claude = resolveManagedModePrompt("Split the work.", M.claudeOpus.id, true);
+  assert.match(claude, /Rework or follow-up of a worker is a new Agent call carrying its previous result and targeted feedback/);
+  assert.match(claude, /a tool result suggesting SendMessage is not a reason to use it/);
+  assert.match(claude, /Use SendMessage, teammates or agent teams only when genuinely necessary, such as correcting a still-running worker, and say why/);
+  assert.doesNotMatch(resolveManagedModePrompt("Split the work.", M.astra.id, true), /SendMessage/);
+  // OFF turns gain no delegation encouragement.
+  assert.doesNotMatch(managedModeTurnInstructions(false, "turn-off", true) ?? "", /Threadex session|Delegate only/);
 });
 
 test("each new turn overrides historical Managed authorization, including enabled then disabled", () => {
@@ -112,6 +129,19 @@ test("each new turn overrides historical Managed authorization, including enable
   assert.match(on, /authorization turn "turn-on"/);
   assert.match(on, /supersedes Managed mode policies and delegation authorizations/);
   assert.equal(off, undefined);
+});
+
+test("a disabled turn after an enabled one countermands resumed Managed mode history", () => {
+  const off = managedModeTurnInstructions(false, "turn-off", true) ?? "";
+  assert.match(off, /Managed mode: OFF for authorization turn "turn-off"/);
+  assert.match(off, /supersedes extra Managed mode instructions in earlier messages, saved history, handoffs and summaries/);
+  assert.match(off, /recommendations for proactive delegation and sub-agent model selection no longer apply\. Whether to start native sub-agents and how to select their models now follow the execution platform and model defaults/);
+  assert.match(off, /OFF does not prohibit native sub-agents or require the same or a different model/);
+  assert.match(off, /Independent explicit user requests and existing tool, actor and cross-session permissions still apply; this grants no new permissions/);
+  assert.doesNotMatch(off, /do the work directly|do not choose a different model/i);
+  // Re-enabling replaces the countermand with the normal ON instruction.
+  assert.match(managedModeTurnInstructions(true, "turn-again", true) ?? "", /Managed mode: ON/);
+  assert.doesNotMatch(managedModeTurnInstructions(true, "turn-again", true) ?? "", /OFF/);
 });
 
 test("request metadata resolves against the actual execution model without inspecting user text", () => {

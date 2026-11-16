@@ -1,4 +1,6 @@
 import { DEFAULT_MODEL, defaultGearProfiles, type ModelProvider } from "../modelCatalog";
+import { isDeepStrictEqual } from "node:util";
+import { cloneJsonDocument } from "./jsonDocument";
 import type { LightweightTodo } from "../lightweightTodo";
 import { normalizeSubagentActivity, SUBAGENT_ACTIVITY_RETAINED_PER_AGENT, type SubagentActivityPayload } from "../eventProtocol";
 import type { DecisionAudit } from "./decision/policy";
@@ -44,7 +46,8 @@ function concurrentWorkerSessionPredicate(sessionAlias: string) {
   SELECT member->>'sessionId'
   FROM collaboration_group AS concurrent_group,
     jsonb_array_elements(concurrent_group.state->'members') AS member
-  WHERE member->>'localId' <> 'main' AND member->>'sessionId' IS NOT NULL
+  WHERE NOT starts_with(concurrent_group.id, 'actor_tree_')
+    AND member->>'localId' <> 'main' AND member->>'sessionId' IS NOT NULL
 )`;
 }
 const concurrentWorkerSessionSql = concurrentWorkerSessionPredicate("sessions");
@@ -71,6 +74,10 @@ const legacyWatchdogStoppedResponseSql = "^Prompt runner (unknown|[0-9]+) stoppe
 function isLegacyWatchdogStoppedTurn(pendingReason: unknown, response: unknown) {
   return (pendingReason == null || pendingReason === "queued") &&
     typeof response === "string" && legacyWatchdogStoppedResponse.test(response);
+}
+/** A stopped Todo turn is parked for a manual retry: it never runs by itself, so it keeps no session busy. */
+export function isParkedPendingTurn(turn: Pick<SessionTurnRecord, "pendingReason" | "agentResponse">) {
+  return turn.pendingReason === "stopped" || isLegacyWatchdogStoppedTurn(turn.pendingReason, turn.agentResponse);
 }
 function workspacePendingTaskSql(alias: string) {
   return `${alias}.status = 'todo' AND ${alias}.pending_reason IS DISTINCT FROM 'stopped'
@@ -721,6 +728,8 @@ export type SessionSteerMessageRecord = {
   attachments: unknown[];
   forcePlan: boolean;
   created: string;
+  /** Recorded by durable `steer` events; legacy `steer.accepted` traces have none. */
+  source?: string;
 };
 
 type SessionInspectFileChange = {
@@ -955,6 +964,8 @@ type UpdateSessionTurnInput = {
   id: string;
   agentResponse: string;
   tokenIn: number;
+  /** Cached subset of tokenIn, when the runner reports it in its final result. */
+  cachedInputTokens?: number;
   tokenOut: number;
   status: SessionTurnStatus;
   runnerExitCode?: number | null;
@@ -1125,6 +1136,10 @@ const latestUsageSampleJoinSql = `
 const latestUsageSampleSelectSql = `
   turn_usage_totals.input_tokens AS turn_usage_input_tokens,
   turn_usage_totals.cached_input_tokens AS turn_usage_cached_input_tokens,
+  -- Claude turns report cached input only in their final result. Zero there means
+  -- "not recorded" for turns finished before it was stored.
+  (SELECT NULLIF(final_usage.cached_input_tokens, 0) FROM token_usage AS final_usage
+    WHERE final_usage.id = 'agent:turn:' || session_turn.id) AS turn_final_cached_input_tokens,
   turn_usage_totals.output_tokens AS turn_usage_output_tokens,
   turn_subagent_usage_totals.input_tokens AS subagent_usage_input_tokens,
   turn_subagent_usage_totals.cached_input_tokens AS subagent_usage_cached_input_tokens,
@@ -1298,6 +1313,7 @@ type SessionTurnRow = {
   token_out?: unknown;
   turn_usage_input_tokens?: unknown;
   turn_usage_cached_input_tokens?: unknown;
+  turn_final_cached_input_tokens?: unknown;
   turn_usage_output_tokens?: unknown;
   subagent_usage_input_tokens?: unknown;
   subagent_usage_cached_input_tokens?: unknown;
@@ -1618,6 +1634,7 @@ export class SessionStore {
   private queue = Promise.resolve();
   private readonly pendingReads = new Set<Promise<unknown>>();
   private readonly actorRoomCache = new Map<string, { version: string; room: ActorRoom }>();
+  private readonly actorRoomReads = new Map<string, Promise<ActorRoom>>();
   private connection: SessionDbConnection | null = null;
   private duckDbUiStarted = false;
   private closed = false;
@@ -1669,7 +1686,18 @@ export class SessionStore {
   }
 
   async getDomainActorRoom(workspaceId: string): Promise<ActorRoom> {
-    return this.read(async connection => (await this.readActorRoom(connection, workspaceId)) ?? emptyActorRoom(workspaceId));
+    let pending = this.actorRoomReads.get(workspaceId);
+    if (!pending) {
+      // A cold cache must not fan out several concurrent detoasts/JSON encodes
+      // of the same large document in PostgreSQL after an API restart.
+      pending = this.read(async connection => (await this.readActorRoom(connection, workspaceId)) ?? emptyActorRoom(workspaceId));
+      this.actorRoomReads.set(workspaceId, pending);
+    }
+    try {
+      return cloneJsonDocument(await pending);
+    } finally {
+      if (this.actorRoomReads.get(workspaceId) === pending) this.actorRoomReads.delete(workspaceId);
+    }
   }
 
   /** The room is one multi-MB document polled several times a second. xmin changes with every committed
@@ -1678,13 +1706,13 @@ export class SessionStore {
     const versionRows = await (await connection.run("SELECT xmin::text AS version FROM actor_room WHERE workspace_id = $workspaceId", { workspaceId })).getRowObjectsJS();
     if (!versionRows[0]) return null;
     const cached = this.actorRoomCache.get(workspaceId);
-    if (cached?.version === String(versionRows[0].version)) return structuredClone(cached.room);
+    if (cached?.version === String(versionRows[0].version)) return cached.room;
     const rows = await (await connection.run("SELECT xmin::text AS version, state FROM actor_room WHERE workspace_id = $workspaceId", { workspaceId })).getRowObjectsJS();
     if (!rows[0]) return null;
     const room = (typeof rows[0].state === "string" ? JSON.parse(rows[0].state) : rows[0].state) as ActorRoom;
     this.actorRoomCache.set(workspaceId, { version: String(rows[0].version), room });
-    // Callers normalise and mutate rooms in place; the cached copy must stay pristine.
-    return structuredClone(room);
+    // Public readers and writers clone before normalising or mutating this cached copy.
+    return room;
   }
 
   /** Store only a SHA256 verifier. The opaque bearer stays in the runner environment.
@@ -1772,12 +1800,19 @@ export class SessionStore {
           session_turn t JOIN sessions s ON s.id = t.session_id
         WHERE room.workspace_id = $workspaceId AND s.workspace_id = $workspaceId
           AND t.session_id = execution->>'taskSessionId'
+          -- A turn-scoped item (a session @mention, or a native child of one) owns only its own turns;
+          -- the rest of the shared session is not its work. Same rule as Cancel's running check.
+          AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(room.state->'workItems') host
+            WHERE host->>'id' = COALESCE(item->>'hostWorkItemId', item->>'id') AND host->>'sessionScope' = 'turn'
+              AND t.id <> ALL (ARRAY_REMOVE(ARRAY[execution->>'taskTurnId', item->>'activeTurnId', host->>'taskTurnId', host->>'activeTurnId'], NULL)))
           AND (t.status = 'running' OR (${workspacePendingTaskSql("t")})
-            ${includeLoops ? "OR EXISTS (SELECT 1 FROM loop_continuation c WHERE c.session_id = t.session_id AND c.pending = TRUE)" : ""})`, { workspaceId })).getRowObjectsJS();
+            ${includeLoops ? "OR EXISTS (SELECT 1 FROM loop_continuation c WHERE c.turn_id = t.id AND c.pending = TRUE)" : ""})`, { workspaceId })).getRowObjectsJS();
       // A manual follow-up counts as soon as it is queued; one entry per actor session, preferring the running turn.
       const sessions = new Map<string, import("../domainActors").ActorRunningSession>();
       for (const row of rows) {
-        const key = JSON.stringify([row.actor_id, row.work_item_id, row.session_id]);
+        // Lifecycle checks need every live turn: a shared session may contain several
+        // independent turn-scoped assignments. Display queries still collapse by session.
+        const key = JSON.stringify([row.actor_id, row.work_item_id, row.session_id, ...(includeLoops ? [row.turn_id] : [])]);
         const existing = sessions.get(key);
         if (existing && (existing.status === "running" || row.status !== "running")) continue;
         sessions.set(key, { actorId: String(row.actor_id), workItemId: String(row.work_item_id),
@@ -1795,22 +1830,24 @@ export class SessionStore {
       if (options?.actorLifecycleLock) await connection.run("SELECT workspace_id FROM actor_room WHERE workspace_id = $workspaceId FOR UPDATE", { workspaceId });
       const runningSessions = options?.actorLifecycleLock ? await this.actorRunningSessionsWithConnection(connection, workspaceId, true) : undefined;
       for (let attempt = 0; attempt < 32; attempt++) {
-        const room = (await this.readActorRoom(connection, workspaceId))!;
+        const room = cloneJsonDocument((await this.readActorRoom(connection, workspaceId))!);
         // Every writer bumps revision, so it is the CAS token; comparing the whole multi-MB document cost seconds per write.
         const previousRevision = Number(room.revision) || 0;
-        const before = JSON.stringify(room);
+        const before = cloneJsonDocument(room);
         const result = change(room, runningSessions);
         room.revision = previousRevision;
         // A no-op change must not rewrite (and re-TOAST) the whole document.
-        if (JSON.stringify(room) === before) return result;
+        const normalized = cloneJsonDocument(room);
+        if (isDeepStrictEqual(normalized, before)) return result;
         room.revision = previousRevision + 1;
-        const state = JSON.stringify(room);
+        normalized.revision = room.revision;
+        const state = JSON.stringify(normalized);
         const updated = await connection.run(`UPDATE actor_room SET state = $state::JSONB
           WHERE workspace_id = $workspaceId AND COALESCE((state->>'revision')::BIGINT, 0) = $previousRevision
           RETURNING xmin::text AS version`, { workspaceId, state, previousRevision });
         if (updated.rowCount === 1) {
           const [row] = await updated.getRowObjectsJS();
-          this.actorRoomCache.set(workspaceId, { version: String(row.version), room: JSON.parse(state) as ActorRoom });
+          this.actorRoomCache.set(workspaceId, { version: String(row.version), room: normalized });
           return result;
         }
       }
@@ -1826,11 +1863,11 @@ export class SessionStore {
       const rows = sessionId || turnId ? await (await run(`SELECT s.id, s.workspace_id FROM sessions s
         ${turnId ? "JOIN session_turn t ON t.session_id = s.id WHERE t.id = $turnId" : "WHERE s.id = $sessionId"}`,
         turnId ? { turnId } : { sessionId })).getRowObjectsJS() : [];
-      if (rows[0]) await this.lockActorTurnAdmission(pinned, String(rows[0].workspace_id), String(rows[0].id));
+      if (rows[0]) await this.lockActorTurnAdmission(pinned, String(rows[0].workspace_id), String(rows[0].id), turnId);
       return operation(pinned);
     }));
   }
-  private async lockActorTurnAdmission(connection: SessionDbConnection, workspaceId: string, sessionId: string) {
+  private async lockActorTurnAdmission(connection: SessionDbConnection, workspaceId: string, sessionId: string, turnId?: string) {
     // Unbound sessions neither lock nor transfer the workspace's potentially multi-MB document.
     const rows = await (await connection.run(`SELECT state FROM actor_room WHERE workspace_id = $workspaceId
       AND EXISTS (SELECT 1 FROM jsonb_array_elements(state->'workItems') item
@@ -1845,6 +1882,11 @@ export class SessionStore {
       const executions = [work, ...work.executionHistory].filter(execution => execution.taskSessionId === sessionId);
       if (executions.some(execution => !active.has(work.ownerActorId) || !active.has(execution.executorActorId)))
         throw new Error("This task belongs to a deleted worker. Its history is available, but new execution is disabled.");
+      // A turn-scoped cancellation blocks only its own turns; an unknown turnId must not
+      // match a work item whose optional activeTurnId is also absent.
+      if (!work.hostWorkItemId && work.cancelledAt && executions.some(execution => work.sessionScope !== "turn"
+        || (turnId !== undefined && (turnId === execution.taskTurnId || turnId === work.activeTurnId))))
+        throw new Error("This task was cancelled; new execution is disabled. Send a new request instead.");
     }
   }
 
@@ -1888,6 +1930,22 @@ export class SessionStore {
         /^[a-f0-9-]{36}$/i.test(turnId)) return { threadId, lastTurnId: turnId };
       return null;
     });
+  }
+
+  /**
+   * Native Codex boundary for a "Fork from this message" session that has not run
+   * yet. Null once the fork has run its own turn, for Claude parents, or when the
+   * source turn has no saved native turn link (callers fall back to transcript recovery).
+   */
+  async sessionForkNativeSource(sessionId: string, currentTurnId: string): Promise<CollaborationFork | null> {
+    const session = await this.getSession(sessionId);
+    if (!session?.parentSessionId || !session.forkedFromTurnId || session.threadId) return null;
+    const turns = await this.listSessionTurns(sessionId);
+    if (turns.some(turn => turn.id !== currentTurnId && (turn.runnerLogPath || turn.runnerStarted))) return null;
+    const parent = await this.getSession(session.parentSessionId);
+    if (!parent?.threadId || threadProvider(parent.threadId) !== "codex") return null;
+    const source = await this.collaborationNativeTurn(parent.id, session.forkedFromTurnId, parent.threadId);
+    return source && threadProvider(source.threadId) === "codex" ? source : null;
   }
 
   async collaborationSteerReceipt(commandId: string, turnId: string, runnerLogPath?: string | null) {
@@ -2857,14 +2915,15 @@ export class SessionStore {
     });
   }
 
-  async createRoundtableRound(round: RoundtableRound): Promise<RoundtableRound> {
+  /** `fromUser` marks the turn as the signed-in user's own prompt, so actor authorization can read it. */
+  async createRoundtableRound(round: RoundtableRound, origin: { fromUser?: boolean } = {}): Promise<RoundtableRound> {
     return this.transaction(async connection => {
       await this.assertSessionExistsWithConnection(connection, round.sessionId);
       const inserted = await this.insertSessionTurnWithConnection(connection, {
         id: round.turnId, sessionId: round.sessionId, agentResponse: roundtableResponse(round),
         // Inherited next-round files stay listed on their source turn.
         userInput: round.attachments?.length && !round.continuation ? formatStoredUserInput(round.prompt, round.attachments) : round.prompt,
-        tokenIn: 0, tokenOut: 0, status: "todo", pendingReason: "queued", requestMetadata: { roundtable: true }
+        tokenIn: 0, tokenOut: 0, status: "todo", pendingReason: "queued", requestMetadata: { roundtable: true, ...(origin.fromUser ? { fromUser: true } : {}) }
       }, true);
       if (!inserted) {
         const rows = await (await connection.run("SELECT document FROM session_roundtable_round WHERE turn_id = $turnId", { turnId: round.turnId })).getRowObjectsJS();
@@ -4278,6 +4337,18 @@ export class SessionStore {
   }
 
   async getWorkspaceModelPreferences(workspaceId: string): Promise<WorkspaceModelPreferences> {
+    // Existing settings are a read, and must not wait behind background writes.
+    // Only first-time initialization/legacy migration needs the write queue.
+    const existing = await this.read(async (connection) => {
+      const result = await connection.run(
+        "SELECT workspace_id FROM workspace_model_preferences WHERE workspace_id = $workspaceId",
+        { workspaceId }
+      );
+      return (await result.getRowObjectsJS()).length > 0
+        ? this.getWorkspaceModelPreferencesWithConnection(connection, workspaceId)
+        : null;
+    });
+    if (existing) return existing;
     return this.write(async (connection) => {
       const preferences = await this.getWorkspaceModelPreferencesWithConnection(connection, workspaceId);
       // Materialize either the defaults or the legacy-session migration so all
@@ -4570,6 +4641,30 @@ export class SessionStore {
         { sessionId, ...(turnIds ? { turnIds } : {}) }
       );
       return (await result.getRowObjectsJS()).map(toSessionTurnRecord);
+    });
+  }
+
+  /** Collective memory digest input: every running or queued turn of the workspace's sessions, and every finished turn whose
+   * last runner activity (millisecond precision) is after `since`. A stopped turn waiting for a manual retry is neither. */
+  async listMemoryDigestTurns(workspaceId: string, since: string): Promise<Array<{ sessionId: string; cwd: string; turnId: string;
+    status: "done" | "running" | "queued"; lastActivityAt: string; userInput: string; agentResponse: string; changedFiles: string[]; runnerExitCode: number | null }>> {
+    return this.read(async (connection) => {
+      const rows = await (await connection.run(`
+        SELECT t.id, t.session_id, s.cwd, t.status, t.user_input, t.agent_response, t.runner_exit_code,
+          to_jsonb(t.changed_files)::VARCHAR AS changed_files_json,
+          CAST(date_trunc('milliseconds', coalesce(t.runner_heartbeat, t.runner_started, t.created)) AS VARCHAR) AS last_activity_at
+        FROM session_turn t JOIN sessions s ON s.id = t.session_id
+        WHERE s.workspace_id = $workspaceId
+          AND (t.status = 'running' OR (${workspacePendingTaskSql("t")})
+            OR t.status = 'done' AND date_trunc('milliseconds', coalesce(t.runner_heartbeat, t.runner_started, t.created)) > CAST($since AS TIMESTAMPTZ))
+        ORDER BY last_activity_at ASC, t.id ASC
+      `, { workspaceId, since })).getRowObjectsJS();
+      return rows.map(row => ({ sessionId: String(row.session_id), cwd: String(row.cwd), turnId: String(row.id),
+        status: row.status === "done" ? "done" as const : row.status === "running" ? "running" as const : "queued" as const,
+        lastActivityAt: new Date(Date.parse(String(row.last_activity_at))).toISOString(),
+        userInput: String(row.user_input ?? ""), agentResponse: String(row.agent_response ?? ""),
+        changedFiles: stringArrayFromJson(row.changed_files_json),
+        runnerExitCode: row.runner_exit_code === null || row.runner_exit_code === undefined ? null : Number(row.runner_exit_code) }));
     });
   }
 
@@ -5520,7 +5615,10 @@ export class SessionStore {
         `,
         {
           id: input.id,
-          threadId: parentSession.threadId,
+          // Never share the parent's native thread: resuming it would continue the
+          // parent's later (possibly running) turns. The first fork turn creates its
+          // own thread at the fork boundary (see sessionForkNativeSource).
+          threadId: null,
           workspaceId: parentSession.workspaceId,
           cwd: parentSession.cwd,
           accountId: parentSession.accountId,
@@ -6886,7 +6984,7 @@ export class SessionStore {
       const id = input.id ?? crypto.randomUUID();
       if (input.requireIdleSession) {
         const busy = await (await connection.run(`SELECT id FROM session_turn
-          WHERE session_id = $sessionId AND id <> $id AND status IN ('running', 'todo') LIMIT 1`, { sessionId: input.sessionId, id })).getRowObjectsJS();
+          WHERE session_id = $sessionId AND id <> $id AND (status = 'running' OR (${workspacePendingTaskSql("session_turn")})) LIMIT 1`, { sessionId: input.sessionId, id })).getRowObjectsJS();
         if (busy.length) throw new Error("Existing session is running or queued; wait for it to finish before retrying this continuation.");
       }
       await this.insertSessionTurnWithConnection(connection, { ...input, id });
@@ -6977,7 +7075,7 @@ export class SessionStore {
         const result = await connection.withTransaction(async run => {
           const pinned = Object.assign(Object.create(connection) as SessionDbConnection, { run });
           const session = await this.getSessionWithConnection(pinned, sessionId);
-          if (session) await this.lockActorTurnAdmission(pinned, session.workspaceId, sessionId);
+          if (session) await this.lockActorTurnAdmission(pinned, session.workspaceId, sessionId, turnId);
           return run(
           `
             UPDATE session_turn AS pending_turn
@@ -7691,17 +7789,18 @@ export class SessionStore {
           `
             INSERT INTO token_usage (
               id, usage_type, source, session_id, turn_id, account_id, model,
-              input_tokens, output_tokens, total_tokens, source_timestamp, created, updated
+              input_tokens, cached_input_tokens, output_tokens, total_tokens, source_timestamp, created, updated
             )
             VALUES (
               $id, 'agent', 'turn_final', $sessionId, $turnId, $accountId, NULL,
-              $inputTokens, $outputTokens, $totalTokens, now(), now(), now()
+              $inputTokens, $cachedInputTokens, $outputTokens, $totalTokens, now(), now(), now()
             )
             ON CONFLICT (id) DO UPDATE SET
               account_id = excluded.account_id,
               source = excluded.source,
               model = COALESCE(excluded.model, token_usage.model),
               input_tokens = excluded.input_tokens,
+              cached_input_tokens = excluded.cached_input_tokens,
               output_tokens = excluded.output_tokens,
               total_tokens = excluded.total_tokens,
               source_timestamp = excluded.source_timestamp,
@@ -7713,6 +7812,7 @@ export class SessionStore {
             turnId: input.id,
             accountId: turn.accountId,
             inputTokens: input.tokenIn,
+            cachedInputTokens: Math.min(input.tokenIn, Math.max(0, input.cachedInputTokens ?? 0)),
             outputTokens: input.tokenOut,
             totalTokens: input.tokenIn + input.tokenOut
           }
@@ -10527,7 +10627,7 @@ export class SessionStore {
       return connection.withTransaction(async run => {
         const pinned = Object.assign(Object.create(connection) as SessionDbConnection, { run });
         const session = await this.getSessionWithConnection(pinned, input.sessionId);
-        if (session) await this.lockActorTurnAdmission(pinned, session.workspaceId, input.sessionId);
+        if (session) await this.lockActorTurnAdmission(pinned, session.workspaceId, input.sessionId, input.id);
         return this.insertSessionTurnWithConnection(pinned, input, ignoreConflicts, true);
       });
     }
@@ -11110,7 +11210,8 @@ export class SessionStore {
           SELECT
             turn_id,
             json_extract_string(payload, '$.approvalId') AS approval_id,
-            min(created) AS submitted_at
+            min(created) AS submitted_at,
+            bool_and(coalesce(json_extract_string(payload, '$.fromUser'), 'false') = 'true') AS answered_by_user
           FROM session_turn_event
           WHERE session_id = $sessionId
             AND event_name = 'approval.decision'
@@ -11123,7 +11224,8 @@ export class SessionStore {
           ranked.event_name,
           CAST(ranked.payload AS VARCHAR) AS payload_json,
           CAST(ranked.created AS VARCHAR) AS created,
-          CAST(answer_events.submitted_at AS VARCHAR) AS answer_submitted_at
+          CAST(answer_events.submitted_at AS VARCHAR) AS answer_submitted_at,
+          answer_events.answered_by_user
         FROM ranked
         LEFT JOIN answer_events
           ON answer_events.turn_id = ranked.turn_id
@@ -11278,7 +11380,8 @@ export class SessionStore {
             content,
             attachments: Array.isArray(steer.attachments) ? steer.attachments : [],
             forcePlan: steer.forcePlan === true,
-            created: stringValue(record.created)
+            created: stringValue(record.created),
+            ...(isDurableSteer && typeof steer.source === "string" ? { source: steer.source } : {})
           }
         });
       }
@@ -13358,7 +13461,7 @@ function toSessionTurnRecord(row: SessionTurnRow): SessionTurnRecord {
     ...(row.requested_service_tier === "fast" || row.requested_service_tier === "default"
       ? { requestedServiceTier: row.requested_service_tier } : {}),
     tokenIn: nullableNumber(row.turn_usage_input_tokens) ?? numberValue(row.token_in),
-    cachedInputTokens: nullableNumber(row.turn_usage_cached_input_tokens) ?? undefined,
+    cachedInputTokens: nullableNumber(row.turn_usage_cached_input_tokens) ?? nullableNumber(row.turn_final_cached_input_tokens) ?? undefined,
     tokenOut: nullableNumber(row.turn_usage_output_tokens) ?? numberValue(row.token_out),
     // sum() yields HUGEINT, which arrives as a string.
     ...((nullableNumber(row.subagent_usage_agent_count) ?? 0) > 0 ? { subagentUsage: {
@@ -14374,6 +14477,7 @@ function approvalLiveItemFromRow(row: Record<string, unknown>): unknown | null {
     // Expiry is durable so reloads match the live expired card.
     status: resolved ? record.expired === true ? "expired" : "resolved" : "pending",
     ...(resolved && row.answer_submitted_at ? { answerSubmittedAt: stringValue(row.answer_submitted_at) } : {}),
+    ...(resolved && row.answered_by_user === true ? { answeredByUser: true } : {}),
     ...(resolved ? { decision: record.decision, error: record.error } : {})
   };
 }

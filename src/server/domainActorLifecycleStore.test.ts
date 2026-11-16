@@ -127,6 +127,49 @@ test("pending loop continuation blocks deletion until explicitly ended; failed d
   } finally { await h.close(); }
 });
 
+test("turn-scoped work counts only its own live turns, not other pending turns of the shared session", async () => {
+  const h = await fixture();
+  try {
+    const base = (await h.first.getDomainActorRoom("default")).workItems[0];
+    const mention = (id: string, extra: Partial<ActorWorkItem>): ActorWorkItem => ({ ...base, id, taskSessionId: "ordinary-session", executionHistory: [], ...extra });
+    await h.first.changeDomainActorRoom("default", room => { room.workItems.push(
+      mention("cancelled-mention", { sessionScope: "turn", taskTurnId: "mention-turn", status: "assigned", cancelledAt: "2020-01-02T00:00:00Z" }),
+      mention("hosted-child", { executorActorId: "historical", hostWorkItemId: "cancelled-mention", taskTurnId: "mention-turn", status: "completed" }),
+      mention("live-mention", { sessionScope: "turn", taskTurnId: "live-mention-turn", status: "started" })); });
+    // The user's own turn, parked on a rate limit, belongs to none of the mentions.
+    await h.first.recordSessionTurn({ ...h.turn("user-turn", "ordinary-session"), status: "todo", pendingReason: "rate_limit" });
+    assert.deepEqual(await h.first.getDomainActorRunningSessions("default"), []);
+    await h.first.updateSessionTurn({ id: "user-turn", agentResponse: "", tokenIn: 0, tokenOut: 0, status: "done", runnerExitCode: 0 });
+    await h.first.recordSessionTurn({ ...h.turn("live-mention-turn", "ordinary-session"), status: "todo", pendingReason: "queued" });
+    assert.deepEqual((await h.first.getDomainActorRunningSessions("default")).map(session => [session.workItemId, session.turnId]), [["live-mention", "live-mention-turn"]]);
+  } finally { await h.close(); }
+});
+
+test("a cancelled turn-scoped mention without activeTurnId does not block the session's own pending retry", async () => {
+  const h = await fixture();
+  try {
+    const base = (await h.first.getDomainActorRoom("default")).workItems[0];
+    await h.first.changeDomainActorRoom("default", room => { room.workItems.push({ ...base, id: "cancelled-mention",
+      taskSessionId: "ordinary-session", taskTurnId: "mention-turn", executionHistory: [], sessionScope: "turn",
+      status: "assigned", cancelledAt: "2020-01-02T00:00:00Z" }); });
+    assert.equal((await h.first.getDomainActorRoom("default")).workItems.find(work => work.id === "cancelled-mention")?.activeTurnId, undefined);
+    await h.first.recordSessionTurn({ ...h.turn("user-turn", "ordinary-session"), status: "todo", pendingReason: "rate_limit" });
+    assert.equal((await h.second.claimPendingSessionTurn("user-turn", "ordinary-session")).disposition, "started");
+    await h.first.updateSessionTurn({ id: "user-turn", agentResponse: "", tokenIn: 0, tokenOut: 0, status: "done", runnerExitCode: 0 });
+    await assert.rejects(h.second.claimSessionTurn(h.turn("mention-turn", "ordinary-session")), /was cancelled/);
+  } finally { await h.close(); }
+});
+
+test("an idle-only continuation is held by queued turns but not by a stopped turn parked for manual retry", async () => {
+  const h = await fixture();
+  try {
+    const continuation = (id: string) => h.first.recordSessionTurn({ ...h.turn(id, "ordinary-session"), status: "todo", pendingReason: "queued", requireIdleSession: true });
+    await h.first.recordSessionTurn({ ...h.turn("parked", "ordinary-session"), status: "todo", pendingReason: "stopped" });
+    await continuation("after-parked");
+    await assert.rejects(continuation("behind-queued"), /running or queued/);
+  } finally { await h.close(); }
+});
+
 test("ordinary sessions keep one writer and a busy pending claim remains recoverable", async () => {
   const h = await fixture();
   try {

@@ -164,13 +164,30 @@ export async function mergeClaudeAccountQuota(
 ) {
   const current = await getClaudeAccount(connection, id);
   if (!current) return null;
-  const merged: ClaudeQuotaSnapshot = { ...(current.quotaSnapshot ?? {}), ...stripUndefined(patch) };
+  const merged = mergeClaudeQuotaSnapshot(current.quotaSnapshot, patch);
   await connection.run(
     `UPDATE claude_accounts SET quota_snapshot = $quota::JSON, quota_updated_at = now(), quota_error = $quotaError, updated = now()
      WHERE id = $id`,
     { id, quota: JSON.stringify(merged), quotaError }
   );
   return getClaudeAccount(connection, id);
+}
+
+/**
+ * Run-time rate_limit_events usually carry a reset time but no utilization. For the
+ * same window (matching reset), keep the last known percentage instead of blanking it.
+ */
+export function mergeClaudeQuotaSnapshot(current: ClaudeQuotaSnapshot | null, patch: ClaudeQuotaSnapshot): ClaudeQuotaSnapshot {
+  const merged: ClaudeQuotaSnapshot = { ...(current ?? {}), ...stripUndefined(patch) };
+  for (const key of ["fiveHour", "weekly"] as const) {
+    const previous = current?.[key];
+    const next = patch[key];
+    if (next && next.usedPercent === null && previous && previous.usedPercent !== null
+      && previous.resetsAt !== null && next.resetsAt !== null && Math.abs(previous.resetsAt - next.resetsAt) <= 5 * 60_000) {
+      merged[key] = { ...next, usedPercent: previous.usedPercent };
+    }
+  }
+  return merged;
 }
 
 export async function touchClaudeAccount(connection: SessionDbConnection, id: string) {

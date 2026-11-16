@@ -129,7 +129,8 @@ export class RoundtableService {
     return attempt.logPath;
   }
 
-  async create(sessionId: string, body: Record<string, unknown>) {
+  /** `fromUser`: set by the route only for a signed-in user's own prompt, never from the request body. */
+  async create(sessionId: string, body: Record<string, unknown>, origin: { fromUser?: boolean } = {}) {
     const actors = parseRoundtableActors(body.actors);
     if (typeof body.turnId !== "string" || !/^rt_[a-zA-Z0-9_-]{1,100}$/.test(body.turnId)) throw new Error("Invalid round table turn ID.");
     if (typeof body.message !== "string" || !body.message.trim() || body.message.length > 100_000) throw new Error("Enter a round table prompt (maximum 100,000 characters).");
@@ -141,7 +142,7 @@ export class RoundtableService {
       ...roundtableInputs(source ?? body),
       summarizerModel: this.options.summarizerModel(), answers: actors.map(actor => ({ actor, status: "waiting", text: "", error: null })),
       hostModel: preferences.selectedModel === "auto" ? DEFAULT_MODEL : preferences.selectedModel, hostEffort: roundtableHostEffort(preferences.selectedEffort),
-      summary: "", error: null, tokenIn: 0, tokenOut: 0 });
+      summary: "", error: null, tokenIn: 0, tokenOut: 0 }, { fromUser: origin.fromUser === true && !source });
     await this.notify(round);
     void this.wake(sessionId).catch(error => console.warn("Round table start:", detail(error)));
     return round;
@@ -489,7 +490,8 @@ export function createRoundtableRouter(service: RoundtableService, store: Store,
       if (typeof req.body?.message !== "string" || !req.body.message.trim() || req.body.message.length > 100_000
         || typeof req.body.turnId !== "string" || !/^rt_[a-zA-Z0-9_-]{1,100}$/.test(req.body.turnId)) throw new Error("Invalid round table prompt.");
       const host = await createHost(req.body);
-      const round = await service.create(host.id, { ...req.body, attachments: host.attachments, skills: host.skills });
+      const round = await service.create(host.id, { ...req.body, attachments: host.attachments, skills: host.skills },
+        { fromUser: res.locals.threadexUserAuthenticated === true });
       host.release?.();
       res.status(202).json({ sessionId: host.id, round });
     } catch (error) { res.status(400).json({ error: detail(error) }); }

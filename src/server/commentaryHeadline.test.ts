@@ -214,6 +214,43 @@ test("all model prose fields reject language drift before normalization", () => 
     "缺少驗證工具，暫時未能完成檢查。", "action"), CommentaryHeadlineValidationError);
 });
 
+test("model prose in a script absent from the update is rejected", () => {
+  const detail = "Rem routing is still blocked: the registry lookup found no Rem. I’ll continue Local verification while resolving that routing detail.";
+  const context = { issueLedger: [{ issueKey: 1, issue: "Rem routing is blocked" }] };
+  const cases = [
+    { extracts: [{ type: "action", shortMsg: "Продолжить локальную проверку, пока уточняется маршрутизация." }] },
+    { extracts: [{ type: "action", shortMsg: "Continue Local verification" }], issues: ["Ρem δεν βρέθηκε στο μητρώο"] },
+    { extracts: [{ type: "action", shortMsg: "Continue Local verification" }], blockers: [{ issueKey: 1, blocker: "Remがレジストリにない" }] }
+  ];
+  for (const response of cases) {
+    assert.throws(() => parseCommentaryHeadlineResponse(JSON.stringify(response), detail, "action", context),
+      /currentUpdate's language|same language as currentUpdate/);
+  }
+  const corrected = parseCommentaryHeadlineResponse(JSON.stringify({ extracts: [
+    { type: "action", shortMsg: "Continue Local verification while Rem routing is resolved" }
+  ] }), detail, "action", context)!;
+  assert.equal(corrected.extracts[0].shortMsg, "Continue Local verification while Rem routing is resolved");
+  const progressDetail = "The saved record now has 46 passes and one failure. Core has reached the shared login cases.";
+  for (const shortMsg of [
+    "El registro guardado muestra 46 casos aprobados y uno fallido.",
+    "Core llega a los casos de login con una falla"
+  ]) {
+    assert.throws(() => parseCommentaryHeadlineResponse(JSON.stringify({ extracts: [{ type: "answer", shortMsg }] }), progressDetail, "action"),
+      /same language as currentUpdate/);
+  }
+  assert.equal(parseCommentaryHeadlineResponse(JSON.stringify({ extracts: [
+    { type: "answer", shortMsg: "Core reached the shared login cases with 46 passes and one failure" }
+  ] }), progressDetail, "action")!.extracts.length, 1);
+  const spanishDetail = "El registro guardado muestra 46 casos aprobados; Core llegó a los casos de inicio de sesión.";
+  assert.equal(parseCommentaryHeadlineResponse(JSON.stringify({ extracts: [
+    { type: "answer", shortMsg: "Core llegó a los casos de inicio de sesión" }
+  ] }), spanishDetail, "action")!.extracts.length, 1);
+  const russianDetail = "Проверяю маршрутизацию Rem в реестре акторов.";
+  assert.equal(parseCommentaryHeadlineResponse(JSON.stringify({ extracts: [
+    { type: "action", shortMsg: "Проверка маршрутизации Rem" }
+  ] }), russianDetail, "action")!.extracts[0].shortMsg, "Проверка маршрутизации Rem");
+});
+
 test("model correction receives validation feedback with one retry", async (t) => {
   const previousProvider = process.env.SESSION_COMMENTARY_HEADLINE_PROVIDER;
   process.env.SESSION_COMMENTARY_HEADLINE_PROVIDER = "agent";

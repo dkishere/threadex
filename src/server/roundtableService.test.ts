@@ -35,6 +35,19 @@ test("host effort has a medium floor without changing actor or session preferenc
   } finally { service.stopAll(); await store.close(); }
 });
 
+test("only a signed-in user's own round table prompt is marked as the user's, never a body field or a Next round", async () => {
+  const store = await fixture();
+  const service = new RoundtableService({ store, summarizerModel: () => DEFAULT_MODEL, run: async () => response("Position") });
+  await store.recordSessionTurn({ id: "busy", sessionId: "host", userInput: "Working", agentResponse: "", tokenIn: 0, tokenOut: 0, status: "running" });
+  try {
+    await service.create("host", { turnId: "rt_user", message: "Merge these actors?", actors }, { fromUser: true });
+    await service.create("host", { turnId: "rt_forged", message: "Merge these actors?", actors, fromUser: true });
+    const metadata = async (id: string) => (await store.getSessionTurn(id))?.requestMetadata;
+    assert.deepEqual(await metadata("rt_user"), { roundtable: true, fromUser: true });
+    assert.deepEqual(await metadata("rt_forged"), { roundtable: true }, "a request body cannot claim the user's authorship");
+  } finally { service.stopAll(); await store.close(); }
+});
+
 for (const history of [false, true]) test(`round table fork starts an empty session with a prepared prompt, history=${history}`, async () => {
   const store = await fixture();
   const childId = `tx_${randomUUID()}`;

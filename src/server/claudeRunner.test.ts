@@ -4,7 +4,7 @@ import { USER_INPUT_METHOD } from "../userInputRequest";
 import { managedModeTurnInstructions } from "../managedMode";
 import { inspectorCommand } from "./sessionInspectorCommand";
 import { withProviderHandoff } from "./sessionProviderThreads";
-import { REPLY_LANGUAGE_INSTRUCTIONS } from "./replyLanguage";
+import { NO_SOUND_NOTIFICATION_INSTRUCTIONS, REPLY_LANGUAGE_INSTRUCTIONS } from "./replyLanguage";
 import {
   buildClaudeUserMessage,
   claudeSystemPromptAppend,
@@ -71,15 +71,15 @@ function context(overrides: Partial<ClaudeRunnerContext> = {}) {
 const init = { type: "system", subtype: "init", session_id: "claude-123", model: "claude-opus-5-5" };
 const success = (text: string) => ({ type: "result", subtype: "success", is_error: false, result: text, total_cost_usd: 0.01, usage: { input_tokens: 100, output_tokens: 20 } });
 
-test("Fable 5.1 reaches the Claude SDK unchanged for new and resumed turns", async () => {
-  for (const threadId of [null, "claude:claude-123"]) {
+test("Fable 5.2 and legacy 5.1 reach the Claude SDK unchanged for new and resumed turns", async () => {
+  for (const [model, threadId] of ["claude-fable-5-2", "claude-fable-5-1"].flatMap(id => [null, "claude:claude-123"].map(thread => [id, thread] as const))) {
     const seen: { options?: Record<string, unknown>; prompts: any[] } = { prompts: [] };
-    const { ctx, emitted } = context({ model: "claude-fable-5-1", reasoningEffort: "max", threadId });
+    const { ctx, emitted } = context({ model, reasoningEffort: "max", threadId });
     await runClaudeTurn(ctx, fakeSdk(async function* () {
-      yield { ...init, model: "claude-fable-5-1" };
+      yield { ...init, model };
       yield success("Done");
     }, seen));
-    assert.equal(seen.options?.model, "claude-fable-5-1");
+    assert.equal(seen.options?.model, model);
     assert.equal(seen.options?.effort, "max");
     assert.equal(seen.options?.resume, threadId ? "claude-123" : undefined);
     assert.equal(emitted.find(entry => entry.event === "result")?.data.reply, "Done");
@@ -92,7 +92,7 @@ test("Claude resume receives current Managed state after an enabled turn", async
     const seen: { options?: any; prompts: any[] } = { prompts: [] };
     const { ctx } = context({
       threadId: enabled ? null : "claude:claude-123",
-      appendSystemPrompt: managedModeTurnInstructions(enabled, enabled ? "on" : "off") ?? "base prompt"
+      appendSystemPrompt: managedModeTurnInstructions(enabled, enabled ? "on" : "off", !enabled) ?? "base prompt"
     });
     await runClaudeTurn(ctx, fakeSdk(async function* () {
       yield init;
@@ -101,7 +101,11 @@ test("Claude resume receives current Managed state after an enabled turn", async
     if (enabled) assert.match(seen.options.systemPrompt.append, /Managed mode: ON/);
     else {
       assert.equal(seen.options.resume, "claude-123");
-      assert.doesNotMatch(seen.options.systemPrompt.append, /Managed mode/);
+      assert.doesNotMatch(seen.options.systemPrompt.append, /Managed mode: ON/);
+      assert.match(seen.options.systemPrompt.append, /Managed mode: OFF/);
+      assert.match(seen.options.systemPrompt.append, /proactive delegation and sub-agent model selection no longer apply\. Whether to start native sub-agents and how to select their models now follow the execution platform and model defaults/);
+      assert.match(seen.options.systemPrompt.append, /OFF does not prohibit native sub-agents or require the same or a different model/);
+      assert.doesNotMatch(seen.options.systemPrompt.append, /do the work directly|do not choose a different model/i);
     }
   }
 });
@@ -164,6 +168,14 @@ test("read-only Claude planners can invoke their CLI command but cannot escalate
   assert.equal(seen.options!.mcpServers, undefined);
 });
 
+test("a private MCP config file replaces argv mcpServers so secrets stay out of the command line", async () => {
+  const { ctx } = context({ mcpServers: { codex_image: { type: "stdio", command: "node", args: [], env: {} } }, mcpConfigPath: "/private/tmp/mcp-config.json" });
+  const seen: { options?: Record<string, unknown>; prompts: any[] } = { prompts: [] };
+  await runClaudeTurn(ctx, fakeSdk(async function* () { yield init; yield success("Done"); }, seen));
+  assert.deepEqual(seen.options!.extraArgs, { "mcp-config": "/private/tmp/mcp-config.json" });
+  assert.equal(seen.options!.mcpServers, undefined);
+});
+
 test("effort and environment mapping", () => {
   assert.equal(claudeEffort("ultra", "claude-opus-5-5"), "max");
   assert.equal(claudeEffort("minimal", "claude-sonnet-5-5"), "low");
@@ -222,11 +234,11 @@ test("auto approvals cannot bypass the workspace through file tools or unsandbox
 
 test("native split children run as fixed actor agents and every actor call carries its caller's own credential", async () => {
   const seen: { options?: Record<string, any>; prompts: any[] } = { prompts: [] };
-  const credentials = { main: "a".repeat(64), toolNames: ["actor_read_memory"], children: { actor_ui_123456: { workItemId: "ui-work", capability: "b".repeat(64) } } };
+  const credentials = { main: "a".repeat(64), toolNames: ["actor_read_memory", "actor_handoff"], children: { actor_ui_123456: { workItemId: "ui-work", capability: "b".repeat(64) } } };
   const agents = { actor_ui_123456: { description: "Domain actor UI", prompt: "You are domain actor UI", model: "claude-sonnet-5-5", effort: "high" } };
   const call = (input: object) => `${inspectorCommand} actor_read_memory '${JSON.stringify(input)}'`;
   const injected = (output: any) => JSON.parse(output.hookSpecificOutput.updatedInput.command.match(/actor_read_memory' '(.*)'$/)[1]);
-  await runClaudeTurn(context({ actorCredentials: credentials, agents, approvedInspectorCommands: ["actor_read_memory"] }).ctx,
+  await runClaudeTurn(context({ actorCredentials: credentials, agents, approvedInspectorCommands: ["actor_read_memory", "actor_handoff"] }).ctx,
     fakeSdk(async function* () {
       yield init;
       const hook = seen.options!.hooks.PreToolUse[0].hooks[0];
@@ -237,6 +249,13 @@ test("native split children run as fixed actor agents and every actor call carri
       assert.deepEqual(injected(child), { field: "rolePrompt", _actorCredential: "b".repeat(64), _actorWorkItem: "ui-work" });
       const helper = await hook({ tool_name: "Bash", agent_id: "agent-2", agent_type: "general-purpose", tool_input: { command: call({ field: "rolePrompt" }) } });
       assert.deepEqual(injected(helper), { field: "rolePrompt", _actorCredential: "a".repeat(64) }, "non-actor helpers keep the session actor");
+      const handoff = (agent: object) => hook({ tool_name: "Bash", ...agent, tool_input: { command: `${inspectorCommand} actor_handoff '${JSON.stringify({ executorActorId: "ui", task: "x", requestId: "r" })}'` } });
+      for (const agent of [{ agent_id: "agent-1", agent_type: "actor_ui_123456" }, { agent_id: "agent-2", agent_type: "general-purpose" }]) {
+        const denied = await handoff(agent);
+        assert.equal(denied.hookSpecificOutput.permissionDecision, "deny", "no sub-agent delegates, even with the session actor's credential");
+        assert.match(denied.hookSpecificOutput.permissionDecisionReason, /host session decides/);
+      }
+      assert.equal((await handoff({})).hookSpecificOutput.permissionDecision, "allow", "the host thread may hand off");
       const spawn = await hook({ tool_name: "Agent", tool_input: { subagent_type: "actor_ui_123456", prompt: "Build the form", description: "UI", model: "opus", effort: "max", isolation: "worktree", run_in_background: true, name: "ui" } });
       assert.deepEqual(spawn.hookSpecificOutput.updatedInput, { subagent_type: "actor_ui_123456", prompt: "Build the form", description: "UI", run_in_background: false });
       const rework = await hook({ tool_name: "SendMessage", tool_input: { to: "actor_ui_123456", message: "Fix the label" } });
@@ -245,6 +264,17 @@ test("native split children run as fixed actor agents and every actor call carri
       assert.deepEqual(await hook({ tool_name: "SendMessage", tool_input: { to: "helper", message: "hi" } }), {}, "messages to non-actor helpers are untouched");
       const nested = await hook({ tool_name: "Agent", agent_id: "agent-1", agent_type: "actor_ui_123456", tool_input: { subagent_type: "actor_ui_123456", prompt: "again" } });
       assert.equal(nested.hookSpecificOutput.permissionDecision, "deny");
+      // A child handed off in place this turn has no definition: its marked brief runs as a foreground general-purpose agent.
+      const inPlace = { subagent_type: "Explore", prompt: "[threadex-actor-assignment:actor_handoff_abc123]\nYou are domain actor Docs", description: "Docs handoff",
+        model: "opus", effort: "high", isolation: "worktree", run_in_background: true, name: "docs" };
+      const started = await hook({ tool_name: "Agent", tool_input: inPlace });
+      assert.equal(started.hookSpecificOutput.permissionDecision, "allow");
+      assert.deepEqual(started.hookSpecificOutput.updatedInput, { subagent_type: "general-purpose", prompt: inPlace.prompt, description: "Docs handoff",
+        model: "opus", effort: "high", run_in_background: false }, "the host-listed model and effort stay; isolation and name go");
+      assert.equal((await hook({ tool_name: "Agent", agent_id: "agent-2", agent_type: "general-purpose", tool_input: inPlace })).hookSpecificOutput.permissionDecision, "deny",
+        "only the host starts a marked child");
+      assert.deepEqual(await hook({ tool_name: "Agent", tool_input: { subagent_type: "general-purpose", prompt: "Quote [threadex-actor-assignment:actor_x_1] later", description: "d" } }), {},
+        "only a prompt that begins with the marker is a child launch");
       assert.deepEqual(await hook({ tool_name: "Bash", tool_input: { command: "ls" } }), {}, "ordinary tools are untouched");
       yield success("ok");
     }, seen));
@@ -345,7 +375,7 @@ test("a turn streams items, routes Bash approval and publishes the result", asyn
   assert.equal(seen.options?.model, "claude-opus-5-5");
   assert.equal(seen.options?.effort, "high");
   assert.equal(seen.options?.resume, undefined);
-  assert.deepEqual(seen.options?.systemPrompt, { type: "preset", preset: "claude_code", append: `Threadex rules\n\n${REPLY_LANGUAGE_INSTRUCTIONS}` });
+  assert.deepEqual(seen.options?.systemPrompt, { type: "preset", preset: "claude_code", append: `Threadex rules\n\n${REPLY_LANGUAGE_INSTRUCTIONS}\n\n${NO_SOUND_NOTIFICATION_INSTRUCTIONS}` });
   assert.equal(approvals[0].method, "item/commandExecution/requestApproval");
   assert.equal(approvals[0].params.command, "npm test");
   assert.equal(approvals[0].params.cwd, "/repo");
@@ -460,8 +490,11 @@ test("every Claude query carries the reply-language rule exactly once", async ()
   assert.equal(queries.length, 2);
   for (const options of queries) assert.equal(count((options.systemPrompt as any).append), 1);
   // Caller-supplied copies and empty prompts stay single.
-  assert.equal(claudeSystemPromptAppend(`base\n\n${REPLY_LANGUAGE_INSTRUCTIONS}`), `base\n\n${REPLY_LANGUAGE_INSTRUCTIONS}`);
-  assert.equal(claudeSystemPromptAppend(""), REPLY_LANGUAGE_INSTRUCTIONS);
+  const full = `base\n\n${REPLY_LANGUAGE_INSTRUCTIONS}\n\n${NO_SOUND_NOTIFICATION_INSTRUCTIONS}`;
+  assert.equal(claudeSystemPromptAppend(full), full);
+  assert.equal(claudeSystemPromptAppend(`base\n\n${REPLY_LANGUAGE_INSTRUCTIONS}`), full);
+  assert.equal(claudeSystemPromptAppend(""), `${REPLY_LANGUAGE_INSTRUCTIONS}\n\n${NO_SOUND_NOTIFICATION_INSTRUCTIONS}`);
+  assert.match(NO_SOUND_NOTIFICATION_INSTRUCTIONS, /afplay/);
 });
 
 test("declined edits deny the tool and plan-mode turns refuse mutation", async () => {

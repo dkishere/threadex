@@ -72,6 +72,25 @@ test("client pages keep workspace isolation, global notifications and reset sema
   assert.equal(clientEventPage(entries, "other", 9).nextPos, 11);
 });
 
+test("a reader too far behind on client events is told to reload the snapshot", () => {
+  const entries = [event(1, "runner.done"), event(2, "runner.item"), event(3, "runner.done", null, "other"),
+    event(4, "runner.done"), event(5, "runner.done"), event(6, "runner.done", null, null)];
+  // Only this workspace's client events count: 4, 5 and the global 6.
+  const reset = clientEventPage(entries, "one", 1, undefined, 2);
+  assert.equal(reset.resetRequired, true);
+  assert.equal(reset.resetReason, "backlog");
+  assert.equal(reset.backlog, 3);
+  assert.deepEqual(reset.events, []);
+  assert.equal(reset.nextPos, 6);
+  const within = clientEventPage(entries, "one", 1, undefined, 3);
+  assert.equal(within.resetRequired, false);
+  assert.deepEqual(within.events.map(item => item.pos), [4, 5, 6]);
+  // 0 disables the limit; a fresh cursor still reads from the ring.
+  assert.equal(clientEventPage(entries, "one", 1, undefined, 0).resetRequired, false);
+  assert.equal(clientEventPage(entries, "one", 0, undefined, 1).resetRequired, false);
+  assert.equal(clientEventPage(entries, "one", 20, undefined, 1).resetReason, "evicted");
+});
+
 test("state versions omit unchanged sections and send explicit empty arrays for removals", () => {
   const state = { statusMonitor: [{ id: "other" }], processMonitors: [{ command: "large command" }], grillSummaries: [{ revision: 1 }],
     waitEvents: [{ id: "event", status: "pending" }], waitSubscriptions: [{ id: "subscription", status: "waiting" }] };

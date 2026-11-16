@@ -9,7 +9,8 @@ import {
   pendingRetryAt,
   pendingTurnRunsAutomatically,
   pendingUsesWorkspaceAccountPool,
-  rateLimitFallbackDelayMs
+  rateLimitFallbackDelayMs,
+  supersededRetryWaitTurnIds
 } from "./pendingTurnRouting";
 
 test("keeps a rate-limited load-balanced turn routable when workspace LB is enabled", () => {
@@ -195,4 +196,37 @@ test("scopes a cleared limit wait to the reset or switched account", () => {
   assert.equal(pendingInLimitWaitScope(codexTurn, { sessionId: "s1" }), true);
   // A scope without filters must not release every waiting turn.
   assert.equal(pendingInLimitWaitScope(codexTurn, {}), false);
+});
+
+test("parks a usage-limit wait once later turns of its session have run", () => {
+  // tx_cfda0f59: "try again" hit the limit at 23:54, the user continued on other turns, then the
+  // reset re-ran the stale prompt mid-history and held the newer queued prompt behind it.
+  const staleWait = { id: "try-again", created: "2026-11-08 22:34:14.476495+00",
+    runnerStarted: "2026-11-08 22:34:15.892054+00", pendingReason: "rate_limit" as const };
+  const queued = { id: "queued", created: "2026-11-09 11:03:51.276573+00", runnerStarted: null, pendingReason: "queued" as const };
+  const sessionTurns = [
+    { id: "try-again", runnerStarted: staleWait.runnerStarted },
+    { id: "take-over", runnerStarted: "2026-11-09 00:07:44.758118+00" },
+    { id: "queued", runnerStarted: null }
+  ];
+  assert.deepEqual(supersededRetryWaitTurnIds([staleWait, queued], sessionTurns), ["try-again"]);
+  // An auth wait is superseded the same way.
+  assert.deepEqual(supersededRetryWaitTurnIds([{ ...staleWait, pendingReason: "auth" }], sessionTurns), ["try-again"]);
+});
+
+test("keeps a usage-limit wait that nothing has overtaken", () => {
+  const wait = { id: "latest", created: "2026-11-09 11:00:00+00", runnerStarted: "2026-11-09 11:00:01+00", pendingReason: "rate_limit" as const };
+  // Earlier turns ran before it; a queued prompt behind it has not started.
+  assert.deepEqual(supersededRetryWaitTurnIds([wait], [
+    { id: "earlier", runnerStarted: "2026-11-09 10:00:00+00" }, { id: "latest", runnerStarted: wait.runnerStarted }, { id: "queued", runnerStarted: null }
+  ]), []);
+  // A manual retry of an old prompt restarts its clock, so the turns it once trailed do not park it again.
+  assert.deepEqual(supersededRetryWaitTurnIds([{ ...wait, created: "2026-11-08 09:00:00+00" }], [
+    { id: "later-created", runnerStarted: "2026-11-09 10:30:00+00" }, { id: "latest", runnerStarted: wait.runnerStarted }
+  ]), []);
+  // Queued and stopped turns are never parked by this rule.
+  assert.deepEqual(supersededRetryWaitTurnIds([{ ...wait, runnerStarted: null, created: "2026-11-09 09:00:00+00", pendingReason: "queued" },
+    { ...wait, runnerStarted: null, created: "2026-11-09 09:00:00+00", pendingReason: "stopped" }], [
+    { id: "other", runnerStarted: "2026-11-09 10:00:00+00" }
+  ]), []);
 });

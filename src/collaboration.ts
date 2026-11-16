@@ -7,6 +7,8 @@ export type CollaborationMember = {
   requestFingerprint?: string;
   sourceSessionId: string;
   sourceTurnId: string | null;
+  /** Main's turn whose agent spawned this worker; the timeline shows the worker under it rather than under its context boundary. */
+  spawnTurnId?: string;
   fork: CollaborationFork | null;
   model: string;
   effort: string;
@@ -59,6 +61,9 @@ export type CollaborationGroup = {
   updated: string;
   lease: { owner: string; until: number } | null;
   error?: string | null;
+  /** Main is blocked in `concurrent_wait` for this turn: worker results stay pending for the tool
+   * to claim instead of being steered. A crashed CLI stops renewing it, so steering resumes. */
+  mainWait?: { turnId: string; until: number } | null;
   members: CollaborationMember[];
   messages: CollaborationMessage[];
   results: CollaborationResult[];
@@ -69,9 +74,17 @@ export type CollaborationView = CollaborationGroup & {
   conflicts: Array<{ path: string; members: string[] }>;
 };
 
+/** Actor steering records its sender and target in an actor_tree_* group only to deliver coordination
+ * context. Its members are independent actor task sessions, not Concurrent workers. */
+export const ACTOR_COORDINATION_GROUP_PREFIX = "actor_tree_";
+
+export function isActorCoordinationGroup(group: { id: string }): boolean {
+  return group.id.startsWith(ACTOR_COORDINATION_GROUP_PREFIX);
+}
+
 export function isCollaborationMemberEnded(group: CollaborationView, localId: string): boolean {
   const member = group.members.find(member => member.localId === localId);
-  if (!member || localId === "main") return false;
+  if (!member || localId === "main" || isActorCoordinationGroup(group)) return false;
   if (member.stopped) return true;
   if (group.activity[localId]?.status !== "idle") return false;
   return !group.messages.some(message => !message.completed && message.state !== "cancelled" &&

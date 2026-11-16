@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { Router } from "express";
 import type { CollaborationGroup, CollaborationMember, CollaborationMessage, CollaborationView } from "../collaboration";
-import { isCollaborationMemberEnded } from "../collaboration";
+import { isActorCoordinationGroup, isCollaborationMemberEnded } from "../collaboration";
 import type { SessionStore, SessionTurnRecord } from "./sessionStore";
 import type { UploadedAttachment } from "./attachmentUploads";
 import { MODEL_OPTIONS, DEFAULT_MODEL, isClaudeModel } from "../modelCatalog";
@@ -107,9 +107,14 @@ export class CollaborationService {
     return payload;
   }
 
-  async view(sessionId: string, groupId?: string): Promise<CollaborationView | null> {
+  /** The session's Concurrent group. Actor coordination groups are reachable only by explicit ID. */
+  private async concurrentGroup(sessionId: string, groupId?: string) {
     const groups = await this.store.listCollaborationGroups(sessionId);
-    const group = groupId ? groups.find(group => group.id === groupId) : groups[0];
+    return groupId ? groups.find(group => group.id === groupId) : groups.find(group => !isActorCoordinationGroup(group));
+  }
+
+  async view(sessionId: string, groupId?: string): Promise<CollaborationView | null> {
+    const group = await this.concurrentGroup(sessionId, groupId);
     if (!group) return null;
     const activity: CollaborationView["activity"] = {};
     const paths = new Map<string, Set<string>>();
@@ -132,7 +137,7 @@ export class CollaborationService {
   }
 
   async create(mainSessionId: string) {
-    const existing = (await this.store.listCollaborationGroups(mainSessionId))[0];
+    const existing = await this.concurrentGroup(mainSessionId);
     if (existing) return existing;
     const main = await this.store.getSession(mainSessionId);
     if (!main) throw new Error("Main session not found.");
@@ -156,9 +161,12 @@ export class CollaborationService {
     const source = await this.store.getSession(sourceMember.sessionId);
     if (!source) throw new Error("The source session is unavailable.");
     const sourceTurns = await this.store.listSessionTurns(source.id);
-    const target = body.turnId ? sourceTurns.find(t => t.id === body.turnId) : sourceTurns.filter(t => t.status === "done").at(-1);
-    if (!target) throw new Error("The selected source turn does not belong to this session.");
-    if (target.status !== "done") throw new Error("Choose a completed source turn. A running turn has no stable boundary to fork; pick an earlier completed turn.");
+    // An agent delegating during main's first turn has no completed boundary: that worker starts from its brief alone.
+    const target = body.turnId ? sourceTurns.find(t => t.id === body.turnId) : sourceTurns.filter(t => t.status === "done").at(-1) ?? null;
+    if (body.turnId && !target) throw new Error("The selected source turn does not belong to this session.");
+    if (target && target.status !== "done") throw new Error("Choose a completed source turn. A running turn has no stable boundary to fork; pick an earlier completed turn.");
+    const spawnTurnId = body.origin === "agent" && typeof body.spawnTurnId === "string" ? body.spawnTurnId : undefined;
+    if (spawnTurnId && !sourceTurns.some(t => t.id === spawnTurnId)) throw new Error("The spawning turn does not belong to this session.");
     const childSessionId = `tx_${stableId(group.id, requestId)}`;
     const requestFingerprint = stableId(JSON.stringify({ task, source: source.id, turnId: body.turnId ?? null,
       model: body.model ?? null, effort: body.modelReasoningEffort ?? null, fastMode: body.fastMode === true,
@@ -177,7 +185,7 @@ export class CollaborationService {
     // Codex thread/fork is the only native fork. Claude sources, Claude workers and
     // turns without a native link (roundtables, unsynchronized turns) start a fresh
     // worker thread seeded with the source transcript up to the selected turn.
-    const nativeFork = source.threadId && !isClaudeThreadId(source.threadId) && !isClaudeModel(model)
+    const nativeFork = target && source.threadId && !isClaudeThreadId(source.threadId) && !isClaudeModel(model)
       ? await this.store.collaborationNativeTurn(source.id, target.id, source.threadId) : null;
     const effort = typeof body.modelReasoningEffort === "string" ? body.modelReasoningEffort : preferences.selectedEffort;
     if (!["minimal", "low", "medium", "high", "xhigh", "max", "ultra"].includes(effort)) throw new Error("Invalid reasoning effort.");
@@ -196,11 +204,11 @@ export class CollaborationService {
       if (current.members.length >= 33) throw new Error("A Concurrent group supports up to 32 workers.");
       const member: CollaborationMember = { localId: `c${current.members.length}`, sessionId: childSessionId,
         requestFingerprint,
-        task, sourceSessionId: source.id, sourceTurnId: target.id, fork: nativeFork,
+        task, sourceSessionId: source.id, sourceTurnId: target?.id ?? null, ...(spawnTurnId ? { spawnTurnId } : {}), fork: nativeFork,
         model, effort, fastMode: body.fastMode === true, approvalPolicy, stopped: false, observed: {} };
       current.members.push(member);
       enqueue(current, message({ id: stableId(childSessionId, "initial"), from: "main", to: member.localId,
-        text: task, reason: "User requested Concurrent work", kind: "task", attachments, skills }));
+        text: task, reason: body.origin === "agent" ? "Main agent delegated Concurrent work" : "User requested Concurrent work", kind: "task", attachments, skills }));
       return member;
     });
     // Make the child visible to session navigation before the fork request
@@ -211,8 +219,7 @@ export class CollaborationService {
   }
 
   async send(sessionId: string, body: Record<string, unknown>, groupId?: string) {
-    const groups = await this.store.listCollaborationGroups(sessionId);
-    const group = groupId ? groups.find(group => group.id === groupId) : groups[0];
+    const group = await this.concurrentGroup(sessionId, groupId);
     if (!group) throw new Error("Concurrent is not enabled for this session.");
     const from = requester(group, sessionId);
     const to = required(body.to, "to");
@@ -250,7 +257,7 @@ export class CollaborationService {
   }
 
   async control(sessionId: string, body: Record<string, unknown>) {
-    const group = (await this.store.listCollaborationGroups(sessionId))[0];
+    const group = await this.concurrentGroup(sessionId);
     if (!group || group.mainSessionId !== sessionId) throw new Error("Only the main session can control workers.");
     const localId = required(body.localId, "localId");
     if (localId === "main") throw new Error("Use the normal main-session stop control.");
@@ -281,7 +288,7 @@ export class CollaborationService {
   }
 
   async resolveDelivery(sessionId: string, body: Record<string, unknown>) {
-    const group = (await this.store.listCollaborationGroups(sessionId))[0];
+    const group = await this.concurrentGroup(sessionId);
     if (!group || group.mainSessionId !== sessionId) throw new Error("Only main can resolve uncertain delivery.");
     return this.store.changeCollaboration(group.id, null, current => {
       const item = current.messages.find(m => m.id === body.id);
@@ -301,6 +308,49 @@ export class CollaborationService {
       item.error = null;
       return item;
     });
+  }
+
+  /** One poll of main's `concurrent_wait`: renews the wait hold, claims the awaited workers' undelivered
+   * results for main's running turn (so they are returned once instead of also steered), and reports
+   * which awaited workers have settled. The CLI repeats it until its mode is met or it times out. */
+  async wait(sessionId: string, body: Record<string, unknown>) {
+    const group = await this.concurrentGroup(sessionId);
+    if (!group || group.mainSessionId !== sessionId) throw new Error("Only the main session can wait for its Concurrent workers.");
+    const turnId = required(body.turnId, "turnId");
+    const turn = await this.store.getSessionTurn(turnId);
+    if (turn?.sessionId !== sessionId || turn.status !== "running") throw new Error("concurrent_wait requires main's running turn.");
+    if (body.localIds !== undefined && !Array.isArray(body.localIds)) throw new Error("Invalid localIds.");
+    const requested = Array.isArray(body.localIds) ? [...new Set(body.localIds.map(id => required(id, "localId")))] : null;
+    for (const localId of requested ?? []) if (localId === "main" || !group.members.some(m => m.localId === localId)) throw new Error(`Unknown worker ${localId}.`);
+    const targets = requested ?? group.members.filter(m => m.localId !== "main" && !m.stopped).map(m => m.localId);
+    const claimed = await this.store.changeCollaboration(group.id, null, current => {
+      current.mainWait = { turnId, until: Date.now() + 15_000 };
+      const items = current.messages.filter(m => m.to === "main" && m.kind === "result" && m.state === "pending" && targets.includes(m.from));
+      // Delivered to this turn: when it ends, collect() completes them like any other delivery.
+      for (const item of items) { item.state = "delivered"; item.targetTurnId = turnId; item.error = null; }
+      return items.map(item => ({ id: item.id, from: item.from, text: item.text }));
+    });
+    const view = (await this.view(sessionId, group.id))!;
+    const results = claimed.flatMap(item => view.results.filter(result => stableId(result.id, "main") === item.id));
+    const notices = claimed.filter(item => !results.some(result => stableId(result.id, "main") === item.id)).map(item => ({ from: item.from, text: item.text.slice(0, 4000) }));
+    const members = targets.map(localId => {
+      const activity = view.activity[localId];
+      const member = memberOf(view, localId);
+      const settled = member.stopped || (isCollaborationMemberEnded(view, localId)
+        && view.results.some(result => result.localId === localId && result.turnId === activity?.turnId));
+      return { localId, sessionId: member.sessionId, model: member.model, status: activity?.status ?? "creating", turnId: activity?.turnId ?? null, settled };
+    });
+    return { members, results, notices };
+  }
+
+  /** Main's wait hold ends with its tool call; pending results then steer as usual. */
+  async endWait(sessionId: string, body: Record<string, unknown>) {
+    const group = await this.concurrentGroup(sessionId);
+    if (!group || group.mainSessionId !== sessionId) return { ok: true };
+    await this.store.changeCollaboration(group.id, null, current => {
+      if (current.mainWait?.turnId === body.turnId) current.mainWait = null;
+    });
+    return { ok: true };
   }
 
   async runnerContext(sessionId: string, currentTurnId: string) {
@@ -510,8 +560,10 @@ export class CollaborationService {
           await this.collect(group);
           // One dispatch per group per pulse bounds lease duration and gives siblings fair progress.
           const fresh = (await this.store.listCollaborationGroups(group.mainSessionId)).find(candidate => candidate.id === group.id);
+          const holding = fresh?.mainWait && fresh.mainWait.until > Date.now();
           const next = fresh?.messages.find(m => (m.state === "pending" || m.state === "steering") &&
-            (m.nextAttemptAt ?? 0) <= Date.now() && !memberOf(fresh, m.to).stopped);
+            (m.nextAttemptAt ?? 0) <= Date.now() && !memberOf(fresh, m.to).stopped &&
+            !(holding && m.state === "pending" && m.to === "main" && m.kind === "result"));
           if (fresh && next) {
             const renewed = await this.store.changeCollaboration(group.id, null, current => {
               if (current.lease?.owner !== this.owner) return false;
@@ -544,7 +596,7 @@ export function createCollaborationRouter(service: CollaborationService) {
     try { res.json({ group: await service.view(req.params.sessionId) }); }
     catch (error) { res.status(400).json({ error: detail(error) }); }
   });
-  for (const action of ["fork", "send", "control", "resolveDelivery"] as const) {
+  for (const action of ["fork", "send", "control", "resolveDelivery", "wait", "endWait"] as const) {
     router.post(`/:sessionId/${action}`, async (req, res) => {
       try { res.json(await service[action](req.params.sessionId, req.body ?? {})); }
       catch (error) { res.status(409).json({ error: detail(error) }); }

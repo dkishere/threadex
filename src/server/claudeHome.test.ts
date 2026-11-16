@@ -73,3 +73,46 @@ test("refresh synchronization never overwrites a relogin, logout or another runn
     }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("an overlapping or killed turn's unsynced refresh is promoted instead of overwritten", () => {
+  const root = mkdtempSync(resolve(tmpdir(), "claude-auth-test-"));
+  const home = resolve(root, "workspace");
+  const other = resolve(root, "other-workspace");
+  const source = resolve(root, "account");
+  const saved = new Map<string, ReturnType<typeof credential> | null>();
+  const store: ClaudeCredentialStore = { read: key => saved.get(key) ?? null,
+    write: (key, value) => { saved.set(key, value as ReturnType<typeof credential> | null); } };
+  try {
+    saved.set(source, credential("original"));
+    const first = prepareClaudeHome(home, source, store);
+    saved.set(home, credential("rotated", 2)); // First turn refreshes and is still running (or was killed).
+    const second = prepareClaudeHome(home, source, store);
+    assert.deepEqual(saved.get(home), credential("rotated", 2));
+    assert.deepEqual(saved.get(source), credential("rotated", 2));
+    first.syncAuth();
+    second.syncAuth();
+    assert.deepEqual(saved.get(source), credential("rotated", 2));
+    // Mid-turn syncs keep publishing later rotations from the same lineage.
+    saved.set(home, credential("rotated-again", 3));
+    first.syncAuth();
+    assert.deepEqual(saved.get(source), credential("rotated-again", 3));
+    // Another home's newer refresh wins; this home is reseeded rather than promoted.
+    prepareClaudeHome(other, source, store);
+    saved.set(other, credential("elsewhere", 4));
+    prepareClaudeHome(other, source, store);
+    saved.set(home, credential("stale", 5));
+    prepareClaudeHome(home, source, store);
+    assert.deepEqual(saved.get(source), credential("elsewhere", 4));
+    assert.deepEqual(saved.get(home), credential("elsewhere", 4));
+    // A relogin or logout at the source is never replaced by a home's refresh.
+    saved.set(home, credential("late-refresh", 6));
+    saved.set(source, credential("relogin", 1));
+    prepareClaudeHome(home, source, store);
+    assert.deepEqual(saved.get(source), credential("relogin", 1));
+    saved.set(home, credential("late-refresh", 7));
+    saved.set(source, null);
+    prepareClaudeHome(home, source, store);
+    assert.equal(saved.get(source), null);
+    assert.equal(saved.get(home), null);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

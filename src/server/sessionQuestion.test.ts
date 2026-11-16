@@ -90,7 +90,7 @@ test("Claude side chats resume one Claude session per Threadex session", async (
     assert.equal(calls[0].idleTimeout, true);
     assert.equal(calls[0].configDir, "/accounts/a");
     assert.deepEqual(calls[0].allowedTools, ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch"]);
-    assert.deepEqual(calls[0].inspectorCli?.approvedCommands, ["get_session", "search_sessions", "prompt_session"]);
+    assert.deepEqual(calls[0].inspectorCli?.approvedCommands, ["get_session", "search_sessions", "prompt_session", "post_group_chat"]);
     assert.equal(calls[0].inspectorCli?.env.THREADEX_SIDE_CHAT_HOST_PROMPT, "1");
     assert.match(calls[0].systemPrompt, /When the user explicitly asks/);
     assert.doesNotMatch(calls[0].systemPrompt, /Never ask another side-chat agent, prompt a session/);

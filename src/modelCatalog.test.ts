@@ -10,7 +10,7 @@ import { normalizeEffortForModel } from "./client/sessionHelpers04";
 import { updateGearProfile } from "./client/sessionActions05";
 
 test("Claude gears and actors share provider effort choices and model-switch normalization", () => {
-  for (const model of ["opus", "sonnet", "haiku", "fable", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"]) {
+  for (const model of ["opus", "sonnet", "haiku", "fable", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-2", "claude-fable-5-1"]) {
     assert.deepEqual(modelEfforts(model), ["low", "medium", "high", "xhigh", "max"]);
     assert.equal(roundtableEfforts(model), modelEfforts(model));
     assert.equal(normalizeModelEffort(model, "minimal"), "low");
@@ -33,10 +33,10 @@ test("Claude gears and actors share provider effort choices and model-switch nor
   assert.equal(normalizeModelEffort("gpt-5.4", "max"), "xhigh");
 });
 
-test("Fable 5.1 is selectable, survives stored preferences and routes to Claude", () => {
-  const model = "claude-fable-5-1";
+test("Fable 5.2 is selectable, survives stored preferences and routes to Claude", () => {
+  const model = "claude-fable-5-2";
   assert.ok(composerModels.includes(model));
-  assert.equal(modelOptionLabel({}, model), "Fable 5.1");
+  assert.equal(modelOptionLabel({}, model), "Fable 5.2");
   for (const value of [model, "fable"]) {
     assert.equal(normalizeModelId(value), model);
     assert.equal(normalizeStoredModel({ AUTO_MODEL_VALUE: "auto", MODEL_OPTIONS }, value), model);
@@ -45,6 +45,19 @@ test("Fable 5.1 is selectable, survives stored preferences and routes to Claude"
   }
   assert.ok(!(AUTO_MODEL_ORDER as readonly string[]).includes(model));
   assert.equal(supportsUltraEffort(model), false);
+  assert.equal(modelWorkTier(model), "astra");
+});
+
+test("legacy Fable 5.1 keeps its id, label, tier and stored selection", () => {
+  const legacy = "claude-fable-5-1";
+  assert.equal(normalizeModelId(legacy), legacy, "5.1 must not be rewritten to 5.2");
+  assert.equal(modelLabel(legacy), "Fable 5.1");
+  assert.equal(modelWorkTier(legacy), "astra");
+  assert.equal(modelProvider(legacy), "claude");
+  assert.ok(composerModels.includes(legacy), "stored 5.1 selections must stay valid");
+  assert.equal(normalizeStoredModel({ AUTO_MODEL_VALUE: "auto", MODEL_OPTIONS }, legacy), legacy);
+  assert.deepEqual(modelEfforts(legacy), modelEfforts("claude-fable-5-2"));
+  assert.notEqual(normalizeModelId("fable"), legacy);
 });
 
 test("composer, persisted gears and Auto share the catalog", () => {

@@ -4,6 +4,7 @@ import { isCollaborationMemberEnded, type CollaborationView } from "./collaborat
 
 function view(status = "idle", stopped = false): CollaborationView {
   return {
+    id: "collab_test",
     members: [{ localId: "main", stopped: false }, { localId: "w1", stopped }],
     activity: { w1: { status, turnId: "turn-1", progress: "" } },
     messages: []
@@ -29,4 +30,10 @@ test("queued deliveries and unresolved dependencies keep an idle worker open", (
   assert.equal(isCollaborationMemberEnded(group, "w1"), false);
   group.messages[0].completed = true;
   assert.equal(isCollaborationMemberEnded(group, "w1"), true);
+});
+
+test("an idle actor steered through a coordination group is not an ended Concurrent worker", () => {
+  const coordination = { ...view(), id: "actor_tree_abc" };
+  assert.equal(isCollaborationMemberEnded(coordination, "w1"), false);
+  assert.equal(isCollaborationMemberEnded({ ...view(), id: "collab_abc" }, "w1"), true);
 });

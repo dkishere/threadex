@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { readAccountAuthIdentity, type AccountAuthIdentity } from "./accountAuth";
 import { approvedBrowserBridgeCommand, browserBridgeEnvironment, browserBridgeInstructions, type BrowserBridgeCliConfig } from "./browserBridgeCommand";
@@ -54,6 +54,8 @@ export type IsolatedLunaRunnerOptions = {
   /** Explicitly expose this project directory to an otherwise isolated read-only job. */
   workspaceCwd?: string | null;
   allowWorkspaceRead?: boolean;
+  /** Use the host HOME for user-requested inspection, while keeping Codex auth/config private. */
+  inheritHostHome?: boolean;
   /** Let the model write and run scripts in its own temp workspace; nothing else is writable. */
   scratchWrite?: boolean;
   /** With `scratchWrite`: let shell commands use the network. Codex cannot limit this to loopback. */
@@ -72,7 +74,7 @@ export type IsolatedLunaRunOptions = {
 
 /**
  * A small reusable app-server for isolated non-interactive tasks. It gets a fresh
- * temp workspace and an auth-only Codex home, so no user config, skills, MCPs,
+ * temp workspace and an auth-only Codex home, so no Codex config, skills, MCPs,
  * apps, dynamic tools, or workspace files are exposed to the model unless the
  * caller explicitly supplies a thread config. Stateless callers can request a
  * fresh ephemeral thread for every run and periodically recycle the whole process,
@@ -241,7 +243,7 @@ export class IsolatedLunaRunner {
           ...this.options.inspectorCli?.env,
           ...(this.options.browserBridgeCli ? browserBridgeEnvironment(this.options.browserBridgeCli) : {}),
           ...(this.options.githubReadCli ? githubReadEnvironment(this.options.githubReadCli) : {}),
-          HOME: this.agentHome.home,
+          HOME: this.options.inheritHostHome ? process.env.HOME || homedir() : this.agentHome.home,
           AGENT_CLI_HOME: this.agentHome.home,
           CODEX_HOME: this.agentHome.home,
           CODEX_WORKDIR: this.workspace,

@@ -36,6 +36,7 @@ export function roundtableInstructions(input: Pick<RoundtableInference, "actorTo
   const workspace = input.actorTools ? [
     `Host project working directory: ${JSON.stringify(input.actorTools.session.cwd)}.`,
     "Resolve the user's relative project paths (including @path references) against that host directory, never against your scratch cwd. The empty scratch directory does not mean the host project is missing.",
+    "Your HOME is the host HOME, so tools such as AWS CLI can discover the host's existing profiles. Use existing logins only for user-requested read-only inspection; do not read or output credentials, log in, log out, or change account settings. Report an actual authentication or permission error rather than assuming access is unavailable.",
     "You may inspect host project files and Git changes read-only. Use absolute file paths and explicitly set the command working directory to the host directory or the requested repository for read-only commands. Keep all generated files and verification scripts in your private scratch directory; never modify the host project."
   ].join(" ") : "";
   return [...ROUNDTABLE_RULES, input.actorTools ? ACTOR_TOOLS_RULE : NO_TOOLS_RULE, workspace, "", input.systemPrompt].join("\n");
@@ -70,6 +71,7 @@ export async function runRoundtableInference(input: RoundtableInference) {
     onEvent: event => input.onEvent?.("codex", event),
     ...(inspector ? {
       scratchWrite: true,
+      inheritHostHome: true,
       inspectorCli: inspector,
       browserBridgeCli,
       githubReadCli,

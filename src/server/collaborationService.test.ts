@@ -104,6 +104,90 @@ test("Codex workers keep the native fork and fall back to the transcript without
   assert.equal(fallback.fork, null);
 });
 
+test("main's agent can spawn a worker during its first turn, seeded by the brief alone", async () => {
+  const running = [{ id: "t1", status: "running", userInput: "First request still running", agentResponse: "", runnerExitCode: null }] as Array<Partial<SessionTurnRecord>>;
+  for (const threadId of ["claude:source-thread", "codex-thread"]) {
+    const fixture = forkStore({ threadId, turns: running, nativeLink: true });
+    const service = new CollaborationService(fixture.store, "http://unused", () => []);
+    await assert.rejects(service.fork("main", { requestId: "a0", task: "Go", origin: "agent", spawnTurnId: "elsewhere" }), /spawning turn/);
+    const member = await service.fork("main", { requestId: "a1", task: "Review the parser", model: "claude-opus-5-5", origin: "agent", spawnTurnId: "t1" });
+    assert.equal(member.sourceTurnId, null);
+    assert.equal(member.spawnTurnId, "t1", "the timeline shows the worker under the turn that delegated it");
+    assert.equal(member.fork, null);
+    assert.deepEqual(fixture.nativeLookups, [], "no boundary means no native fork lookup");
+    assert.equal(fixture.group().messages[0].reason, "Main agent delegated Concurrent work");
+    assert.equal(fixture.group().messages[0].text, "Review the parser");
+    const context = await service.runnerContext(member.sessionId, "worker-turn");
+    assert.doesNotMatch(context?.recovery?.handoff ?? "", /First request still running/, "main's running turn is never inherited");
+  }
+});
+
+function waitFixture() {
+  const turns: Record<string, Array<Partial<SessionTurnRecord>>> = {
+    main: [{ id: "main-turn", status: "running", sessionId: "main" }],
+    c1: [{ id: "c1-turn", status: "done", agentResponse: "Parser reviewed", runnerExitCode: 0 }],
+    c2: [{ id: "c2-turn", status: "running" }]
+  };
+  const group = { id: "group", workspaceId: "ws", mainSessionId: "main", revision: 0, lease: null, results: [], messages: [],
+    members: ["main", "c1", "c2"].map(localId => ({ localId, sessionId: localId, model: "gpt-6-sol", observed: {}, stopped: false }))
+  } as unknown as CollaborationGroup;
+  const store = {
+    listCollaborationGroups: async () => [group],
+    listSessionTurns: async (id: string) => turns[id] ?? [],
+    listSessionTurnLiveItems: async () => [],
+    getSessionTurn: async (id: string) => Object.values(turns).flat().find(turn => turn.id === id) ?? null,
+    inspectSession: async () => ({ fileChanges: [] }),
+    changeCollaboration: async (_id: string, _initial: unknown, change: (value: CollaborationGroup) => unknown) => change(group)
+  } as unknown as SessionStore;
+  const service = new CollaborationService(store, "http://unused", () => []);
+  const collect = () => (service as unknown as { collect(group: CollaborationGroup): Promise<void> }).collect(group);
+  return { group, turns, service, collect };
+}
+
+test("concurrent_wait claims undelivered results for main's turn and reports settled workers", async () => {
+  const { group, turns, service, collect } = waitFixture();
+  await collect();
+  const pending = group.messages.find(m => m.to === "main" && m.kind === "result")!;
+  assert.equal(pending.state, "pending");
+  const first = await service.wait("main", { turnId: "main-turn" });
+  assert.deepEqual(first.results.map(result => [result.localId, result.summary]), [["c1", "Parser reviewed"]]);
+  assert.deepEqual(first.members.map(member => [member.localId, member.settled]), [["c1", true], ["c2", false]]);
+  assert.equal(pending.state, "delivered", "claimed results are not steered again");
+  assert.equal(pending.targetTurnId, "main-turn");
+  assert.equal(group.mainWait?.turnId, "main-turn");
+  assert.deepEqual((await service.wait("main", { turnId: "main-turn" })).results, [], "a result is returned once");
+  turns.c2 = [{ id: "c2-turn", status: "done", agentResponse: "Tests added", runnerExitCode: 0 }];
+  await collect();
+  const last = await service.wait("main", { turnId: "main-turn", localIds: ["c2"] });
+  assert.deepEqual(last.results.map(result => result.localId), ["c2"]);
+  assert.deepEqual(last.members.map(member => [member.localId, member.settled]), [["c2", true]]);
+  await service.endWait("main", { turnId: "main-turn" });
+  assert.equal(group.mainWait, null);
+});
+
+test("concurrent_wait is main-only, needs main's running turn and known workers", async () => {
+  const { service } = waitFixture();
+  await assert.rejects(service.wait("c1", { turnId: "c1-turn" }), /Only the main session/);
+  await assert.rejects(service.wait("main", { turnId: "c1-turn" }), /running turn/);
+  await assert.rejects(service.wait("main", { turnId: "main-turn", localIds: ["main"] }), /Unknown worker main/);
+  await assert.rejects(service.wait("main", { turnId: "main-turn", localIds: ["c9"] }), /Unknown worker c9/);
+});
+
+test("results to main stay pending while its wait hold is live, then steer as usual", async () => {
+  const { group, service, collect } = waitFixture();
+  await collect();
+  const internal = service as unknown as { collect: (group: CollaborationGroup) => Promise<void>; deliver: (group: CollaborationGroup, message: CollaborationGroup["messages"][number]) => Promise<void> };
+  const delivered: string[] = [];
+  internal.collect = async () => {};
+  internal.deliver = async (_group, message) => { delivered.push(message.to); message.state = "delivered"; };
+  group.mainWait = { turnId: "main-turn", until: Date.now() + 60_000 };
+  await service.pulse();
+  assert.deepEqual(delivered, []);
+  group.mainWait = { turnId: "main-turn", until: Date.now() - 1 };
+  await service.pulse();
+  assert.deepEqual(delivered, ["main"], "an expired hold from a crashed CLI no longer blocks delivery");
+});
+
 test("a running or foreign source turn is rejected with a clear reason", async () => {
   const fixture = forkStore({ threadId: "claude:source-thread", turns: sourceTurns });
   const service = new CollaborationService(fixture.store, "http://unused", () => []);
@@ -148,3 +232,22 @@ for (const resolution of ["completed", "cancelled"] as const) {
     assert.equal(group.messages.length, count, "repeated collection does not resend results");
   });
 }
+
+test("an actor coordination group neither makes a steered session a Concurrent worker nor hides its real group", async () => {
+  const member = (localId: string, sessionId: string) => ({ localId, sessionId, stopped: false, fork: null, observed: {} });
+  const coordination = { id: "actor_tree_abc", workspaceId: "ws", mainSessionId: "steerer", messages: [], results: [],
+    members: [member("main", "steerer"), member("actor-task", "actor-task")] } as unknown as CollaborationGroup;
+  const concurrent = { id: "collab_abc", workspaceId: "ws", mainSessionId: "actor-task", messages: [], results: [],
+    members: [member("main", "actor-task"), member("c1", "worker")] } as unknown as CollaborationGroup;
+  let groups = [coordination];
+  const store = { listCollaborationGroups: async () => groups,
+    listSessionTurns: async () => [{ id: "turn", status: "done" }], listSessionTurnLiveItems: async () => []
+  } as unknown as SessionStore;
+  const service = new CollaborationService(store, "http://unused", () => []);
+  assert.equal(await service.view("actor-task"), null);
+  await service.assertAcceptsPrompt("actor-task");
+  assert.equal(await service.runnerContext("actor-task", "turn"), null);
+  assert.equal((await service.view("actor-task", coordination.id))?.id, coordination.id, "steering still reaches it by ID");
+  groups = [coordination, concurrent];
+  assert.equal((await service.view("actor-task"))?.id, concurrent.id);
+});

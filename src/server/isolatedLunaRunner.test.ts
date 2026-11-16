@@ -56,6 +56,54 @@ test("scratch-write jobs may run shell commands in a writable sandbox", () => {
   assert.ok(buildIsolatedLunaAppServerArgs([], false, true, true).includes("sandbox_workspace_write.network_access=true"));
 });
 
+for (const inheritHostHome of [true, false]) {
+  test(`host HOME inheritance ${inheritHostHome ? "preserves tool profiles" : "stays off for background helpers"} without changing Codex auth`, async () => {
+    const fixture = createFakeCodexFixture("isolated-luna-host-home-", `
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method === "initialize") send({ id: request.id, result: {} });
+  if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "thread-1" } } });
+  if (request.method === "turn/start") {
+    send({ id: request.id, result: { turn: { id: "turn-1" } } });
+    const profilePath = resolve(process.env.HOME, ".aws/config");
+    const result = { home: process.env.HOME, codexHome: process.env.CODEX_HOME,
+      agentHome: process.env.AGENT_CLI_HOME,
+      auth: readFileSync(resolve(process.env.CODEX_HOME, "auth.json"), "utf8"),
+      profiles: ${inheritHostHome} ? readFileSync(profilePath, "utf8") : null };
+    send({ method: "item/completed", params: { threadId: "thread-1", item: { type: "agentMessage", text: JSON.stringify(result) } } });
+    send({ method: "turn/completed", params: { threadId: "thread-1", turn: { status: "completed" } } });
+  }
+});`);
+    const hostHome = resolve(fixture.root, "host-home");
+    const previousHome = process.env.HOME;
+    mkdirSync(resolve(hostHome, ".aws"), { recursive: true });
+    writeFileSync(resolve(hostHome, ".aws/config"), "[profile test-sso]\nregion = eu-west-2\n");
+    mkdirSync(resolve(hostHome, ".codex"));
+    writeFileSync(resolve(hostHome, ".codex/auth.json"), '{"wrongAccount":true}');
+    process.env.HOME = hostHome;
+    const runner = fixture.runner({ name: "host-home", baseInstructions: "Inspect profiles.", inheritHostHome });
+    let codexHome: string | undefined;
+    try {
+      const result = JSON.parse((await runner.run("inspect")).responseText);
+      codexHome = result.codexHome;
+      assert.notEqual(codexHome, hostHome);
+      assert.equal(result.agentHome, codexHome);
+      assert.equal(result.auth, "{}", "the selected Threadex account wins over the host login");
+      assert.equal(result.home, inheritHostHome ? hostHome : codexHome);
+      assert.equal(result.profiles, inheritHostHome ? "[profile test-sso]\nregion = eu-west-2\n" : null);
+    } finally {
+      runner.stop();
+      assert.ok(!codexHome || !existsSync(codexHome), "the temporary Codex home is cleaned up");
+      assert.ok(existsSync(resolve(hostHome, ".aws/config")), "cleanup preserves the host profile");
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      fixture.cleanup();
+    }
+  });
+}
+
 test("scratch jobs expose a shell but grant writes only to their private directory", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "isolated-luna-scratch-test-"));
   const capturePath = resolve(root, "requests.json");
@@ -466,7 +514,7 @@ ${body}
   process.env.CODEX_PATH = fakeCodexPath;
   return {
     root,
-    runner: (options: Pick<ConstructorParameters<typeof IsolatedLunaRunner>[0], "name" | "baseInstructions" | "freshThreadPerRun" | "maxRunsPerProcess" | "workspaceCwd" | "allowWorkspaceRead" | "scratchWrite" | "timeoutMs" | "idleTimeout" | "onEvent" | "inspectorCli" | "browserBridgeCli" | "githubReadCli">) => new IsolatedLunaRunner({
+    runner: (options: Pick<ConstructorParameters<typeof IsolatedLunaRunner>[0], "name" | "baseInstructions" | "freshThreadPerRun" | "maxRunsPerProcess" | "workspaceCwd" | "allowWorkspaceRead" | "inheritHostHome" | "scratchWrite" | "timeoutMs" | "idleTimeout" | "onEvent" | "inspectorCli" | "browserBridgeCli" | "githubReadCli">) => new IsolatedLunaRunner({
       model: "gpt-5.6-luna",
       reasoningEffort: "none",
       timeoutMs: 2_000,

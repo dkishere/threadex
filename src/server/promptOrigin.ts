@@ -20,6 +20,8 @@ export type PromptOrigin = {
   sourceSessionId?: string;
   sourceTurnId?: string;
   sourceRoundId?: string;
+  /** Decision dispatch only: the claiming (root) actor when it differs from the executor named in sourceActorId. */
+  dispatcherActorId?: string;
 };
 
 const text = (value: unknown) => typeof value === "string" && value.trim() ? value.trim().slice(0, 200) : undefined;
@@ -30,7 +32,8 @@ export function normalizePromptOrigin(value: unknown): PromptOrigin | undefined 
   const trigger = PROMPT_ORIGIN_TRIGGERS.find(item => item === raw.trigger);
   if (raw.kind !== "inter-actor" || !trigger) return undefined;
   const origin: PromptOrigin = { kind: "inter-actor", trigger, sourceActorId: text(raw.sourceActorId), sourceActorName: text(raw.sourceActorName),
-    sourceSessionId: text(raw.sourceSessionId), sourceTurnId: text(raw.sourceTurnId), sourceRoundId: text(raw.sourceRoundId) };
+    sourceSessionId: text(raw.sourceSessionId), sourceTurnId: text(raw.sourceTurnId), sourceRoundId: text(raw.sourceRoundId),
+    dispatcherActorId: text(raw.dispatcherActorId) };
   if (!origin.sourceActorId && !origin.sourceSessionId) return undefined;
   return Object.fromEntries(Object.entries(origin).filter(([, item]) => item !== undefined)) as PromptOrigin;
 }
@@ -38,13 +41,16 @@ export function normalizePromptOrigin(value: unknown): PromptOrigin | undefined 
 /** Origin of an actor task's first prompt: a handoff, an actor_assign_many child, or a Decision dispatch from the Actors chat. */
 export function actorTaskPromptOrigin(room: Pick<ActorRoom, "actors" | "workItems">, work: ActorWorkItem): PromptOrigin {
   const parent = work.parentWorkItemId ? room.workItems.find(item => item.id === work.parentWorkItemId) : undefined;
-  const sourceActorId = work.handoff?.sourceActorId ?? work.ownerActorId;
+  // A Decision dispatch belongs to the actor that executes it; the claiming root is kept apart as dispatcherActorId.
+  const dispatch = !work.handoff && !parent;
+  const sourceActorId = work.handoff?.sourceActorId ?? (dispatch ? work.executorActorId : work.ownerActorId);
+  const dispatcherActorId = dispatch && work.ownerActorId !== work.executorActorId ? work.ownerActorId : undefined;
   const sourceActorName = room.actors.find(actor => actor.id === sourceActorId)?.name;
   const source = work.handoff
     ? { trigger: "handoff" as const, sourceSessionId: work.handoff.sourceSessionId }
     : parent ? { trigger: "assignment" as const, sourceSessionId: parent.taskSessionId, sourceTurnId: parent.activeTurnId ?? parent.taskTurnId }
       : { trigger: "decision-dispatch" as const };
-  return normalizePromptOrigin({ kind: "inter-actor", sourceActorId, sourceActorName, sourceRoundId: work.roundId, ...source })!;
+  return normalizePromptOrigin({ kind: "inter-actor", sourceActorId, sourceActorName, sourceRoundId: work.roundId, dispatcherActorId, ...source })!;
 }
 
 /**

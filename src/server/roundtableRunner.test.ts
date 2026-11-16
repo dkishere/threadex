@@ -10,6 +10,8 @@ test("actors receive the host path for project inspection while keeping scratch 
   });
   assert.match(instructions, /Host project working directory: "\/Volumes\/dev\/my projects"/);
   assert.match(instructions, /including @path references/);
+  assert.match(instructions, /Your HOME is the host HOME/);
+  assert.match(instructions, /do not read or output credentials/);
   assert.match(instructions, /inspect host project files and Git changes read-only/);
   assert.match(instructions, /never modify the host project/);
   assert.match(instructions, /private scratch directory/);
@@ -20,5 +22,5 @@ test("actors receive the host path for project inspection while keeping scratch 
 test("context-only inference does not gain project inspection instructions", () => {
   const instructions = roundtableInstructions({ systemPrompt: "Summarize context" });
   assert.match(instructions, /do not invoke tools/);
-  assert.doesNotMatch(instructions, /Host project working directory|You may inspect host project|Verification scope/);
+  assert.doesNotMatch(instructions, /Host project working directory|Your HOME is the host HOME|You may inspect host project|Verification scope/);
 });

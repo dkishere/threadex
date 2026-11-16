@@ -46,8 +46,13 @@ test("actorTaskPromptOrigin describes an assignment child from the parent work i
   assert.equal(fallback.sourceTurnId, "t-old");
 });
 
-test("actorTaskPromptOrigin describes a Decision dispatch by owner and round without a session", () => {
+test("actorTaskPromptOrigin attributes a sub-actor Decision dispatch to the executor and keeps the claimant as dispatcher", () => {
   const origin = actorTaskPromptOrigin(room(), work({}));
+  assert.deepEqual(origin, { kind: "inter-actor", trigger: "decision-dispatch", sourceActorId: "exec", sourceActorName: "Exec Actor", sourceRoundId: "r1", dispatcherActorId: "owner" });
+});
+
+test("actorTaskPromptOrigin describes a Decision dispatch by owner and round without a session", () => {
+  const origin = actorTaskPromptOrigin(room(), work({ executorActorId: "owner" }));
   assert.deepEqual(origin, { kind: "inter-actor", trigger: "decision-dispatch", sourceActorId: "owner", sourceActorName: "Owner Actor", sourceRoundId: "r1" });
   assert.ok(!Object.hasOwn(origin, "sourceSessionId"));
 });

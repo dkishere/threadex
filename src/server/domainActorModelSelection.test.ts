@@ -1,8 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { MODEL_CATALOG as M, MODEL_OPTIONS } from "../modelCatalog";
-import { ACTOR_MODEL_SELECTION_INSTRUCTIONS, ACTOR_MODEL_TIER_GUIDANCE, ACTOR_WORKFLOW_QUESTION, ACTOR_WORKLOAD_ASSESSMENT, PROMPT_WORK_MODEL_FLOOR, actorChosenModel, actorWorkflowAssessment, actorWorkflowExecutionGuidance, actorExecutionModels, actorModelOptions } from "./domainActorModelSelection";
+import { ACTOR_MODEL_SELECTION_INSTRUCTIONS, ACTOR_MODEL_TIER_GUIDANCE, ACTOR_WORKFLOW_QUESTION, ACTOR_WORKLOAD_ASSESSMENT, PROMPT_WORK_MODEL_FLOOR, actorChosenModel, actorWorkflowAssessment, actorWorkflowExecutionGuidance, actorExecutionModels, actorModelOptions, actorRequestedExecution, actorTaskExecutionEffort, actorWorkloadKind } from "./domainActorModelSelection";
 import type { DecisionResult } from "./decision/types";
+
+test("explicit canonical model and effort directives beat routing defaults", () => {
+  assert.deepEqual(actorRequestedExecution(["continue merging HMS into hub on a new branch, with astra XH managed"]), { model: M.astra.id, effort: "xhigh" });
+  assert.deepEqual(actorRequestedExecution(["用 astra xh", "use sol high"]), { model: M.sol61.id, effort: "high" });
+  for (const text of ["don't use astra xh", "唔用 astra xh", "> use astra xh", "```\nuse astra xh\n```", "Compare Astra and Sol"]) {
+    assert.equal(actorRequestedExecution([text]), undefined, text);
+  }
+});
 
 test("prompt provider offers one concrete model per workload tier independent of actor defaults", () => {
   assert.deepEqual(actorExecutionModels([...MODEL_OPTIONS], M.claudeSonnet.id), [M.claudeHaiku.id, M.claudeSonnet.id, M.claudeOpus.id]);
@@ -42,6 +50,26 @@ test("tier guidance sends mechanical work low, keeps Astra for genuine difficult
   assert.equal(actorChosenModel(M.luna.id, [M.luna.id, M.astra.id]), M.luna.id);
   assert.equal(actorChosenModel(M.astra.id, [M.luna.id]), undefined, "a choice outside the allowed options falls back to Decision");
   assert.equal(actorChosenModel(undefined, [M.luna.id]), undefined);
+});
+
+test("lighter models run at raised effort unless the work is mechanical; Sol/Astra tiers keep the actor's effort", () => {
+  for (const model of [M.luna.id, M.terra61.id, M.mini.id, M.claudeSonnet.id, M.claudeHaiku.id]) {
+    assert.equal(actorTaskExecutionEffort(model, "medium"), "high", model);
+    assert.equal(actorTaskExecutionEffort(model, "low", { workloadKind: "reasoning" }), "high", model);
+    assert.equal(actorTaskExecutionEffort(model, "medium", { workloadKind: "mechanical" }), "medium", model);
+  }
+  assert.equal(actorTaskExecutionEffort(M.luna.id, "xhigh"), "xhigh", "the floor never lowers a higher actor effort");
+  for (const model of [M.sol61.id, M.astra.id, M.claudeOpus.id, M.claudeFable.id, M.claudeFable51.id]) assert.equal(actorTaskExecutionEffort(model, "medium"), "medium", model);
+  assert.equal(actorTaskExecutionEffort(M.luna.id, "medium", { requestedEffort: "low" }), "low", "an explicit user effort is final");
+  assert.equal(actorTaskExecutionEffort(M.claudeOpus.id, "medium", { requestedEffort: "xhigh" }), "xhigh");
+  const options = actorModelOptions([M.luna.id, M.sol61.id], "medium");
+  assert.match(options[M.luna.id], /actual execution effort high \(medium for mechanical work\)\./);
+  assert.match(options[M.sol61.id], /actual execution effort medium\./);
+  const decision = (choice: string): DecisionResult => ({ ok: true, answers: { workload_kind: { kind: "choice", choice, confidence: 1 } }, attempts: [] } as unknown as DecisionResult);
+  assert.equal(actorWorkloadKind(decision("mechanical")), "mechanical");
+  assert.equal(actorWorkloadKind(decision("other")), undefined);
+  assert.equal(actorWorkloadKind(undefined), undefined);
+  assert.match(ACTOR_MODEL_TIER_GUIDANCE, /Lighter models run at raised effort unless the work is mechanical/);
 });
 
 test("workflow assessment keeps workload suitability separate from mode authorization", () => {

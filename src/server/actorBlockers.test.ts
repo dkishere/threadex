@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  ACTOR_BLOCKER_CONTEXT_LIMIT, ACTOR_BLOCKER_TEXT_CHARS, actorBlockerContext, actorBlockerContextDigest, actorBlockerNote,
+  ACTOR_BLOCKER_CONTEXT_LIMIT, ACTOR_BLOCKER_TEXT_CHARS, actorBlockerContext, actorBlockerContextDigest, actorBlockerContextEmpty, actorBlockerNeedsAssessment, actorBlockerNote,
   actorBlockerOverview, actorBlockerPendingDecision, approveActorBlockerProposal,
   closeActorBlocker, declareActorBlockerUnresolvable, escalateOverdueActorBlockers, openActorBlocker, proposeActorBlockerSolution,
-  recordActorBlockerAttempt, rejectActorBlockerProposal, resolveActorBlockersWhere, transitionActorBlocker
+  recordActorBlockerAttempt, rejectActorBlockerProposal, requestActorBlockerUserDecision, resolveActorBlockersWhere, transitionActorBlocker
 } from "../actorBlockers";
 import type { ActorBlockerRoom, OpenActorBlockerInput } from "../actorBlockers";
 
@@ -37,6 +37,18 @@ test("dedupe: same session, kind and normalized description opens one blocker", 
   assert.equal(second.created, false);
   assert.equal(second.blocker, first.blocker);
   assert.equal(room.blockers!.length, 1);
+});
+
+test("decision context stays bounded and its digest changes on delivery, cancellation and answers", () => {
+  const room = makeRoom(), blocker = open(room).blocker;
+  requestActorBlockerUserDecision(blocker, { question: "q".repeat(2000), reason: "r".repeat(2000), options: [{ label: "A", description: "a".repeat(1000) }, { label: "B", description: "b".repeat(1000) }] }, "owner1", T1);
+  let context = actorBlockerContext(room, "owner1"), digest = actorBlockerContextDigest(context);
+  assert.ok(context.ownBlockers[0].userDecision!.detail.length <= ACTOR_BLOCKER_TEXT_CHARS);
+  assert.equal("options" in context.ownBlockers[0].userDecision!, false);
+  for (const change of [() => { blocker.userDecision!.delivery = "uncertain"; }, () => { blocker.userDecision!.retryable = true; blocker.userDecision!.error = "Question expired"; }, () => { blocker.userDecision!.state = "answered"; }]) {
+    change(); context = actorBlockerContext(room, "owner1");
+    const next = actorBlockerContextDigest(context); assert.notEqual(next, digest); digest = next;
+  }
 });
 
 test("dedupe: different session, kind or a resolved blocker allows a new one", () => {
@@ -106,15 +118,53 @@ test("escalation: a failed attempt escalates with proposal_failed and a notice",
   assert.deepEqual(room.blockerNotices!.map(entry => [entry.blockerId, entry.kind]), [[blocker.id, "escalated"]]);
 });
 
-test("escalation: rejecting the proposal escalates with proposal_rejected", () => {
+test("rejection: a rejected proposal is noted and dismisses the blocker without escalating", () => {
   const room = makeRoom();
   const { blocker } = open(room);
   proposeActorBlockerSolution(blocker, { actorId: "owner1", text: "Force push", requiresApproval: true }, T1);
   rejectActorBlockerProposal(room, blocker, "user", T2, "no");
-  assert.equal(blocker.status, "escalated");
-  assert.equal(blocker.escalation!.reason, "proposal_rejected");
+  assert.equal(blocker.status, "dismissed");
+  assert.equal(blocker.escalation, undefined);
   assert.equal(blocker.proposals[0].outcome, "rejected");
-  assert.equal(room.blockerNotices![0].kind, "escalated");
+  assert.deepEqual(blocker.history.map(entry => entry.status), ["open", "solution_proposed", "rejected", "dismissed"]);
+  assert.equal(room.blockerNotices?.length ?? 0, 0);
+  assert.equal(actorBlockerPendingDecision(blocker), null);
+  assert.ok(actorBlockerContextEmpty(actorBlockerContext(room, "owner1")));
+});
+
+test("rejection: a pending proposal on an open blocker reopened for a user decision can be rejected", () => {
+  const room = makeRoom();
+  const { blocker } = open(room);
+  declareActorBlockerUnresolvable(room, blocker, "owner1", T1, "stuck");
+  const pending = proposeActorBlockerSolution(blocker, { actorId: "owner2", text: "Retry the handoff", requiresApproval: true }, T1);
+  requestActorBlockerUserDecision(blocker, { question: "Retry?", reason: "User choice", options: [{ label: "Yes", description: "Retry" }, { label: "No", description: "Stop" }] }, "owner1", T2);
+  blocker.userDecision!.state = "answered";
+  assert.equal(blocker.status, "open");
+  assert.equal(actorBlockerPendingDecision(blocker), pending, "the user is shown Approve/Reject for this proposal");
+  rejectActorBlockerProposal(room, blocker, "user", T3, "No retry", pending.id);
+  assert.equal(blocker.status, "dismissed");
+  assert.equal(pending.outcome, "rejected");
+  assert.deepEqual(blocker.history.slice(-2).map(entry => [entry.status, entry.by]), [["open", "user"], ["dismissed", "user"]]);
+  assert.match(blocker.history.at(-2)!.note!, /Proposal rejected\. No retry/);
+  assert.equal(actorBlockerNeedsAssessment(blocker), false);
+  assert.ok(actorBlockerContextEmpty(actorBlockerContext(room, "owner1")));
+});
+
+test("rejection: rejecting an escalated blocker's proposal also ends it, and legacy rejected escalations need no assessment", () => {
+  const room = makeRoom();
+  const { blocker } = open(room);
+  declareActorBlockerUnresolvable(room, blocker, "owner1", T1, "stuck");
+  proposeActorBlockerSolution(blocker, { actorId: "owner2", text: "Rewrite history", requiresApproval: true }, T2);
+  rejectActorBlockerProposal(room, blocker, "user", T3);
+  assert.equal(blocker.status, "dismissed");
+  assert.deepEqual(room.blockerNotices!.map(entry => entry.kind), ["escalated", "dismissed"]);
+
+  const legacy = open(room, { description: "legacy" }).blocker;
+  declareActorBlockerUnresolvable(room, legacy, "owner1", T1, "old");
+  assert.equal(actorBlockerNeedsAssessment(legacy), true);
+  legacy.escalation!.reason = "proposal_rejected";
+  assert.equal(actorBlockerNeedsAssessment(legacy), false);
+  assert.deepEqual(actorBlockerContext(room, "anyone").escalatedBlockers, []);
 });
 
 test("escalation: declaring unresolvable escalates and needs a reason", () => {
@@ -350,11 +400,8 @@ test("approve refuses closed, decided and ungated proposals; reject validates th
   assert.throws(() => rejectActorBlockerProposal(room, blocker, "user", T3, "no", "blocker:other"), /not found/);
   rejectActorBlockerProposal(room, blocker, "user", T3, "Too risky", gated.id);
   assert.equal(actorBlockerPendingDecision(blocker), null);
-  assert.equal(blocker.status, "escalated");
-  assert.equal(blocker.escalation?.reason, "proposal_rejected");
-  assert.throws(() => approveActorBlockerProposal(blocker, "user", T4), /already rejected/);
-  closeActorBlocker(room, blocker, "resolved", "owner1", T4);
-  assert.throws(() => approveActorBlockerProposal(blocker, "user", T4), /already resolved/);
+  assert.equal(blocker.status, "dismissed");
+  assert.throws(() => approveActorBlockerProposal(blocker, "user", T4), /already dismissed/);
 });
 
 test("overview groups task > actor > project, counting each blocker once under its executing actor", () => {

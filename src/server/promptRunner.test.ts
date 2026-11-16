@@ -467,6 +467,70 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   }
 });
 
+test("prompt runner injects global MCP servers through thread config and links global skills into CODEX_HOME", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "prompt-runner-global-tools-"));
+  const fakeCodexPath = resolve(root, "fake-codex.mjs");
+  const jobPath = resolve(root, "job.json");
+  const logPath = resolve(root, "runner.ndjson");
+  const capturedArgsPath = resolve(root, "captured-args.json");
+  const capturedThreadPath = resolve(root, "captured-thread.json");
+  const globalToolsPath = resolve(root, "global-agent-tools.json");
+  const skillSource = resolve(root, "skill-source", "probe-skill");
+  mkdirSync(skillSource, { recursive: true });
+  writeFileSync(resolve(skillSource, "SKILL.md"), "---\nname: probe-skill\ndescription: probe\n---\n");
+  writeFileSync(globalToolsPath, JSON.stringify({
+    mcpServers: [{ name: "probe", transport: "stdio", command: process.execPath, args: ["probe.mjs"], env: { PROBE_TOKEN: "global-secret-value" } },
+      { name: "claude_only", transport: "http", url: "https://example.com/mcp", providers: ["claude"] }],
+    skills: [{ path: resolve(root, "skill-source") }]
+  }));
+  writeFileSync(fakeCodexPath, `#!/usr/bin/env node
+import { createInterface } from "node:readline";
+import { writeFileSync } from "node:fs";
+writeFileSync(process.env.CAPTURED_ARGS_PATH, JSON.stringify(process.argv.slice(2)));
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method === "initialize") send({ id: request.id, result: {} });
+  if (request.method === "thread/start") {
+    writeFileSync(process.env.CAPTURED_THREAD_PATH, JSON.stringify(request.params));
+    send({ id: request.id, result: { thread: { id: "thread-1" } } });
+  }
+  if (request.method === "thread/goal/clear") send({ id: request.id, result: {} });
+  if (request.method === "turn/start") {
+    send({ id: request.id, result: { turn: { id: "app-turn-1" } } });
+    send({ method: "item/completed", params: { item: { id: "answer-1", type: "agentMessage", text: "done" } } });
+    send({ method: "turn/completed", params: { turn: { id: "app-turn-1", status: "completed" } } });
+  }
+});
+`, "utf8");
+  chmodSync(fakeCodexPath, 0o755);
+  writeFileSync(jobPath, JSON.stringify({
+    sessionId: "session-1", turnId: "turn-1", message: "hello", executionMode: "default", approvalPolicy: "on-request",
+    logPath, codexHome: resolve(root, "codex-home"), cwd: projectRoot, globalAgentToolsPath: globalToolsPath
+  }), "utf8");
+  try {
+    const child = spawn(process.execPath, ["--import", "tsx", runnerPath, jobPath], {
+      cwd: projectRoot,
+      env: { ...process.env, CODEX_PATH: fakeCodexPath, CAPTURED_ARGS_PATH: capturedArgsPath, CAPTURED_THREAD_PATH: capturedThreadPath },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const exitCode = await new Promise<number | null>((resolveExit) => child.once("exit", resolveExit));
+    assert.equal(exitCode, 0, stderr);
+    const thread = JSON.parse(readFileSync(capturedThreadPath, "utf8"));
+    assert.deepEqual(thread.config.mcp_servers.probe, { command: process.execPath, args: ["probe.mjs"], env: { PROBE_TOKEN: "global-secret-value" }, enabled: true });
+    assert.equal(thread.config.mcp_servers.claude_only, undefined);
+    assert.equal(thread.config.mcp_servers.session_inspector.enabled, false);
+    assert.equal(readFileSync(capturedArgsPath, "utf8").includes("global-secret-value"), false);
+    assert.equal(readFileSync(logPath, "utf8").includes("global-secret-value"), false);
+    assert.equal(readFileSync(resolve(root, "codex-home", "skills", "probe-skill", "SKILL.md"), "utf8").includes("probe-skill"), true);
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
 test("prompt runner injects force-plan metadata into model input without changing the stored prompt", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "prompt-runner-todo-language-"));
   const fakeCodexPath = resolve(root, "fake-codex.mjs");
@@ -549,6 +613,10 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.match(thread.developerInstructions, /Code-file edit tracking/i);
   assert.match(thread.developerInstructions, /explicit prior permission for the specific alternative method and file scope/i);
   assert.match(thread.developerInstructions, /never silently fall back/i);
+  assert.match(thread.developerInstructions, /use only native sub-agents \(the Claude Code Agent tool or Codex spawn_agent\) or Threadex sessions/);
+  assert.match(thread.developerInstructions, /Do not assign, continue or rework work through Claude Code SendMessage, teammates or agent teams, which Threadex cannot track, unless genuinely necessary; then say why/);
+  assert.match(thread.developerInstructions, /actor_steer only passes coordination context and never assigns work/);
+  assert.match(thread.developerInstructions, /This grants no delegation permission/);
   assert.equal(thread.approvalPolicy, "on-request");
   assert.equal(thread.approvalsReviewer, "user");
   assert.equal(thread.config.mcp_servers.session_inspector.enabled, false);
@@ -617,46 +685,60 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 });
 `, "utf8");
   chmodSync(fakeCodexPath, 0o755);
-  writeFileSync(jobPath, JSON.stringify({
-    sessionId: "local_session-1",
-    turnId: "turn-1",
-    threadId: "thread-1",
-    message: "what about that earlier result?",
-    serverUrl: "http://127.0.0.1:8787",
-    logPath,
-    codexHome: resolve(root, "codex-home"),
-    cwd: projectRoot
-  }), "utf8");
+  for (const managedMode of [false, true]) {
+    writeFileSync(jobPath, JSON.stringify({
+      sessionId: "local_session-1",
+      turnId: "turn-1",
+      threadId: "thread-1",
+      message: "what about that earlier result?",
+      managedMode,
+      managedModePreviouslyEnabled: true,
+      serverUrl: "http://127.0.0.1:8787",
+      logPath,
+      codexHome: resolve(root, "codex-home"),
+      cwd: projectRoot
+    }), "utf8");
 
-  const child = spawn(process.execPath, ["--import", "tsx", runnerPath, jobPath], {
-    cwd: projectRoot,
-    env: {
-      ...process.env,
-      CODEX_PATH: fakeCodexPath,
-      CAPTURED_ARGS_PATH: capturedArgsPath,
-      CAPTURED_THREAD_PATH: capturedThreadPath,
-      CAPTURED_TURN_PATH: capturedTurnPath,
-      SESSION_INSPECTOR_MCP_MODE: "auto"
-    },
-    stdio: ["ignore", "pipe", "pipe"]
-  });
-  let stderr = "";
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk) => { stderr += chunk; });
-  const exitCode = await new Promise<number | null>((resolveExit) => child.once("exit", resolveExit));
-  assert.equal(exitCode, 0, stderr);
+    const child = spawn(process.execPath, ["--import", "tsx", runnerPath, jobPath], {
+      cwd: projectRoot,
+      env: {
+        ...process.env,
+        CODEX_PATH: fakeCodexPath,
+        CAPTURED_ARGS_PATH: capturedArgsPath,
+        CAPTURED_THREAD_PATH: capturedThreadPath,
+        CAPTURED_TURN_PATH: capturedTurnPath,
+        SESSION_INSPECTOR_MCP_MODE: "auto"
+      },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const exitCode = await new Promise<number | null>((resolveExit) => child.once("exit", resolveExit));
+    assert.equal(exitCode, 0, stderr);
 
-  const args = JSON.parse(readFileSync(capturedArgsPath, "utf8")) as string[];
-  assert.ok(args.includes("mcp_servers.session_inspector.enabled=false"));
-  const thread = JSON.parse(readFileSync(capturedThreadPath, "utf8"));
-  const turn = JSON.parse(readFileSync(capturedTurnPath, "utf8"));
-  assert.equal(thread.threadId, "thread-1");
-  assert.equal(thread.excludeTurns, true);
-  assert.equal(turn.threadId, "thread-1");
-  assert.match(thread.developerInstructions, /call recover_current_session/i);
-  assert.match(thread.developerInstructions, /complete user prompts and final assistant responses/i);
-  assert.doesNotMatch(thread.developerInstructions, /For Todo CLI planning|Use list_processes/);
-  assert.doesNotMatch(turn.settings?.developer_instructions ?? "", /recover_current_session|THREADEX_WORKTREE_REVIEW/);
+    const args = JSON.parse(readFileSync(capturedArgsPath, "utf8")) as string[];
+    assert.ok(args.includes("mcp_servers.session_inspector.enabled=false"));
+    const thread = JSON.parse(readFileSync(capturedThreadPath, "utf8"));
+    const turn = JSON.parse(readFileSync(capturedTurnPath, "utf8"));
+    assert.equal(thread.threadId, "thread-1");
+    assert.equal(thread.excludeTurns, true);
+    assert.equal(turn.threadId, "thread-1");
+    assert.match(thread.developerInstructions, /call recover_current_session/i);
+    assert.match(thread.developerInstructions, /complete user prompts and final assistant responses/i);
+    assert.doesNotMatch(thread.developerInstructions, /For Todo CLI planning|Use list_processes/);
+    assert.doesNotMatch(turn.settings?.developer_instructions ?? "", /recover_current_session|THREADEX_WORKTREE_REVIEW/);
+    const instructions = turn.settings.developer_instructions;
+    if (managedMode) {
+      assert.match(instructions, /Current Threadex Managed mode: ON/);
+      assert.doesNotMatch(instructions, /Managed mode: OFF/);
+    } else {
+      assert.match(instructions, /Current Threadex Managed mode: OFF/);
+      assert.match(instructions, /proactive delegation and sub-agent model selection no longer apply\. Whether to start native sub-agents and how to select their models now follow the execution platform and model defaults/);
+      assert.match(instructions, /OFF does not prohibit native sub-agents or require the same or a different model/);
+      assert.doesNotMatch(instructions, /do the work directly|do not choose a different model/i);
+    }
+  }
 });
 
 test("prompt runner treats force-plan requests as existing-plan follow-ups when todo items already exist", async () => {
@@ -1051,6 +1133,79 @@ syncBuiltinESMExports();
   assert.doesNotMatch(turn.settings.developer_instructions, /Use list_processes for a compact view/);
   assert.equal(turn.sandboxPolicy.type, thread.sandbox === "workspace-write" ? "workspaceWrite" : thread.sandbox === "danger-full-access" ? "dangerFullAccess" : "readOnly");
   assert.equal(turn.approvalPolicy, thread.approvalPolicy);
+});
+
+test("prompt runner runs Full access Codex turns without approvals or a sandbox", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "prompt-runner-full-access-"));
+  const fakeCodexPath = resolve(root, "fake-codex.mjs");
+  const jobPath = resolve(root, "job.json");
+  const logPath = resolve(root, "runner.ndjson");
+  const capturedThreadPath = resolve(root, "captured-thread.json");
+  const capturedTurnPath = resolve(root, "captured-turn.json");
+
+  writeFileSync(fakeCodexPath, `#!/usr/bin/env node
+import { createInterface } from "node:readline";
+import { writeFileSync } from "node:fs";
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method === "initialize") send({ id: request.id, result: {} });
+  if (request.method === "thread/start") {
+    writeFileSync(process.env.CAPTURED_THREAD_PATH, JSON.stringify(request.params));
+    send({ id: request.id, result: { thread: { id: "thread-1" } } });
+  }
+  if (request.method === "thread/goal/clear") send({ id: request.id, result: {} });
+  if (request.method === "turn/start") {
+    writeFileSync(process.env.CAPTURED_TURN_PATH, JSON.stringify(request.params));
+    send({ id: request.id, result: { turn: { id: "app-turn-1" } } });
+    send({ method: "item/completed", params: { item: { id: "answer-1", type: "agentMessage", text: "done" } } });
+    send({ method: "turn/completed", params: { turn: { id: "app-turn-1", status: "completed" } } });
+  }
+});
+`, "utf8");
+  chmodSync(fakeCodexPath, 0o755);
+
+  writeFileSync(jobPath, JSON.stringify({
+    sessionId: "session-1",
+    turnId: "turn-1",
+    message: "inspect the ministack container",
+    approvalPolicy: "never",
+    logPath,
+    codexHome: resolve(root, "codex-home"),
+    cwd: projectRoot
+  }), "utf8");
+
+  const spawnShimPath = resolve(root, "spawn-shim.mjs");
+  writeFileSync(spawnShimPath, `
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+const originalSpawn = childProcess.spawn;
+childProcess.spawn = function (command, args, options) {
+  return command === process.env.CODEX_PATH
+    ? originalSpawn(process.execPath, [command, ...args], options)
+    : originalSpawn(command, args, options);
+};
+syncBuiltinESMExports();
+`, "utf8");
+
+  const child = spawn(process.execPath, ["--import", "tsx", "--import", pathToFileURL(spawnShimPath).href, runnerPath, jobPath], {
+    cwd: projectRoot,
+    env: { ...process.env, CODEX_PATH: fakeCodexPath, CAPTURED_THREAD_PATH: capturedThreadPath, CAPTURED_TURN_PATH: capturedTurnPath },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  await new Promise<void>((resolveExit, rejectExit) => {
+    child.once("exit", (code) => code === 0 ? resolveExit() : rejectExit(new Error(`runner exited ${code}: ${stderr}`)));
+  });
+
+  const thread = JSON.parse(readFileSync(capturedThreadPath, "utf8"));
+  assert.equal(thread.approvalPolicy, "never");
+  assert.equal(thread.sandbox, "danger-full-access");
+  const turn = JSON.parse(readFileSync(capturedTurnPath, "utf8"));
+  assert.equal(turn.approvalPolicy, "never");
+  assert.deepEqual(turn.sandboxPolicy, { type: "dangerFullAccess" });
 });
 
 test("prompt runner retries an ignored context fork and verifies that a child session was created", async () => {

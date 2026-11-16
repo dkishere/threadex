@@ -7,9 +7,10 @@ import {
   manualLoginCommand,
   parseClaudeAuthStatus,
   quotaFromRateLimitInfo,
-  quotaFromUsageReport
+  quotaFromUsageReport,
+  quotaFromUsageText
 } from "./claudeAccounts";
-import { resolveClaudeAccount } from "./claudeAccountStore";
+import { mergeClaudeQuotaSnapshot, resolveClaudeAccount } from "./claudeAccountStore";
 import type { SessionDbConnection } from "./sessionDb";
 
 test("auth status JSON is read defensively", () => {
@@ -73,6 +74,56 @@ test("usage reports are parsed by window name", () => {
   const list = quotaFromUsageReport({ windows: [{ name: "session", used_percentage: 0.5, resetsAt: 1_800_000_000 }] });
   assert.deepEqual(list.fiveHour, { usedPercent: 50, resetsAt: 1_800_000_000_000 });
   assert.deepEqual(quotaFromUsageReport(null), {});
+});
+
+test("SDK usage_report rows are classified by kind with 0-100 percents", () => {
+  const quota = quotaFromUsageReport({
+    session: { total_cost_usd: 0 },
+    rate_limits: {
+      limits: [
+        { kind: "session", group: "session", percent: 1, resets_at: "2026-11-03T12:39:00Z", severity: "normal" },
+        { kind: "weekly_scoped", group: "weekly", percent: 2, resets_at: "2026-11-05T00:59:00Z", severity: "normal", scope: { model: { display_name: "Fable" } } },
+        { kind: "weekly_all", group: "weekly", percent: 54, resets_at: "2026-11-05T00:59:00Z", severity: "normal" }
+      ]
+    }
+  });
+  assert.deepEqual(quota, {
+    fiveHour: { usedPercent: 1, resetsAt: Date.parse("2026-11-03T12:39:00Z") },
+    weekly: { usedPercent: 54, resetsAt: Date.parse("2026-11-05T00:59:00Z") }
+  });
+});
+
+test("plain /usage text is parsed when no structured report is attached", () => {
+  const now = Date.parse("2026-11-03T10:28:00Z");
+  const quota = quotaFromUsageText([
+    "You are currently using your subscription to power your Claude Code usage",
+    "",
+    "Current session: 18% used · resets Nov 3 at 12:39pm (Europe/London)",
+    "Current week (all models): 54% used · resets Nov 5 at 12:59am (Europe/London)",
+    "Current week (Fable): 2% used · resets Nov 5 at 12:59am (Europe/London)"
+  ].join("\n"), now);
+  // London is on GMT in November.
+  assert.deepEqual(quota, {
+    fiveHour: { usedPercent: 18, resetsAt: Date.parse("2026-11-03T12:39:00Z") },
+    weekly: { usedPercent: 54, resetsAt: Date.parse("2026-11-05T00:59:00Z") }
+  });
+  const summer = quotaFromUsageText("Current session: 5% used · resets 4pm (Europe/London)", Date.parse("2026-07-01T10:00:00Z"));
+  assert.deepEqual(summer.fiveHour, { usedPercent: 5, resetsAt: Date.parse("2026-07-01T15:00:00Z") });
+  const nextYear = quotaFromUsageText("Current week: 9% used · resets Jan 2 at 1am (UTC)", Date.parse("2026-12-30T10:00:00Z"));
+  assert.deepEqual(nextYear.weekly, { usedPercent: 9, resetsAt: Date.parse("2027-01-02T01:00:00Z") });
+  assert.deepEqual(quotaFromUsageText("Current session: 7% used", now).fiveHour, { usedPercent: 7, resetsAt: null });
+  assert.deepEqual(quotaFromUsageText("No plan limits apply.", now), {});
+});
+
+test("run-time limit events without utilization keep the known percent of the same window", () => {
+  const current = { fiveHour: { usedPercent: 18, resetsAt: 1_793_709_540_000 }, weekly: { usedPercent: 54, resetsAt: 1_793_840_000_000 }, source: "usage" as const };
+  const sameWindow = mergeClaudeQuotaSnapshot(current, quotaFromRateLimitInfo({ status: "allowed", rateLimitType: "five_hour", resetsAt: 1_793_709_600 }));
+  assert.deepEqual(sameWindow.fiveHour, { usedPercent: 18, resetsAt: 1_793_709_600_000 });
+  assert.deepEqual(sameWindow.weekly, current.weekly);
+  const nextWindow = mergeClaudeQuotaSnapshot(current, quotaFromRateLimitInfo({ status: "allowed", rateLimitType: "five_hour", resetsAt: 1_793_727_600 }));
+  assert.deepEqual(nextWindow.fiveHour, { usedPercent: null, resetsAt: 1_793_727_600_000 });
+  const measured = mergeClaudeQuotaSnapshot(current, quotaFromRateLimitInfo({ status: "allowed_warning", rateLimitType: "five_hour", resetsAt: 1_793_709_600, utilization: 0.9 }));
+  assert.deepEqual(measured.fiveHour, { usedPercent: 90, resetsAt: 1_793_709_600_000 });
 });
 
 test("retry time comes from the limiting window", () => {

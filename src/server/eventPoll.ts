@@ -88,12 +88,28 @@ export class EventWaiters {
   }
 }
 
-export function clientEventPage(entries: readonly RingEvent[], workspaceId: string, after: number, limits = { count: 128, bytes: 128 * 1024 }) {
+// Client events a reader may trail by before it is told to reload the
+// snapshot instead of replaying each one. The ring keeps every event.
+export function clientEventBacklog(entries: readonly RingEvent[], workspaceId: string, after: number) {
+  let backlog = 0;
+  for (let index = entries.length - 1; index >= 0 && entries[index]!.pos > after; index--) {
+    const entry = entries[index]!;
+    if ((!entry.workspaceId || entry.workspaceId === workspaceId) && clientTypes.has(entry.type)) backlog++;
+  }
+  return backlog;
+}
+
+export function clientEventPage(entries: readonly RingEvent[], workspaceId: string, after: number,
+  limits = { count: 128, bytes: 128 * 1024 }, maxBacklog = 0) {
   const latestPos = entries.at(-1)?.pos ?? 0;
   const oldestPos = entries[0]?.pos ?? 0;
   const resetRequired = after > 0 && (latestPos === 0 || after > latestPos || after < oldestPos - 1);
   const events: RingEvent[] = [];
-  if (resetRequired) return { workspaceId, events, nextPos: latestPos, resetRequired, hasMore: false };
+  if (resetRequired) return { workspaceId, events, nextPos: latestPos, resetRequired, resetReason: "evicted" as const, hasMore: false };
+  if (after > 0 && maxBacklog > 0) {
+    const backlog = clientEventBacklog(entries, workspaceId, after);
+    if (backlog > maxBacklog) return { workspaceId, events, nextPos: latestPos, resetRequired: true, resetReason: "backlog" as const, backlog, hasMore: false };
+  }
   let nextPos = after;
   let bytes = 0;
   for (const entry of entries) {

@@ -69,6 +69,11 @@ export function actorChatProjectId(key: string): string | null {
 export function actorRoundInGroupChat(round: Pick<ActorRound, "namedActorIds" | "chatProjectId" | "taskBinding">, projectId: string | null) {
   return (round.namedActorIds ?? []).length !== 1 && actorRoundChatKey(round) === projectId;
 }
+/** Actor chat: the user talking to one actor directly. Its reply is an opinion or a task the actor opens, never a group-chat claim.
+ * Session @mentions and cross-workspace handoffs also name one actor but keep their own contracts. */
+export function isActorDirectChatRound(round: Pick<ActorRound, "namedActorIds" | "sessionTarget" | "crossWorkspaceOrigin">) {
+  return (round.namedActorIds ?? []).length === 1 && !round.sessionTarget && !round.crossWorkspaceOrigin;
+}
 /** Server-side partition of one group chat: only its group rounds; everything else is unchanged. */
 export function actorRoomForChat(room: ActorRoom, key: string): ActorRoom {
   const projectId = actorChatProjectId(key);
@@ -86,6 +91,10 @@ export type ActorReply = { actorId: string; status: "opinion" | "claimed" | "err
   proposedModel?: string;
   /** "actor" when the claiming actor explicitly chose the model; Decision selects only as a fallback. */
   modelSource?: "actor" | "decision";
+  /** Why a model directive inherited from a selected earlier round was ignored instead of blocking the current request. */
+  inheritedExecutionIgnored?: string;
+  /** Why a permitted fallback model replaced a failed or invalid model Decision; never blocks dispatch. */
+  modelFallback?: "decision_failed" | "invalid_choice";
   modelDecision?: DecisionResult; modelDecisionAudit?: DecisionRequest["audit"]; executorActorId?: string; error?: string };
 export type ActorCandidateSnapshot = { actorId: string; memoryVersion: number; actor: DomainActor };
 export type ActorResponseProfile = { model: string; effort: string };
@@ -96,8 +105,20 @@ export type ActorTaskBinding = { workspaceId: string; cwd: string; projectId?: s
 /** An @mention from an ordinary session's Composer: the named actors execute in that session, never in a new task. */
 export type ActorSessionTarget = { sessionId: string; projectId: string;
   /** The session's selected model when the mention was sent: it sets the execution provider group, as a reply gear does. */
-  model: string };
+  model: string;
+  /** The session's selected effort when the mention was sent: an actor task session's host turn runs with it, as with the model. */
+  effort?: string;
+  /** Set when the session is an actor task session: its bound work item. That actor keeps the session and hosts a turn
+   * in which every mentioned actor runs as its native sub-agent; the mentioned actors never take over the session. */
+  hostWorkItemId?: string;
+  /** Pick owner of an unowned session (docs/session-pick-owner.md): no actor is named, the session's project group chat
+   * picks as usual, and the claimant becomes the owner of this same session instead of a turn-scoped guest. */
+  takeover?: true };
 export type ActorRound = {
+  /** Set only by the server for a handoff an actor of another workspace sent at the user's explicit request. */
+  crossWorkspaceOrigin?: ActorCrossWorkspaceOrigin;
+  /** Set only by the server for a message an agent posted through session-inspector post_group_chat. */
+  sessionOrigin?: ActorSessionOrigin;
   /** Set for a Composer @mention: candidates are the named actors only and work runs as turn-scoped bindings of this session. */
   sessionTarget?: ActorSessionTarget;
   /** Group chat this round was sent in: a project ID or null (Unassigned). Absent on legacy rounds; read via actorRoundChatKey. */
@@ -108,6 +129,8 @@ export type ActorRound = {
   approvalPolicy?: ApprovalPolicy;
   id: string; requestId: string; userPrompt: string; namedActorIds: string[];
   responseProfile?: ActorResponseProfile;
+  /** Latest manual retry gear per speaker; the original request gear remains intact. */
+  replyResponseProfiles?: Record<string, ActorResponseProfile>;
   candidateSnapshots: ActorCandidateSnapshot[]; stakeholderIds: string[]; replies: ActorReply[];
   /** Failed replies replaced by a manual retry, oldest first; kept for history only. */
   retriedReplies?: Array<ActorReply & { retriedAt: string }>;
@@ -119,11 +142,19 @@ export type ActorRound = {
   /** Completed all-unrelated picking passes; replies remain intact for display and replay. */
   pickingHistory?: Array<{ stakeholderIds: string[]; selection?: ActorRound["selection"]; decision?: DecisionResult }>;
   routingDecisions: { fastTrack?: DecisionResult; selection?: DecisionResult; owner?: DecisionResult; coverage?: DecisionResult; models?: Record<string, DecisionResult> };
+  /** Why claim arbitration used a deterministic owner instead of a confident Decision; never blocks dispatch. */
+  ownerFallback?: "low_confidence" | "decision_failed";
   /** A sole partial claim judged to leave work outside its scope. repicked: stakeholders were added once for the rest;
    * uncovered: nobody else claimed it, so the claimant executes only its scope and the rest stays unpicked. */
   coverageGap?: { actorId: string; claimScope: string; repicked?: boolean; uncovered?: boolean };
-  /** Frozen session choice and delivery snapshot, retained across retries. */
-  continuation?: { decision: DecisionResult; queue?: boolean; workItem?: ActorWorkItem; userPrompt?: string;
+  /** Why the partial-claim planner failed; the claims then route owner-led instead of blocking. */
+  allocationFallback?: string;
+  /** Owner-led claims whose selected context is private to some trees: only eligibleOwnerIds could read all of it
+   * (empty when none could); excludedRoundIds were withheld from the owner, as were the briefs of withheldBriefActorIds. */
+  privateContextRouting?: { eligibleOwnerIds: string[]; excludedRoundIds: string[]; withheldBriefActorIds: string[] };
+  /** Frozen session choice and delivery snapshot, retained across retries.
+   * newSessionFallback: a failed or invalid session Decision dispatched a new task session instead of blocking. */
+  continuation?: { decision: DecisionResult; newSessionFallback?: "decision_failed" | "invalid_choice"; queue?: boolean; workItem?: ActorWorkItem; userPrompt?: string;
     /** Frozen Actors-chat source note sent as a developer note, never as user text. */
     sourceNote?: string; delivered?: boolean; error?: string;
     /** Turns ahead of the delivered follow-up in the task session's queue when it was queued; 0 means it starts next. */
@@ -147,6 +178,10 @@ export type ActorAllocation = {
   integrationAssignmentId?: string;
 };
 export type ActorWorkItem = {
+  /** Server-assigned ownership of the whole request across stakeholder domains. */
+  ownerLed?: boolean;
+  /** Workflow inference was deliberately skipped for a single full claim. */
+  workflowDecisionSkipped?: boolean;
   /** Planning recommendation only; never a mode setting or delegation permission. */
   workflowAssessment?: "small_direct" | "substantial_managed" | "substantial_direct";
   /** Per-execution completion reviews. Only passed reviews contain a conclusion. */
@@ -155,9 +190,11 @@ export type ActorWorkItem = {
   executionEffort?: string;
   requirementIds?: string[]; allocationId?: string; pickedUpAt?: string;
   dispatchKey: string; taskSessionId: string; taskTurnId: string;
-  /** "turn": the session is an ordinary user session (Composer @mention). The actor binding covers only this
-   * work item's own turns (taskTurnId/activeTurnId); other turns of the session run without an actor binding. */
+  /** "turn": a Composer @mention in an existing session. The actor binding covers only this work item's own turns
+   * (taskTurnId/activeTurnId) and wins over an actor task session's own binding there; other turns keep theirs. */
   sessionScope?: "turn";
+  /** The task took over a pre-existing session via Pick owner: that session is never created, retitled or replaced. */
+  sessionTakeover?: true;
   status: "claimed" | "assigned" | "started" | "completed" | "failed" | "needs_user";
   dispatchError: string | null; created: string; updated: string;
   dispatched: boolean; dispatchLease: { owner: string; until: number } | null;
@@ -166,7 +203,7 @@ export type ActorWorkItem = {
   pendingApprovalIds?: string[];
   /** Latest explicit Stop of the active task turn; it ends the work unless a later event supersedes it. */
   stoppedAt?: string;
-  /** Explicit user cancel of a failed task: final, so no retry, dependency wake-up, continuation or recovery dispatches it again. History is kept. */
+  /** Explicit user cancel of a failed or idle task: final, so no retry, dependency wake-up, continuation or recovery dispatches it again. History is kept. */
   cancelledAt?: string;
   /** Allocation dependencies whose tasks had not ended at the last dispatch attempt. */
   blockedBy?: string[];
@@ -193,7 +230,7 @@ export type ActorWorkItem = {
     resultPending?: boolean };
   parentWorkItemId?: string;
   delegatedTask?: string;
-  /** Follow-up an actor handed to another actor's domain; the parent is the source task. */
+  /** Follow-up an actor handed to another actor's domain; the parent is the source task (and its host when hosted). */
   handoff?: { sourceActorId: string; sourceSessionId: string };
   preparedPrompt?: string;
   /** Session title decided when the actor claimed the job; the summariser never replaces it. */
@@ -204,10 +241,22 @@ export type ActorWorkItem = {
     requestId: string; sourceActorId: string; sourceSessionId: string;
     /** "handoff": a follow-up in another actor's domain, authorized by the user's request scope rather than an explicit concurrency request. */
     kind?: "handoff";
+    /** Hosted handoff: the work runs as a native sub-agent of the source session's host work item, started in a queued host turn. */
+    hosted?: true;
+    /** Codex host: the calling turn in which the host spawns the hosted child in place; no follow-up turn is queued. */
+    inPlaceTurnId?: string;
+    /** Every executor is an actor the user @mentioned in this task's request or its follow-ups: Decision only selects models. */
+    userNamedExecutors?: true;
     tasks: Array<{ executorActorId: string; task: string }>;
     sourceSnapshot: DomainActor; executorSnapshots: DomainActor[]; userMessages: string[];
     status: "pending" | "assigned" | "failed"; workItemIds: string[];
     decision?: DecisionResult; error?: string; lease: { owner: string; until: number } | null;
+  }>;
+  /** Handoffs this task sent to an actor of another workspace; each runs as a round of that workspace's own room. */
+  crossWorkspaceHandoffs?: Array<{
+    requestId: string; sourceActorId: string; sourceSessionId: string; sourceTurnId: string;
+    targetWorkspaceId: string; targetActorId: string; targetActorName: string; targetRequestId: string; task: string;
+    status: "pending" | "submitted" | "failed"; targetRoundId?: string; decision?: DecisionResult; error?: string; created: string;
   }>;
   executionHistory: Array<{ executorActorId: string; model: string; taskSessionId: string; taskTurnId: string; dispatchKey: string; dispatched: boolean; status: ActorWorkItem["status"] }>;
   assignmentRequests: Array<{ requestId: string; executorActorId: string; model: string; proposedModel?: string;
@@ -261,6 +310,43 @@ export type ActorRoom = {
   blockerDeliveries?: Record<string, string>;
   /** Group chat round tables, each held by its own session; see docs/actor-roundtable-sessions.md. */
   roundtables?: ActorRoundtable[];
+  /** Append-only audit of applied registry reorganizations; see docs/actor-reorganization.md. */
+  reorganizations?: ActorReorganization[];
+  /** Collective memory digest watermarks and saved memory diffs; see docs/domain-actors.md#collective-memory-digest. */
+  memoryDigests?: ActorMemoryDigests;
+};
+/** Short summary of one finished session turn, the input of a collective memory digest. */
+export type ActorMemoryDigestTurnSummary = { sessionId: string; turnId: string; completedAt: string; summary: string; changedFiles: string[] };
+/** Digest progress of one project (a project ID or UNASSIGNED_ACTOR_PROJECT). */
+export type ActorMemoryDigestProject = {
+  /** Last activity time (ISO) of the newest turn already digested, or when the project was first observed. */
+  watermark: string;
+  /** The batch being digested: its new watermark and the turn summaries made so far. Cleared when the batch ends. */
+  pending?: { watermark: string; started: string; summaries: ActorMemoryDigestTurnSummary[] };
+  lastDigestAt?: string;
+};
+/** One digest write of an actor's memory: the fields before and after, and the turns it read. */
+export type ActorMemoryDigestRecord = {
+  id: string; actorId: string; projectKey: string; watermark: string; sourceEventId: string; created: string;
+  sources: Array<{ sessionId: string; turnId: string }>;
+  before: Pick<ActorMemoryContent, "longTerm" | "rolling">; after: Pick<ActorMemoryContent, "longTerm" | "rolling">;
+};
+export type ActorMemoryDigests = { projects: Record<string, ActorMemoryDigestProject>; records: ActorMemoryDigestRecord[] };
+/** One step of an atomic registry reorganization, applied in order; the final registry is validated as a whole. */
+export type ActorReorganizationOperation =
+  | { op: "create"; actor: CreateDomainActor & { projectIds?: string[] } }
+  | { op: "update"; actorId: string; changes: Omit<UpdateDomainActor, "type" | "avatar"> }
+  | { op: "move"; actorId: string; parentActorId: string | null; expectedParentActorId: string | null }
+  | { op: "memory"; actorId: string; expectedVersion: number; memory: Partial<ActorMemoryContent> }
+  | { op: "archive"; actorId: string };
+export type ActorReorganizationInitiator = { kind: "user" }
+  | { kind: "actor"; actorId: string; workItemId: string; sessionId: string; turnId: string };
+export type ActorReorganizationRequest = { requestId: string; reason: string; operations: ActorReorganizationOperation[]; dryRun?: boolean };
+export type ActorReorganization = {
+  id: string; requestId: string; reason: string; initiator: ActorReorganizationInitiator; created: string;
+  operations: ActorReorganizationOperation[];
+  /** Full registry entries of every touched actor; null before creation or after archiving. */
+  changes: Array<{ actorId: string; before: DomainActor | null; after: DomainActor | null }>;
 };
 export type CreateDomainActor = {
   type?: "worker";
@@ -282,7 +368,19 @@ export type SubmitActorRequest = ActorTaskSelection & { workspaceId: string; req
   /** Group chat of the request: a project ID or null/absent for the Unassigned chat. Ignored for individual (single named actor) requests. */
   chatProjectId?: string | null; userPrompt: string; attachments?: ActorAttachment[]; namedActorIds?: string[]; taskReference?: string; responseProfile?: ActorResponseProfile; approvalPolicy?: ApprovalPolicy;
   /** Composer @mention target, set only by the server after validating the session, its project and every named actor. */
-  sessionTarget?: ActorSessionTarget };
+  sessionTarget?: ActorSessionTarget;
+  /** Cross-workspace handoff source, set only by the server after checking the user's explicit request. */
+  crossWorkspaceOrigin?: ActorCrossWorkspaceOrigin;
+  /** Agent group chat post source, set only by the server's post_group_chat endpoint. */
+  sessionOrigin?: ActorSessionOrigin };
+/** Where an agent-posted group chat message came from: a task session turn or that session's side chat.
+ * The message text is agent-written; it is not the user's own words. */
+export type ActorSessionOrigin = { sourceSessionId: string; sourceSessionTitle: string; sourceTurnId?: string; sideChat: boolean;
+  sourceActorId?: string; sourceActorName?: string; sourceRequestId: string };
+/** Where a cross-workspace handoff came from. userPrompt of its round is the user's own message;
+ * task is the source actor's description: untrusted context, never authorization. */
+export type ActorCrossWorkspaceOrigin = { sourceWorkspaceId: string; sourceWorkspaceName: string; sourceSessionId: string; sourceTurnId: string;
+  sourceActorId: string; sourceActorName: string; sourceRequestId: string; task: string };
 export type ActorPromptPageContext = { url: string; title?: string; selector?: string };
 /** A pasted Browser Bridge JSON object at the start of a prompt is page context, not the request itself. */
 export function splitActorPromptPageContext(prompt: string): { page: ActorPromptPageContext | null; text: string } {

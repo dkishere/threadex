@@ -15,7 +15,9 @@ export const MODEL_CATALOG = {
   claudeOpus: { id: "claude-opus-5-5", label: "Opus 5.5", ultra: false, autoLowEffort: false, workTier: "sol", aliases: ["opus"] },
   claudeSonnet: { id: "claude-sonnet-5-5", label: "Sonnet 5.5", ultra: false, autoLowEffort: false, workTier: null, aliases: ["sonnet"] },
   claudeHaiku: { id: "claude-haiku-5-5", label: "Haiku 5.5", ultra: false, autoLowEffort: false, workTier: null, aliases: ["haiku"] },
-  claudeFable: { id: "claude-fable-5-1", label: "Fable 5.1", ultra: false, autoLowEffort: false, workTier: "astra", aliases: ["fable"] }
+  claudeFable: { id: "claude-fable-5-2", label: "Fable 5.2", ultra: false, autoLowEffort: false, workTier: "astra", aliases: ["fable"] },
+  // Superseded by Fable 5.2 but kept so stored selections, actor allowedModels and history keep their label and tier.
+  claudeFable51: { id: "claude-fable-5-1", label: "Fable 5.1", ultra: false, autoLowEffort: false, workTier: "astra", aliases: [] }
 } as const;
 export type ModelWorkTier = NonNullable<typeof MODEL_CATALOG[keyof typeof MODEL_CATALOG]["workTier"]>;
 export function modelWorkTier(value: string | null | undefined): ModelWorkTier | null {

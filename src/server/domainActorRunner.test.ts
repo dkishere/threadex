@@ -6,12 +6,108 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { DomainActor } from "../domainActors";
 import { validateActorMemory } from "./domainActorStore";
-import { actorMemoryMaintenancePrompt, actorModelHooks } from "./domainActorRunner";
+import { actorMemoryDigestPrompt, actorMemoryMaintenancePrompt, actorModelHooks, blockerUserFollowUps } from "./domainActorRunner";
 import type { SessionStore } from "./sessionStore";
 import type { SessionSummarizer } from "./sessionSummarizer";
-import { actorInputBudget } from "./domainActorContext";
+import { actorInputBudget, actorFollowupTurnId } from "./domainActorContext";
 import { MODEL_CATALOG } from "../modelCatalog";
 import { ACTOR_MODEL_TIER_GUIDANCE, ACTOR_WORKLOAD_ASSESSMENT } from "./domainActorModelSelection";
+import { emptyActorRoom, type ActorWorkItem } from "../domainActors";
+import { openActorBlocker, requestActorBlockerUserDecision, actorBlockerUserDecisionPrompt } from "../actorBlockers";
+import { actorSessionWork } from "./actorNativeAgents";
+
+test("blocker follow-ups say what a short user reply answers and include the user's mid-turn answers", async () => {
+  const turn = (id: string, created: string, userInput: string, agentResponse: string, requestMetadata: Record<string, unknown>) =>
+    ({ id, created, userInput, agentResponse, requestMetadata });
+  const store = {
+    listSessionTurns: async () => [
+      turn("t2", "2026-11-05T14:19:00Z", "yes, go", "Restart refused.", { clientLayout: "desktop" }),
+      turn("t1", "2026-11-05T13:53:00Z", "continue", "I've requested approval to restart only ports 8084/8085, without resetting data.", { clientLayout: "desktop" }),
+      turn("t3", "2026-11-05T14:20:00Z", "[Threadex hosted handoff] start it", "Done.", { promptOrigin: { kind: "inter-actor" } })],
+    listSessionApprovalLiveItems: async () => ({}),
+    listSessionSteerMessages: async () => ({ t2: [{ id: "s1", content: "only the workbench please", attachments: [], forcePlan: false, created: "2026-11-05T14:19:30Z", source: "user" },
+      { id: "s2", content: "agent note", attachments: [], forcePlan: false, created: "2026-11-05T14:19:40Z", source: "actor" }] })
+  } as unknown as SessionStore;
+  const followUps = await blockerUserFollowUps(store, "session");
+  assert.deepEqual(followUps.map(item => item.text), ["continue", "yes, go", "only the workbench please"], "the user's prompts and steers, oldest first; automated turns are excluded");
+  assert.equal((followUps[1] as { repliesTo?: string }).repliesTo, "I've requested approval to restart only ports 8084/8085, without resetting data.", "a short reply carries the answer it responds to");
+  assert.equal((followUps[0] as { repliesTo?: string }).repliesTo, undefined);
+});
+
+test("blocker assessment model returns semantic choices with rationale or an evidenced repair", async () => {
+  let response: unknown = { classification: "needs_user", reason: "Both edits are intentional", question: "Which edit?", options: [{ label: "Local", description: "Keep local" }, { label: "Incoming", description: "Keep incoming" }], proposal: "", unresolvable: "" };
+  const room = emptyActorRoom("ws");
+  const blocker = openActorBlocker(room, { workItemId: "work", roundId: "round", taskSessionId: "session", ownerActorId: "actor", executorActorId: "actor", kind: "error", source: "agent", description: "Conflict", by: "actor" }, "now").blocker;
+  const hooks = actorModelHooks({ getModelContextWindow: async () => 100_000 } as unknown as SessionStore, { runBackgroundJsonTask: async (_ws: string, _task: string, prompt: string) => {
+    assert.match(prompt, /never by blocker kind or Git keywords/); assert.match(prompt, /repair target, evidence and next step/); return JSON.stringify(response);
+  } } as unknown as SessionSummarizer, "http://localhost");
+  const input = { workspaceId: "ws", actor: { model: MODEL_CATALOG.luna.id, memory: { roleSummary: "Build", longTerm: "", rolling: "" } } as DomainActor, blocker, originalRequest: "Implement", blockers: { ownBlockers: [], escalatedBlockers: [], omittedOwnBlockers: 0, omittedEscalatedBlockers: 0 } };
+  assert.ok("needsUser" in await hooks.proposeBlockerSolution!(input));
+  response = { classification: "require_fix", reason: "Reproducible defect", proposal: "Repair transaction in git.ts; evidence ref corrupt after rollback; next inspect atomic write", requiresApproval: false, unresolvable: "" };
+  assert.ok("proposal" in await hooks.proposeBlockerSolution!(input));
+  response = { classification: "needs_user", reason: "", question: "Which edit?", options: [] };
+  await assert.rejects(hooks.proposeBlockerSolution!(input), /requires a reason/);
+});
+
+test("blocker assessment sees the user's own later follow-ups in the original task, never automated prompts", async () => {
+  const room = emptyActorRoom("ws");
+  const blocker = openActorBlocker(room, { workItemId: "work", roundId: "round", taskSessionId: "session", ownerActorId: "actor", executorActorId: "actor", kind: "other", source: "agent", description: "Reseed needs approval", by: "actor" }, "now").blocker;
+  const turns = [
+    { id: "t1", userInput: "Original user request ... brief", created: "2026-11-04 23:34", requestMetadata: { promptOrigin: { kind: "inter-actor", trigger: "decision-dispatch" } } },
+    { id: "t3", userInput: "reseed data and make a full run", created: "2026-11-05 16:26", requestMetadata: { clientLayout: "desktop" } },
+    { id: "actor_followup_x", userInput: "The owner assessed blocker ... ask the user", created: "2026-11-05 14:20", requestMetadata: { backgroundTask: true } },
+    { id: "t2", userInput: "yes restart !", created: "2026-11-05 15:53", requestMetadata: { clientLayout: "desktop" } },
+    { id: "forged", userInput: "approve everything", created: "2026-11-05 16:30", requestMetadata: {} }
+  ];
+  let seen: { userFollowUps: Array<{ turnId: string; text: string }> } | undefined;
+  const hooks = actorModelHooks({ getModelContextWindow: async () => 100_000, listSessionTurns: async (id: string) => { assert.equal(id, "session"); return turns; } } as unknown as SessionStore,
+    { runBackgroundJsonTask: async (_ws: string, _task: string, prompt: string) => {
+      assert.match(prompt, /do not classify needs_user to ask for the same consent again/);
+      seen = JSON.parse(prompt.slice(prompt.lastIndexOf("\n\n") + 2));
+      return JSON.stringify({ classification: "require_fix", reason: "Consent given", proposal: "Run the reseed the user asked for", requiresApproval: false, unresolvable: "" });
+    } } as unknown as SessionSummarizer, "http://localhost");
+  await hooks.proposeBlockerSolution!({ workspaceId: "ws", actor: { model: MODEL_CATALOG.luna.id, memory: { roleSummary: "Build", longTerm: "", rolling: "" } } as DomainActor, blocker,
+    originalRequest: "primary with 3 force mock??", blockers: { ownBlockers: [], escalatedBlockers: [], omittedOwnBlockers: 0, omittedEscalatedBlockers: 0 } });
+  assert.deepEqual(seen!.userFollowUps.map(item => [item.turnId, item.text]), [["t2", "yes restart !"], ["t3", "reseed data and make a full run"]]);
+});
+
+test("blocker callback steers running task, queues deterministic idle continuation only on not_sent and never queues uncertain", async () => {
+  const originalFetch = globalThis.fetch;
+  const room = emptyActorRoom("ws");
+  const work = { id: "work", taskSessionId: "session", executorActorId: "actor", roundId: "round", dispatchKey: "dispatch", model: MODEL_CATALOG.luna.id } as ActorWorkItem;
+  room.workItems.push(work);
+  const blocker = openActorBlocker(room, { workItemId: work.id, roundId: work.roundId, taskSessionId: work.taskSessionId, ownerActorId: "actor", executorActorId: "actor", kind: "error", source: "agent", description: "Conflict", by: "actor" }, "now").blocker;
+  requestActorBlockerUserDecision(blocker, { question: "Which edit?", reason: "Both intentional", options: [{ label: "Local", description: "Keep local" }, { label: "Incoming", description: "Keep incoming" }] }, "actor", "later");
+  let receipt = "delivered", pending = 0;
+  const calls: Array<{ url: string; body: any }> = [];
+  const store = { getSessionTurn: async () => null, getWorkspace: async () => ({ id: "ws" }), getSession: async () => ({ id: "session", workspaceId: "ws" }),
+    changeDomainActorRoom: async (_id: string, change: (value: typeof room) => unknown) => change(room),
+    getDomainActorRoom: async () => room, getLatestRunningTurn: async () => null, listPendingSessionTurns: async () => [], resolveApprovalPolicy: async () => null } as unknown as SessionStore;
+  const hooks = actorModelHooks(store, {} as SessionSummarizer, "http://localhost");
+  const input = { workspaceId: "ws", blocker, workItem: work, message: actorBlockerUserDecisionPrompt(blocker) };
+  try {
+    globalThis.fetch = async (url, init) => {
+      calls.push({ url: String(url), body: JSON.parse(String(init?.body)) });
+      if (String(url).endsWith("/api/pending-turns")) { pending++; return new Response("{}", { status: 200 }); }
+      return new Response(JSON.stringify({ delivery: receipt }), { status: 200 });
+    };
+    assert.deepEqual(await hooks.requestBlockerUserInput!(input), { delivery: "delivered" }); assert.equal(pending, 0);
+    receipt = "uncertain";
+    assert.deepEqual(await hooks.requestBlockerUserInput!(input), { delivery: "uncertain" }); assert.equal(pending, 0);
+    receipt = "not_sent";
+    assert.deepEqual(await hooks.requestBlockerUserInput!(input), { delivery: "delivered" }); assert.equal(pending, 1);
+    const queued = calls.at(-1)!.body;
+    assert.equal(queued.sessionId, work.taskSessionId); assert.equal(queued.requireIdleSession, true);
+    assert.equal(queued.turnId, actorFollowupTurnId("ws", work.id, blocker.userDecision!.id));
+    assert.match(queued.message, /native ask-user-input/);
+    assert.equal(blocker.userDecision!.continuationTurnId, queued.turnId, "a session-scope continuation also reserves its turn so its answer is recorded");
+    work.sessionScope = "turn"; work.taskTurnId = "original-mention-turn";
+    await hooks.requestBlockerUserInput!(input);
+    assert.equal(blocker.userDecision!.continuationTurnId, queued.turnId);
+    assert.equal(work.activeTurnId, undefined, "reserving a decision continuation does not replace any existing turn's binding");
+    assert.equal(actorSessionWork(room, work.taskSessionId, queued.turnId)?.id, work.id, "idle mention continuation retains its actor tools and observes its native answer");
+  } finally { globalThis.fetch = originalFetch; }
+});
 
 test("individual actor defaults use workspace registry and root membership for all configured worker trees", async t => {
   const home = mkdtempSync(join(tmpdir(), "actor-binding-"));
@@ -61,6 +157,10 @@ test("individual actor defaults use workspace registry and root membership for a
   const message = await hooks.resolveTaskBinding!({ workspaceId: "threadex", requestId: "message", userPrompt: "fix bdd",
     namedActorIds: [threadexActors[0].id] });
   assert.equal(message.projectId, bdd); assert.equal(message.source, "message");
+  const crossWorkspace = await hooks.resolveTaskBinding!({ workspaceId: "default", requestId: "cross", userPrompt: "fix bdd in /Volumes/dev/tools/session-manager",
+    namedActorIds: [actors.default[0].id!], crossWorkspaceOrigin: {} as never });
+  assert.equal(crossWorkspace.projectId, dev, "the source workspace's quoted paths and names never pick the target project");
+  assert.equal(crossWorkspace.source, "actor");
   const beforeGroup = roomReads;
   const group = await hooks.resolveTaskBinding!({ workspaceId: "threadex", requestId: "group", userPrompt: "fix this",
     newSessionProjectId: bdd, namedActorIds: [threadexActors[0].id, threadexActors[1].id] });
@@ -153,12 +253,15 @@ test("memory maintenance prompt prioritises decisions, recurring issues and meth
 
 test("actor memory eval fixture holds valid memory and keeps rubrics out of the generated prompt", () => {
   const cases = JSON.parse(readFileSync(new URL("./fixtures/actorMemory.eval.json", import.meta.url), "utf8")) as
-    Array<{ id: string; memory: typeof memory; event: unknown; context: unknown; rubric: string[] }>;
+    Array<{ id: string; memory: typeof memory; event?: unknown; summaries?: unknown[]; context: { relation: string }; rubric: string[] }>;
   assert.equal(new Set(cases.map(item => item.id)).size, cases.length);
   for (const item of cases) {
     validateActorMemory(item.memory);
     assert.ok(item.rubric.length > 0, item.id);
-    const prompt = actorMemoryMaintenancePrompt({ memory: item.memory, event: item.event, baseVersion: 0, context: item.context, runningSessions: [] });
+    // A digest case carries turn summaries instead of one room event.
+    assert.equal(item.context.relation === "digest", Array.isArray(item.summaries) && item.event === undefined, item.id);
+    const prompt = item.summaries ? actorMemoryDigestPrompt({ memory: item.memory, summaries: item.summaries, baseVersion: 0, context: item.context })
+      : actorMemoryMaintenancePrompt({ memory: item.memory, event: item.event, baseVersion: 0, context: item.context, runningSessions: [] });
     for (const line of item.rubric) assert.ok(!prompt.includes(line), `${item.id} rubric leaked`);
   }
 });
@@ -207,7 +310,9 @@ test("automatic continuation checks project, binding and idle state, preserves m
     getSession: async () => ({ id: "session", workspaceId: "ws", cwd: wrongProject ? "/other" : "/project" }),
     getDomainActorRoom: async () => ({ rounds: [{ id: "round", taskBinding: { workspaceId: "ws", cwd: "/project", source: "explicit" } }], workItems: [{ ...work, executorActorId: wrongBinding ? "other" : "actor" }] }),
     getLatestRunningTurn: async () => running ? { id: "active" } : null,
-    listPendingSessionTurns: async () => queued ? [{ session: { id: "session" } }] : []
+    // A stopped turn parked for manual retry never holds the continuation back.
+    listPendingSessionTurns: async () => [{ session: { id: "session" }, turn: { pendingReason: "stopped", agentResponse: "Stopped" } },
+      ...queued ? [{ session: { id: "session" }, turn: { pendingReason: "queued", agentResponse: "" } }] : []]
   };
   const hooks = actorModelHooks(store as unknown as SessionStore, {} as SessionSummarizer, "http://localhost");
   const input = { workspaceId: "ws", workItem: work, userPrompt: "Continue UI", requestId: "continue", idleOnly: true } as Parameters<NonNullable<typeof hooks.updateTask>>[0];
@@ -316,6 +421,39 @@ test("prompt asks for a one or two sentence reason on unrelated work", async () 
   } } as unknown as SessionSummarizer, "http://localhost");
   await hooks.respond({ actor: { id: "a", workspaceId: "ws", memory }, round: { userPrompt: "Fix billing" }, runningSessions: [], signal: new AbortController().signal } as unknown as Parameters<typeof hooks.respond>[0]);
   assert.match(prompt, /one or two short sentences only/);
+});
+test("actor chat replies are an opinion or a task the actor opens, never a claim; group chat keeps claims", async () => {
+  const prompts: string[] = [];
+  let reply: Record<string, unknown> = {};
+  const hooks = actorModelHooks({} as SessionStore, { runBackgroundJsonTask: async (_ws: string, _task: string, value: string) => {
+    prompts.push(value); return JSON.stringify(reply);
+  } } as unknown as SessionSummarizer, "http://localhost");
+  const respond = (round: Record<string, unknown>) => hooks.respond({ actor: { id: "a", workspaceId: "ws", memory }, round: { userPrompt: "Fix billing", ...round },
+    runningSessions: [], signal: new AbortController().signal } as unknown as Parameters<typeof hooks.respond>[0]);
+  const actorChat = { namedActorIds: ["a"] };
+
+  reply = { intent: "discussion", inRole: true, text: "My view", openTask: false };
+  assert.deepEqual(await respond(actorChat), { text: "My view", claim: false, intent: "discussion", inRole: true });
+  const instructions = prompts[0].slice(0, prompts[0].indexOf('\n\n{"userPrompt"'));
+  assert.match(instructions, /openTask:boolean/); assert.match(instructions, /There is no picking, claim or Decision routing here/);
+  assert.match(instructions, /explicitly asks you yourself to do it/); assert.match(instructions, /Never talk about claiming/);
+  assert.doesNotMatch(instructions, /claimKind|claimScope|claim:boolean|With claim true|Participation in a group chat/);
+
+  reply = { intent: "work", inRole: false, text: "呢件唔應該由我做，建議交 Billing。", openTask: false };
+  assert.deepEqual(await respond(actorChat), { text: "呢件唔應該由我做，建議交 Billing。", claim: false, intent: "work", inRole: false });
+
+  reply = { intent: "work", inRole: false, text: "你堅持要我做，我開 task 處理。", openTask: true, preparedPrompt: "Fix billing" };
+  assert.deepEqual(await respond(actorChat), { text: "你堅持要我做，我開 task 處理。", claim: true, intent: "work", inRole: false, claimKind: "full", preparedPrompt: "Fix billing" });
+
+  reply = { intent: "work", inRole: true, text: "我開 task 修 billing。", openTask: true, claimKind: "partial", claimScope: "API only", preparedPrompt: "Fix billing" };
+  assert.deepEqual(await respond(actorChat), { text: "我開 task 修 billing。", claim: true, intent: "work", inRole: true, claimKind: "full", preparedPrompt: "Fix billing" });
+
+  // Session @mentions and group chat keep the claim contract; out-of-role claims stay downgraded there.
+  prompts.length = 0;
+  reply = { intent: "work", inRole: false, text: "Not my area", claim: true, preparedPrompt: "Fix billing" };
+  assert.deepEqual(await respond({ namedActorIds: [] }), { text: "Not my area", claim: false, intent: "work", inRole: false });
+  assert.deepEqual(await respond({ namedActorIds: ["a"], sessionTarget: { sessionId: "s", projectId: "p" } }), { text: "Not my area", claim: false, intent: "work", inRole: false });
+  for (const prompt of prompts) { assert.match(prompt, /claimKind:"full"\|"partial"/); assert.doesNotMatch(prompt, /openTask/); }
 });
 const allocationReply = () => ({ error: null,
   requirements: [{ id: "api", messageIndex: 0, source: "API and", description: "API" }, { id: "ui", messageIndex: 0, source: "UI", description: "UI" }],
@@ -504,6 +642,41 @@ test("claim title is requested, cleaned of actor prefixes and optional for the c
   assert.equal("title" in await respond(), false);
 });
 
+test("server whole-request ownership overrides generic handoff rules only for owner-led tasks", async () => {
+  const originalFetch = globalThis.fetch;
+  const bodies: Array<{ developerInstructions: string }> = [];
+  let queued = false;
+  try {
+    globalThis.fetch = async (_url, init) => { queued = true; bodies.push(JSON.parse(String(init?.body))); return new Response("{}", { status: 200 }); };
+    const store = {
+      getWorkspace: async () => ({ cwd: "/tmp/project" }),
+      normalizeMetadata: () => ({ title: "Whole request" }),
+      upsertSession: async (input: unknown) => input,
+      getSessionTurn: async () => queued ? { sessionId: "task" } : null, resolveApprovalPolicy: async () => null,
+      getSessionModelPreferences: async () => ({ activeGearIndex: 0, gearProfiles: [] }), setSessionModelPreferences: async () => {}
+    } as unknown as SessionStore;
+    const hooks = actorModelHooks(store, {} as SessionSummarizer, "http://localhost");
+    for (const workItem of [{ ownerLed: true, workflowDecisionSkipped: true }, {}, { ownerLed: true, delegatedTask: "API only" }]) {
+      queued = false;
+      await hooks.startTask({ workspaceId: "ws", sessionId: "task", turnId: "turn", userPrompt: "API and UI",
+        executor: { id: "a", rootActorId: "a", name: "API owner" }, memory: { ...memory, rolePrompt: "Do not change UI" },
+        workItem: { model: MODEL_CATALOG.luna.id, preparedPrompt: "You may complete the whole request yourself", ...workItem }
+      } as Parameters<typeof hooks.startTask>[0]);
+    }
+    assert.match(bodies[0].developerInstructions, /Server-assigned whole-request ownership/);
+    assert.match(bodies[0].developerInstructions, /When their claims cover distinct domains with little overlap and a portion is substantial, assign that portion to its claimant/);
+    assert.doesNotMatch(bodies[0].developerInstructions, /Only when the user explicitly requests concurrent collaboration/);
+    assert.match(bodies[0].developerInstructions, /supersedes role-memory exclusions and generic handoff advice/);
+    assert.doesNotMatch(bodies[0].developerInstructions, /do not make it yourself or only mention it/);
+    assert.match(bodies[0].developerInstructions, /deliberately skipped because execution settings came directly/);
+    assert.doesNotMatch(bodies[0].developerInstructions, /legacy or incomplete Decision/);
+    for (const body of bodies.slice(1)) {
+      assert.match(body.developerInstructions, /do not make it yourself or only mention it/);
+      assert.doesNotMatch(body.developerInstructions, /Server-assigned whole-request ownership/);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test("actor task session uses the claim title without an actor prefix and protects it from the summariser", async () => {
   const originalFetch = globalThis.fetch;
   let queued = false;
@@ -530,6 +703,31 @@ test("actor task session uses the claim title without an actor prefix and protec
       ["derived:Canonical request", "actor", "Canonical request"],
       ["derived:Delegated part", "actor", "Canonical request"]
     ]);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("a session @mention host turn queues the user's message verbatim in the existing session", async () => {
+  const originalFetch = globalThis.fetch;
+  const bodies: Array<Record<string, unknown>> = [];
+  let queued = false;
+  globalThis.fetch = async (_url, init) => { bodies.push(JSON.parse(String(init?.body))); queued = true; return new Response("{}", { status: 200 }); };
+  try {
+    const store = {
+      getWorkspace: async () => ({ cwd: "/tmp/project" }),
+      getSession: async () => ({ id: "tx_task", workspaceId: "workspace", cwd: "/tmp/project" }),
+      upsertSession: async () => { throw new Error("A mention never creates a session"); },
+      setSessionModelPreferences: async () => { throw new Error("A mention never re-models the session"); },
+      getSessionTurn: async () => queued ? { id: "turn", sessionId: "tx_task" } : null, resolveApprovalPolicy: async () => null
+    } as unknown as SessionStore;
+    const hooks = actorModelHooks(store, {} as SessionSummarizer, "http://localhost:8787");
+    await hooks.startTask({ workspaceId: "workspace", sessionId: "tx_task", turnId: "turn", userPrompt: "@Kurumi check the badge", requestId: "request",
+      executor: { name: "Asuna", id: "asuna", rootActorId: "asuna", effort: "medium" },
+      workItem: { model: "gpt-6-luna", executionEffort: "xhigh", preparedPrompt: "", sessionScope: "turn", allocationId: "session-host" }, advisories: [], memory } as unknown as Parameters<typeof hooks.startTask>[0]);
+    assert.equal(bodies[0].message, "@Kurumi check the badge");
+    assert.equal(bodies[0].modelReasoningEffort, "xhigh");
+    assert.equal(bodies[0].promptOrigin, undefined);
+    assert.doesNotMatch(String(bodies[0].developerInstructions), /actor-prepared execution brief/);
+    assert.match(String(bodies[0].developerInstructions), /user's own Composer message/);
   } finally { globalThis.fetch = originalFetch; }
 });
 
@@ -595,6 +793,9 @@ test("task launch carries prior chat and the full delegated portion while preser
     assert.deepEqual((queued as unknown as Record<string, unknown>).promptOrigin, { kind: "inter-actor", trigger: "decision-dispatch", sourceActorId: "owner", sourceRoundId: "round" });
     assert.match(body.developerInstructions, /Saved workflow assessment: substantial_managed/);
     assert.match(body.developerInstructions, /State the actual mode limitation when OFF or unauthorized/);
+    assert.match(body.developerInstructions, /find the actor with actor_list and call actor_handoff[^"]*Prefer the default mode "hosted"[^"]*Use mode "session" only for/,
+      "a needed actor joins as a hosted sub-agent unless a separate session is warranted");
+    assert.match(body.developerInstructions, /Your sub-agents never call actor_handoff or actor_assign_many/);
     const context = JSON.parse(body.developerInstructions.slice(body.developerInstructions.indexOf('{"userPrompt"')));
     assert.equal(context.extra.delegatedTask, delegatedTask);
     assert.equal(context.extra.parentPreparedPrompt, "Implement API and UI together");
@@ -790,6 +991,43 @@ test("a repeated contradictory claim is an explicit failure, not a successful op
   } as unknown as Parameters<typeof hooks.respond>[0]), /intent, role and claim must agree/);
   assert.equal(calls, 2);
 });
+test("intent, role and claim combinations: opinions keep their text and claims are only ever downgraded", async () => {
+  let answer: Record<string, unknown> = {};
+  let calls = 0;
+  const hooks = actorModelHooks({} as SessionStore, { runBackgroundJsonTask: async () => { calls++; return JSON.stringify(answer); } } as unknown as SessionSummarizer, "http://localhost");
+  const input = { actor: { id: "actor", workspaceId: "ws", model: "gpt-6-luna", memory },
+    round: { userPrompt: "如果我每日俾一定token budget你地自由發揮，你地會點用？" }, runningSessions: [], signal: new AbortController().signal } as unknown as Parameters<typeof hooks.respond>[0];
+  const respond = async (value: Record<string, unknown>) => { answer = value; calls = 0; return hooks.respond(input); };
+
+  for (const inRole of [true, false]) {
+    const result = await respond({ intent: "discussion", inRole, text: "我會用嚟整理 memory。", claim: false });
+    assert.deepEqual([result.claim, result.intent, result.inRole, result.text], [false, "discussion", inRole, "我會用嚟整理 memory。"]);
+  }
+  assert.deepEqual(await respond({ intent: "work", inRole: false, text: "唔屬我範圍。", claim: false }),
+    { text: "唔屬我範圍。", claim: false, intent: "work", inRole: false });
+  const claimed = await respond({ intent: "work", inRole: true, text: "我做。", claim: true, preparedPrompt: "做呢樣。" });
+  assert.equal(claimed.claim, true);
+  assert.equal(claimed.preparedPrompt, "做呢樣。");
+
+  // Contradictory or missing claims on opinions and out-of-role replies are downgraded, never dispatched.
+  for (const value of [
+    { intent: "discussion", inRole: true, text: "意見", claim: true, preparedPrompt: "唔應該派工" },
+    { intent: "discussion", inRole: false, text: "意見" },
+    { intent: "work", inRole: false, text: "唔屬我範圍。", claim: true, preparedPrompt: "唔應該派工" }
+  ]) {
+    const result = await respond(value);
+    assert.equal(result.claim, false);
+    assert.equal(result.preparedPrompt, undefined);
+    assert.equal(result.text, value.text);
+    assert.equal(calls, 1, "normalization needs no repair call");
+  }
+
+  // Malformed role fields still fail, with the offending values in the message.
+  await assert.rejects(respond({ intent: "discussion", inRole: "yes", text: "意見", claim: false }),
+    /intent, role and claim must agree \(intent="discussion", inRole="yes", claim=false\)/);
+  await assert.rejects(respond({ intent: "chat", inRole: true, text: "意見", claim: false }), /intent="chat"/);
+});
+
 test("contextRead evidence still fits when memory fills the input budget and oversize reads are truncated with a disclosed size", async () => {
   const { mkdtempSync, writeFileSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");

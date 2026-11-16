@@ -62,6 +62,11 @@ type ProcessMonitorOptions = {
   onWake?: (wake: ProcessMonitorWake) => Promise<void>;
   /** When configured, managed process stdout and stderr are captured here. */
   logDir?: string;
+  /**
+   * How long a finished removeOnExit monitor stays listed with its exit status
+   * and log before it is removed. Zero removes it as soon as it completes.
+   */
+  completedRetentionMs?: number;
 };
 
 export type ProcessMonitorLog = {
@@ -82,16 +87,25 @@ const monitorPollMs = Number(process.env.PROCESS_MONITOR_POLL_MS ?? 2_000);
 const metricRefreshMs = Number(process.env.PROCESS_METRIC_REFRESH_MS ?? 5_000);
 const metricCommandTimeoutMs = Number(process.env.PROCESS_METRIC_TIMEOUT_MS ?? 5_000);
 const maxMetricOutputChars = 4_000;
+const defaultCompletedRetentionMs = Number(process.env.PROCESS_MONITOR_COMPLETED_RETENTION_MS ?? 10 * 60_000);
+const completedStatuses = new Set<ProcessMonitorStatus>(["exited", "stopped", "error"]);
 
 export class ProcessMonitorService {
   private timer: NodeJS.Timeout | null = null;
   private children = new Map<string, ChildProcess>();
   private metricRefreshes = new Map<string, Promise<ProcessMonitorRecord>>();
+  private completions = new Map<string, Promise<ProcessMonitorRecord | null>>();
+  /** Monitors this service is launching right now; a sweep snapshot of them may predate their PID. */
+  private launchingMonitorIds = new Set<string>();
+  private readonly completedRetentionMs: number;
 
   constructor(
     private readonly store: SessionStore,
     private readonly options: ProcessMonitorOptions = {}
-  ) {}
+  ) {
+    const retention = options.completedRetentionMs ?? defaultCompletedRetentionMs;
+    this.completedRetentionMs = Number.isFinite(retention) && retention > 0 ? retention : 0;
+  }
 
   async start() {
     await this.syncAll();
@@ -191,6 +205,7 @@ export class ProcessMonitorService {
         ...monitorOptions,
         startedAt: new Date().toISOString()
       });
+      await this.retireSupersededServiceMonitors(attached);
       return this.refreshMetrics(attached, true);
     }
 
@@ -218,6 +233,7 @@ export class ProcessMonitorService {
     if (input.registerOnly) return record;
     try {
       await this.startProcess(record);
+      await this.retireSupersededServiceMonitors(record);
       return this.refreshMetrics((await this.store.getProcessMonitor(record.id)) ?? record, true);
     } catch (error) {
       const failed = await this.store.updateProcessMonitor({ id: record.id, status: "error", error: errorMessage(error) });
@@ -235,6 +251,7 @@ export class ProcessMonitorService {
     validateExecutableArgs(record.executable, record.args);
     await this.terminate(record);
     await this.startProcess(record);
+    await this.retireSupersededServiceMonitors(record);
     return this.refreshMetrics((await this.store.getProcessMonitor(record.id)) ?? record, true);
   }
 
@@ -316,16 +333,56 @@ export class ProcessMonitorService {
       lastSignal: null,
       error: null
     })) ?? record;
+    await this.retireSupersededServiceMonitors(adopted);
     return this.refreshMetrics(adopted, true);
   }
 
   async remove(workspaceId: string, id: string) {
     const record = await this.requireWorkspaceRecord(workspaceId, id);
     await this.terminate(record);
-    await this.store.deleteProcessMonitor(id);
+    await this.deleteRecord(record);
+  }
+
+  private async deleteRecord(record: ProcessMonitorRecord) {
+    await this.store.deleteProcessMonitor(record.id);
     if (this.options.logDir && !record.logFile) {
-      rmSync(this.internalLogPath(id), { force: true });
+      rmSync(this.internalLogPath(record.id), { force: true });
     }
+  }
+
+  /** Removes a finished one-off monitor now, or leaves it listed until its retention window passes. */
+  private async releaseCompleted(record: ProcessMonitorRecord): Promise<ProcessMonitorRecord | null> {
+    if (!record.removeOnExit || this.completedRetentionMs > 0) return record;
+    await this.deleteRecord(record);
+    return null;
+  }
+
+  /**
+   * A service launched for an endpoint replaces finished service monitors in the
+   * same workspace that served the same host and port, so relaunching a dev server
+   * from a new session does not leave its earlier monitors behind.
+   */
+  private async retireSupersededServiceMonitors(serviceMonitor: ProcessMonitorRecord) {
+    if (serviceMonitor.removeOnExit) return;
+    const serviceOrigins = entryPointOrigins(serviceMonitor.entryPoints);
+    if (serviceOrigins.size === 0) return;
+    try {
+      for (const candidate of await this.store.listProcessMonitors(serviceMonitor.workspaceId)) {
+        if (candidate.id === serviceMonitor.id || candidate.removeOnExit || candidate.workspaceId !== serviceMonitor.workspaceId) continue;
+        if (!completedStatuses.has(candidate.status) || this.completions.has(candidate.id)) continue;
+        if (![...entryPointOrigins(candidate.entryPoints)].some((origin) => serviceOrigins.has(origin))) continue;
+        await this.deleteRecord(candidate);
+      }
+    } catch (error) {
+      console.warn(`Failed to retire monitors superseded by ${serviceMonitor.id}: ${errorMessage(error)}`);
+    }
+  }
+
+  private isRetentionExpired(record: ProcessMonitorRecord) {
+    // An exit still publishing its event or wake-up is not finished yet.
+    if (!record.removeOnExit || !completedStatuses.has(record.status) || this.completions.has(record.id)) return false;
+    const finishedAt = Date.parse(record.updated);
+    return !Number.isFinite(finishedAt) || finishedAt + this.completedRetentionMs <= Date.now();
   }
 
   async stopProcess(workspaceId: string, id: string) {
@@ -375,11 +432,15 @@ export class ProcessMonitorService {
 
   private async syncRecord(record: ProcessMonitorRecord): Promise<ProcessMonitorRecord | null> {
     if (record.status !== "running" && record.status !== "starting") {
-      return record;
+      if (!this.isRetentionExpired(record)) return record;
+      await this.deleteRecord(record);
+      return null;
     }
     record = await this.refreshMetrics(record);
     if (record.pid === null) {
-      if (record.status !== "starting") return record;
+      if (record.status !== "starting" || this.launchingMonitorIds.has(record.id)) return record;
+      const current = await this.store.getProcessMonitor(record.id);
+      if (!current || current.status !== "starting" || current.pid !== null) return current;
       const failed = (await this.store.updateProcessMonitor({
         id: record.id,
         status: "error",
@@ -406,6 +467,15 @@ export class ProcessMonitorService {
   }
 
   private async startProcess(record: ProcessMonitorRecord) {
+    this.launchingMonitorIds.add(record.id);
+    try {
+      await this.launchProcess(record);
+    } finally {
+      this.launchingMonitorIds.delete(record.id);
+    }
+  }
+
+  private async launchProcess(record: ProcessMonitorRecord) {
     const parameterEnv = Object.fromEntries(Object.entries(record.parameterValues ?? {}).map(([name, value]) => [`THREADEX_PARAM_${name}`, String(value)]));
     const logFd = this.openLog(record);
     const spawnOptions: SpawnOptions = {
@@ -498,7 +568,21 @@ export class ProcessMonitorService {
     this.children.delete(id);
   }
 
-  private async complete(record: ProcessMonitorRecord, code: number | null, signal: NodeJS.Signals | null) {
+  /** The child exit handler and the liveness sweep can both observe one exit; finish it once. */
+  private complete(record: ProcessMonitorRecord, code: number | null, signal: NodeJS.Signals | null) {
+    const running = this.completions.get(record.id);
+    if (running) return running;
+    const completion = this.completeOnce(record, code, signal).finally(() => {
+      this.completions.delete(record.id);
+    });
+    this.completions.set(record.id, completion);
+    return completion;
+  }
+
+  private async completeOnce(record: ProcessMonitorRecord, code: number | null, signal: NodeJS.Signals | null) {
+    const current = await this.store.getProcessMonitor(record.id);
+    // A stale sweep snapshot must not re-complete a monitor that already finished or was removed.
+    if (!current || (current.status !== "running" && current.status !== "starting") || current.pid !== record.pid) return current;
     let updated = (await this.store.updateProcessMonitor({
       id: record.id,
       status: "exited",
@@ -536,11 +620,7 @@ export class ProcessMonitorService {
           console.warn(`Failed to publish process exit ${updated.id}: ${errorMessage(error)}`);
         }
       }
-      if (updated.removeOnExit) {
-        await this.store.deleteProcessMonitor(updated.id);
-        return null;
-      }
-      return updated;
+      return this.releaseCompleted(updated);
     }
     if (updated.wakePrompt && updated.wakeSessionId && updated.wakeStatus === "pending") {
       const sent = (await this.store.updateProcessMonitor({
@@ -549,17 +629,10 @@ export class ProcessMonitorService {
         wakeError: null
       })) ?? updated;
       await this.dispatchWake(sent);
-      if (sent.removeOnExit) {
-        await this.store.deleteProcessMonitor(sent.id);
-        return null;
-      }
-      return (await this.store.getProcessMonitor(sent.id)) ?? sent;
+      const released = await this.releaseCompleted(sent);
+      return released && ((await this.store.getProcessMonitor(sent.id)) ?? sent);
     }
-    if (updated.removeOnExit) {
-      await this.store.deleteProcessMonitor(updated.id);
-      return null;
-    }
-    return updated;
+    return this.releaseCompleted(updated);
   }
 
   private async dispatchWake(record: ProcessMonitorRecord) {
@@ -602,11 +675,7 @@ export class ProcessMonitorService {
       pid: null,
       error: "Process monitor timed out."
     })) ?? record;
-    if (updated.removeOnExit) {
-      await this.store.deleteProcessMonitor(updated.id);
-      return null;
-    }
-    return updated;
+    return this.releaseCompleted(updated);
   }
 
   private async terminate(record: ProcessMonitorRecord) {
@@ -720,6 +789,24 @@ function normalizeEntryPoints(value: unknown, legacyValue: unknown) {
     }
   });
   return [...new Set(entryPoints)];
+}
+
+const loopbackHostnames = new Set(["localhost", "127.0.0.1", "[::1]", "0.0.0.0"]);
+
+/** Endpoint identity is scheme, host and port; loopback aliases are the same local listener. */
+export function entryPointOrigins(entryPoints: string[]) {
+  const origins = new Set<string>();
+  for (const entryPoint of entryPoints) {
+    try {
+      const url = new URL(entryPoint);
+      const hostname = loopbackHostnames.has(url.hostname) ? "loopback" : url.hostname;
+      const port = url.port || (url.protocol === "https:" ? "443" : "80");
+      origins.add(`${url.protocol}//${hostname}:${port}`);
+    } catch {
+      // Stored entry points are validated on write; ignore any legacy malformed value.
+    }
+  }
+  return origins;
 }
 
 function normalizeMetricMonitors(value: unknown): ProcessMetricMonitor[] {

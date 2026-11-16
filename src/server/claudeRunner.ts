@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { buildSubagentStartupSnapshot } from "./subagentStartup";
 import { approvedInspectorCommand, inspectorAliases, inspectorArgv, inspectorScript } from "./sessionInspectorCommand";
+import { ACTOR_DELEGATION_TOOLS, NATIVE_CHILD_DELEGATION_ERROR } from "./domainActorTools";
+import { actorAssignmentPromptName } from "./actorNativeAgents";
 import { normalizeModelEffort } from "../modelCatalog";
 import { readFileSync, statSync } from "node:fs";
 import { USER_INPUT_METHOD } from "../userInputRequest";
@@ -14,7 +16,7 @@ import {
   type ClaudeUsage
 } from "./claudeEvents";
 import type { StreamItem } from "./codexEvents";
-import { REPLY_LANGUAGE_INSTRUCTIONS } from "./replyLanguage";
+import { NO_SOUND_NOTIFICATION_INSTRUCTIONS, REPLY_LANGUAGE_INSTRUCTIONS } from "./replyLanguage";
 
 /**
  * Runs one Threadex turn on Claude through the Claude Agent SDK.
@@ -87,6 +89,8 @@ export type ClaudeRunnerContext = {
   sandboxMode?: ClaudeSandboxMode;
   protectedPaths?: string[];
   mcpServers: Record<string, { type: "stdio"; command: string; args: string[]; env: Record<string, string> }>;
+  /** Private MCP config file used instead of `mcpServers`, keeping secret env/header values out of argv. */
+  mcpConfigPath?: string;
   allowedTools: string[];
   approvedInspectorCommands?: string[];
   /** The user approved sandbox escapes for this session in an earlier turn. */
@@ -141,6 +145,13 @@ export function actorCredentialedInput(credentials: ActorToolCredentials | undef
     const { model: _model, effort: _effort, isolation: _isolation, name: _name, ...rest } = args;
     return { updatedInput: { ...rest, run_in_background: false } };
   }
+  // A child handed off in place during this turn has no definition: a general-purpose agent runs its marked brief,
+  // with the model and effort its start lists, in the foreground and in this working directory so its result is recorded.
+  if ((tool === "Agent" || tool === "Task") && actorAssignmentPromptName(args.prompt)) {
+    if (agent.agentId) return { deny: "Only the split host session starts actor sub-agents." };
+    const { isolation: _isolation, name: _name, ...rest } = args;
+    return { updatedInput: { ...rest, subagent_type: "general-purpose", run_in_background: false } };
+  }
   // SendMessage output is not a sub-agent result; rework reruns the actor agent so its outcome is recorded.
   if (tool === "SendMessage" && typeof args.to === "string" && agentNames.includes(args.to))
     return { deny: "Actor sub-agent rework must start the same subagent_type again with the Agent tool, including its previous result and the changes needed." };
@@ -149,6 +160,8 @@ export function actorCredentialedInput(credentials: ActorToolCredentials | undef
   if (!argv || argv[0] !== process.execPath || argv[1] !== inspectorScript || argv.length > 4) return null;
   const name = inspectorAliases[argv[2]] ?? argv[2];
   if (!credentials.toolNames.includes(name)) return null;
+  // Any sub-agent, actor or helper, reports the actor it needs to the host instead of delegating.
+  if (agent.agentId && ACTOR_DELEGATION_TOOLS.includes(name)) return { deny: NATIVE_CHILD_DELEGATION_ERROR };
   let input: Record<string, unknown>;
   try {
     const parsed: unknown = JSON.parse(argv[3] ?? "{}");
@@ -244,9 +257,8 @@ export function providerSwitchNote(previousProvider: string) {
 // Every Claude query (new, resume, recovery retry, actor and managed turns)
 // rebuilds its system prompt here, so the reply-language rule is added once per query.
 export function claudeSystemPromptAppend(appendSystemPrompt: string) {
-  return appendSystemPrompt.includes(REPLY_LANGUAGE_INSTRUCTIONS)
-    ? appendSystemPrompt
-    : [appendSystemPrompt, REPLY_LANGUAGE_INSTRUCTIONS].filter(Boolean).join("\n\n");
+  const missing = [REPLY_LANGUAGE_INSTRUCTIONS, NO_SOUND_NOTIFICATION_INSTRUCTIONS].filter(rule => !appendSystemPrompt.includes(rule));
+  return [appendSystemPrompt, ...missing].filter(Boolean).join("\n\n");
 }
 
 export async function runClaudeTurn(ctx: ClaudeRunnerContext, sdkOverride?: SdkModule): Promise<void> {
@@ -273,7 +285,7 @@ export async function runClaudeTurn(ctx: ClaudeRunnerContext, sdkOverride?: SdkM
   const checkBoundary = async (tool: string, args: Record<string, unknown>, toolUseID: string, options: CanUseToolOptions = {}): Promise<PermissionResult | null> => {
     const reason = boundary(tool, args);
     if (!reason) return null;
-    // approval_policy=never disables escalation, it never disables the sandbox.
+    // approval_policy=never cannot ask, so escalation is denied; Full access lifts the sandbox through sandboxMode instead.
     if (ctx.readOnly || sandboxMode === "read-only" || ctx.autoApproveAll) return { behavior: "deny", message: reason };
     const escape = tool === "Bash" && args.dangerouslyDisableSandbox === true;
     if (escape && escapesApproved) return { behavior: "allow", updatedInput: args };
@@ -401,7 +413,8 @@ export async function runClaudeTurn(ctx: ClaudeRunnerContext, sdkOverride?: SdkM
     canUseTool,
     systemPrompt: { type: "preset", preset: "claude_code", append: claudeSystemPromptAppend(ctx.appendSystemPrompt) },
     settingSources: ["user", "project", "local"],
-    ...(Object.keys(ctx.mcpServers).length ? { mcpServers: ctx.mcpServers } : {}),
+    ...(ctx.mcpConfigPath ? { extraArgs: { "mcp-config": ctx.mcpConfigPath } }
+      : Object.keys(ctx.mcpServers).length ? { mcpServers: ctx.mcpServers } : {}),
     ...(ctx.agents && Object.keys(ctx.agents).length ? { agents: Object.fromEntries(Object.entries(ctx.agents).map(([name, agent]) => [name, {
       description: agent.description, prompt: agent.prompt, model: agent.model,
       ...(claudeEffort(agent.effort, agent.model) ? { effort: claudeEffort(agent.effort, agent.model) } : {}) }])) } : {}),
@@ -642,6 +655,9 @@ export async function runClaudeTurn(ctx: ClaudeRunnerContext, sdkOverride?: SdkM
     elapsedMs: Date.now() - startedAt,
     reply: mapper.lastAgentText || "Turn completed without a final agent message.",
     tokenIn: usage.inputTokens + usage.cacheReadInputTokens + usage.cacheCreationInputTokens,
+    // Cached portion of tokenIn, the same subset convention as Codex cached_input_tokens.
+    // Cache writes stay in the uncached remainder.
+    cachedInputTokens: usage.cacheReadInputTokens,
     tokenOut: usage.outputTokens,
     ...(promptSuggestion ? { promptSuggestion } : {})
   }, { waitForCallback: true });

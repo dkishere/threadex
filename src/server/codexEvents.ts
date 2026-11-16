@@ -482,9 +482,38 @@ function normalizeCommentType(type: string, detail: string): StructuredAgentComm
   return inferCommentType(detail);
 }
 
+// Latin and Han are exempt: identifiers and mixed Chinese/English text use them freely.
+const COMMENT_SHORT_FOREIGN_SCRIPTS = [
+  /\p{Script=Cyrillic}/u,
+  /\p{Script=Greek}/u,
+  /\p{Script=Arabic}/u,
+  /\p{Script=Hebrew}/u,
+  /\p{Script=Armenian}/u,
+  /\p{Script=Georgian}/u,
+  /\p{Script=Thai}/u,
+  /\p{Script=Devanagari}/u,
+  /[\p{Script=Hiragana}\p{Script=Katakana}]/u,
+  /\p{Script=Hangul}/u
+];
+
+// Accented Latin letters and function words of other Latin-script languages, e.g. Spanish for an English update.
+const COMMENT_SHORT_ACCENTED_LATIN = /[\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u024f]/u;
+const COMMENT_SHORT_FOREIGN_LATIN_WORDS = new Set([
+  "el", "la", "los", "las", "del", "al", "y", "en", "que", "con", "para", "por", "una", "uno", "pero", "sin",
+  "und", "der", "das", "ist", "nicht", "mit", "ein", "eine", "zu", "auf",
+  "le", "les", "des", "une", "et", "avec", "pour", "dans", "est", "n\u00e3o", "uma", "com", "il", "della", "sono"
+]);
+
 export function commentShortMatchesDetailLanguage(short: string, detail: string) {
   const usesCjkScript = (value: string) => /[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]/u.test(value);
-  return usesCjkScript(short) === usesCjkScript(detail);
+  if (usesCjkScript(short) !== usesCjkScript(detail)) return false;
+  // Reject a script absent from the source, e.g. Russian for an English update.
+  if (!COMMENT_SHORT_FOREIGN_SCRIPTS.every((script) => !script.test(short) || script.test(detail))) return false;
+  if (COMMENT_SHORT_ACCENTED_LATIN.test(short) && !COMMENT_SHORT_ACCENTED_LATIN.test(detail)) return false;
+  const detailWords = new Set(detail.toLowerCase().match(/\p{L}+/gu) ?? []);
+  const foreignWords = new Set((short.toLowerCase().match(/\p{L}+/gu) ?? [])
+    .filter((word) => COMMENT_SHORT_FOREIGN_LATIN_WORDS.has(word) && !detailWords.has(word)));
+  return foreignWords.size < 2;
 }
 
 function looksLikeTruncatedDetailPrefix(short: string, detail: string) {

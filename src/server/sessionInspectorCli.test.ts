@@ -31,6 +31,10 @@ test("actor CLI binds actions to its current turn and blocks arbitrary task crea
     const denied = await runCli(["create_task", JSON.stringify({ prompt: "Unscoped work" })], env);
     assert.equal(denied.code, 1);
     assert.match(denied.stderr, /not available/);
+    const handoff = { requestId: "h", executorActorId: "ui", task: "Build the settings UI", mode: "session" };
+    const handed = await runCli(["actor_handoff", JSON.stringify(handoff)], env);
+    assert.equal(handed.code, 0, handed.stderr);
+    assert.deepEqual(received, { path: "/api/domain-actors/sessions/actor-task/action", body: { ...handoff, action: "actor_handoff", sourceTurnId: "actor-turn" } });
   } finally { server.closeAllConnections(); await new Promise<void>(done => server.close(() => done())); }
 });
 
@@ -56,6 +60,9 @@ test("hook-injected actor credentials travel only in headers and the removed ter
     const main = await runCli(["actor_read_memory", JSON.stringify({ field: "rolePrompt", _actorCredential: "main-secret" })], env);
     assert.equal(main.code, 0, main.stderr);
     assert.equal(calls[1].capability, "main-secret"); assert.equal(calls[1].workItem, undefined);
+    // A piped call loses the hook-injected credential; it fails locally with the fix instead of a server capability error.
+    const piped = await runCli(["actor_list", "{}"], env);
+    assert.equal(piped.code, 1); assert.match(piped.stderr, /standalone command/); assert.equal(calls.length, 2);
   } finally { server.closeAllConnections(); await new Promise<void>(done => server.close(() => done())); }
 });
 
@@ -89,6 +96,33 @@ test("worker consultant commands bind the source session/turn and preserve both 
     const denied = await runCli(["consultant_ask", JSON.stringify({ requestId: "r", consultantId: "critic", question: "Delegate" })],
       { ...env, THREADEX_DOMAIN_ACTOR: "0", THREADEX_ACTOR_CAPABILITY: "", THREADEX_TODO_AGENT_ROLE: "side_chat" });
     assert.equal(denied.code, 1); assert.match(denied.stderr, /not available/); assert.equal(calls.length, 5);
+  } finally { server.closeAllConnections(); await new Promise<void>(done => server.close(() => done())); }
+});
+
+test("an ordinary task CLI exposes only the actor registry tools with its turn capability", async () => {
+  const calls: any[] = [];
+  const server = createServer(async (req, res) => {
+    let body = ""; for await (const chunk of req) body += chunk;
+    calls.push({ path: req.url, capability: req.headers["x-threadex-actor-capability"], body: JSON.parse(body) });
+    res.setHeader("Content-Type", "application/json"); res.end(JSON.stringify({ ok: true }));
+  });
+  await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
+  const address = server.address(); assert.ok(address && typeof address === "object");
+  const env = { RUNNER_SERVER_URL: `http://127.0.0.1:${address.port}`, THREADEX_DOMAIN_ACTOR: "0", THREADEX_ACTOR_REGISTRY: "1",
+    THREADEX_SESSION_ID: "plain", THREADEX_TURN_ID: "turn", THREADEX_ACTOR_CAPABILITY: "registry-fixture" };
+  try {
+    const help = JSON.parse((await runCli(["help"], env)).stdout).commands.map((command: { name: string }) => command.name);
+    assert.deepEqual(help.filter((name: string) => name.startsWith("actor_")), ["actor_list", "actor_read_memory", "actor_create_root"]);
+    const listed = await runCli(["actor_list", JSON.stringify({ allWorkspaces: true })], env);
+    assert.equal(listed.code, 0, listed.stderr);
+    assert.deepEqual(calls, [{ path: "/api/domain-actors/sessions/plain/action", capability: "registry-fixture",
+      body: { allWorkspaces: true, action: "actor_list", sourceTurnId: "turn" } }]);
+    for (const name of ["actor_tree_status", "actor_handoff", "actor_reorganize"]) {
+      const denied = await runCli([name, "{}"], env);
+      assert.equal(denied.code, 1); assert.match(denied.stderr, /not available/);
+    }
+    const sideChat = await runCli(["actor_list", "{}"], { ...env, THREADEX_TODO_AGENT_ROLE: "side_chat" });
+    assert.equal(sideChat.code, 1); assert.equal(calls.length, 1);
   } finally { server.closeAllConnections(); await new Promise<void>(done => server.close(() => done())); }
 });
 
@@ -512,7 +546,7 @@ test(`interactive side chat ${running ? "queues" : "starts"} host work and rejec
     THREADEX_APPROVAL_POLICY: "granular" } });
   try {
     const listed = await rpc(1, "tools/list");
-    assert.deepEqual((listed.result as any).tools.map((tool: any) => tool.name), ["get_session", "search_sessions", "prompt_session"]);
+    assert.deepEqual((listed.result as any).tools.map((tool: any) => tool.name), ["get_session", "search_sessions", "prompt_session", "post_group_chat"]);
     const rejected = await rpc(2, "tools/call", { name: "prompt_session", arguments: { sessionId: "other", message: "Do it" } });
     assert.match(JSON.stringify(rejected), /only prompt its host session/);
     assert.equal(received.length, 0);
@@ -529,6 +563,37 @@ test(`interactive side chat ${running ? "queues" : "starts"} host work and rejec
   }
 });
 }
+
+test("post_group_chat posts from task sessions and the interactive side chat, never a transcript-only side chat", async () => {
+  const received: Array<{ url?: string; body: any; capability: unknown }> = [];
+  const server = createServer(async (request, response) => {
+    let text = ""; for await (const chunk of request) text += chunk;
+    received.push({ url: request.url, body: JSON.parse(text), capability: request.headers["x-threadex-actor-capability"] });
+    response.setHeader("Content-Type", "application/json"); response.end(JSON.stringify({ status: "submitted" }));
+  });
+  await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
+  const address = server.address(); assert.ok(address && typeof address === "object");
+  const base = { RUNNER_SERVER_URL: `http://127.0.0.1:${address.port}`, THREADEX_SESSION_ID: "host", THREADEX_WORKSPACE_MANAGER: "0",
+    THREADEX_CONTINUITY_ONLY: "0", THREADEX_LIGHTWEIGHT_TODO: "0", THREADEX_MANAGER_CONCURRENT: "0", THREADEX_CONCURRENT_ID: "" };
+  const post = JSON.stringify({ requestId: "p1", message: "Review the login flow" });
+  try {
+    const ordinary = await runCli(["post_group_chat", post], { ...base, THREADEX_TURN_ID: "turn-1", THREADEX_DOMAIN_ACTOR: "0", THREADEX_TODO_AGENT_ROLE: "default" });
+    assert.equal(ordinary.code, 0, ordinary.stderr);
+    const actor = await runCli(["post_group_chat", JSON.stringify({ requestId: "p2", message: "Hi", projectId: null })],
+      { ...base, THREADEX_TURN_ID: "turn-2", THREADEX_DOMAIN_ACTOR: "1", THREADEX_ACTOR_CAPABILITY: "cap", THREADEX_TODO_AGENT_ROLE: "default" });
+    assert.equal(actor.code, 0, actor.stderr);
+    const side = await runCli(["post_group_chat", post], { ...base, THREADEX_TURN_ID: "", THREADEX_DOMAIN_ACTOR: "0", THREADEX_TODO_AGENT_ROLE: "side_chat", THREADEX_SIDE_CHAT_HOST_PROMPT: "1" });
+    assert.equal(side.code, 0, side.stderr);
+    const transcript = await runCli(["post_group_chat", post], { ...base, THREADEX_TURN_ID: "", THREADEX_DOMAIN_ACTOR: "0", THREADEX_TODO_AGENT_ROLE: "side_chat", THREADEX_SIDE_CHAT_HOST_PROMPT: "0" });
+    assert.equal(transcript.code, 1); assert.match(transcript.stderr, /not available/);
+    assert.deepEqual(received.map(item => [item.url, item.body]), [
+      ["/api/sessions/host/group-chat-posts", { requestId: "p1", message: "Review the login flow", sourceTurnId: "turn-1", sideChat: false }],
+      ["/api/sessions/host/group-chat-posts", { requestId: "p2", message: "Hi", projectId: null, sourceTurnId: "turn-2", sideChat: false }],
+      ["/api/sessions/host/group-chat-posts", { requestId: "p1", message: "Review the login flow", sideChat: true }]
+    ]);
+    assert.equal(received[1].capability, undefined, "the actor credential is not sent to the group chat endpoint");
+  } finally { server.closeAllConnections(); await new Promise<void>(done => server.close(() => done())); }
+});
 
 test("recover_current_session reads completed turns from the managed session without an id", async () => {
   const received: Array<{ url: string | undefined; body: Record<string, unknown> }> = [];
@@ -1109,6 +1174,47 @@ test(`prompt_session ${running ? "queues" : "starts"} with parent=${policy.paren
 }
 }
 
+test("side chat prompt_session returns once the host turn starts instead of waiting for it to finish", { timeout: 15_000 }, async () => {
+  let openChatStream: import("node:http").ServerResponse | null = null;
+  let chatStreamClosed = false;
+  const server = createServer(async (request, response) => {
+    for await (const _chunk of request) { /* drain */ }
+    if (request.method === "POST" && request.url === "/api/session-inspector/session") {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ session: { id: "host-1", workspaceId: "default" }, turns: [] }));
+      return;
+    }
+    if (request.method === "POST" && request.url === "/api/chat") {
+      response.writeHead(200, { "Content-Type": "text/event-stream" });
+      // The host turn keeps running: the stream stays open after the turn starts.
+      response.write('event: session\ndata: {"sessionId":"host-1","turnId":"host-turn-1","message":"Prompt runner started"}\n\n');
+      response.on("close", () => { chatStreamClosed = true; });
+      openChatStream = response;
+      return;
+    }
+    response.writeHead(404).end();
+  });
+  await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const rpc = cliHarness({ env: { ...process.env, SESSION_INSPECTOR_SERVER_URL: `http://127.0.0.1:${address.port}`,
+    THREADEX_SESSION_ID: "host-1", THREADEX_TODO_AGENT_ROLE: "side_chat", THREADEX_SIDE_CHAT_HOST_PROMPT: "1" } });
+  try {
+    await rpc(1, "initialize");
+    const called = await rpc(2, "tools/call", { name: "prompt_session", arguments: { message: "Work on it." } });
+    assert.equal((called.result as { isError?: boolean }).isError, undefined);
+    const payload = JSON.parse((called.result as any).content[0].text);
+    assert.equal(payload.turnId, "host-turn-1");
+    assert.equal(payload.status, "running");
+    assert.equal(payload.reply, null);
+    await new Promise(resolveWait => setTimeout(resolveWait, 100));
+    assert.equal(chatStreamClosed, true);
+  } finally {
+    (openChatStream as import("node:http").ServerResponse | null)?.end();
+    await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+  }
+});
+
 
 test("lightweight agent exposes nested content tools and hides all legacy status writers", async () => {
   const rpc = cliHarness({ env: { ...process.env, THREADEX_SESSION_ID: "outcomes", SESSION_INSPECTOR_SERVER_URL: "http://127.0.0.1:1", THREADEX_LIGHTWEIGHT_TODO: "1" } });
@@ -1123,4 +1229,44 @@ test("lightweight agent exposes nested content tools and hides all legacy status
     const rejected = await rpc(3, "tools/call", { name: "todo_update_item", arguments: { itemId: "x", status: "done" } });
     assert.equal(rejected.result.isError, true);
   } finally {   }
+});
+
+test("an ordinary session can become Concurrent main and wait for its workers inside the turn", { timeout: 15_000 }, async () => {
+  const requests: Array<{ url: string; body: any }> = [];
+  let polls = 0;
+  const server = createServer(async (request, response) => {
+    let body = ""; for await (const chunk of request) body += chunk;
+    requests.push({ url: request.url!, body: JSON.parse(body) });
+    const reply = request.url!.endsWith("/fork") ? { localId: "c1", sessionId: "tx_c1", model: "claude-opus-5-5", effort: "high", sourceTurnId: null }
+      : request.url!.endsWith("/wait") ? (++polls === 1
+        ? { members: [{ localId: "c1", settled: false }], results: [], notices: [] }
+        : { members: [{ localId: "c1", settled: true }], results: [{ localId: "c1", summary: "Reviewed" }], notices: [] })
+      : { ok: true };
+    response.writeHead(200, { "Content-Type": "application/json" }); response.end(JSON.stringify(reply));
+  });
+  await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
+  const address = server.address(); assert.ok(address && typeof address === "object");
+  const env = { RUNNER_SERVER_URL: `http://127.0.0.1:${address.port}`, THREADEX_SESSION_ID: "tx_main", THREADEX_TURN_ID: "main-turn",
+    THREADEX_CONCURRENT_ID: "", THREADEX_APPROVAL_POLICY: "granular" };
+  try {
+    const help = JSON.parse((await runCli(["help"], env)).stdout).commands.map((tool: { name: string }) => tool.name);
+    for (const name of ["concurrent_spawn", "concurrent_wait", "concurrent_stop", "concurrent_status", "concurrent_send"]) assert.ok(help.includes(name), name);
+    const spawned = await runCli(["concurrent_spawn", JSON.stringify({ requestId: "review-1", task: "Review the parser", model: "claude-opus-5-5" })], env);
+    assert.equal(spawned.code, 0, spawned.stderr);
+    assert.equal(JSON.parse(spawned.stdout).localId, "c1");
+    assert.deepEqual(requests[0], { url: "/api/concurrent/sessions/tx_main/fork", body: { requestId: "review-1", task: "Review the parser",
+      model: "claude-opus-5-5", approvalPolicy: "granular", origin: "agent", spawnTurnId: "main-turn" } });
+    const waited = await runCli(["concurrent_wait", JSON.stringify({ timeoutSeconds: 10 })], env);
+    assert.equal(waited.code, 0, waited.stderr);
+    assert.deepEqual(JSON.parse(waited.stdout), { done: true, timedOut: false, members: [{ localId: "c1", settled: true }],
+      results: [{ localId: "c1", summary: "Reviewed" }], notices: [] });
+    assert.deepEqual(requests.slice(1).map(item => item.url), ["/api/concurrent/sessions/tx_main/wait", "/api/concurrent/sessions/tx_main/wait", "/api/concurrent/sessions/tx_main/endWait"]);
+    assert.deepEqual(requests[1].body, { turnId: "main-turn" });
+    assert.equal((await runCli(["concurrent_stop", JSON.stringify({ localId: "c1" })], env)).code, 0);
+    assert.deepEqual(requests.at(-1), { url: "/api/concurrent/sessions/tx_main/control", body: { localId: "c1", stopped: true } });
+    for (const role of [{ THREADEX_TODO_AGENT_ROLE: "side_chat" }, { THREADEX_WORKSPACE_MANAGER: "1", THREADEX_MANAGER_CONCURRENT: "1" }, { THREADEX_DOMAIN_ACTOR: "1" }]) {
+      const hidden = JSON.parse((await runCli(["help"], { ...env, ...role })).stdout).commands.map((tool: { name: string }) => tool.name);
+      assert.ok(!hidden.includes("concurrent_spawn"), JSON.stringify(role));
+    }
+  } finally { server.closeAllConnections(); await new Promise<void>(done => server.close(() => done())); }
 });

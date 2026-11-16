@@ -15,8 +15,49 @@ const session = (actorId: string, sessionId: string) =>
 
 test("summary classifies every work item status into open or attention", () => {
   const statuses: ActorWorkItem["status"][] = ["claimed", "assigned", "started", "completed", "failed", "needs_user"];
-  const summary = actorSummary(room([actor("a", "a", null)], statuses.map(status => item(status, "a", "a", status))), []);
+  const summary = actorSummary(room([actor("a", "a", null)], statuses.map(status => item(status, "a", "a", status))),
+    [{ ...session("a", "s"), workItemId: "needs_user" }]);
   assert.deepEqual(summary.actors[0].counts, { open: 3, attention: 2 });
+});
+
+const asking = (id: string, workItemId: string, retryable = false) =>
+  ({ id, workItemId, status: "open", updated: "t", taskSessionId: "task", proposals: [], history: [],
+    userDecision: { id: `${id}:decision:1`, state: "waiting", question: "q", options: [], reason: "r", created: "t", ...(retryable ? { retryable: true } : {}) } }) as unknown as ActorBlocker;
+
+test("needs_user counts only while a question is still asked or an approval is pending in a live turn", () => {
+  const items = ["question", "ended-question", "approval", "approval-turn-ended", "approvals-resolved", "legacy-ended"].map(id => item(id, "a", "a", "needs_user"));
+  items[2].pendingApprovalIds = ["x"]; items[3].pendingApprovalIds = ["y"]; items[4].pendingApprovalIds = [];
+  const blockers = [asking("b1", "question"), asking("b2", "ended-question", true), asking("b3", "legacy-ended", true), asking("b4", "legacy-ended", true)];
+  const live = ["approval", "approvals-resolved"].map(workItemId => ({ ...session("a", `s-${workItemId}`), workItemId }));
+  const summary = actorSummary({ ...room([actor("a", "a", null)], items), blockers }, live);
+  // question: asked; approval: pending in a live turn. A question that ended unanswered, an approval of an ended turn,
+  // resolved approvals, and a needs_user left over after all its questions ended (an earlier replay) do not hold Needs you.
+  assert.deepEqual(summary.actors[0].counts, { open: 0, attention: 2 });
+});
+
+test("one asked question keeps Needs you while another question of the same work has ended", () => {
+  const work = item("w", "a", "a", "needs_user");
+  const summary = actorSummary({ ...room([actor("a", "a", null)], [work]), blockers: [asking("ended", "w", true), asking("open", "w")] }, []);
+  assert.equal(summary.actors[0].counts.attention, 1);
+});
+
+test("a failed attempt superseded by the same executor's later work for the same round is not Needs you", () => {
+  const at = (id: string, executor: string, status: ActorWorkItem["status"], roundId: string, created: string, cancelledAt?: string) =>
+    ({ ...item(id, "owner", executor, status), roundId, created, ...(cancelledAt ? { cancelledAt } : {}) }) as ActorWorkItem;
+  const actors = [actor("owner", "owner", null), actor("x", "x", null), actor("y", "y", null), actor("z", "z", null)];
+  const summary = actorSummary(room(actors, [
+    at("x-native", "x", "failed", "r1", "2026-11-03T14:12:51Z"), at("x-handoff", "x", "completed", "r1", "2026-11-03T14:15:18Z"),
+    at("y-native", "y", "failed", "r1", "2026-11-03T14:12:51Z"), at("y-other-round", "y", "completed", "r2", "2026-11-03T15:00:00Z"),
+    at("z-native", "z", "failed", "r1", "2026-11-03T14:12:51Z"), at("z-cancelled-retry", "z", "started", "r1", "2026-11-03T14:20:00Z", "2026-11-03T14:21:00Z")
+  ]), []);
+  const byId = Object.fromEntries(summary.actors.map(entry => [entry.id, entry.counts.attention]));
+  assert.deepEqual(byId, { owner: 2, x: 0, y: 1, z: 1 }, "only another round or a cancelled retry leaves the failure needing the user");
+});
+
+test("running counts each actor session once, however many work items share it", () => {
+  const running = [session("a", "shared"), { ...session("a", "shared"), workItemId: "w2" }, session("a", "other"), session("b", "shared")];
+  const summary = actorSummary(room([actor("a", "a", null), actor("b", "b", null)], []), running);
+  assert.deepEqual(summary.actors.map(entry => entry.running), [2, 1]);
 });
 
 test("summary includes configured avatars and leaves missing avatars undefined", () => {
@@ -37,7 +78,7 @@ test("sub-actors count executed work while roots roll up owned and executed tree
     item("executed-for-other", "other", "sub", "failed"),
     item("other-only", "other", "other-sub", "assigned"),
     item("own", "root", "root", "claimed")
-  ]), []);
+  ]), [{ ...session("other", "s"), workItemId: "owned-by-sub" }]);
   const byId = Object.fromEntries(summary.actors.map(entry => [entry.id, entry.counts]));
   assert.deepEqual(byId.root, { open: 2, attention: 2 }, "root counts own, delegated, sub-owned and sub-executed items once each");
   assert.deepEqual(byId.sub, { open: 1, attention: 1 }, "sub counts only items it executes, not items it owns");

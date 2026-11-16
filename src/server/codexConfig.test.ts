@@ -1,7 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildAppServerArgs, resolveApprovalSettings } from "./codexConfig";
+import { buildAppServerArgs, buildSandboxPolicy, resolveApprovalSettings, sandboxModeForApprovalPolicy } from "./codexConfig";
+
+test("Full access lifts the sandbox while other policies keep the configured one", () => {
+  assert.equal(sandboxModeForApprovalPolicy("never", "workspace-write"), "danger-full-access");
+  for (const policy of ["on-request", "granular", "untrusted"]) {
+    assert.equal(sandboxModeForApprovalPolicy(policy, "workspace-write"), "workspace-write");
+  }
+  // An operator read-only sandbox is a ceiling that Full access does not lift.
+  assert.equal(sandboxModeForApprovalPolicy("never", "read-only"), "read-only");
+  assert.deepEqual(buildSandboxPolicy("/work", "danger-full-access"), { type: "dangerFullAccess" });
+  assert.equal(buildSandboxPolicy("/work", "workspace-write").type, "workspaceWrite");
+});
 
 test("Approve for me uses on-request approvals with the automatic reviewer", () => {
   assert.deepEqual(resolveApprovalSettings("granular"), {

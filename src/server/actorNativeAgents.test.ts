@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ActorRoom, ActorWorkItem, DomainActor } from "../domainActors";
-import { actorCodexChildMessage, actorNativeAgentName, actorNativeSignals, actorSessionWork, actorSplitHostContext, projectActorNativeSignals } from "./actorNativeAgents";
+import { actorChildMessage, actorClaudeAgentModel, actorNativeAgentName, actorNativeSignals, actorSessionWork, actorSplitHostContext, projectActorNativeSignals } from "./actorNativeAgents";
 import { RunnerUpdateQueue } from "./runnerUpdateQueue";
 
 test("a failed native projection fails the runner callback, so the update stays unapplied and its replay is projected", async () => {
@@ -34,14 +34,23 @@ test("Claude Agent cards and Codex child items become child lifecycle signals", 
     "the system-fixed model is recorded when the host passes none");
   assert.equal(actorNativeSignals(claude("item.completed", "failed"))[0].phase, "failed");
   assert.equal(actorNativeSignals(claude("item.completed", "declined"))[0].phase, "failed");
+  // A child handed off in place runs as a general-purpose agent named by its brief's marker, with an Agent model alias.
+  const inPlace = (eventType: string, status: string, message?: string) => ({ ...claude(eventType, status, message), model: "opus",
+    prompt: `${actorChildMessage("actor_handoff_abc123", "You are domain actor Docs")}\n\nCoordination notes`,
+    agents: [{ id: "toolu_1", name: "general-purpose", status, ...(message ? { message } : {}) }] });
+  assert.deepEqual(actorNativeSignals(inPlace("item.started", "inProgress")), [{ name: "actor_handoff_abc123", agentId: "toolu_1", phase: "started", result: undefined, model: "claude-opus-5-5" }]);
+  assert.deepEqual(actorNativeSignals(inPlace("item.completed", "completed", "Docs done")).map(signal => [signal.name, signal.phase, signal.result]), [["actor_handoff_abc123", "completed", "Docs done"]]);
+  assert.equal(actorNativeSignals({ ...inPlace("item.started", "inProgress"), prompt: "Notes first [threadex-actor-assignment:actor_handoff_abc123]" })[0].name, "general-purpose",
+    "only a prompt that begins with the marker names a child");
 
   const activity = { id: "a1", eventType: "item.started", itemType: "subagent", tool: "activity", status: "started", label: "/root/actor_api_654321", receiverThreadIds: ["thread-api"] };
   assert.deepEqual(actorNativeSignals(activity), [{ name: "actor_api_654321", agentId: "thread-api", phase: "started" }]);
+  assert.deepEqual(actorNativeSignals({ ...activity, status: "interacted" }), [], "a host call on a finished child must not open a phantom run");
   const waited = { id: "w1", eventType: "item.completed", itemType: "subagent", tool: "wait", status: "completed", receiverThreadIds: ["thread-api", "thread-x"],
     agents: [{ id: "thread-api", status: "completed", message: "API ready" }, { id: "thread-x", status: "errored" }, { id: "thread-y", status: "shutdown" }] };
   assert.deepEqual(actorNativeSignals(waited), [{ agentId: "thread-api", phase: "completed", result: "API ready" }, { agentId: "thread-x", phase: "failed", result: undefined }]);
   const spawned = { id: "s1", eventType: "item.completed", itemType: "subagent", tool: "spawnAgent", status: "completed", receiverThreadIds: ["thread-api"],
-    prompt: actorCodexChildMessage("actor_api_654321", "brief"), agents: [{ id: "thread-api", status: "running" }] };
+    prompt: actorChildMessage("actor_api_654321", "brief"), agents: [{ id: "thread-api", status: "running" }] };
   assert.deepEqual(actorNativeSignals(spawned), [{ name: "actor_api_654321", agentId: "thread-api", phase: "started" }], "the brief marker names the child");
   assert.deepEqual(actorNativeSignals({ itemType: "command_execution" }), []);
 });
@@ -114,6 +123,59 @@ test("a child awaiting recovery is defined only in its own recovery turn", async
   assert.deepEqual(earlier!.children, []); assert.match(earlier!.instructions, /Queued for its own recovery turn/);
   const own = await context("recovery-turn");
   assert.deepEqual(own!.children.map(child => child.name), ["actor_ui_123456"]);
+});
+
+test("a cancelled child receives no launch definition or capability in later host turns", async () => {
+  const room = splitRoom("claude-sonnet-5-5");
+  room.workItems[0].cancelledAt = "2026-10-31T00:00:00Z";
+  const context = await actorSplitHostContext({ room, host: room.workItems[1], hostActor: actor("api"), turnId: "later-turn", runningSessions: [],
+    contextWindow: async () => null, issue: async () => { throw new Error("Cancelled child must not receive a capability"); } });
+  assert.ok(context);
+  assert.deepEqual(context.children, []); assert.deepEqual(context.capabilities, {});
+  assert.match(context.instructions, /Task cancelled/);
+});
+
+test("an ordinary task hosting a handoff defines its hosted child with a credential and no-delegation rules", async () => {
+  const room = splitRoom("claude-sonnet-5-5");
+  delete room.rounds[0].allocation;
+  // Without a split, only a hosted handoff child makes the task a host.
+  assert.equal(await actorSplitHostContext({ room, host: room.workItems[1], hostActor: actor("api"), turnId: "t-follow", runningSessions: [],
+    contextWindow: async () => null, issue: async () => "x" }), undefined);
+  room.workItems[0] = { ...room.workItems[0], allocationId: "handoff", parentWorkItemId: "host", handoff: { sourceActorId: "api", sourceSessionId: "s-host" },
+    nativeAgent: { name: "actor_handoff_123456", provider: "claude" } };
+  const issued: string[] = [];
+  const context = await actorSplitHostContext({ room, host: room.workItems[1], hostActor: actor("api"), turnId: "t-follow", runningSessions: [],
+    contextWindow: async () => null, issue: async id => { issued.push(id); return "c".repeat(64); } });
+  assert.ok(context);
+  assert.deepEqual(issued, ["ui-child"]); assert.deepEqual(Object.keys(context.capabilities), ["actor_handoff_123456"]);
+  const [child] = context.children;
+  assert.equal(child.name, "actor_handoff_123456"); assert.match(child.description, /follow-up handed off by this session/);
+  assert.match(child.prompt, /follow-up work that API handed off to you/);
+  assert.match(child.prompt, /Never call actor_handoff or actor_assign_many.*the host decides/);
+  assert.match(context.instructions, /^Hosted handoff host/); assert.doesNotMatch(context.instructions, /Partial-claim integration owner/);
+  assert.match(context.instructions, /Children cannot delegate/);
+  assert.equal(await actorSplitHostContext({ room, host: room.workItems[2], hostActor: actor("ops"), turnId: "t-ops", runningSessions: [],
+    contextWindow: async () => null, issue: async () => "x" }), undefined, "other tasks host nothing");
+});
+
+test("a Claude child handed off in place gets a verbatim brief, no definition and no credential", async () => {
+  const room = splitRoom("claude-sonnet-5-5");
+  delete room.rounds[0].allocation;
+  room.workItems[0] = { ...room.workItems[0], allocationId: "handoff", parentWorkItemId: "host", handoff: { sourceActorId: "api", sourceSessionId: "s-host" },
+    nativeAgent: { name: "actor_handoff_123456", provider: "claude" } };
+  const context = await actorSplitHostContext({ room, host: room.workItems[1], hostActor: actor("api"), turnId: "t-host", runningSessions: [], contextWindow: async () => null });
+  assert.ok(context);
+  assert.deepEqual(context.children, []); assert.deepEqual(context.capabilities, {});
+  const [brief] = context.briefs;
+  assert.deepEqual([brief.name, brief.model, brief.effort], ["actor_handoff_123456", "claude-sonnet-5-5", "medium"]);
+  assert.match(brief.brief!, /^\[threadex-actor-assignment:actor_handoff_123456\]\nYou are domain actor UI \(ui\)/);
+  assert.match(brief.brief!, /ui decisions/); assert.match(brief.brief!, /Do not call actor tools/);
+  assert.doesNotMatch(brief.brief!, /bound to your own actor/);
+});
+
+test("Claude in-place children use the Agent model alias that runs exactly their model", () => {
+  assert.deepEqual(["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-2", "claude-fable-5-1", "gpt-6-luna"].map(actorClaudeAgentModel),
+    ["opus", "sonnet", "haiku", "fable", undefined, undefined]);
 });
 
 test("a Codex host passes each child brief verbatim and issues no unusable credentials", async () => {

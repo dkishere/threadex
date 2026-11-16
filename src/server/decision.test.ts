@@ -113,26 +113,58 @@ test("actor callers do not fabricate an owner, use backend thresholds, and bypas
   const claims = [{ actorId: "a", claim: "I can code" }];
   const single = await breakClaimTie({ ...context, claims, decide: async () => { throw new Error("must not call"); } });
   assert.deepEqual(single, { ok: true, actorId: "a" });
-  const other = await breakClaimTie({ ...context, claims: [...claims, { actorId: "b", claim: "I can write" }], decide: decideWith({ owner: { kind: "choice", choice: "other", confidence: 0.9 } }) });
-  assert.equal(other.ok, false);
+  const both = [...claims, { actorId: "b", claim: "I can write" }];
+  const failed = await breakClaimTie({ ...context, claims: both, decide: async () => { throw new Error("backend down"); } });
+  assert.deepEqual(failed, { ok: true, actorId: "a", fallback: "decision_failed" });
+  const relevant = await breakClaimTie({ ...context, claims: both, relevance: { a: 0.2, b: 0.9 }, decide: async () => ({ ok: false, attempts: [] }) });
+  assert.ok(relevant.ok && relevant.actorId === "b" && relevant.fallback === "decision_failed");
+  const unknown = await breakClaimTie({ ...context, claims: [{ actorId: "ghost", claim: "?" }, ...claims], decide: async () => { throw new Error("must not call"); } });
+  assert.deepEqual(unknown, { ok: true, actorId: "a" });
+  const none = await breakClaimTie({ ...context, claims: [{ actorId: "ghost", claim: "?" }], decide: async () => { throw new Error("must not call"); } });
+  assert.equal(none.ok, false);
 });
 
-test("claim tiebreak rejects tied maxima (including other) and inconsistent choices", async () => {
+test("claim tiebreak judges the business domain, not a named delivery vehicle such as ABC", async () => {
+  const actors = [
+    { id: "integrity", systemHeader: "Scoring & integrity owner", roleSummary: "Scoring & integrity: proctoring, CDD/evidence and their UI." },
+    { id: "abc", systemHeader: "Own Fairshot-hub ABC use case definitions", roleSummary: "ABC mode: use case definitions and verification." }
+  ];
+  const claims = [
+    { actorId: "integrity", claim: "I'll mock the three-option CD setting in ABC.", claimScope: "Own the CD detection modes and hard-gate behaviour." },
+    { actorId: "abc", claim: "I'll mock the three-option CD setting in ABC.", claimScope: "ABC case construction for the mock." }
+  ];
+  let seen: DecisionRequest | undefined;
+  const result = await breakClaimTie({ userPrompt: "update the per recruitment role CD config to default/disable/force detection; mock this in abc first",
+    actors, claims, audit: request.audit, policy: { order: ["fake" as const], threshold: { fake: 0.5 } },
+    decide: async req => { seen = req; return decideWith({ owner: { kind: "choice", choice: "integrity", confidence: 0.9, probabilities: { integrity: 0.9, abc: 0.1 } } })(req); } });
+  assert.ok(result.ok && result.actorId === "integrity" && result.fallback === undefined);
+  const question = seen!.questions[0];
+  assert.match(question.instructions, /business or product domain/);
+  assert.match(question.instructions, /mock this in ABC first/);
+  assert.match(question.instructions, /stakeholder/);
+  assert.ok(question.kind === "choice");
+  const abcOption = JSON.parse(question.options.abc);
+  assert.equal(abcOption.claimScope, "ABC case construction for the mock.");
+  assert.equal(abcOption.roleSummary, actors[1].roleSummary);
+});
+
+test("claim tiebreak always selects a claimant; low confidence and ties only mark a fallback", async () => {
   const context = {
     userPrompt: "Fix code", audit: request.audit,
     actors: ["a", "b"].map(id => ({ id, systemHeader: "Developer", roleSummary: "Code" })),
     claims: ["a", "b"].map(actorId => ({ actorId, claim: "I can do it" })),
     policy: { order: ["fake" as const], threshold: { fake: 0.5 } }
   };
-  for (const [probabilities, expected] of [
-    [{ a: 0.5, b: 0.5, other: 0 }, false],
-    [{ a: 0.5, b: 0, other: 0.5 }, false],
-    [{ a: 0.2, b: 0.8, other: 0 }, false],
-    [{ a: 0.6, b: 0.2, other: 0.2 }, true]
+  for (const [choice, confidence, probabilities, actorId, fallback] of [
+    ["a", 0.5, { a: 0.5, b: 0.5 }, "a", "low_confidence"],
+    ["a", 0.5, { a: 0.2, b: 0.8 }, "b", "low_confidence"],
+    ["b", 0.33, { a: 0.45, b: 0.55 }, "b", "low_confidence"],
+    ["a", 0.5, { a: 0.6, b: 0.4 }, "a", undefined]
   ] as const) {
-    const result = await breakClaimTie({ ...context, decide: decideWith({ owner: { kind: "choice", choice: "a", confidence: 0.5, probabilities } }) });
-    assert.equal(result.ok, expected);
-    if (!result.ok) assert.equal(result.reason, "routing_failed");
+    const result = await breakClaimTie({ ...context, decide: decideWith({ owner: { kind: "choice", choice, confidence, probabilities } }) });
+    assert.ok(result.ok);
+    assert.equal(result.actorId, actorId);
+    assert.equal(result.fallback, fallback);
   }
 });
 

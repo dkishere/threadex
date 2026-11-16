@@ -51,6 +51,18 @@ export function buildTurnGrillMidTurnInputs(approvalItems: unknown[], steerMessa
   return inputs.sort((left, right) => left.created.localeCompare(right.created));
 }
 
+/**
+ * The user's own mid-turn messages in time order: composer steers and question answers a signed-in user
+ * submitted. Automation steers, legacy steers without a recorded source and unattributed answers are excluded,
+ * so the messages can count as user requests (e.g. for delegation authorization).
+ */
+export function userMidTurnMessages(approvalItems: unknown[], steerMessages: SessionSteerMessageRecord[]): string[] {
+  const answeredByUser = approvalItems.filter(item => (item as { answeredByUser?: unknown } | null)?.answeredByUser === true);
+  return buildTurnGrillMidTurnInputs(answeredByUser, steerMessages.filter(steer => steer.source === "user"))
+    .map(input => input.kind === "steer" ? input.content
+      : input.questions.map(({ question, answer }) => `Answer to "${question}": ${answer}`).join("\n"));
+}
+
 export const TURN_GRILL_INSTRUCTIONS = [
   "Inspect one complete saved task turn and maintain a structured Grill discussion attached to that turn.",
   "Each respond or followup action is one turn covering the selected questions together. For respond, speak as the source thread's agent, answering the review from the supplied context. For followup, speak as the griller and evaluate the agent's saved response. Do not begin a separate conversation per question.",

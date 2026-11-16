@@ -173,20 +173,14 @@ class PostgresSessionConnection implements SessionDbConnection {
 
   async withSchemaLock<T>(operation: () => Promise<T>): Promise<T> {
     const key = `threadex.schema:${this.schema ?? "public"}`;
-    const client = await this.pool.connect();
-    let unlocked = false;
-    try {
+    return this.withClient(this.pool, async client => {
       await client.query("SELECT pg_advisory_lock(hashtext($1))", [key]);
       try {
         return await operation();
       } finally {
         await client.query("SELECT pg_advisory_unlock(hashtext($1))", [key]);
-        unlocked = true;
       }
-    } finally {
-      // Discarding the session releases a lock that could not be released explicitly.
-      client.release(!unlocked);
-    }
+    });
   }
 
   async withTransaction<T>(operation: (run: SessionDbConnection["run"]) => Promise<T>): Promise<T> {
@@ -222,13 +216,25 @@ class PostgresSessionConnection implements SessionDbConnection {
 
   private async withClient<T>(pool: pg.Pool, operation: (client: pg.PoolClient) => Promise<T>): Promise<T> {
     const client = await pool.connect();
+    let failure: Error | undefined;
+    // pg-pool removes its error listener while a client is checked out. A server
+    // disconnect between queries must reject this operation instead of crashing Node.
+    const onError = (error: Error) => { failure = error; };
+    client.on("error", onError);
     try {
       if (this.schema) {
         await client.query(`SET search_path TO ${quoteIdentifier(this.schema)}`);
       }
-      return await operation(client);
+      const result = await operation(client);
+      if (failure) throw failure;
+      return result;
+    } catch (error) {
+      failure = error instanceof Error ? error : new Error(String(error));
+      throw error;
     } finally {
-      client.release();
+      // Discard failed clients, including sessions whose advisory unlock failed.
+      client.release(failure);
+      client.removeListener("error", onError);
     }
   }
 }

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
 import { parseSessionListSearchTerms, SessionStore } from "./sessionStore.js";
-import { buildTurnGrillMidTurnInputs } from "./turnGrill.js";
+import { buildTurnGrillMidTurnInputs, userMidTurnMessages } from "./turnGrill.js";
 import { USER_INPUT_METHOD } from "../userInputRequest.js";
 
 test("sandbox escape grants persist across turns and stay within their session", async () => {
@@ -62,6 +62,17 @@ test("sidebar pages hide Concurrent workers but preserve ordinary child sessions
       created: new Date().toISOString(), updated: new Date().toISOString(), lease: null,
       messages: [], results: [], members: ["main", "worker"].map(id => ({
         localId: id === "main" ? "main" : "c3", sessionId: id, task: id,
+        sourceSessionId: "main", sourceTurnId: null, fork: null, model: "gpt-6", effort: "medium",
+        stopped: false, observed: {}
+      }))
+    }, () => {});
+    // Actor steering uses the same transport, but its recipient remains an
+    // ordinary task in sidebar, project and Manager queries.
+    await store.changeCollaboration("actor_tree_sidebar", {
+      id: "actor_tree_sidebar", workspaceId: "concurrent-sidebar", mainSessionId: "main", revision: 0,
+      created: new Date().toISOString(), updated: new Date().toISOString(), lease: null,
+      messages: [], results: [], members: ["main", "ordinary-child"].map(id => ({
+        localId: id === "main" ? "main" : "actor-task", sessionId: id, task: id,
         sourceSessionId: "main", sourceTurnId: null, fork: null, model: "gpt-6", effort: "medium",
         stopped: false, observed: {}
       }))
@@ -456,6 +467,27 @@ test("turn changed_files is a persistent path-only array updated before completi
     const persisted = await store.runSqlQuery({ sql: "SELECT changed_files FROM session_turn WHERE id = 'turn-1'" });
     assert.deepEqual(persisted.rows[0]?.changed_files, result.rows[0]?.changed_files);
   } finally { await store.close(); }
+});
+
+test("final turn results store their cached input subset for turns without usage samples", async () => {
+  const store = await createStore();
+  try {
+    assert.equal(await store.updateSessionTurn({ id: "turn-1", agentResponse: "done", tokenIn: 1_000, cachedInputTokens: 800,
+      tokenOut: 50, status: "done", runnerExitCode: 0 }), true);
+    await store.recordSessionTurn({ id: "turn-2", sessionId: "session-1", userInput: "older", agentResponse: "",
+      tokenIn: 0, tokenOut: 0, status: "running" });
+    assert.equal(await store.updateSessionTurn({ id: "turn-2", agentResponse: "done", tokenIn: 400, tokenOut: 10,
+      status: "done", runnerExitCode: 0 }), true);
+    const rows = await store.runSqlQuery({ sql: "SELECT id, input_tokens, cached_input_tokens FROM token_usage WHERE source = 'turn_final' ORDER BY id" });
+    assert.deepEqual(rows.rows.map((row) => [row.id, Number(row.input_tokens), Number(row.cached_input_tokens)]),
+      [["agent:turn:turn-1", 1_000, 800], ["agent:turn:turn-2", 400, 0]]);
+    const turns = await store.listSessionTurns("session-1");
+    assert.equal(turns.find((turn) => turn.id === "turn-1")?.cachedInputTokens, 800);
+    // A zero from a result without the field reads as not recorded, not as fully uncached.
+    assert.equal(turns.find((turn) => turn.id === "turn-2")?.cachedInputTokens, undefined);
+  } finally {
+    await store.close();
+  }
 });
 
 test("session turn effort falls back to a recorded setting when the preferred token sample omits it", async () => {
@@ -1051,6 +1083,41 @@ test("grill orders a QA answer after a manual steer made while the question was 
     assert.ok(Date.parse(approvals[0].sortCreated as string) > Date.parse(approvals[0].answerSubmittedAt as string));
     assert.ok(Date.parse(approvals[0].sortCreated as string) > Date.parse(steers[0].created));
     assert.deepEqual(buildTurnGrillMidTurnInputs(approvals, steers).map((entry) => entry.kind), ["steer", "qa"]);
+  } finally {
+    await store.close();
+  }
+});
+
+test("only signed-in answers and user steers become the user's own mid-turn messages", async () => {
+  const store = await createStore();
+  const params = (question: string) => ({ questions: [{ id: "0", header: "Q", question }] });
+  const decision = (answer: string) => ({ answers: { "0": { answers: [answer] } } });
+  try {
+    for (const [approvalId, question, answer, fromUser] of [["user-qa", "How to fix the backend?", "Open a separate task", true],
+      ["agent-qa", "Self-answered?", "Unattributed answer", false]] as const) {
+      await store.recordSessionTurnEvent({ id: `approval.requested:${approvalId}`, turnId: "turn-1", sessionId: "session-1",
+        eventName: "approval.requested", payload: { approvalId, method: USER_INPUT_METHOD, params: params(question) } });
+      await store.recordSessionTurnEvent({ id: `approval.decision:${approvalId}`, turnId: "turn-1", sessionId: "session-1",
+        eventName: "approval.decision", payload: { approvalId, method: USER_INPUT_METHOD, decision: decision(answer), ...(fromUser ? { fromUser: true } : {}) } });
+      await store.recordSessionTurnEvent({ id: `approval.resolved:${approvalId}`, turnId: "turn-1", sessionId: "session-1",
+        eventName: "approval.resolved", payload: { approvalId, method: USER_INPUT_METHOD, params: params(question), decision: decision(answer) } });
+    }
+    await store.recordSessionTurnEvent({ id: "steer:user", turnId: "turn-1", sessionId: "session-1", eventName: "steer",
+      payload: { id: "user", content: "見唔到開task", source: "user" } });
+    await store.recordSessionTurnEvent({ id: "steer:automation", turnId: "turn-1", sessionId: "session-1", eventName: "steer",
+      payload: { id: "automation", content: "Automation update", source: "automation" } });
+    await store.recordSessionTurnEvent({ id: "steer.accepted:legacy", turnId: "turn-1", sessionId: "session-1", eventName: "steer.accepted",
+      payload: { commandId: "legacy", message: "System blocker instruction" } });
+
+    const [approvalsByTurn, steersByTurn] = await Promise.all([
+      store.listSessionApprovalLiveItems("session-1"), store.listSessionSteerMessages("session-1")
+    ]);
+    const approvals = approvalsByTurn["turn-1"] as Array<Record<string, unknown>>;
+    assert.equal(approvals.find(item => item.approvalId === "user-qa")?.answeredByUser, true);
+    assert.equal(approvals.find(item => item.approvalId === "agent-qa")?.answeredByUser, undefined);
+    assert.equal(steersByTurn["turn-1"].find(steer => steer.id === "legacy")?.source, undefined);
+    assert.deepEqual(userMidTurnMessages(approvals, steersByTurn["turn-1"]).sort(),
+      ['Answer to "How to fix the backend?": Open a separate task', "見唔到開task"]);
   } finally {
     await store.close();
   }

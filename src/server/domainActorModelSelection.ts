@@ -1,10 +1,34 @@
-import { DEFAULT_MODEL, MODEL_CATALOG, modelProvider, normalizeModelEffort, normalizeModelId } from "../modelCatalog";
+import { DEFAULT_MODEL, MODEL_CATALOG, modelProvider, modelWorkTier, normalizeModelEffort, normalizeModelId } from "../modelCatalog";
 import type { ActorRound, ActorWorkItem } from "../domainActors";
 import type { DecisionQuestion, DecisionResult } from "./decision/types";
 
-/** The model whose provider group a round's execution uses: its reply gear, else the mentioning session's model. */
-export function actorInitiatingModel(round: Pick<ActorRound, "responseProfile" | "sessionTarget"> | undefined) {
-  return round?.responseProfile?.model ?? round?.sessionTarget?.model;
+/** Recognize affirmative execution directives in canonical user messages only. */
+export function actorRequestedExecution(messages: string[]): { model: string; effort?: string } | undefined {
+  const aliases: Record<string, string> = { astra: MODEL_CATALOG.astra.id, sol: MODEL_CATALOG.sol61.id,
+    luna: MODEL_CATALOG.luna.id, terra: MODEL_CATALOG.terra61.id, opus: MODEL_CATALOG.claudeOpus.id,
+    sonnet: MODEL_CATALOG.claudeSonnet.id, haiku: MODEL_CATALOG.claudeHaiku.id };
+  let requested: { model: string; effort?: string } | undefined;
+  for (const message of messages) {
+    const text = message.replace(/```[\s\S]*?```/g, "").replace(/^\s*>.*$/gm, "");
+    const pattern = /(?:\b(?:with|use|using)\s+|(?<![不唔別])用\s*)(gpt-6(?:\.1)?-(?:astra|sol|luna|terra)|astra|sol|luna|terra|opus|sonnet|haiku)\b(?:\s+(xh|xhigh|high|medium|low|max|ultra)\b)?/gi;
+    for (const match of text.matchAll(pattern)) {
+      if (/(?:do not|don't|never|唔好|不要|別)\s*$/i.test(text.slice(0, match.index))) continue;
+      const name = match[1].toLowerCase();
+      requested = { model: aliases[name] ?? normalizeModelId(name),
+        ...(match[2] ? { effort: match[2].toLowerCase() === "xh" ? "xhigh" : match[2].toLowerCase() } : {}) };
+    }
+  }
+  return requested;
+}
+
+/** A retry overrides only its speaker's reply gear, including after detached-worker readback. */
+export function actorReplyResponseProfile(round: Pick<ActorRound, "responseProfile" | "replyResponseProfiles"> | undefined, actorId: string) {
+  return round?.replyResponseProfiles?.[actorId] ?? round?.responseProfile;
+}
+
+/** Execution follows the speaker's reply gear, else the mentioning session's model. */
+export function actorInitiatingModel(round: Pick<ActorRound, "responseProfile" | "replyResponseProfiles" | "sessionTarget"> | undefined, actorId?: string) {
+  return (actorId ? actorReplyResponseProfile(round, actorId)?.model : round?.responseProfile?.model) ?? round?.sessionTarget?.model;
 }
 
 /** The initiating prompt chooses the provider; actors only choose capability within it.
@@ -33,13 +57,43 @@ export const ACTOR_WORKFLOW_QUESTION: DecisionQuestion = {
   }
 };
 
+/** Separates judgment-free work from work needing reasoning; only the former keeps a lighter model at the actor's effort. */
+export const ACTOR_WORKLOAD_KIND_QUESTION: DecisionQuestion = {
+  id: "workload_kind", kind: "choice",
+  instructions: "Classify the reasoning demand of the entire assigned scope. Choose mechanical only when every step has an explicit target and method and needs no judgment, such as applying a stated configuration, mapping or fixed rule, renaming, moving or repeating identical edits, or running a known command. Investigation, debugging, design, ambiguity, interacting requirements, prompt work or verification needing judgment is reasoning. When uncertain, choose reasoning.",
+  options: {
+    mechanical: "Every step is explicit and judgment-free.",
+    reasoning: "Some part needs analysis, investigation or judgment."
+  }
+};
+
+export type ActorWorkloadKind = "mechanical" | "reasoning";
+export function actorWorkloadKind(result: DecisionResult | undefined, questionId = "workload_kind"): ActorWorkloadKind | undefined {
+  const answer = result?.ok ? result.answers[questionId] : undefined;
+  return answer?.kind === "choice" && (answer.choice === "mechanical" || answer.choice === "reasoning") ? answer.choice : undefined;
+}
+
+/** Lighter models compensate with effort, so models without a Sol/Astra work tier run at least at this effort unless the work is mechanical. */
+export const ACTOR_LIGHT_TIER_MIN_EFFORT = "high";
+const EFFORT_ORDER = ["minimal", "none", "low", "medium", "high", "xhigh", "max", "ultra"];
+
+/** A task's execution effort: an explicit user effort is final; Sol/Astra tiers and mechanical work keep the actor's effort;
+ * other lighter models are raised to ACTOR_LIGHT_TIER_MIN_EFFORT, never lowered. */
+export function actorTaskExecutionEffort(model: string, actorEffort: string, options: { requestedEffort?: string; workloadKind?: ActorWorkloadKind } = {}): string {
+  if (options.requestedEffort) return options.requestedEffort;
+  if (modelWorkTier(model) || options.workloadKind === "mechanical") return actorEffort;
+  return EFFORT_ORDER.indexOf(actorEffort) >= EFFORT_ORDER.indexOf(ACTOR_LIGHT_TIER_MIN_EFFORT) ? actorEffort
+    : normalizeModelEffort(model, ACTOR_LIGHT_TIER_MIN_EFFORT);
+}
+
 export function actorWorkflowAssessment(result: DecisionResult, questionId = "workflow"): ActorWorkItem["workflowAssessment"] {
   const answer = result.ok ? result.answers[questionId] : undefined;
   return answer?.kind === "choice" && ["small_direct", "substantial_managed", "substantial_direct"].includes(answer.choice)
     ? answer.choice as ActorWorkItem["workflowAssessment"] : undefined;
 }
 
-export function actorWorkflowExecutionGuidance(assessment: ActorWorkItem["workflowAssessment"]): string {
+export function actorWorkflowExecutionGuidance(assessment: ActorWorkItem["workflowAssessment"], deliberatelySkipped = false): string {
+  if (deliberatelySkipped) return "Workflow Decision was deliberately skipped because execution settings came directly from the claim or an explicit user request. Execute the authorized scope proportionately; no separate suitability explanation is required. Follow the current turn's mode and actor binding. This shortcut does not enable Managed mode or grant delegation permissions.";
   return [
     `Saved workflow assessment: ${assessment ?? "unavailable (legacy or incomplete Decision); assess the assigned workload before execution"}. This is a recommendation, not proof Managed mode is enabled.`,
     "This assessment does not enable Managed mode. Follow the execution turn's actual mode and actor binding; the system turns it on for Sol/Opus and Astra/Fable tier actor turns, and its current-turn Managed mode instruction is authoritative. Do not infer permission from this assessment or a prior turn.",
@@ -64,7 +118,7 @@ export const ACTOR_MODEL_TIER_GUIDANCE = [
   "Match the tier to what the assigned work itself requires. Mechanical work with an explicit target and method, such as applying a stated configuration, mapping or fixed rule, renaming, moving or repeating identical edits, suits the lightest sufficient tier even when it spans several actors, workspaces or records. Routine small development, lookups and ordinary debugging with a clear target suit Terra or Sonnet. Substantive implementation, investigation or root-cause analysis with several interacting requirements suits Sol or Opus. Astra is an exception tier for difficult architecture, security analysis, large reviews or plans, demanding correctness reasoning, or demonstrated failures at a lower tier.",
   "When complexity is genuinely uncertain, choose adequate headroom rather than the cheapest optimistic guess: take the next tier above the evident workload, not the strongest offered. The initiating prompt's model, the actor's role or domain (for example security), and instructions to preserve existing permissions, isolation or safeguards are not evidence that the work needs a stronger tier.",
   PROMPT_WORK_MODEL_FLOOR,
-  "Evaluate each model at its stated execution effort. Effort is configured on the actor, not selected with the model; do not assume it will be increased. Raising effort is not a substitute for sufficient model capability.",
+  "Evaluate each model at its stated execution effort. Lighter models run at raised effort unless the work is mechanical; Sol/Opus and Astra/Fable tiers run at the actor's configured effort. Do not assume any further increase. Raising effort is not a substitute for sufficient model capability.",
   "For delegated work, assess its actual scoped task together with its dependencies and integration obligations. Count the entire parent workload when the actor still owns coordination; do not assume uncreated workers will do it. A genuinely isolated small subtask may use a lightweight model.",
   "An explicit user model or tier requirement in the user's messages takes precedence over this tier guidance within the allowed options."
 ].join(" ");
@@ -87,7 +141,8 @@ export function actorModelOptions(models: string[], effort: string) {
     const id = normalizeModelId(model);
     const lightweight = [MODEL_CATALOG.luna.id, MODEL_CATALOG.mini.id, MODEL_CATALOG.claudeHaiku.id].some(value => value === id);
     const belowPromptFloor = lightweight || id === MODEL_CATALOG.claudeSonnet.id || id === MODEL_CATALOG.terra61.id;
-    return [model, `${model}, actual execution effort ${normalizeModelEffort(model, effort)}. ${lightweight
+    const configured = normalizeModelEffort(model, effort), raised = actorTaskExecutionEffort(model, effort);
+    return [model, `${model}, actual execution effort ${raised === configured ? configured : `${raised} (${configured} for mechanical work)`}. ${lightweight
       ? "Eligible only for small, clear, self-contained, low-risk tasks; exclude substantial or interacting multi-part work."
       : "Assess capability and headroom against the full assigned workload before considering cost."}${belowPromptFloor
       ? " Not eligible for any prompt work, however small." : ""}${id === MODEL_CATALOG.astra.id

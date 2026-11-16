@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import { extname, resolve, sep } from "node:path";
 
 const SAFE_INLINE_IMAGE_EXTENSIONS = new Set([
@@ -16,10 +17,26 @@ export function resolveWorkspaceFilePath(workspaceCwd: string, requestedPath: st
   const normalizedPath = process.platform === "win32" ? requestedPath.replace(/^\/([a-zA-Z]:[\\/])/, "$1") : requestedPath;
   const filePath = resolve(workspaceRoot, normalizedPath);
   const allowedRoots = [workspaceRoot, ...additionalRoots.map((root) => resolve(root))];
-  if (!allowedRoots.some((root) => filePath === root || filePath.startsWith(`${root}${sep}`))) {
+  if (isInsideAnyRoot(filePath, allowedRoots)) return filePath;
+  // Agents often cite aliases of an allowed root, such as macOS /tmp for the
+  // /private/tmp runner root. Accept them only when the existing file's
+  // canonical location is inside a canonical allowed root.
+  const canonicalFilePath = canonicalExistingPath(filePath);
+  if (!canonicalFilePath) return null;
+  const canonicalRoots = allowedRoots.map((root) => canonicalExistingPath(root) ?? root);
+  return isInsideAnyRoot(canonicalFilePath, canonicalRoots) ? canonicalFilePath : null;
+}
+
+function isInsideAnyRoot(filePath: string, roots: string[]) {
+  return roots.some((root) => filePath === root || filePath.startsWith(`${root}${sep}`));
+}
+
+function canonicalExistingPath(path: string) {
+  try {
+    return realpathSync(path);
+  } catch {
     return null;
   }
-  return filePath;
 }
 
 export function canInlineWorkspaceFile(filePath: string) {

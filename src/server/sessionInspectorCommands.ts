@@ -3,7 +3,7 @@ import { INTENT_APPROVAL_TOOL, intentRequest } from "../intentApproval";
 import { AUTO_MODEL_ORDER, isClaudeModel } from "../modelCatalog";
 import type { CollaborationView } from "../collaboration";
 import { WORKSPACE_MANAGER_TOOLS, WORKSPACE_MANAGER_ACTIONS } from "./workspaceManagerTools";
-import { DOMAIN_ACTOR_TOOLS } from "./domainActorTools";
+import { ACTOR_REGISTRY_TOOLS, DOMAIN_ACTOR_TOOLS } from "./domainActorTools";
 import { createTurnGrillHistoryReader } from "./turnGrillContext";
 import type {
   SessionInspectInput,
@@ -52,6 +52,8 @@ const managerSessionId = process.env.THREADEX_SESSION_ID?.trim() || null;
 const collaborationId = process.env.THREADEX_CONCURRENT_ID?.trim() || process.env.THREADEX_COLLABORATION_ID?.trim() || null;
 const workspaceManager = process.env.THREADEX_WORKSPACE_MANAGER === "1";
 const domainActor = process.env.THREADEX_DOMAIN_ACTOR === "1";
+/** An ordinary task turn without an actor binding: it may read the actor registry and create roots as its user asks. */
+const actorRegistry = !domainActor && process.env.THREADEX_ACTOR_REGISTRY === "1";
 const managerConcurrent = workspaceManager && process.env.THREADEX_MANAGER_CONCURRENT === "1";
 const managerThreadId = process.env.THREADEX_THREAD_ID?.trim() || null;
 const managerTurnId = process.env.THREADEX_TURN_ID?.trim() || null;
@@ -313,7 +315,7 @@ const tools: ToolSpec[] = [
   },
   {
     name: "wait_for_task_end",
-    description: "When another running task blocks your work (it holds a file, process, branch or result you need), do not give up or report it as blocked. Find it with search_sessions status=running or get_session, then call this with its session ID and a self-contained resume instruction. Your session is woken with that instruction when the blocker's turn completes, fails or is stopped. If the result is already_ended, continue now. Otherwise end your turn unless independent work remains. Waiting on a task that already waits for you is rejected as a deadlock.",
+    description: "When another running task blocks your work (it holds a file, process, branch or result you need), do not give up or report it as blocked. Find it with search_sessions status=running or get_session, then call this with its session ID and a self-contained resume instruction. Your session is woken with that instruction when the blocker's turn completes, fails or is stopped. If the result is already_ended, continue now. Otherwise end your turn unless independent work remains. Waiting on a task that already waits for you is rejected as a deadlock. This is for dependencies on other tasks; for your own Concurrent workers use concurrent_wait.",
     inputSchema: {
       type: "object",
       required: ["targetSessionId", "message"],
@@ -327,7 +329,7 @@ const tools: ToolSpec[] = [
   },
   {
     name: "monitor_process",
-    description: "Start a restartable process from a complete launch spec, temporarily observe one existing PID, or attach an existing PID with a complete launch spec for later restart. All monitors default to automatic cleanup after completion; set removeOnExit: false explicitly to retain one after exit. Labels are display text only and never discover a process. PID-only monitors store no executable/args, cannot restart, and disappear when that PID exits by default. A PID paired with exe plus complete args, dockerImage, or command keeps that launch spec: it can be restarted into a Threadex-owned, captured process. Threadex captures logs only for commands it launches; external attachments and supervisor-managed processes may have no readable output. Add metrics when output may be unavailable: each name-and-command probe reports its latest value in the monitor detail panel. Never launch a bare interpreter such as node, sh, bash, or python. Do not create duplicate built-in monitors. When list_processes marks a built-in read-only record restartable, restart_process_monitor delegates to its external supervisor.",
+    description: "Start a restartable process from a complete launch spec, temporarily observe one existing PID, or attach an existing PID with a complete launch spec for later restart. All monitors default to automatic cleanup: a finished monitor stays listed with its exit status and log for about 10 minutes, then is removed, and its process.exited event keeps the result. Keep that default for tests, builds, verification runs and other one-off jobs. Set removeOnExit: false only for a long-running service, such as a dev server, that the user should be able to restart after it stops. Before starting a service, check list_processes and use restart_process_monitor on its existing monitor instead of creating another; give every service its entryPoints. A newly started service replaces finished service monitors in the same workspace whose entryPoints use the same host and port. Each new monitor is checked for similar existing ones; when the call is rejected as similar, reuse the listed monitor, or, if another is truly needed, ask the user and retry with similarMonitorApproval. Labels are display text only and never discover a process. PID-only monitors store no executable/args, cannot restart, and disappear when that PID exits by default. A PID paired with exe plus complete args, dockerImage, or command keeps that launch spec: it can be restarted into a Threadex-owned, captured process. Threadex captures logs only for commands it launches; external attachments and supervisor-managed processes may have no readable output. Add metrics when output may be unavailable: each name-and-command probe reports its latest value in the monitor detail panel. Never launch a bare interpreter such as node, sh, bash, or python. Do not create duplicate built-in monitors. When list_processes marks a built-in read-only record restartable, restart_process_monitor delegates to its external supervisor.",
     inputSchema: {
       type: "object",
       required: ["label"],
@@ -370,7 +372,17 @@ const tools: ToolSpec[] = [
         cwd: { type: "string", description: "Optional path inside the active workspace." },
         wakePrompt: { type: "string", maxLength: 12000, description: "Optional follow-up prompt queued when the process exits, using the calling runner's approval policy." },
         timeoutSeconds: { type: "integer", minimum: 1, maximum: 604800, description: "Maximum monitor lifetime in seconds." },
-        removeOnExit: { type: "boolean", default: true, description: "Automatically remove the monitor after completion. Explicitly set false only for a persistent monitor that must remain available after exit." }
+        removeOnExit: { type: "boolean", default: true, description: "Remove the monitor shortly after completion. Set false only for a long-running service that must keep its Restart control after it stops; never for a one-off job." },
+        similarMonitorApproval: {
+          type: "object",
+          required: ["monitorIds", "userAnswer"],
+          description: "Only after a rejection listing similar monitors and the user's explicit approval to add another anyway. Never fill this without asking the user.",
+          properties: {
+            monitorIds: { type: "array", items: { type: "string" }, description: "Every similar monitor id from the rejection." },
+            userAnswer: { type: "string", minLength: 1, maxLength: 2000, description: "The user's exact reply approving the additional monitor." }
+          },
+          additionalProperties: false
+        }
       },
       additionalProperties: false
     }
@@ -758,8 +770,45 @@ const collaborationTools: ToolSpec[] = [{
       message: { type: "string", minLength: 1, maxLength: 100000 }, reason: { type: "string", minLength: 1, maxLength: 4000 }, wait: { type: "boolean" } } }
 }];
 
+// Main-only delegation: the caller's session becomes (or already is) Concurrent main and coordinates its workers.
+const concurrentMainTools: ToolSpec[] = [{
+  name: "concurrent_spawn", description: "Delegate a self-contained task to a new Concurrent worker of this session on any model, including the other provider (Claude or Codex). You stay main: the worker runs in parallel in the same project directory, appears in this session's Concurrent panel, and its result returns to you automatically. The worker sees this session only up to its latest completed turn, never the current turn, so put everything it needs in task. Give disjoint file ownership to parallel writers. Reuse requestId on retries. Use concurrent_wait to collect results; use wait_for_task_end only for unrelated tasks.",
+  inputSchema: { type: "object", required: ["requestId", "task"], additionalProperties: false,
+    properties: { requestId: { type: "string", minLength: 1, maxLength: 100 },
+      task: { type: "string", minLength: 1, maxLength: 100000, description: "Complete brief: objective, files the worker owns, constraints, and expected result." },
+      model: { type: "string", description: "Always set it by the work's strongest requirement (Codex | Claude): mechanical with explicit method → gpt-6-luna | claude-haiku-5-5; routine small development or debugging → gpt-6.1-terra | claude-sonnet-5-5; default implementation, UI, reviews, investigation → gpt-6.1-sol | claude-opus-5-5 or claude-fable-5-2; exception tier after an observed failure or unresolved architecture/security → gpt-6-astra | claude-fable-5-2. Never use superseded gpt-6-sol, gpt-5.5, gpt-5.4 or gpt-5.4-mini. Omitted means this session's model." },
+      modelReasoningEffort: { type: "string", enum: ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"], description: "low for mechanical work, medium for settled implementation, higher only for a concrete reasoning difficulty." } } }
+}, {
+  name: "concurrent_wait", description: "Block inside this turn until your Concurrent workers settle, then return their conclusions and change lists in this tool result. Results returned here are not delivered again as messages. mode=all (default) waits for every awaited worker; mode=any returns at the first new result. On timedOut, call again to keep waiting or continue other work; a result already being steered to you arrives as a message instead. Set the shell command timeout above timeoutSeconds.",
+  inputSchema: { type: "object", additionalProperties: false,
+    properties: { localIds: { type: "array", items: { type: "string" }, maxItems: 32, description: "Workers to await (c1, c2, …). Defaults to every worker that is not stopped." },
+      mode: { type: "string", enum: ["all", "any"] },
+      timeoutSeconds: { type: "integer", minimum: 1, maximum: 540, description: "Defaults to 90." } } }
+}, {
+  name: "concurrent_stop", description: "Stop one of your Concurrent workers: its running and queued turns are cancelled and its work is reported as not complete.",
+  inputSchema: { type: "object", required: ["localId"], additionalProperties: false, properties: { localId: { type: "string" } } }
+}];
+
+const groupChatPostTool: ToolSpec = {
+  name: "post_group_chat",
+  description: "Post a message to a workspace group chat when the user asks you to (for example \"send this to the group chat\"). Do not post on your own initiative. The group chat routes it like any user message there: its actors claim it and Decision picks the owner and starts the task, so you cannot name the owner and the work runs independently of this session. Defaults to this session's project group chat (the Unassigned chat when the session is in no single registered project); projectId selects another project of this workspace, null the Unassigned chat. The post is labelled with this session as an agent-written message, not the user's own words. Write a self-contained request. Unlike prompt_session/actor_prompt_session (a turn in one known session) and actor_steer (context for a running task, no new work), this creates new routed work. A task started from such a post cannot post again. Reuse requestId on retries.",
+  inputSchema: { type: "object", required: ["requestId", "message"], additionalProperties: false, properties: {
+    requestId: { type: "string", pattern: "^[\\w-]{1,100}$", description: "Stable ID for this post; reuse it when retrying an uncertain result." },
+    message: { type: "string", minLength: 1, maxLength: 20000 },
+    projectId: { type: ["string", "null"], description: "Group chat project ID; omit for this session's own project group chat, null for the Unassigned chat." }
+  } }
+};
+
+/** Task sessions (ordinary and actor) and the Side chat tab that may prompt its host can post to a group chat. */
+function groupChatPostExposed() {
+  if (!managerSessionId || workspaceManager || continuityOnly) return false;
+  if (todoAgentRole === "side_chat") return process.env.THREADEX_SIDE_CHAT_HOST_PROMPT === "1";
+  return todoAgentRole === "default" || todoAgentRole === "worker";
+}
+
 export function toolsForAgent() {
   const base = [...baseToolsForAgent()].filter(tool => tool.name !== INTENT_APPROVAL_TOOL.name || !isClaudeModel(managerModel));
+  if (groupChatPostExposed()) base.push(groupChatPostTool);
   if (domainActor) {
     // Actor task mutations use server-checked tree actions. Ordinary task creation,
     // arbitrary follow-ups and autonomous subscriptions bypass that binding.
@@ -770,8 +819,13 @@ export function toolsForAgent() {
     base.push(...WORKSPACE_MANAGER_TOOLS.filter(tool => todoAgentRole !== "planner" ||
       ["workspace_status", "workspace_search_tasks", "workspace_inspect_task"].includes(tool.name)));
   }
-  return collaborationId && !["side_chat", "turn_grill", "planner"].includes(todoAgentRole)
-    ? [...base, ...collaborationTools] : base;
+  const concurrentRole = !["side_chat", "turn_grill", "planner"].includes(todoAgentRole);
+  if (actorRegistry && concurrentRole && !workspaceManager) base.push(...ACTOR_REGISTRY_TOOLS);
+  // An ordinary task session can become Concurrent main mid-turn, before its runner carries a group ID.
+  // Manager sessions delegate through their own tools; the server rejects spawning from a worker.
+  const concurrentMain = concurrentRole && Boolean(managerSessionId) && !continuityOnly && !workspaceManager;
+  if (!concurrentRole || (!collaborationId && !concurrentMain)) return base;
+  return [...base, ...collaborationTools, ...(concurrentMain ? concurrentMainTools : [])];
 }
 
 function baseToolsForAgent() {
@@ -815,16 +869,30 @@ function isToolExposed(name: string) {
 
 export async function runCommand(name: string, args: Record<string, unknown>) {
   if (!name || !isToolExposed(name)) {
-    throw new Error(`Command is not available to this ${todoAgentRole} agent: ${name ?? "unknown"}`);
+    throw new Error(`Command is not available to this ${todoAgentRole} agent: ${name ?? "unknown"}${domainActor && name === "prompt_session"
+      ? ". Actor sessions use actor_prompt_session." : ""}`);
   }
-  if (domainActor && DOMAIN_ACTOR_TOOLS.some(tool => tool.name === name)) {
+  if (domainActor && DOMAIN_ACTOR_TOOLS.some(tool => tool.name === name) || actorRegistry && ACTOR_REGISTRY_TOOLS.some(tool => tool.name === name)) {
     if (!managerSessionId || !managerTurnId) throw new Error("An active actor task turn is required.");
     // Claude runners inject the calling agent's credential into the JSON argument; the model never writes it.
     const { _actorCredential: credential, _actorWorkItem: workItem, ...input } = args;
-    return postJson(`/api/domain-actors/sessions/${encodeURIComponent(managerSessionId)}/action`, {
+    const capability = typeof credential === "string" ? credential : process.env.THREADEX_ACTOR_CAPABILITY ?? "";
+    if (!capability) throw new Error("No actor credential was attached to this call. Run session-inspector as a standalone command: no pipes, redirects (including 2>&1), chaining or wrappers such as head or jq.");
+    const result = await postJson(`/api/domain-actors/sessions/${encodeURIComponent(managerSessionId)}/action`, {
       ...input, action: name, sourceTurnId: managerTurnId
-    }, { "x-threadex-actor-capability": typeof credential === "string" ? credential : process.env.THREADEX_ACTOR_CAPABILITY ?? "",
+    }, { "x-threadex-actor-capability": capability,
       ...(typeof workItem === "string" && workItem ? { "x-threadex-actor-work-item": workItem } : {}) });
+    if (name !== "actor_prompt_session") return result;
+    // The server resolved and checked the target; only now is the prompt sent.
+    const authorized = readObject(result);
+    return promptSession({ sessionId: readString(authorized?.sessionId) ?? undefined, workspaceId: readString(authorized?.workspaceId) ?? undefined, message: String(input.message),
+      model: readString(input.model) ?? undefined, modelReasoningEffort: readString(input.modelReasoningEffort) ?? undefined });
+  }
+  if (name === "post_group_chat") {
+    return postJson(`/api/sessions/${encodeURIComponent(managerSessionId!)}/group-chat-posts`, {
+      requestId: readRequiredString(args, "requestId"), message: readRequiredString(args, "message"),
+      ...(args.projectId !== undefined ? { projectId: args.projectId } : {}),
+      ...(managerTurnId ? { sourceTurnId: managerTurnId } : {}), sideChat: todoAgentRole === "side_chat" });
   }
   if (name === "record_subagent_prompt") {
     if (!managerSessionId || !managerTurnId) throw new Error("A Threadex runner turn is required.");
@@ -843,8 +911,38 @@ export async function runCommand(name: string, args: Record<string, unknown>) {
     }
   }
 
+  if (name === "concurrent_spawn" || name === "concurrent_wait" || name === "concurrent_stop") {
+    if (!managerSessionId || !managerTurnId) throw new Error("A Threadex runner turn is required.");
+    const path = `/api/concurrent/sessions/${encodeURIComponent(managerSessionId)}`;
+    if (name === "concurrent_spawn") {
+      const member = await postJson(`${path}/fork`, { requestId: readRequiredString(args, "requestId"), task: readRequiredString(args, "task"),
+        ...(readString(args.model) ? { model: readString(args.model) } : {}),
+        ...(readString(args.modelReasoningEffort) ? { modelReasoningEffort: readString(args.modelReasoningEffort) } : {}),
+        ...(managerApprovalPolicy ? { approvalPolicy: managerApprovalPolicy } : {}), origin: "agent", spawnTurnId: managerTurnId }) as Record<string, unknown>;
+      return { localId: member.localId, sessionId: member.sessionId, model: member.model, effort: member.effort,
+        sourceTurnId: member.sourceTurnId, note: "Running in parallel. Its result returns to you; collect it with concurrent_wait." };
+    }
+    if (name === "concurrent_stop") return postJson(`${path}/control`, { localId: readRequiredString(args, "localId"), stopped: true });
+    const mode = args.mode === "any" ? "any" : "all";
+    const deadline = Date.now() + readBoundedInteger(args.timeoutSeconds, 90, 1, 540) * 1000;
+    const results: unknown[] = [], notices: unknown[] = [];
+    try {
+      while (true) {
+        const step = await postJson(`${path}/wait`, { turnId: managerTurnId, ...(args.localIds !== undefined ? { localIds: args.localIds } : {}) }) as
+          { members: Array<{ settled: boolean }>; results: unknown[]; notices: unknown[] };
+        results.push(...step.results); notices.push(...step.notices);
+        const settled = step.members.every(member => member.settled);
+        const done = settled || (mode === "any" && results.length + notices.length > 0);
+        if (done || Date.now() >= deadline) return { done, timedOut: !done, members: step.members, results, notices };
+        await new Promise(resolve => setTimeout(resolve, 1500));
+      }
+    } finally {
+      await postJson(`${path}/endWait`, { turnId: managerTurnId }).catch(() => undefined);
+    }
+  }
+
   if (name === "concurrent_status" || name === "concurrent_send") {
-    if (!managerSessionId || !collaborationId) throw new Error("No active Concurrent group.");
+    if (!managerSessionId) throw new Error("No active Concurrent group.");
     const path = `/api/concurrent/sessions/${encodeURIComponent(managerSessionId)}`;
     if (name === "concurrent_send") return (await postJson(`${path}/send`, { ...args, turnId: managerTurnId }));
     const { group } = await getJson(path) as { group: CollaborationView | null };
@@ -1387,6 +1485,7 @@ async function monitorProcess(input: Record<string, unknown>) {
     ...(input.wakePrompt !== undefined && managerApprovalPolicy ? { approvalPolicy: managerApprovalPolicy } : {}),
     ...(input.timeoutSeconds !== undefined ? { timeoutSeconds: input.timeoutSeconds } : {}),
     ...(input.removeOnExit !== undefined ? { removeOnExit: input.removeOnExit } : {}),
+    ...(input.similarMonitorApproval !== undefined ? { similarMonitorApproval: input.similarMonitorApproval } : {}),
     ...(managerSessionId ? { sessionId: managerSessionId } : {}),
     ...(managerThreadId ? { threadId: managerThreadId } : {})
   });
@@ -1556,7 +1655,8 @@ async function postChatStream(payload: unknown) {
     throw new Error(`HTTP ${response.status}: ${await response.text()}`);
   }
 
-  const events = parseSseEvents(await response.text());
+  const events = await readChatStreamUntilTurnStarts(response);
+  const turnStarted = events.some(isChatTurnStartedEvent);
   const sessionEvents = events.filter((event) => event.type === "session");
   const lastSession = readObject(sessionEvents.at(-1)?.data);
   const result = readObject(events.find((event) => event.type === "result")?.data);
@@ -1567,6 +1667,10 @@ async function postChatStream(payload: unknown) {
   return {
     ok: !error,
     mode: pending ? "pending" : "runner",
+    ...(turnStarted && !result && !pending && !error ? {
+      status: "running",
+      message: "The prompt started a turn in the target session; it runs independently. Do not wait for it: report its sessionId/turnId and check later with get_session."
+    } : {}),
     sessionId: readString(lastSession?.sessionId) ?? readString(result?.sessionId) ?? readString(pending?.sessionId),
     threadId: readString(lastSession?.threadId) ?? readString(result?.threadId) ?? readString(pending?.threadId),
     turnId: readString(lastSession?.turnId) ?? readString(result?.turnId) ?? readString(pending?.turnId),
@@ -1577,6 +1681,39 @@ async function postChatStream(payload: unknown) {
     done: done ?? null,
     eventCount: events.length
   };
+}
+
+// /api/chat emits this session message when the prompt is queued; pending/done follow immediately.
+const CHAT_QUEUED_SESSION_MESSAGE = "Queued behind the active turn";
+
+/** The server emits a session event with turnId only after the runner is attached, so the turn survives this client disconnecting. */
+function isChatTurnStartedEvent(event: { type: string; data: unknown }) {
+  const data = readObject(event.data);
+  return event.type === "session" && Boolean(readString(data?.turnId)) && readString(data?.message) !== CHAT_QUEUED_SESSION_MESSAGE;
+}
+
+/** Reads /api/chat only until the turn has started, queued or failed; the caller never waits for the turn to finish. */
+async function readChatStreamUntilTurnStarts(response: globalThis.Response) {
+  const settledEventTypes = new Set(["pending", "error", "result", "done"]);
+  if (!response.body) return parseSseEvents(await response.text());
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const events: Array<{ type: string; data: unknown }> = [];
+  let buffered = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      buffered += decoder.decode(value, { stream: !done });
+      const boundary = done ? buffered.length : Math.max(buffered.lastIndexOf("\n\n"), buffered.lastIndexOf("\r\n\r\n"));
+      if (boundary >= 0) {
+        events.push(...parseSseEvents(buffered.slice(0, boundary)));
+        buffered = buffered.slice(boundary);
+      }
+      if (done || events.some(event => settledEventTypes.has(event.type) || isChatTurnStartedEvent(event))) return events;
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
 }
 
 function parseSseEvents(text: string) {
