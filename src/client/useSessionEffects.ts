@@ -355,6 +355,10 @@ useEffect(() => {
                 }
                 else if (resetRequired) {
                     await loadWorkspaceSnapshot({ preserveSelectedSession: true });
+                    // The skipped events may have changed the open transcript,
+                    // which the preserved workspace reload does not re-read.
+                    if (!cancelled && sessionIdRef.current)
+                        await refreshSelectedSessionSnapshot(sessionIdRef.current);
                 }
             }
             catch (error) {

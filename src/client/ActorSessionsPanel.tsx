@@ -29,6 +29,9 @@ function truncate(value: string) {
 }
 
 function sessionTitle(entry: ActorOwnedSession, task: WorkspaceManagerTask | undefined, session: SessionRecord | undefined, room: ActorRoom) {
+  // A sub-agent shares its host's session, so the session's own title names the host, not this task.
+  if (entry.subagent) return entry.workItem.title?.trim() || truncate(entry.workItem.delegatedTask ?? "")
+    || truncate(room.rounds.find(round => round.id === entry.workItem.roundId)?.userPrompt ?? "") || "Untitled sub-agent task";
   return task?.title?.trim() || session?.title?.trim() || entry.workItem.delegatedTask?.trim()
     || truncate(room.rounds.find(round => round.id === entry.workItem.roundId)?.userPrompt ?? "") || "Untitled task";
 }
@@ -96,9 +99,13 @@ export function ActorSessionsPanel({ actor, room, snapshot, sessions, hidden, on
       {room && !entries.length && <p role="status">{actor.name} has no sessions yet.</p>}
       {room && entries.length > 0 && !visible.length && <p role="status">No sessions match this filter.</p>}
       {room && visible.map(entry => {
-        const running = runningTasks.get(entry.sessionId);
-        const task = running ?? completedTasks.get(entry.sessionId);
-        const title = sessionTitle(entry, task, sessions.find(session => session.id === entry.sessionId), room);
+        // Session metrics and activity belong to the host session, not to a sub-agent running inside it.
+        const hostTask = runningTasks.get(entry.sessionId) ?? completedTasks.get(entry.sessionId);
+        const running = entry.subagent ? undefined : runningTasks.get(entry.sessionId);
+        const task = entry.subagent ? undefined : hostTask;
+        const session = sessions.find(candidate => candidate.id === entry.sessionId);
+        const title = sessionTitle(entry, task, session, room);
+        const hostTitle = hostTask?.title?.trim() || session?.title?.trim() || "its host session";
         const label = entry.current ? actorTaskPresentation(entry.workItem, room.events).label : earlierLabels[entry.status];
         const metrics = task ? [
           ...(running ? [{ label: "Running", value: workspaceTaskElapsed(running.runningSince, now), icon: Clock3 }] : []),
@@ -106,16 +113,19 @@ export function ActorSessionsPanel({ actor, room, snapshot, sessions, hidden, on
           { label: "Context", value: task.contextPercent == null ? "Unavailable" : `${task.contextPercent}%`, icon: Gauge },
           { label: "Files updated", value: task.updatedFiles == null ? "Unavailable" : String(task.updatedFiles), icon: Files }
         ] : [];
-        return <article key={entry.sessionId} className="actor-session-card workspace-task-card" data-session-id={entry.sessionId}
+        return <article key={entry.id} className="actor-session-card workspace-task-card" data-session-id={entry.sessionId}
+          data-work-item-id={entry.subagent ? entry.workItem.id : undefined} data-subagent={entry.subagent || undefined} data-nested={entry.nestedUnderHost || undefined}
           data-status={entry.status} data-current={entry.current} onClick={() => onOpenSession(entry.sessionId)}>
           <div className="workspace-task-heading">
-            <button type="button" className="workspace-task-title" title={title}>
+            <button type="button" className="workspace-task-title" title={entry.subagent ? `${title} · Opens ${hostTitle}` : title}>
               <span>{title}</span><ArrowUpRight className="workspace-task-open" aria-hidden="true" />
             </button>
             {running && <TaskActivity task={running} now={now} />}
           </div>
           <div className="actor-session-meta">
             <span className="actor-session-status" data-status={entry.status}>{label}</span>
+            {entry.subagent && <span className="actor-session-subagent">Sub-agent</span>}
+            {entry.subagent && !entry.nestedUnderHost && <span>In {hostTitle}</span>}
             {entry.executorActorId !== entry.workItem.ownerActorId && <span>Executed by {actorName(entry.executorActorId)}</span>}
             {entry.executorActorId === entry.workItem.ownerActorId && entry.workItem.ownerActorId !== actor.id && <span>Owned by {actorName(entry.workItem.ownerActorId)}</span>}
             {!entry.current && <span className="actor-session-earlier">Earlier session</span>}

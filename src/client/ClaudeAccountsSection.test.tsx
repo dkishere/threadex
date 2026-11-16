@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { ClaudeAccountRows, ClaudeAccountsSection, claudeQuotaWindow, formatClaudeRemaining,formatClaudeStatus, type ClaudeAccount, type ClaudeAccounts } from "./ClaudeAccountsSection";
+import { ClaudeAccountRows, ClaudeAccountsSection, claudeQuotaWindow, claudeUsageNeedsRefresh, formatClaudeRemaining,formatClaudeStatus, type ClaudeAccount, type ClaudeAccounts } from "./ClaudeAccountsSection";
 
 const now = Date.UTC(2026, 9, 13, 12);
 
@@ -29,12 +29,26 @@ test("Claude rows in the workspace account table cannot join load balancing", ()
 });
 
 test("Claude popover shows remaining usage per window like Codex accounts", () => {
-  const listing = { accounts: [account()], workspaceId: "w", workspaceAccountId: "claude-max", sessionAccountId: null, effectiveAccountId: "claude-max" };
+  const live = Date.now();
+  const current = account({ quotaSnapshot: { fiveHour: { usedPercent: 30, resetsAt: live + 3_600_000 }, weekly: { usedPercent: 55, resetsAt: live + 86_400_000 } } });
+  const listing = { accounts: [current], workspaceId: "w", workspaceAccountId: "claude-max", sessionAccountId: null, effectiveAccountId: "claude-max" };
   const claude = { listing, accounts: listing.accounts, busyId: null, error: "", sessionId: null } as unknown as ClaudeAccounts;
   const html = renderToStaticMarkup(<ClaudeAccountsSection claude={claude} onLogin={() => undefined} />);
   assert.match(html, /5hr <strong>70%<\/strong><small>Auto reset: /);
   assert.match(html, /Weekly <strong>45%<\/strong><small>Reset: /);
   assert.equal(claudeQuotaWindow({ usedPercent: null, resetsAt: now }), null);
+});
+
+test("Claude windows past their reset show no stale percentage and ask for a refresh", () => {
+  const expired = account({ quotaSnapshot: { fiveHour: { usedPercent: 30, resetsAt: now - 1 }, weekly: { usedPercent: 80, resetsAt: now + 86_400_000 } } });
+  assert.equal(claudeQuotaWindow({ usedPercent: 30, resetsAt: now - 1 }, now), null);
+  assert.deepEqual(claudeQuotaWindow({ usedPercent: 30, resetsAt: now + 1 }, now), { remaining: 70, resetAt: now + 1 });
+  assert.equal(formatClaudeRemaining(expired, now), "20%");
+  assert.equal(claudeUsageNeedsRefresh(expired, now), true);
+  assert.equal(claudeUsageNeedsRefresh(account(), now), false);
+  assert.equal(claudeUsageNeedsRefresh(account({ quotaSnapshot: { fiveHour: { usedPercent: null, resetsAt: now + 1 } } }), now), true);
+  assert.equal(claudeUsageNeedsRefresh(account({ quotaSnapshot: null }), now), true);
+  assert.equal(claudeUsageNeedsRefresh(account({ quotaSnapshot: null, loggedIn: false }), now), false);
 });
 
 test("Claude remaining and status follow the tightest window and login state", () => {

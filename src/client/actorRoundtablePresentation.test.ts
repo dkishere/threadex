@@ -41,6 +41,18 @@ test("saved receipts are validated and the request body drops client bookkeeping
   const receipts = parseActorRoundtableReceipts(saved);
   assert.deepEqual(receipts.map(item => item.requestId), ["r1"]);
   assert.deepEqual(actorRoundtableRequest(receipts[0]), { requestId: "r1", message: "Topic", actors: [actor, actor], sourceRoundId: "round-1" });
+  // The group chat's project travels with a retry, including the Unassigned chat (null).
+  const chats = parseActorRoundtableReceipts(JSON.stringify([
+    { requestId: "dev", message: "Topic", actors: [actor, actor], created: "now", chatProjectId: "project-dev" },
+    { requestId: "none", message: "Topic", actors: [actor, actor], created: "now", chatProjectId: null },
+    { requestId: "bad-chat", message: "Topic", actors: [actor, actor], created: "now", chatProjectId: 7 }
+  ]));
+  assert.deepEqual(chats.map(item => actorRoundtableRequest(item).chatProjectId), ["project-dev", null]);
+  // The gear box choice travels with a retry, so the host model stays the user's.
+  const [geared] = parseActorRoundtableReceipts(JSON.stringify([
+    { requestId: "gear", message: "Topic", actors: [actor, actor], created: "now", hostProfile: { model: "claude-opus-5-5", effort: "xhigh" } }
+  ]));
+  assert.deepEqual(actorRoundtableRequest(geared).hostProfile, { model: "claude-opus-5-5", effort: "xhigh" });
   assert.deepEqual(parseActorRoundtableReceipts("not json"), []);
   assert.deepEqual(parseActorRoundtableReceipts(null), []);
 });

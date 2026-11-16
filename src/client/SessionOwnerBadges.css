@@ -1,0 +1,16 @@
+.session-owner-badges { position: relative; display: inline-flex; flex: 0 1 auto; align-items: center; min-width: 0; max-width: 100%; }
+.session-owner-badge { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; padding: 2px 8px 2px 3px; border: 1px solid #ddd6fe; border-radius: 999px; background: #f5f3ff; color: #4c1d95; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; }
+.session-owner-badge:hover { background: #ede9fe; }
+.session-owner-badge:focus-visible, .session-owner-menu-item:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
+.session-owner-badge .actor-avatar, .session-owner-menu-item .actor-avatar { box-sizing: border-box; display: inline-flex; flex: 0 0 20px; align-items: center; justify-content: center; width: 20px; height: 20px; overflow: hidden; border-radius: 50%; background: #ede9fe; }
+.session-owner-badge .actor-avatar img, .session-owner-menu-item .actor-avatar img { width: 100%; height: 100%; object-fit: cover; }
+.session-owner-name { min-width: 0; max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-owner-more { flex: 0 0 auto; padding: 0 5px; border-radius: 999px; background: #7c3aed; color: #fff; font-size: 11px; }
+.session-owner-menu { position: absolute; top: 100%; left: 0; z-index: 60; display: grid; width: min(280px, calc(100vw - 120px)); min-width: 0; padding: 4px; border: 1px solid #ddd6fe; border-radius: 10px; background: #fff; box-shadow: 0 8px 24px rgba(15, 23, 42, .18); }
+/* Invisible bridge so the pointer can cross the gap without closing the menu. */
+.session-owner-menu::before { content: ""; position: absolute; top: -6px; left: 0; right: 0; height: 6px; }
+.session-owner-menu-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: 0; border-radius: 8px; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.session-owner-menu-item:hover { background: rgba(124, 58, 237, .08); }
+.session-owner-menu-copy { display: grid; min-width: 0; overflow-wrap: anywhere; }
+.session-owner-menu-copy > strong { font-size: 13px; }
+.session-owner-menu-copy > small { color: #64748b; font-size: 11px; }

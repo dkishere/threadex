@@ -24,7 +24,8 @@ export function steerSegmentFromMessage(ctx, message) {
         text: message.content,
         createdAt: message.createdAt,
         attachments: message.attachments,
-        forcePlan: message.forcePlan
+        forcePlan: message.forcePlan,
+        ...(message.pending ? { pending: true } : {})
     };
 
 }
@@ -458,7 +459,7 @@ export function TimelineEntries(ctx, { entries, anchorPrefix, groupPlanSteps = t
                 return (_jsx(MarkdownContent, { className: "message-text", id: anchorId, children: entry.text }, entry.id));
             }
             if (entry.kind === "steer") {
-                return _jsx(SteerEvent, { attachments: entry.attachments, forcePlan: entry.forcePlan, id: anchorId, text: entry.text }, entry.id);
+                return _jsx(SteerEvent, { attachments: entry.attachments, forcePlan: entry.forcePlan, id: anchorId, pending: entry.pending, text: entry.text }, entry.id);
             }
             if (entry.kind === "action_group") {
                 return _jsx(ActionGroup, { groupType: entry.groupType, id: anchorId, items: entry.items, sessionId: sessionId }, entry.id);
@@ -685,7 +686,7 @@ export function compactTimelineEntries(ctx, segments) {
             continue;
         }
         if (segment.type === "steer") {
-            entries.push({ kind: "steer", id: segment.id, text: segment.text, attachments: segment.attachments, forcePlan: segment.forcePlan });
+            entries.push({ kind: "steer", id: segment.id, text: segment.text, attachments: segment.attachments, forcePlan: segment.forcePlan, pending: segment.pending === true });
             index += 1;
             continue;
         }
@@ -871,9 +872,9 @@ export function ActionGroup(ctx, { id, groupType, items, sessionId }) {
 
 }
 
-export function SteerEvent(ctx, { id, text, attachments, forcePlan }) {
+export function SteerEvent(ctx, { id, text, attachments, forcePlan, pending = false }) {
     const { AttachmentList, MarkdownContent, _jsx, _jsxs } = ctx;
-    return (_jsxs("section", { className: "steer-event", id: id, children: [text && _jsx(MarkdownContent, { children: text }), attachments && attachments.length > 0 && _jsx(AttachmentList, { attachments: attachments })] }));
+    return (_jsxs("section", { className: pending ? "steer-event pending" : "steer-event", id: id, "aria-busy": pending || undefined, children: [text && _jsx(MarkdownContent, { children: text }), attachments && attachments.length > 0 && _jsx(AttachmentList, { attachments: attachments }), pending && _jsx("small", { className: "steer-event-status", role: "status", children: "Sending steer…" })] }));
 
 }
 

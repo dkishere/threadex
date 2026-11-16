@@ -279,6 +279,17 @@ export function sessionTurnsToMessages(ctx, turns, title, existingMessages = [],
 
 }
 
+// Steers Threadex injects for the agent (authorization decisions, automation) are not user
+// messages, so the timeline hides them; the agent still receives them and the events stay stored.
+const AGENT_ONLY_STEER_SOURCES = new Set(["intent-approval", "automation"]);
+// Older `steer.accepted` traces carry no source, so fall back to the fixed decision preamble.
+const INTENT_DECISION_STEER_PREFIX = "Threadex user intent decision ";
+
+export function isAgentOnlySteerMessage(steer) {
+    return AGENT_ONLY_STEER_SOURCES.has(steer.source)
+        || (typeof steer.content === "string" && steer.content.startsWith(INTENT_DECISION_STEER_PREFIX));
+}
+
 export function snapshotSteerMessages(value, turnId) {
     if (!Array.isArray(value)) {
         return [];
@@ -290,6 +301,9 @@ export function snapshotSteerMessages(value, turnId) {
         const steer = candidate;
         // Async QA answers are already shown in their question cards.
         if (typeof steer.id !== "string" || !steer.id || steer.id.startsWith("async:") || typeof steer.content !== "string" || !steer.content) {
+            return [];
+        }
+        if (isAgentOnlySteerMessage(steer)) {
             return [];
         }
         return [{

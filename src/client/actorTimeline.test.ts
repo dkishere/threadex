@@ -11,28 +11,28 @@ const round = (id: string, minute: number, names: string[]): ActorRound => ({ id
   workItemId: null, status: "no_claims", error: null, lease: null });
 const event = (id: string, minute: number, type: ActorRoomEvent["type"], workItemId: string) => ({ id, created: at(minute), type, workItemId, taskSessionId: workItemId, taskTurnId: "turn", actorIds: ["a"] }) as ActorRoomEvent;
 
-test("interleaves exchanges, concurrent task events and published conclusions; deduplicates replay", () => {
+test("orders exchanges and published conclusions by time and leaves task events to the Sessions list", () => {
   const room = emptyActorRoom("w"); room.actors = [actor];
   room.rounds = [round("direct", 3, ["a"]), round("group", 0, ["a", "b"]), round("unrelated", 1, ["b"])];
   room.events = [event("end-b", 5, "task.turn_completed", "b"), event("start-a", 1, "task.started", "a"),
-    event("end-a", 4, "task.turn_completed", "a"), event("start-b", 2, "task.started", "b"), event("replay", 2, "task.started", "b")];
+    event("end-a", 4, "task.turn_completed", "a"), event("failed", 2, "task.failed", "b"), event("needs", 2, "task.needs_user", "b")];
   const conclusion = { id: "c", actorId: "a", created: at(6), workItemId: "a", taskSessionId: "a", taskTurnId: "turn", reviewId: "review", text: "Reviewed" };
   room.conclusions = [conclusion, conclusion, { ...conclusion, id: "other", actorId: "b" }];
   const entries = actorTimeline(room, actor);
-  assert.deepEqual(entries.map(entry => entry.kind), ["conversation", "task", "task", "conversation", "task", "task", "conclusion"]);
+  assert.deepEqual(entries.map(entry => entry.kind), ["conversation", "conversation", "conclusion"]);
   assert.deepEqual(entries.flatMap(entry => entry.kind === "conversation" ? [entry.source] : []), ["group", "direct"]);
-  assert.deepEqual(entries, actorTimeline({ ...room, rounds: [...room.rounds].reverse(), events: [...room.events].reverse().filter(e => e.id !== "replay") }, actor));
+  assert.deepEqual(entries, actorTimeline({ ...room, rounds: [...room.rounds].reverse(), events: [] }, actor));
   room.conclusions = [];
   assert.equal(actorTimeline(room, actor).some(entry => entry.kind === "conclusion"), false, "task completion never creates a review verdict");
 });
 
-test("retains historical events and identifies a child's direct chat accurately", () => {
+test("identifies a child's direct chat accurately", () => {
   const room = emptyActorRoom("w"); room.actors = [actor, { id: "child", parentActorId: "a" } as DomainActor];
   room.rounds = [round("child-direct", 1, ["child"])];
   room.events = [event("old", 0, "task.failed", "old")];
   const entries = actorTimeline(room, actor);
-  assert.equal(entries.length, 2);
-  assert.equal(entries[1].kind === "conversation" && entries[1].source, "direct");
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].kind === "conversation" && entries[0].source, "direct");
   assert.equal(actorTimeline(room, { id: "outsider", parentActorId: null } as DomainActor).length, 0);
 });
 

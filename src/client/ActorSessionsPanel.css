@@ -21,5 +21,7 @@
 .actor-session-status { font-weight: 650; color: #2d415d; }
 .actor-session-status[data-status="needs_user"], .actor-session-status[data-status="failed"] { color: #b91c1c; }
 .actor-session-status[data-status="completed"] { color: #299260; }
+.actor-session-card[data-nested] { margin-left: 16px; }
+.actor-session-subagent { padding: 0 6px; border-radius: 999px; background: #eef2ff; color: #4338ca; font-size: 11px; font-weight: 600; }
 .actor-session-earlier { padding: 0 6px; border-radius: 999px; background: #f1f5f9; color: #52637a; font-size: 11px; font-weight: 600; }
 .actor-session-card .workspace-task-metrics { margin-top: 8px; }

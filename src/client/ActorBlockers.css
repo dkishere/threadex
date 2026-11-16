@@ -31,6 +31,15 @@
 .actor-blocker-reason { display: grid; gap: 4px; color: #475569; font-size: 12px; font-weight: 600; }
 .actor-blocker-reason textarea { box-sizing: border-box; width: 100%; max-width: 100%; resize: vertical; font: inherit; font-weight: 400; }
 .actor-blocker-reject { color: #b91c1c; }
+/* Dismiss: final close (kept in history), confirmed inline; wraps under the other actions in narrow columns. */
+.actor-blocker-dismiss { display: grid; gap: 4px; min-width: 0; }
+.actor-blocker-dismiss-confirm { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.actor-blocker-dismiss-prompt { color: #475569; font-size: 12px; font-weight: 600; }
+.actor-blocker-dismiss button { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.actor-blocker-dismiss button > svg { width: 14px; height: 14px; flex: 0 0 auto; }
+.actor-blocker-dismiss-button { color: #475569; }
+.actor-blocker-dismiss-confirm-button { color: #b91c1c; }
+.actor-blocker-dismiss button:focus-visible, .actor-blocker-list:focus-visible, .actor-blockers-panel:focus-visible { outline: 2px solid #2563eb; outline-offset: 1px; }
 .actor-blocker-error { margin: 0; color: #b91c1c; font-size: 12px; overflow-wrap: anywhere; }
 .actor-blocker-card button:focus-visible, .task-blockers-trigger:focus-visible, .actor-list-badge[data-kind="blocker"]:focus-visible { outline: 2px solid #2563eb; outline-offset: 1px; }
 
@@ -99,10 +108,6 @@
   .project-blockers-detail > td { padding: 8px; }
 }
 .task-blockers-trigger[data-compact] { gap: 3px; padding: 3px 6px; }
-.workspace-action-item[data-kind="blocker"]:hover { border-color: #fecaca; background: #fffdfd; }
-.workspace-action-item[data-kind="blocker"] > .workspace-action-icon, .workspace-action-icon[data-kind="blocker"] { background: #fef2f2; color: #b91c1c; }
-.workspace-action-item[data-kind="blocker"] .workspace-action-dot { background: #dc2626; }
-.workspace-action-modal .actor-blocker-card { margin: 0; }
 
 @media (max-width: 520px) {
   .task-blockers-panel { position: fixed; top: 56px; right: 8px; left: 8px; width: auto; }

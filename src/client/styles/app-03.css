@@ -754,6 +754,78 @@
   color: #b91c1c;
 }
 
+.global-agent-tools-heading {
+  margin: 8px 0 0;
+  font-size: 14px;
+}
+
+.global-agent-tools-item {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid #dbe1e8;
+  border-radius: 8px;
+}
+
+.global-agent-tools-row,
+.global-agent-tools-entry,
+.global-agent-tools-providers {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.global-agent-tools-row input[type="text"] {
+  flex: 1 1 220px;
+}
+
+.global-agent-tools-field {
+  display: grid;
+  gap: 6px;
+}
+
+.global-agent-tools-field > span {
+  color: #475569;
+  font-size: 12px;
+}
+
+.global-agent-tools-item input[type="text"],
+.global-agent-tools-item input[type="password"],
+.global-agent-tools-item select,
+.global-agent-tools-item textarea {
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.global-agent-tools-item textarea {
+  min-height: 0;
+  resize: vertical;
+}
+
+.global-agent-tools-entry input {
+  flex: 1 1 160px;
+}
+
+.global-agent-tools-card label,
+.global-agent-tools-settings .global-agent-tools-item label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-weight: 400;
+  font-size: 13px;
+}
+
+.global-agent-tools-add {
+  width: auto;
+  justify-self: start;
+}
+
 .auto-model-settings {
   width: 100%;
   max-width: 920px;

@@ -1,8 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { actorBlockerPendingDecision } from "../actorBlockers";
 import type { LiveItem } from "./appTypes";
-import type { ActorBlockerView } from "./actorBlockerPresentation";
-import { ACTOR_ROOM_CHANGED } from "./actorRoomState";
 
 export type ActionNotification = Extract<LiveItem, { itemType: "approval" }> & {
   workspaceId: string | null;
@@ -88,59 +85,4 @@ export function useActionNotifications(revision: unknown, enabled: boolean) {
     refreshRef.current();
   }, []);
   return { items, error, loaded, remove, refresh: () => refreshRef.current() };
-}
-
-/** Blocker proposals awaiting the user's approval, across every workspace. Blocker decisions do not advance the
- * central event cursor, so this polls and also refreshes on local room changes (e.g. after a decision). */
-export function useBlockerNotifications(revision: unknown, enabled: boolean) {
-  const [items, setItems] = useState<ActorBlockerView[]>([]);
-  const refreshRef = useRef<() => void>(() => {});
-  useEffect(() => {
-    if (!enabled) return;
-    let disposed = false;
-    let busy = false;
-    let again = false;
-    const controller = new AbortController();
-    async function refresh() {
-      if (disposed) return;
-      if (busy) { again = true; return; }
-      busy = true;
-      try {
-        const response = await fetch("/api/domain-actors/blockers/pending", { cache: "no-store", signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]) });
-        // Signed out or an older server without the endpoint: there is nothing to show.
-        if (response.status === 401 || response.status === 404) { if (!disposed) setItems(current => current.length ? [] : current); return; }
-        if (!response.ok) return;
-        const payload = await response.json();
-        if (!Array.isArray(payload.blockers) || disposed) return;
-        const next = (payload.blockers as ActorBlockerView[]).filter(blocker => blocker && typeof blocker.id === "string" && actorBlockerPendingDecision(blocker));
-        setItems(current => JSON.stringify(current) === JSON.stringify(next) ? current : next);
-      } catch {
-        // Keep the last list; the next poll retries.
-      } finally {
-        busy = false;
-        if (again && !disposed) { again = false; void refresh(); }
-      }
-    }
-    refreshRef.current = () => { void refresh(); };
-    const onVisible = () => { if (document.visibilityState === "visible") void refresh(); };
-    const timer = window.setInterval(() => void refresh(), 5000);
-    window.addEventListener("focus", onVisible);
-    window.addEventListener(ACTOR_ROOM_CHANGED, onVisible);
-    document.addEventListener("visibilitychange", onVisible);
-    void refresh();
-    return () => {
-      disposed = true; controller.abort(); window.clearInterval(timer);
-      window.removeEventListener("focus", onVisible); window.removeEventListener(ACTOR_ROOM_CHANGED, onVisible);
-      document.removeEventListener("visibilitychange", onVisible);
-    };
-  }, [enabled]);
-  useEffect(() => {
-    const timer = window.setTimeout(() => refreshRef.current(), 100);
-    return () => window.clearTimeout(timer);
-  }, [revision]);
-  const remove = useCallback((id: string) => {
-    setItems(current => current.filter(item => item.id !== id));
-    refreshRef.current();
-  }, []);
-  return { items, remove, refresh: () => refreshRef.current() };
 }

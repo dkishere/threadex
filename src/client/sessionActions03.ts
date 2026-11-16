@@ -462,6 +462,19 @@ export function scrollToMessage(ctx, messageId, anchorId) {
     
 }
 
+// The featured turn is drawn with less left padding, so featuring a turn reflows
+// it and its neighbour. Keep the current turn until another is clearly larger,
+// or that reflow can flip the choice back every frame (a visible jitter loop).
+export function chooseFeaturedPromptTurnId(visibleTurns, currentFeaturedTurnId, viewportHeight) {
+    const largestTurn = visibleTurns.reduce((featured, candidate) => candidate.visibleHeight > featured.visibleHeight ? candidate : featured, { turnId: undefined, visibleHeight: 0 });
+    const currentTurn = visibleTurns.find((turn) => turn.turnId === currentFeaturedTurnId);
+    if (!currentTurn || largestTurn.turnId === currentFeaturedTurnId) {
+        return largestTurn.turnId;
+    }
+    const switchMargin = Math.max(48, viewportHeight * 0.2);
+    return largestTurn.visibleHeight - currentTurn.visibleHeight > switchMargin ? largestTurn.turnId : currentFeaturedTurnId;
+}
+
 export function updateMessageViewportIndicator(ctx, container) {
     const { messageScrollIndicatorRef, messageViewportIndicatorRef, setActivePromptTurnIds, setFeaturedPromptTurnId, setsEqual } = ctx;
         if (container) {
@@ -476,9 +489,8 @@ export function updateMessageViewportIndicator(ctx, container) {
             })
                 .filter((candidate) => candidate.visibleHeight > 0);
             const visibleTurnIds = new Set(visibleTurns.map((turn) => turn.turnId).filter(Boolean));
-            const featuredTurn = visibleTurns.reduce((featured, candidate) => candidate.visibleHeight > featured.visibleHeight ? candidate : featured, { turnId: undefined, visibleHeight: 0 });
             setActivePromptTurnIds((current) => setsEqual(current, visibleTurnIds) ? current : visibleTurnIds);
-            setFeaturedPromptTurnId((current) => current === featuredTurn.turnId ? current : featuredTurn.turnId);
+            setFeaturedPromptTurnId((current) => chooseFeaturedPromptTurnId(visibleTurns, current, viewport.height));
         }
         const rail = messageScrollIndicatorRef.current;
         const indicator = messageViewportIndicatorRef.current;
@@ -776,6 +788,7 @@ export async function switchSession(ctx, record, options = {}) {
             }
             setMessages(previousMessages);
             sessionIdRef.current = previousSessionId;
+            ctx.restoreSessionComposerModel?.(viewKey);
             explicitNewSessionRef.current = previousExplicitNewSession;
             setSessionTodo(previousSessionTodo);
             setParentSessionTodo(previousParentSessionTodo);

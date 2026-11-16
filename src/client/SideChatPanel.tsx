@@ -24,6 +24,7 @@ import {
   ComposerToolbar,
   type ComposerGearProfile
 } from "./ComposerFrame";
+import { useScrollToBottomWhenOpened } from "./useScrollToBottomWhenOpened";
 import "./Roundtable.css";
 
 type CompletedTurnComponent = (props: {
@@ -181,6 +182,8 @@ export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady,
     const element = scrollRef.current;
     if (element) element.scrollTop = element.scrollHeight;
   }, [isLoading, scrollKey]);
+  // The panel stays mounted but hidden while another session tab is shown, so scrolling above is a no-op until it is opened.
+  useScrollToBottomWhenOpened(scrollRef, active, !isLoading, sessionId);
 
   /** Every addressed speaker answers in parallel; each reply appears as soon as it is saved. */
   function dispatch(replies: OutgoingSideChatReply[]) {

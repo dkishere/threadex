@@ -2,8 +2,9 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { ActorRound } from "../domainActors";
 import { ActorRoomPanel } from "./ActorRoomPanel";
 import { WorkspaceManagerDashboard, type useWorkspaceManagerDashboard } from "./WorkspaceManagerPanel";
-import { Loader2, PanelRightClose } from "lucide-react";
+import { Loader2, PanelRightClose, PanelsTopLeft } from "lucide-react";
 import { apiJson } from "./apiClient";
+import { SessionLoadingIndicator } from "./SessionLoadingIndicator";
 import type { SwitchSessionResponse } from "./appTypes";
 import "./ManagerWorkspace.css";
 
@@ -13,6 +14,8 @@ type Props = {
   dashboard: ReturnType<typeof useWorkspaceManagerDashboard>;
   onOpenSession: (session: NonNullable<SwitchSessionResponse["session"]>) => Promise<void>;
   onCloseSession: () => void;
+  /** Opens that actor's actor view from a group chat reply header. */
+  onOpenActor?: (actorId: string) => void;
   renderSession: (collapseButton: ReactNode) => ReactNode;
   resetKey: number;
   selectedSessionId?: string | null;
@@ -23,11 +26,13 @@ type Props = {
   chatLoading?: boolean;
 };
 
-export function ManagerWorkspace({ workspaceId, approvalPolicy, dashboard, onOpenSession, onCloseSession, renderSession, resetKey, selectedSessionId = null, chatKey, chatName, chatLoading = false }: Props) {
+export function ManagerWorkspace({ workspaceId, approvalPolicy, dashboard, onOpenSession, onCloseSession, onOpenActor, renderSession, resetKey, selectedSessionId = null, chatKey, chatName, chatLoading = false }: Props) {
   const [sessionId, setSessionId] = useState<string | null>(selectedSessionId);
   // A reloaded or shared group chat + session link shows that session first on a phone.
   const [mobilePanel, setMobilePanel] = useState(selectedSessionId ? "details" : "chat");
-  const [load, setLoad] = useState<{ id: string; ready?: boolean; error?: string } | null>(null);
+  const [expanded, setExpanded] = useState(false);
+  // "switching": the shared session block is mounted and shows its own loading state.
+  const [load, setLoad] = useState<{ id: string; switching?: boolean; ready?: boolean; error?: string } | null>(null);
   const [retry, setRetry] = useState(0);
   const openSessionAction = useRef(onOpenSession);
   openSessionAction.current = onOpenSession;
@@ -42,6 +47,7 @@ export function ManagerWorkspace({ workspaceId, approvalPolicy, dashboard, onOpe
   }
 
   function closeSession() {
+    setExpanded(false);
     setSessionId(null);
     onCloseSession();
     requestAnimationFrame(() => {
@@ -61,6 +67,9 @@ export function ManagerWorkspace({ workspaceId, approvalPolicy, dashboard, onOpe
         if (snapshot.session?.id !== sessionId || snapshot.session.workspaceId !== workspaceId)
           throw new Error("This session is not available in this workspace.");
         if (controller.signal.aborted) return;
+        // Mount the session block in the same render the switch starts, so the
+        // main view's loading state and scroll-to-bottom apply here too.
+        setLoad({ id: sessionId, switching: true });
         await openSessionAction.current(snapshot.session);
         if (!controller.signal.aborted) setLoad({ id: sessionId, ready: true });
       }).catch(error => {
@@ -69,25 +78,27 @@ export function ManagerWorkspace({ workspaceId, approvalPolicy, dashboard, onOpe
     return () => controller.abort();
   }, [sessionId, workspaceId, retry]);
 
-  const collapseButton = <button type="button" className="ghost-icon manager-session-collapse" aria-label="Close session and show dashboard" title="Collapse session and show dashboard" onClick={closeSession}><PanelRightClose aria-hidden="true" /></button>;
-  return <div className="manager-workspace" data-mobile-panel={mobilePanel}>
+  const collapseButton = <><button type="button" className="ghost-icon manager-session-collapse" aria-label="Close session and show dashboard" title="Collapse session and show dashboard" onClick={closeSession}><PanelRightClose aria-hidden="true" /></button><button type="button" className="ghost-icon manager-session-expand" aria-label={expanded ? "Restore manager layout" : "Expand session"} title={expanded ? "Restore manager layout" : "Expand session"} aria-pressed={expanded} aria-controls="manager-details" onClick={() => setExpanded(value => !value)}><PanelsTopLeft aria-hidden="true" /></button></>;
+  return <div className="manager-workspace" data-mobile-panel={mobilePanel} data-session-expanded={expanded && !!sessionId}>
     <nav className="manager-workspace-tabs" aria-label="Manager panels">
-      <button type="button" aria-pressed={mobilePanel === "chat"} aria-controls="manager-conversation" onClick={() => setMobilePanel("chat")}>Chat</button>
+      <button type="button" aria-pressed={mobilePanel === "chat"} aria-controls="manager-conversation" onClick={() => { setExpanded(false); setMobilePanel("chat"); }}>Chat</button>
       <button type="button" id="manager-details-tab" aria-pressed={mobilePanel === "details"} aria-controls="manager-details" onClick={() => setMobilePanel("details")}>{sessionId ? "Task session" : "Dashboard"}</button>
     </nav>
     <section id="manager-conversation" className="manager-conversation" aria-label="Manager conversation">
       {chatLoading
         ? <p className="side-chat-state" role="status"><Loader2 className="spin" aria-hidden="true" />Opening group chat…</p>
-        : <ActorRoomPanel workspaceId={workspaceId} approvalPolicy={approvalPolicy} onOpenSession={openSession} disableEscapeStop chatKey={chatKey} chatName={chatName} />}
+        : <ActorRoomPanel workspaceId={workspaceId} approvalPolicy={approvalPolicy} onOpenSession={openSession} onOpenActor={onOpenActor} disableEscapeStop chatKey={chatKey} chatName={chatName} />}
     </section>
     <aside id="manager-details" className="manager-details" aria-label={sessionId ? "Task session panel" : "Dashboard panel"}>
       {!sessionId && <header ref={dashboardHeader} tabIndex={-1} className="manager-dashboard-header"><h2>Dashboard</h2><span>Workspace activity</span></header>}
       <WorkspaceManagerDashboard hidden={!!sessionId} workspaceId={workspaceId} dashboard={dashboard} onOpenTask={openSession} />
-      {sessionId && (load?.id === sessionId && load.ready ?
+      {sessionId && (load?.id === sessionId && (load.ready || load.switching) ?
         renderSession(collapseButton) :
         <section className="manager-task-session" aria-label="Task session">
           <header className="manager-task-header">{collapseButton}<h2>{sessionId}</h2></header>
-          {load?.id === sessionId && load.error ? <div className="manager-task-transcript" role="alert"><p>{load.error}</p><button type="button" onClick={() => setRetry(value => value + 1)}>Retry session</button></div> : <p role="status">Loading session…</p>}
+          {load?.id === sessionId && load.error
+            ? <div className="manager-task-transcript" role="alert"><p>{load.error}</p><button type="button" onClick={() => setRetry(value => value + 1)}>Retry session</button></div>
+            : <div className="manager-task-transcript"><div className="empty" role="status"><SessionLoadingIndicator /></div></div>}
         </section>)}
     </aside>
   </div>;

@@ -43,9 +43,11 @@ export function parseActorRoundtableReceipts(raw: string | null): ActorRoundtabl
     return (Array.isArray(value) ? value : []).filter((item): item is ActorRoundtableReceipt => !!item
       && typeof item.requestId === "string" && typeof item.message === "string" && typeof item.created === "string"
       && Array.isArray(item.actors) && item.actors.every(isActor)
-      && (item.sourceRoundId === undefined || typeof item.sourceRoundId === "string"));
+      && (item.sourceRoundId === undefined || typeof item.sourceRoundId === "string")
+      && (item.chatProjectId === undefined || item.chatProjectId === null || typeof item.chatProjectId === "string"));
   } catch { return []; }
 }
 /** The request body only: client bookkeeping fields are never sent. */
-export const actorRoundtableRequest = ({ requestId, message, actors, sourceRoundId, title }: ActorRoundtableReceipt): StartActorRoundtable =>
-  ({ requestId, message, actors, ...(sourceRoundId ? { sourceRoundId } : {}), ...(title ? { title } : {}) });
+export const actorRoundtableRequest = ({ requestId, message, actors, sourceRoundId, title, chatProjectId, hostProfile }: ActorRoundtableReceipt): StartActorRoundtable =>
+  ({ requestId, message, actors, ...(sourceRoundId ? { sourceRoundId } : {}), ...(title ? { title } : {}), ...(chatProjectId !== undefined ? { chatProjectId } : {}),
+    ...(hostProfile ? { hostProfile } : {}) });

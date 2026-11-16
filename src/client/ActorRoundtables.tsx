@@ -8,6 +8,7 @@ import { ActorMultiSelect } from "./ActorMultiSelect";
 import { RoundtableLibraryPopup } from "./Roundtable";
 import { actorRoundtableActive, actorRoundtableRequest, actorRoundtableStateLabel, mergeActorRoundtables, parseActorRoundtableReceipts,
   type ActorRoundtableLink, type ActorRoundtableReceipt } from "./actorRoundtablePresentation";
+import { SessionPickOwnerButton } from "./SessionPickOwnerButton";
 import "./Roundtable.css";
 
 const POLL_MS = 3000;
@@ -168,6 +169,7 @@ export function ActorRoundtableCard({ link, onOpen }: { link: ActorRoundtableLin
       <span className="actor-roundtable-open">{!unavailable && <><ExternalLink aria-hidden="true" />Open session</>}
         {link.view && link.view.rounds > 1 && <small>{link.view.rounds} rounds</small>}</span>
     </button>
+    {!unavailable && <SessionPickOwnerButton key={link.sessionId} sessionId={link.sessionId} sessionTitle={link.title || "Round table"} />}
   </section>;
 }
 
@@ -201,7 +203,7 @@ export function ActorRoundtableComposerPanel({ draft, disabled }: { draft: Actor
 }
 
 /** Inside a session started from the group chat: a way back to the chat that started it. */
-export function ActorRoundtableSourceLink({ workspaceId, sessionId, onOpen }: { workspaceId: string; sessionId: string; onOpen: () => void }) {
+export function ActorRoundtableSourceLink({ workspaceId, sessionId, onOpen }: { workspaceId: string; sessionId: string; onOpen: (chatKey: string | null) => void }) {
   const [source, setSource] = useState<{ sessionId: string; roundtable: ActorRoundtableView | null } | null>(null);
   useEffect(() => {
     const controller = new AbortController();
@@ -212,7 +214,7 @@ export function ActorRoundtableSourceLink({ workspaceId, sessionId, onOpen }: { 
   }, [workspaceId, sessionId]);
   const roundtable = source?.sessionId === sessionId ? source.roundtable : null;
   if (!roundtable) return null;
-  return <button type="button" className="parent-session-link actor-roundtable-source" onClick={onOpen}
+  return <button type="button" className="parent-session-link actor-roundtable-source" onClick={() => onOpen(roundtable.sourceChatProjectId ?? null)}
     title="Open the group chat that started this round table" aria-label="Open group chat that started this round table">
     <MessageCircle aria-hidden="true" /><span>From group chat</span>
   </button>;

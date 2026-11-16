@@ -6,17 +6,28 @@
 .manager-conversation > .composer { grid-column: 1; grid-row: 2; min-height: 0; max-height: 50dvh; overflow-y: auto; overscroll-behavior: contain; }
 .manager-details { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; background: #f3f6fa; }
 .manager-details { container-type: inline-size; }
-.responsive-layout .manager-details > .chat.session-main-block[data-session-tab] { flex: 1; width: 100%; height: 100%; min-height: 0; margin: 0; grid-template-columns: minmax(0, 1fr); grid-template-rows: 80px 0 minmax(0, 1fr) auto; }
-.responsive-layout .manager-details > .session-main-block > .messages-pane > .messages { display: block; grid-column: 1; grid-row: 3; min-height: 0; }
-.responsive-layout .manager-details > .session-main-block > .composer { display: block; grid-column: 1; grid-row: 4; }
+.responsive-layout .manager-details > .chat.session-main-block[data-session-tab] { flex: 1; width: 100%; height: 100%; min-height: 0; margin: 0; }
+.responsive-layout .manager-workspace[data-session-expanded="false"] .manager-details > .chat.session-main-block[data-session-tab] { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(52px, max-content) 0 minmax(0, 1fr) auto; }
+.responsive-layout .manager-workspace[data-session-expanded="false"] .manager-details > .session-main-block > .messages-pane > .messages { display: block; grid-column: 1; grid-row: 3; min-height: 0; }
+.responsive-layout .manager-workspace[data-session-expanded="false"] .manager-details > .session-main-block > :is(.composer, .composer-ended-notice) { display: block; grid-column: 1; grid-row: 4; }
 .responsive-layout .manager-details > .session-main-block > .composer > .queued-prompts { display: grid; box-sizing: border-box; max-height: min(30dvh, 240px); overflow-y: auto; overscroll-behavior: contain; }
-.responsive-layout .manager-details > .session-main-block :is(.session-view-tabs, .session-plan-view, .session-side-chat-view, .prompt-turns) { display: none; }
+.responsive-layout .manager-workspace[data-session-expanded="false"] .manager-details > .session-main-block :is(.session-view-tabs, .session-plan-view, .session-side-chat-view, .prompt-turns) { display: none; }
+.manager-workspace[data-session-expanded="true"] { grid-template-columns: minmax(0, 1fr); }
+.manager-workspace[data-session-expanded="true"] > .manager-conversation { display: none; }
+.responsive-layout .manager-workspace[data-session-expanded="true"] .manager-details > .chat.session-main-block[data-session-tab] { grid-template-columns: minmax(150px, 35%) minmax(0, 1fr); grid-template-rows: minmax(52px, max-content) 40px minmax(0, 1fr) auto; }
+.responsive-layout .manager-workspace[data-session-expanded="true"] .session-view-tabs { display: flex; position: relative; z-index: 1; }
+.responsive-layout .manager-workspace[data-session-expanded="true"] .session-main-block[data-session-tab="turns"] .prompt-turns { display: grid; }
+.responsive-layout .manager-workspace[data-session-expanded="true"] .session-side-chat-view:not([hidden]),
+.responsive-layout .manager-workspace[data-session-expanded="true"] .session-plan-view:not([hidden]) { display: block; }
+.responsive-layout .manager-workspace[data-session-expanded="true"] .session-main-block > .messages-pane > .messages { display: block; grid-column: 2; grid-row: 2 / 4; }
+.responsive-layout .manager-workspace[data-session-expanded="true"] .session-main-block > :is(.composer, .composer-ended-notice) { display: block; grid-column: 2; grid-row: 4; }
 .responsive-layout .manager-details > .session-main-block > .content-header { position: relative; padding: 8px 12px; gap: 6px; flex-wrap: wrap; align-content: center; border-bottom: 1px solid #dbe3ee; background: #f8fafc; }
-.manager-details .content-header-heading { flex-basis: 100%; }
+.manager-details .content-header-heading { flex: 1 1 320px; }
 .manager-details .content-header h1 { font-size: 14px; }
 .manager-details .content-header-actions { margin-left: auto; flex-wrap: wrap; gap: 6px; }
 .manager-details :is(.concurrent-panel, .roundtable-settings, .session-changes-popover) { width: min(420px, calc(100cqw - 24px)); max-height: min(480px, calc(100dvh - 220px)); }
 .manager-session-collapse { flex: none; }
+.manager-session-expand { flex: none; }
 .manager-dashboard-header { display: flex; flex: none; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 14px 18px; border-bottom: 1px solid #e2e8f0; background: #f8fafc; }
 .manager-dashboard-header h2 { margin: 0; color: #334155; font-size: 14px; }
 .manager-dashboard-header span { color: #64748b; font-size: 11px; }

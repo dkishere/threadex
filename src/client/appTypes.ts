@@ -622,6 +622,8 @@ export type SessionTurnRecord = {
     attachments?: MessageAttachment[];
     forcePlan?: boolean;
     created?: string;
+    /** Who sent the steer; Threadex-injected sources ("intent-approval", "automation") stay out of the timeline. */
+    source?: string;
   }>;
   tokenIn: number;
   tokenOut: number;

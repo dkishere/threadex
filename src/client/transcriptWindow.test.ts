@@ -13,27 +13,42 @@ test("large transcripts initially render only the latest 50 complete turns", () 
   assert.equal(page.messages[0].id, "u1673");
   assert.equal(page.messages.at(-1)?.id, "a1722");
   assert.equal(page.total, 1723);
+  assert.equal(page.earlierTurnCount, 50);
   assert.equal(messages.length, 3446);
 });
 
-test("older and newer pages preserve turn pairs and do not accumulate DOM history", () => {
+test("loading earlier turns prepends history and keeps loaded turns", () => {
   const latest = transcriptWindow(messages);
-  const older = transcriptWindow(messages, latest.previousAnchor);
-  assert.equal(older.messages.length, 100);
-  assert.equal(older.messages.at(-1)?.id, "a1672");
-  assert.deepEqual(transcriptWindow(messages, older.nextAnchor).messages, latest.messages);
+  const expanded = transcriptWindow(messages, latest.earlierFirstMessageId);
+  assert.equal(expanded.messages.length, 200);
+  assert.equal(expanded.messages[0].id, "u1623");
+  assert.deepEqual(expanded.messages.slice(100), latest.messages);
+  const updated = transcriptWindow([...messages, { id: "new", turnId: "new" }], latest.earlierFirstMessageId);
+  assert.equal(updated.messages[0].id, "u1623");
+  assert.equal(updated.messages.at(-1)?.id, "new");
 });
 
-test("deep links include the prompt and response and stay stable when new turns arrive", () => {
+test("the earliest load is partial and then reports no earlier turns", () => {
+  const short = messages.slice(0, 2 * 53);
+  const latest = transcriptWindow(short);
+  assert.equal(latest.start, 3);
+  assert.equal(latest.earlierTurnCount, 3);
+  const all = transcriptWindow(short, latest.earlierFirstMessageId);
+  assert.deepEqual(all.messages, short);
+  assert.equal(all.earlierFirstMessageId, undefined);
+  assert.equal(all.earlierTurnCount, 0);
+});
+
+test("deep links load every turn from the linked one through the latest", () => {
   const page = transcriptWindow(messages, "a12");
   assert.equal(page.messages[0].id, "u12");
-  const updated = transcriptWindow([...messages, { id: "new", turnId: "new" }], "a12");
-  assert.deepEqual(updated.messages, page.messages);
+  assert.equal(page.messages.at(-1)?.id, "a1722");
+  assert.equal(transcriptWindow(messages, "a1700").start, 1673);
 });
 
 test("missing anchors, empty transcripts and messages without turn IDs are supported", () => {
   assert.deepEqual(transcriptWindow(messages, "missing").messages, transcriptWindow(messages).messages);
   assert.deepEqual(transcriptWindow([]).messages, []);
   assert.deepEqual(transcriptWindow([{ id: "standalone" }]).messages, [{ id: "standalone" }]);
-  assert.equal(transcriptWindow(messages, "u0").previousAnchor, undefined);
+  assert.equal(transcriptWindow(messages, "u0").earlierFirstMessageId, undefined);
 });

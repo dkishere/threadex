@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { createPortal } from "react-dom";
 import "./ModelGroupSwitchDialog.css";
 import { modelLabel, modelProvider, type ModelProvider } from "../modelCatalog";
 
@@ -22,13 +23,13 @@ export function ModelGroupSwitchDialog({ from, to, onConfirm, onCancel }: {
       opener?.focus?.();
     };
   }, []);
-  return (
+  return createPortal(
     <dialog ref={dialog} className="model-group-switch-dialog" role="alertdialog" aria-labelledby="model-group-switch-title"
       aria-describedby="model-group-switch-body" onCancel={(event) => { event.preventDefault(); onCancel(); }}>
-      <form method="dialog" onSubmit={(event) => { event.preventDefault(); onConfirm(); }}>
+      <form method="dialog" onSubmit={(event) => { event.preventDefault(); event.stopPropagation(); onConfirm(); }}>
         <h2 id="model-group-switch-title">Switch from {modelGroupLabel(from)} to {modelGroupLabel(to)}?</h2>
         <p id="model-group-switch-body">
-          This session last ran on {modelLabel(from)} ({modelGroupLabel(from)}). Sending this prompt will run it on {modelLabel(to)} ({modelGroupLabel(to)}),
+          This session last ran on {modelLabel(from)} ({modelGroupLabel(from)}). Sending this prompt will run it on {to === "auto" ? "Auto" : modelLabel(to)} ({modelGroupLabel(to)}),
           a different agent backend. It cannot resume the earlier native thread; it continues with a note that the session switched providers.
         </p>
         <div className="model-group-switch-actions">
@@ -36,6 +37,6 @@ export function ModelGroupSwitchDialog({ from, to, onConfirm, onCancel }: {
           <button type="submit" autoFocus>Switch and send</button>
         </div>
       </form>
-    </dialog>
+    </dialog>, document.body
   );
 }

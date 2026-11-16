@@ -1,33 +1,36 @@
 .forked-turns {
+  display: grid;
+  gap: 8px;
   margin-top: 12px;
   padding-left: 16px;
   border-left: 2px solid var(--turn-accent, #64748b);
 }
-.forked-turn {
-  padding: 8px 0;
-  border-top: 1px solid currentColor;
+
+.forked-turn-changes {
+  color: #475569;
   font-size: 12px;
 }
-.forked-turn-heading {
-  display: flex;
+
+.forked-turn-changes ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+
+.forked-turn-open {
+  display: inline-flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 6px;
-}
-.forked-turn-heading button {
-  background: none;
-  border: 0;
-  color: inherit;
-  cursor: pointer;
+  gap: 4px;
+  justify-self: start;
   padding: 0;
-  text-align: left;
-}
-.forked-turn summary {
+  border: 0;
+  background: none;
+  color: #6d28d9;
   cursor: pointer;
-  margin-top: 6px;
+  font: inherit;
+  font-size: 12px;
 }
-.forked-turn-prompt {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  margin-top: 6px;
+
+.forked-turn-open svg {
+  width: 13px;
+  height: 13px;
 }

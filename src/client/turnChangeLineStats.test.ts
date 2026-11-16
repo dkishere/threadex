@@ -51,6 +51,7 @@ test("renders plus and minus counts for every turn change, including zero", () =
     { path: "src/unchanged.ts", kind: "update", additions: 0, deletions: 0 }
   ];
   const ctx = {
+    Copy: () => jsx("svg", {}),
     FileEditIcon: () => jsx("svg", {}),
     FileChangeDiffPopup: () => null,
     _Fragment: Fragment,
@@ -66,7 +67,7 @@ test("renders plus and minus counts for every turn change, including zero", () =
   }
 
   const html = renderToStaticMarkup(createElement(TestList));
-  assert.equal((html.match(/class="file-change-lines"/g) ?? []).length, 2);
+  assert.equal((html.match(/class="file-change-badge"/g) ?? []).length, 2);
   assert.match(html, />\+2<\/span><span data-tone="delete">−1<\/span>/);
   assert.match(html, />\+0<\/span><span data-tone="delete">−0<\/span>/);
 });

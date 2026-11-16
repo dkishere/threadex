@@ -1,4 +1,5 @@
 // @ts-nocheck
+import { fileChangeLineStats as changeLineStats } from "../fileChangeLineStats";
 import { domainActorIdentity } from "./domainActorIdentity";
 import { BotAvatar } from "./BotAvatar";
 import { ActorAvatar } from "./ActorAvatar";
@@ -146,92 +147,7 @@ export function FileChangeList(ctx, { changes }) {
 }
 
 export function fileChangeLineStats(ctx, change) {
-    const {  } = ctx;
-    const explicitAdditions = validLineCount(change?.additions);
-    const explicitDeletions = validLineCount(change?.deletions);
-    if (explicitAdditions !== undefined || explicitDeletions !== undefined) {
-        return {
-            additions: explicitAdditions ?? 0,
-            deletions: explicitDeletions ?? 0
-        };
-    }
-    const diff = firstChangeText(change, ["unifiedDiff", "patch", "diff"]);
-    if (diff !== undefined) {
-        return lineStatsFromDiff(diff);
-    }
-    const before = firstChangeText(change, ["before", "beforeText", "beforeContent", "oldContent", "previousContent", "original"]);
-    const after = firstChangeText(change, ["after", "afterText", "afterContent", "newContent", "currentContent", "updated"]);
-    if (change?.kind === "add") {
-        return { additions: textLineCount(after ?? ""), deletions: 0 };
-    }
-    if (change?.kind === "delete") {
-        return { additions: 0, deletions: textLineCount(before ?? "") };
-    }
-    if (before !== undefined && after !== undefined) {
-        return lineStatsFromTextPair(before, after);
-    }
-    return { additions: 0, deletions: 0 };
-
-}
-
-function validLineCount(value) {
-    return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : undefined;
-
-}
-
-function firstChangeText(change, keys) {
-    for (const key of keys) {
-        if (typeof change?.[key] === "string") {
-            return change[key];
-        }
-    }
-    return undefined;
-
-}
-
-function lineStatsFromDiff(diff) {
-    let additions = 0;
-    let deletions = 0;
-    for (const line of diff.replace(/\r\n/g, "\n").split("\n")) {
-        if (line.startsWith("+++") || line.startsWith("---")) {
-            continue;
-        }
-        if (line.startsWith("+")) {
-            additions += 1;
-        }
-        else if (line.startsWith("-")) {
-            deletions += 1;
-        }
-    }
-    return { additions, deletions };
-
-}
-
-function textLineCount(text) {
-    if (!text) {
-        return 0;
-    }
-    const lines = text.split(/\r?\n/);
-    return /\r?\n$/.test(text) ? Math.max(0, lines.length - 1) : lines.length;
-
-}
-
-function lineStatsFromTextPair(before, after) {
-    const beforeLines = before ? before.split(/\r?\n/) : [];
-    const afterLines = after ? after.split(/\r?\n/) : [];
-    let prefix = 0;
-    while (prefix < beforeLines.length && prefix < afterLines.length && beforeLines[prefix] === afterLines[prefix]) {
-        prefix += 1;
-    }
-    let suffix = 0;
-    while (suffix < beforeLines.length - prefix && suffix < afterLines.length - prefix && beforeLines[beforeLines.length - 1 - suffix] === afterLines[afterLines.length - 1 - suffix]) {
-        suffix += 1;
-    }
-    return {
-        additions: Math.max(0, afterLines.length - prefix - suffix),
-        deletions: Math.max(0, beforeLines.length - prefix - suffix)
-    };
-
+    return changeLineStats(change);
 }
 
 export function hasVisibleTodoPlan(ctx, todo) {
@@ -568,7 +484,8 @@ export function SubagentEvent(ctx, { item, sessionId }) {
 
 /** A Codex actor child's spawn message starts with the system's assignment marker and carries its actor brief. */
 function isActorAssignmentBrief(prompt) {
-    return /^\[threadex-actor-assignment:[a-z0-9_]+\]/.test(prompt);
+    // A host may put its coordination notes before the verbatim brief, so the marker need not open the prompt.
+    return /\[threadex-actor-assignment:[a-z0-9_]+\]/.test(prompt);
 }
 
 /** Actor briefs open with "You are domain actor NAME (ID), ..."; shown as the UI character with the saved name. */
@@ -581,12 +498,14 @@ export function actorContextIdentity(context) {
 
 /** A native actor child (named actor_<allocation>_<work>) whose actor brief has not been read yet. */
 export function awaitsActorBrief(name, actorContexts) {
-    return actorContexts.length === 0 && /^actor_[a-z0-9_]+$/.test(readableAgentName(name));
+    return actorContexts.length === 0 && /^actor_[a-z0-9_]+$/.test(name.split("/").filter(Boolean).pop() ?? "");
 }
 
 /** Internal native agent paths (/root/actor_a2_9fd316) read as their last segment when no actor is known. */
 function readableAgentName(name) {
-    return /^\/root\/.+/.test(name) ? name.split("/").filter(Boolean).pop() : name;
+    const last = /^\/root\/.+/.test(name) ? name.split("/").filter(Boolean).pop() : name;
+    // A handed-off actor child with no brief read yet: actor_handoff_499f80 reads as "Actor handoff", not an internal id.
+    return /^actor_handoff_[a-z0-9]+$/.test(last) ? "Actor handoff" : last;
 }
 
 export function SubagentTranscript(ctx, { anchorPrefix, onRetry, state, threadId, sessionId, workspaceId }) {
@@ -752,31 +671,37 @@ export function FileChangeDiffPopup(ctx, { change, onClose }) {
     const { FileAnnotationComposerContext, MonacoDiffEditor, X, _jsx, _jsxs, buildDiffTextPair, fileChangeLabel, fileChangeTone, getFileName, hasChangeText, useContext, useEffect, useMemo, useState } = ctx;
     const annotationComposer = useContext(FileAnnotationComposerContext);
     const [previewText, setPreviewText] = useState(null);
+    const [historicalChange, setHistoricalChange] = useState(null);
+    const [previewError, setPreviewError] = useState(null);
     const [previewLoading, setPreviewLoading] = useState(false);
-    const previewChange = useMemo(() => (previewText === null || hasChangeText(change) ? change : { ...change, after: previewText }), [change, previewText]);
+    const previewChange = useMemo(() => historicalChange ?? (previewText === null || hasChangeText(change) ? change : { ...change, after: previewText }), [change, previewText, historicalChange]);
     const textPair = useMemo(() => buildDiffTextPair(previewChange), [previewChange]);
     const fileName = getFileName(change.path);
     useEffect(() => {
         setPreviewText(null);
+        setHistoricalChange(null);
+        setPreviewError(null);
         setPreviewLoading(false);
-        if (hasChangeText(change) || change.kind === "delete") {
+        if (!change.contentUrl && (hasChangeText(change) || change.kind === "delete")) {
             return;
         }
         let cancelled = false;
         setPreviewLoading(true);
-        void fetch(`/api/workspaces/file-preview?path=${encodeURIComponent(change.path)}`)
+        void fetch(change.contentUrl ?? `/api/workspaces/file-preview?path=${encodeURIComponent(change.path)}`)
             .then(async (response) => {
             if (!response.ok) {
-                return null;
+                throw new Error("Could not load file content.");
             }
             return (await response.json().catch(() => null));
         })
             .then((payload) => {
-            if (!cancelled && payload?.exists !== false && typeof payload?.text === "string") {
+            if (!cancelled && change.contentUrl && payload) {
+                setHistoricalChange(payload);
+            } else if (!cancelled && payload?.exists !== false && typeof payload?.text === "string") {
                 setPreviewText(payload.text);
             }
         })
-            .catch(() => undefined)
+            .catch(error => { if (!cancelled) setPreviewError(error.message); })
             .finally(() => {
             if (!cancelled) {
                 setPreviewLoading(false);
@@ -798,7 +723,7 @@ export function FileChangeDiffPopup(ctx, { change, onClose }) {
         window.addEventListener("keydown", closeOnEscape);
         return () => window.removeEventListener("keydown", closeOnEscape);
     }, [onClose]);
-    return (_jsx("div", { className: "file-diff-backdrop", role: "presentation", onMouseDown: onClose, children: _jsxs("section", { className: "file-diff-popup", role: "dialog", "aria-modal": "true", "aria-label": `Diff for ${fileName}`, onMouseDown: (event) => event.stopPropagation(), children: [_jsxs("header", { className: "file-diff-header", children: [_jsxs("div", { className: "file-diff-title", children: [_jsx("span", { className: "file-change-badge", "data-operation": fileChangeTone(change.kind), children: fileChangeLabel(change.kind) }), _jsxs("div", { children: [_jsx("strong", { children: fileName }), _jsx("code", { children: change.path })] })] }), _jsx("button", { className: "icon-button", type: "button", onClick: onClose, "aria-label": "Close diff", children: _jsx(X, { "aria-hidden": "true" }) })] }), textPair ? (_jsx(MonacoDiffEditor, { before: textPair.before, after: textPair.after, filePath: change.path, activeAnnotation: annotationComposer?.activeAnnotation, workspaceId: annotationComposer?.workspaceId, sessionUrl: annotationComposer?.sessionUrl, onAsk: annotationComposer?.askAboutFileAnnotation, onRemoveAnnotation: () => annotationComposer?.removeFileAnnotation(change.path) })) : (_jsx("div", { className: "file-diff-state", children: previewLoading ? "Loading file…" : "No comparable text was included for this file change." }))] }) }));
+    return (_jsx("div", { className: "file-diff-backdrop", role: "presentation", onMouseDown: onClose, children: _jsxs("section", { className: "file-diff-popup", role: "dialog", "aria-modal": "true", "aria-label": `Diff for ${fileName}`, onMouseDown: (event) => event.stopPropagation(), children: [_jsxs("header", { className: "file-diff-header", children: [_jsxs("div", { className: "file-diff-title", children: [_jsx("span", { className: "file-change-badge", "data-operation": fileChangeTone(change.kind), children: fileChangeLabel(change.kind) }), _jsxs("div", { children: [_jsx("strong", { children: fileName }), _jsx("code", { children: change.path })] })] }), _jsx("button", { className: "icon-button", type: "button", onClick: onClose, "aria-label": "Close diff", children: _jsx(X, { "aria-hidden": "true" }) })] }), textPair ? (_jsx(MonacoDiffEditor, { before: textPair.before, after: textPair.after, filePath: change.path, activeAnnotation: annotationComposer?.activeAnnotation, workspaceId: annotationComposer?.workspaceId, sessionUrl: annotationComposer?.sessionUrl, onAsk: annotationComposer?.askAboutFileAnnotation, onRemoveAnnotation: () => annotationComposer?.removeFileAnnotation(change.path) })) : (_jsx("div", { className: "file-diff-state", children: previewLoading ? "Loading file…" : previewError ?? "No comparable text was included for this file change." }))] }) }));
 
 }
 

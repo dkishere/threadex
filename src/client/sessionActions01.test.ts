@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { askAboutResponseQuote, captureResponseQuoteSelection, currentWorkspaceId, enqueuePrompt, loadSessions, refreshSelectedSessionSnapshot, selectedSessionReferences, startChatTurn, steerPrompt, submit } from "./sessionActions01";
+import { addSteerMessage, askAboutResponseQuote, captureResponseQuoteSelection, copyThreadexSessionUrl, currentWorkspaceId, enqueuePrompt, loadSessions, refreshSelectedSessionSnapshot, selectedSessionReferences, settleSteerMessage, startChatTurn, steerPrompt, submit } from "./sessionActions01";
+import { buildCodexReference } from "../codexReference";
 import { formatResponseAnnotationsPrompt, parseResponseAnnotations, type ResponseAnnotation } from "./responseAnnotations";
 import { mockSubmissionStorage } from "./pendingSubmissions.testSupport";
 import { acknowledgeSubmissionEvent, isSubmissionSending, readPendingSubmissions, savePendingSubmission } from "./pendingSubmissions";
@@ -186,6 +187,36 @@ function recoveryContext() {
   };
 }
 
+test("direct send captures inherited settings once and preserves workspace gears in the API payload", async t => {
+  mockSubmissionStorage(t);
+  const workspaceGears = [{ model: "gpt-6.1-sol", effort: "low", fastMode: false }];
+  let reads = 0;
+  let body: any;
+  let optimistic: any[] = [];
+  const ctx = {
+    ...recoveryContext(),
+    currentModelPreferences: () => {
+      reads++;
+      return { selectedModel: reads === 1 ? "claude-opus-4-6" : "gpt-6.1-sol", selectedEffort: "max", fastMode: true,
+        gearProfiles: workspaceGears, activeGearIndex: 0 };
+    },
+    setMessages: (update: (current: any[]) => any[]) => { optimistic = update(optimistic); }
+  };
+  t.mock.method(globalThis, "fetch", async (_url: string, options?: RequestInit) => {
+    body = JSON.parse(String(options?.body));
+    return new Response("");
+  });
+  await startChatTurn(ctx, "inherited settings", [], "default", [], false, false, false);
+  assert.equal(reads, 1);
+  assert.equal(body.model, "claude-opus-4-6");
+  assert.equal(body.modelReasoningEffort, "max");
+  assert.equal(body.fastMode, true);
+  assert.deepEqual(body.modelPreferences.gearProfiles, workspaceGears);
+  assert.equal(body.modelPreferences.activeGearIndex, 0);
+  assert.equal(optimistic[0].model, body.model);
+  assert.equal(optimistic[0].reasoningEffort, body.modelReasoningEffort);
+});
+
 test("retry preserves original ID, prompt, attachments and model while persisting SSE failure across reload", async t => {
   mockSubmissionStorage(t);
   savePendingSubmission({ id: "original", turnId: "original", sessionId: "session", workspaceId: "workspace",
@@ -333,6 +364,73 @@ test("ordinary queue writes once to the backend and does not create a frontend q
   assert.equal(readPendingSubmissions().length, 0);
 });
 
+function queueFeedbackContext() {
+  const state = { input: "draft", receipts: [] as Array<{ id: string; content: string; pending?: boolean }>, status: "", refreshes: 0 };
+  const ctx = {
+    queueRetryRef: { current: null },
+    activeWorkspaceIdRef: { current: "workspace" }, sessionIdRef: { current: "session" },
+    requestSettings: { model: "model" },
+    showQueuedPromptReceipt: (receipt: { id: string; content: string; pending?: boolean }) => {
+      const index = state.receipts.findIndex((item) => item.id === receipt.id);
+      if (index < 0) state.receipts.push(receipt); else state.receipts[index] = receipt;
+    },
+    hideQueuedPromptReceipt: (id: string) => { state.receipts = state.receipts.filter((item) => item.id !== id); },
+    clearComposerInputDraft: () => { state.input = ""; },
+    clearComposerSessionLinks() {}, setAttachments() {}, setComposerResponseQuote() {},
+    setResponseQuotePopover() {}, setSelectedSkills() {}, setSlashTrigger() {},
+    setStatus: (value: string) => { state.status = value; },
+    refreshSelectedSessionSnapshot: () => { state.refreshes++; return new Promise<void>(() => {}); }
+  };
+  return { ctx, state };
+}
+
+test("queue shows a pending item and clears the composer before the server responds", async t => {
+  mockSubmissionStorage(t);
+  const { ctx, state } = queueFeedbackContext();
+  let finishRequest!: (response: Response) => void;
+  t.mock.method(globalThis, "fetch", () => new Promise<Response>((resolve) => { finishRequest = resolve; }));
+  const pending = enqueuePrompt(ctx, "first", "queue", "default", [], [], false, false);
+  assert.equal(state.input, "");
+  assert.equal(state.receipts.length, 1);
+  assert.equal(state.receipts[0].pending, true);
+  assert.equal(readPendingSubmissions()[0].message, "first");
+  finishRequest(Response.json({ ok: true, turn: { id: state.receipts[0].id, status: "todo" } }));
+  // A snapshot refresh that never settles must not hold the queue result or the composer lock.
+  assert.equal(await pending, true);
+  assert.equal(state.refreshes, 1);
+  assert.equal(state.receipts[0].pending, undefined);
+  assert.equal(isSubmissionSending("session"), false);
+});
+
+test("consecutive queued prompts keep their order without duplicates", async t => {
+  mockSubmissionStorage(t);
+  const { ctx, state } = queueFeedbackContext();
+  const posted: string[] = [];
+  t.mock.method(globalThis, "fetch", async (_url: string, options?: RequestInit) => {
+    const body = JSON.parse(String(options?.body));
+    posted.push(body.message);
+    return Response.json({ ok: true, turn: { id: body.turnId, status: "todo" } });
+  });
+  for (const message of ["one", "two", "three"]) {
+    assert.equal(await enqueuePrompt(ctx, message, "queue", "default", [], [], false, false), true);
+  }
+  assert.deepEqual(posted, ["one", "two", "three"]);
+  assert.deepEqual(state.receipts.map((receipt) => receipt.content), ["one", "two", "three"]);
+  assert.equal(new Set(state.receipts.map((receipt) => receipt.id)).size, 3);
+});
+
+test("a failed queue removes its pending item and keeps the saved prompt for retry", async t => {
+  mockSubmissionStorage(t);
+  const { ctx, state } = queueFeedbackContext();
+  t.mock.method(globalThis, "fetch", async () => Response.json({ error: "Queue unavailable" }, { status: 503 }));
+  assert.equal(await enqueuePrompt(ctx, "retry me", "queue", "default", [], [], false, false), false);
+  assert.deepEqual(state.receipts, []);
+  assert.match(state.status, /Queue failed: Queue unavailable/);
+  assert.equal(readPendingSubmissions()[0].message, "retry me");
+  assert.equal(readPendingSubmissions()[0].lastError, "Queue unavailable");
+  assert.equal(isSubmissionSending("session"), false);
+});
+
 test("retrying a saved queue item retains its ID, settings and draft through failure and acknowledgement", async t => {
   mockSubmissionStorage(t);
   const saved = {
@@ -394,12 +492,13 @@ test("new-session input is already backed up while session restoration is pendin
 
 function steerTestContext(t: import("node:test").TestContext) {
   mockSubmissionStorage(t);
-  const state = { input: "correct direction", queued: [] as unknown[][], sent: [] as unknown[][], status: "", steering: false };
+  const state = { input: "correct direction", queued: [] as unknown[][], sent: [] as unknown[][], settled: [] as unknown[][], status: "", steering: false };
   const ctx = {
     currentRunningTurnId: "original-turn", sessionIdRef: { current: "session-1" }, isSteering: false,
     executionMode: "default",
     enqueuePrompt: (...args: unknown[]) => state.queued.push(args),
     addSteerMessage: (...args: unknown[]) => state.sent.push(args),
+    settleSteerMessage: (...args: unknown[]) => state.settled.push(args),
     clearComposerInputDraft: () => { state.input = ""; },
     clearComposerSessionLinks() {}, setAttachments() {}, setComposerResponseQuote() {},
     setResponseQuotePopover() {}, setSelectedSkills() {}, setSlashTrigger() {},
@@ -421,15 +520,40 @@ test("outcome tracking sends a steer to the current turn without queuing", async
   t.mock.method(globalThis, "fetch", async (_url: string, options: RequestInit) => {
     body = JSON.parse(String(options.body));
     assert.equal(readPendingSubmissions()[0].message, "correct direction");
-    return Response.json({ ok: true, commandId: "steer-1", attachments: [] });
+    return Response.json({ ok: true, commandId: body.commandId, attachments: [] });
   });
   assert.equal(await steerPrompt(ctx, state.input, [], true, [], true), "sent");
   assert.equal(body.turnId, "original-turn");
   assert.equal(body.forcePlan, true);
   assert.equal(state.queued.length, 0);
   assert.equal(state.sent.length, 1);
+  assert.equal(state.sent[0][6], body.commandId);
+  assert.deepEqual(state.settled, [["session-1", "original-turn", body.commandId, { attachments: [] }]]);
   assert.equal(state.steering, false);
   assert.equal(readPendingSubmissions().length, 0);
+});
+
+test("a steer appears as pending before the runner accepts it", async (t) => {
+  const { ctx, state } = steerTestContext(t);
+  let finishRequest!: (response: Response) => void;
+  let body: Record<string, unknown> = {};
+  t.mock.method(globalThis, "fetch", (_url: string, options: RequestInit) => {
+    body = JSON.parse(String(options.body));
+    return new Promise<Response>((resolve) => { finishRequest = resolve; });
+  });
+  const pending = steerPrompt(ctx, state.input, [], true, [], false);
+  assert.equal(state.input, "");
+  assert.equal(state.sent.length, 1);
+  assert.equal(state.sent[0][6], body.commandId);
+  assert.equal(state.sent[0][7], true);
+  assert.equal(state.settled.length, 0);
+  finishRequest(Response.json({ ok: true, commandId: "server-generated", attachments: [] }));
+  assert.equal(await pending, "sent");
+  // An older server that ignores the client ID still ends with exactly one confirmed steer.
+  assert.deepEqual(state.settled, [["session-1", "original-turn", body.commandId, null]]);
+  assert.equal(state.sent.length, 2);
+  assert.equal(state.sent[1][6], "server-generated");
+  assert.equal(state.sent[1][7], undefined);
 });
 
 test("a rejected steer stays a draft when stop and send have already started another turn", async (t) => {
@@ -443,11 +567,29 @@ test("a rejected steer stays a draft when stop and send have already started ano
   assert.equal(await pending, false);
   assert.equal(state.input, "correct direction");
   assert.equal(state.queued.length, 0);
-  assert.equal(state.sent.length, 0);
+  assert.equal(state.sent.length, 1);
+  assert.deepEqual(state.settled, [["session-1", "original-turn", state.sent[0][6], null]]);
   assert.match(state.status, /target turn has stopped or finished/);
   assert.equal(readPendingSubmissions()[0].message, "correct direction");
   assert.equal(state.steering, false);
   assert.equal(isSubmissionSending("session-1"), false);
+});
+
+test("settling a pending steer confirms or removes both the message and its timeline segment", () => {
+  let messages: any[] = [{ id: "assistant", role: "assistant", turnId: "turn", segments: [] }];
+  const setMessages = (update: (current: any[]) => any[]) => { messages = update(messages); };
+  const ctx = { sessionIdRef: { current: "session" }, setMessages,
+    appendSteerSegment: (segments: any[], message: any) => [...segments, { id: `steer:${message.id}`, type: "steer", pending: message.pending }] };
+  const kept = "00000000-0000-4000-8000-00000000000a";
+  const dropped = "00000000-0000-4000-8000-00000000000b";
+  addSteerMessage(ctx, "session", "turn", "go left", [], "2026-11-05T00:00:00Z", false, kept, true);
+  addSteerMessage(ctx, "session", "turn", "go right", [], "2026-11-05T00:00:01Z", false, dropped, true);
+  assert.equal(messages.find((message) => message.id === kept).pending, true);
+  settleSteerMessage(ctx, "session", "turn", kept, { attachments: [{ name: "saved" }] });
+  settleSteerMessage(ctx, "session", "turn", dropped, null);
+  const steers = messages.filter((message) => message.kind === "steer");
+  assert.deepEqual(steers.map((message) => [message.id, message.pending, message.attachments]), [[kept, undefined, [{ name: "saved" }]]]);
+  assert.deepEqual(messages[0].segments.map((segment: any) => [segment.id, segment.pending]), [[`steer:${kept}`, undefined]]);
 });
 
 test("uses the live workspace ref instead of a stale rendered workspace", () => {
@@ -472,6 +614,32 @@ test("formats selected sessions as newline-separated Codex references", () => {
     ),
     "codex://threads/local_1?workspace=one\ncodex://threads/local_2?workspace=two"
   );
+});
+
+test("copies the canonical Threadex URL for the supplied workspace and session", async t => {
+  const previousNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  const copied: string[] = [];
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: { clipboard: { writeText: async (value: string) => { copied.push(value); } } } });
+  t.after(() => {
+    if (previousNavigator) Object.defineProperty(globalThis, "navigator", previousNavigator);
+    else Reflect.deleteProperty(globalThis, "navigator");
+  });
+  const notices: string[] = [];
+  await copyThreadexSessionUrl({ buildCodexReference, showToast: (message: string) => notices.push(message) }, "threadex workspace", "local_session-1");
+  assert.deepEqual(copied, ["threadex://threadex%20workspace/tx_session-1"]);
+  assert.deepEqual(notices, ["Threadex URL copied"]);
+});
+
+test("reports Threadex URL clipboard write failures", async t => {
+  const previousNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: { clipboard: { writeText: async () => { throw new Error("denied"); } } } });
+  t.after(() => {
+    if (previousNavigator) Object.defineProperty(globalThis, "navigator", previousNavigator);
+    else Reflect.deleteProperty(globalThis, "navigator");
+  });
+  const notices: string[] = [];
+  await copyThreadexSessionUrl({ buildCodexReference, showToast: (message: string) => notices.push(message) }, "workspace-2", "tx_session-2");
+  assert.deepEqual(notices, ["Could not copy Threadex URL"]);
 });
 
 test("consumes Loop mode after submitting one prompt", async () => {

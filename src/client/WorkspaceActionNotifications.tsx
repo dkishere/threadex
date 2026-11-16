@@ -1,79 +1,70 @@
 import { useEffect, useId, useRef, useState, type ComponentType } from "react";
 import { createPortal } from "react-dom";
-import { Bell, CheckCircle2, Clock3, ExternalLink, MessageCircle, OctagonAlert, ShieldCheck, X } from "lucide-react";
+import { Bell, CheckCircle2, Clock3, ExternalLink, MessageCircle, ShieldCheck, X } from "lucide-react";
 import { actionNotificationLabel, type ActionNotification } from "./actionNotifications";
-import { ActorBlockerCard } from "./ActorBlockers";
-import type { ActorBlockerView } from "./actorBlockerPresentation";
 import "./WorkspaceActionNotifications.css";
 
 type Props = {
   workspace: { id: string; name: string };
   items: ActionNotification[];
-  /** Blocker proposals awaiting the user's approval in this workspace. */
-  blockers?: ActorBlockerView[];
   error: string;
   loaded: boolean;
   onRefresh: () => void;
   onDecisionSubmitted: (id: string) => void;
-  onBlockerDecided?: (id: string) => void;
   onOpenSession: (id: string) => void;
   ApprovalEvent: ComponentType<any>;
 };
 
-function blockerActorName(blocker: ActorBlockerView) {
-  return (id: string) => id === blocker.ownerActorId && blocker.ownerActorName ? blocker.ownerActorName : id;
+const DROPDOWN_MAX_WIDTH = 640;
+const DROPDOWN_VIEWPORT_MARGIN = 8;
+
+function isUserInputRequest(item: ActionNotification) {
+  return item.method === "item/tool/requestUserInput";
 }
 
-export function WorkspaceActionNotifications({ workspace, items, blockers = [], error, loaded, onRefresh, onDecisionSubmitted, onBlockerDecided, onOpenSession, ApprovalEvent }: Props) {
+/** Workspace-level inbox: each pending request renders the same card used in the session timeline, so it can be
+ * approved or answered in place. Cards own their request, busy and error state; a submitted card leaves the list.
+ * Blocker solutions are not listed here; they are decided in their task session and the actor workspace. */
+export function WorkspaceActionNotifications({ workspace, items, error, loaded, onRefresh, onDecisionSubmitted, onOpenSession, ApprovalEvent }: Props) {
   const [open, setOpen] = useState(false);
-  const [selected, setSelected] = useState<ActionNotification | null>(null);
-  const [selectedBlocker, setSelectedBlocker] = useState<ActorBlockerView | null>(null);
-  const [position, setPosition] = useState({ top: 40, left: 8, maxHeight: 520 });
+  const [handledNotice, setHandledNotice] = useState("");
+  const [position, setPosition] = useState({ top: 40, left: DROPDOWN_VIEWPORT_MARGIN, maxHeight: 520 });
   const trigger = useRef<HTMLButtonElement>(null);
   const dropdown = useRef<HTMLDivElement>(null);
-  const modal = useRef<HTMLDialogElement>(null);
   const id = useId();
-  const total = items.length + blockers.length;
+  const total = items.length;
   const hasItems = total > 0;
-  const modalOpen = !!selected || !!selectedBlocker;
-  const modalKey = selected ? `approval:${selected.approvalId}` : selectedBlocker ? `blocker:${selectedBlocker.id}` : null;
-  const pending = selected && items.find(item => item.approvalId === selected.approvalId);
-  const pendingBlocker = selectedBlocker && blockers.find(blocker => blocker.id === selectedBlocker.id);
-  const closeModal = () => { setSelected(null); setSelectedBlocker(null); };
   useEffect(() => {
     if (!hasItems) setOpen(false);
   }, [hasItems]);
   useEffect(() => {
-    if (!open && !modalOpen) return;
+    if (!open) setHandledNotice("");
+  }, [open]);
+  useEffect(() => {
+    // A handled card unmounts with its focused button; keep keyboard focus inside the popover.
+    const panel = dropdown.current;
+    if (open && panel && !panel.contains(document.activeElement)) panel.focus({ preventScroll: true });
+  }, [open, total]);
+  useEffect(() => {
+    if (!open) return;
     const button = trigger.current;
-    if (modalOpen) modal.current?.showModal();
-    else dropdown.current?.focus();
+    dropdown.current?.focus();
     function escape(event: KeyboardEvent) {
-      if (event.key === "Tab" && modalOpen && modal.current) {
-        const controls = [...modal.current.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), a[href], [tabindex="0"]')]
-          .filter(element => element.getClientRects().length > 0)
-          .filter(element => {
-            if (!(element instanceof HTMLInputElement) || element.type !== "radio" || !element.name) return true;
-            const group = [...modal.current!.querySelectorAll<HTMLInputElement>('input[type="radio"]')].filter(input => input.name === element.name);
-            return element === (group.find(input => input.checked) ?? group[0]);
-          });
-        const first = controls[0]; const last = controls.at(-1);
-        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
-        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
-      }
-      if (event.key !== "Escape") return;
+      if (event.key !== "Escape" || event.isComposing) return;
       // Do not let the shell interpret dismissal as an instruction to stop work.
       event.preventDefault(); event.stopImmediatePropagation();
-      setOpen(false); closeModal();
+      setOpen(false);
     }
     function outside(event: PointerEvent) {
-      if (!modalOpen && !dropdown.current?.contains(event.target as Node) && !button?.contains(event.target as Node)) setOpen(false);
+      if (!dropdown.current?.contains(event.target as Node) && !button?.contains(event.target as Node)) setOpen(false);
     }
     function reposition() {
       const bounds = button?.getBoundingClientRect();
       if (bounds) {
-        const top = Math.min(bounds.bottom + 4, Math.max(8, window.innerHeight - 160));
-        setPosition({ top, left: Math.max(8, Math.min(bounds.left, window.innerWidth - 388)), maxHeight: Math.min(520, window.innerHeight - top - 8) });
+        const width = Math.min(DROPDOWN_MAX_WIDTH, window.innerWidth - DROPDOWN_VIEWPORT_MARGIN * 2);
+        const top = Math.min(bounds.bottom + 4, Math.max(DROPDOWN_VIEWPORT_MARGIN, window.innerHeight - 160));
+        const left = Math.max(DROPDOWN_VIEWPORT_MARGIN, Math.min(bounds.left, window.innerWidth - width - DROPDOWN_VIEWPORT_MARGIN));
+        setPosition({ top, left, maxHeight: window.innerHeight - top - DROPDOWN_VIEWPORT_MARGIN });
       }
     }
     reposition();
@@ -89,12 +80,18 @@ export function WorkspaceActionNotifications({ workspace, items, blockers = [], 
         : button;
       if (focusTarget?.isConnected) focusTarget.focus({ preventScroll: true });
     };
-  }, [open, modalKey]);
+  }, [open]);
+
+  function openSession(sessionId: string) { setOpen(false); onOpenSession(sessionId); }
+  function approvalHandled(item: ActionNotification) {
+    setHandledNotice(`Handled: ${actionNotificationLabel(item)}`);
+    onDecisionSubmitted(item.approvalId);
+  }
 
   return <>
     <button ref={trigger} type="button" className="workspace-actions-trigger" hidden={!hasItems} data-pending={hasItems}
-      aria-label={`${workspace.name} actions${total ? ` (${total} pending)` : ""}`} aria-haspopup="dialog" aria-expanded={open || modalOpen}
-      aria-controls={open ? `${id}-actions` : modalOpen ? `${id}-request` : undefined}
+      aria-label={`${workspace.name} actions${total ? ` (${total} pending)` : ""}`} aria-haspopup="dialog" aria-expanded={open}
+      aria-controls={open ? `${id}-actions` : undefined}
       title={`${workspace.name} action notifications`} onClick={() => { setOpen(value => !value); onRefresh(); }}>
       <Bell size={15} aria-hidden="true" />{total > 0 && <span className="workspace-actions-count">{total > 99 ? "99+" : total}</span>}
     </button>
@@ -102,46 +99,23 @@ export function WorkspaceActionNotifications({ workspace, items, blockers = [], 
       style={position} onBlur={event => { if (event.relatedTarget && !event.currentTarget.contains(event.relatedTarget as Node) && event.relatedTarget !== trigger.current) setOpen(false); }}>
       <header className="workspace-actions-header"><div className="workspace-actions-heading"><div className="workspace-actions-title"><strong>Actions</strong><span className="workspace-actions-pending-count">{total} pending</span></div><small className="workspace-actions-workspace">{workspace.name}</small></div><button type="button" className="workspace-action-close" aria-label="Close actions" onClick={() => setOpen(false)}><X size={17} aria-hidden="true" /></button></header>
       {error && <p className="workspace-actions-message workspace-actions-error" role="status">{error} <button type="button" onClick={onRefresh}>Retry</button></p>}
+      <p className="workspace-actions-handled" role="status" hidden={!handledNotice}>{handledNotice && <><CheckCircle2 size={15} aria-hidden="true" /><span>{handledNotice}</span></>}</p>
       {!loaded && !error && <p className="workspace-actions-message">Loading actions…</p>}
       {loaded && !total && !error && <p className="workspace-actions-message">No pending actions. You're all caught up.</p>}
-      <div className="workspace-actions-list">{items.map(item => <button type="button" className="workspace-action-item" key={item.approvalId} data-approval-id={item.approvalId}
-        data-kind={item.method === "item/tool/requestUserInput" ? "input" : "approval"}
-        onClick={() => { setSelected(item); setOpen(false); }}>
-        <span className="workspace-action-icon" aria-hidden="true">{item.method === "item/tool/requestUserInput" ? <MessageCircle size={18} /> : <ShieldCheck size={18} />}</span>
-        <span className="workspace-action-content"><span className="workspace-action-title-row"><strong>{item.method === "item/tool/requestUserInput" ? "Your input requested" : "Approval required"}</strong><span className="workspace-action-pending"><span className="workspace-action-dot" aria-hidden="true" />Pending</span></span>
-          <span className="workspace-action-summary">{actionNotificationLabel(item)}</span>
-          <span className="workspace-action-meta"><small className="workspace-action-source"><span className="workspace-action-source-label">Session</span>{item.sessionTitle}</small>
-            {item.createdAt && <small className="workspace-action-time"><Clock3 size={12} aria-hidden="true" /><time dateTime={item.createdAt}>{new Date(item.createdAt).toLocaleString()}</time></small>}</span></span>
-      </button>)}
-      {blockers.map(blocker => <button type="button" className="workspace-action-item" key={blocker.id} data-blocker-id={blocker.id} data-kind="blocker"
-        onClick={() => { setSelectedBlocker(blocker); setOpen(false); }}>
-        <span className="workspace-action-icon" aria-hidden="true"><OctagonAlert size={18} /></span>
-        <span className="workspace-action-content"><span className="workspace-action-title-row"><strong>Blocker solution needs approval</strong><span className="workspace-action-pending"><span className="workspace-action-dot" aria-hidden="true" />{blocker.status === "escalated" ? "Escalated" : "Pending"}</span></span>
-          <span className="workspace-action-summary">{blocker.description}</span>
-          <span className="workspace-action-meta"><small className="workspace-action-source"><span className="workspace-action-source-label">Session</span>{blocker.taskSessionTitle || blocker.taskSessionId}</small>
-            <small className="workspace-action-time"><Clock3 size={12} aria-hidden="true" /><time dateTime={blocker.updated}>{new Date(blocker.updated).toLocaleString()}</time></small></span></span>
-      </button>)}</div>
+      <div className="workspace-actions-list">{items.map(item => {
+        const kind = isUserInputRequest(item) ? "input" : "approval";
+        const titleId = `${id}-${item.approvalId}-title`;
+        return <article className="workspace-action-item" key={item.approvalId} data-approval-id={item.approvalId} data-kind={kind} aria-labelledby={titleId}>
+          <header className="workspace-action-item-header">
+            <span className="workspace-action-icon" aria-hidden="true">{kind === "input" ? <MessageCircle size={18} /> : <ShieldCheck size={18} />}</span>
+            <span className="workspace-action-content"><span className="workspace-action-title-row"><strong id={titleId}>{kind === "input" ? "Your input requested" : "Approval required"}</strong><span className="workspace-action-pending"><span className="workspace-action-dot" aria-hidden="true" />Pending</span></span>
+              <span className="workspace-action-meta"><small className="workspace-action-source"><span className="workspace-action-source-label">Session</span>{item.sessionTitle}</small>
+                {item.createdAt && <small className="workspace-action-time"><Clock3 size={12} aria-hidden="true" /><time dateTime={item.createdAt}>{new Date(item.createdAt).toLocaleString()}</time></small>}</span></span>
+            <button type="button" className="workspace-action-session" aria-label={`Go to session ${item.sessionTitle}`} title="Go to session" onClick={() => openSession(item.sessionId)}><ExternalLink size={14} aria-hidden="true" /><span>Go to session</span></button>
+          </header>
+          <div className="workspace-action-body"><ApprovalEvent item={item} compact onDecisionSubmitted={() => approvalHandled(item)} /></div>
+        </article>;
+      })}</div>
     </div>, document.body)}
-    {selectedBlocker && createPortal(<dialog ref={modal} id={`${id}-request`} className="workspace-action-modal" aria-modal="true" aria-labelledby={`${id}-title`}
-      onCancel={event => { event.preventDefault(); closeModal(); }} onClick={event => { if (event.target === event.currentTarget) {
-        const bounds = event.currentTarget.getBoundingClientRect();
-        if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) closeModal();
-      } }}>
-      <header className="workspace-action-modal-header"><span className="workspace-action-icon" data-kind="blocker" aria-hidden="true"><OctagonAlert size={20} /></span><div className="workspace-action-modal-heading"><h2 id={`${id}-title`}>Blocker solution needs approval</h2>
-        <small className="workspace-action-modal-source">{workspace.name} · {selectedBlocker.taskSessionTitle || selectedBlocker.taskSessionId}</small></div><button type="button" className="workspace-action-close" aria-label="Close request" onClick={closeModal}><X size={19} aria-hidden="true" /></button></header>
-      <button type="button" className="workspace-action-session" onClick={() => { closeModal(); onOpenSession(selectedBlocker.taskSessionId); }}><ExternalLink size={15} /> Go to session</button>
-      {pendingBlocker ? <ActorBlockerCard key={pendingBlocker.id} blocker={pendingBlocker} actorName={blockerActorName(pendingBlocker)} onDecided={() => onBlockerDecided?.(pendingBlocker.id)} />
-        : <p className="workspace-action-handled" role="status"><CheckCircle2 size={20} aria-hidden="true" /><span>This blocker decision has been recorded or is no longer pending.</span></p>}
-    </dialog>, document.body)}
-    {selected && createPortal(<dialog ref={modal} id={`${id}-request`} className="workspace-action-modal" aria-modal="true" aria-labelledby={`${id}-title`}
-      onCancel={event => { event.preventDefault(); closeModal(); }} onClick={event => { if (event.target === event.currentTarget) {
-        const bounds = event.currentTarget.getBoundingClientRect();
-        if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) closeModal();
-      } }}>
-      <header className="workspace-action-modal-header"><span className="workspace-action-icon" data-kind={selected.method === "item/tool/requestUserInput" ? "input" : "approval"} aria-hidden="true">{selected.method === "item/tool/requestUserInput" ? <MessageCircle size={20} /> : <ShieldCheck size={20} />}</span><div className="workspace-action-modal-heading"><h2 id={`${id}-title`}>{selected.method === "item/tool/requestUserInput" ? "Your input requested" : "Approval required"}</h2>
-        <small className="workspace-action-modal-source">{workspace.name} · {selected.sessionTitle}</small></div><button type="button" className="workspace-action-close" aria-label="Close request" onClick={() => setSelected(null)}><X size={19} aria-hidden="true" /></button></header>
-      <button type="button" className="workspace-action-session" onClick={() => { setSelected(null); onOpenSession(selected.sessionId); }}><ExternalLink size={15} /> Go to session</button>
-      {pending ? <ApprovalEvent key={pending.approvalId} item={pending} onDecisionSubmitted={onDecisionSubmitted} /> : <p className="workspace-action-handled" role="status"><CheckCircle2 size={20} aria-hidden="true" /><span>This request has been handled or is no longer pending.</span></p>}
-    </dialog>, document.body)}
   </>;
 }

@@ -794,6 +794,56 @@
   height: 15px;
 }
 
+.composer-gear-settings--inherited {
+  grid-template-columns: 32px minmax(0, 1fr);
+  width: 100%;
+  border-right: 0;
+  text-align: left;
+}
+
+.composer-gear-inherited-summary {
+  display: grid;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  padding-right: 6px;
+  font-size: 10px;
+  line-height: 1.25;
+}
+
+.composer-gear-inherited-model,
+.composer-gear-inherited-options {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-gear-inherited-details {
+  display: grid;
+  grid-template-columns: minmax(0, max-content) max-content;
+  gap: 3px;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+@media (width < 768px) {
+  .responsive-layout .composer-layout:has(.composer-gears[data-state="inherited"]),
+  .responsive-layout .chat[data-side-chat-open="true"] .composer-layout:has(.composer-gears[data-state="inherited"]) {
+    --composer-gear-width: min(40%, 280px);
+  }
+
+  .responsive-layout .composer-gear-settings--inherited.composer-gear-settings {
+    grid-template-rows: minmax(0, 1fr);
+    gap: 0;
+  }
+
+  .responsive-layout .composer-gear-settings--inherited.composer-gear-settings svg {
+    width: 15px;
+    height: 15px;
+    transform: none;
+  }
+}
+
 .composer-gear-settings[data-fast-mode="true"] {
   position: relative;
 }
@@ -1243,6 +1293,11 @@ body[data-file-drag-active="true"]::after {
   background: #f8fafc;
   color: #27272a;
   box-shadow: 0 1px 2px rgb(15 23 42 / 6%);
+}
+
+.queued-prompt.pending {
+  opacity: 0.7;
+  border-style: dashed;
 }
 
 .queued-prompt[data-dragging="true"] {

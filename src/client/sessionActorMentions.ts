@@ -7,7 +7,8 @@ export const SESSION_ACTOR_MENTION_LIMIT = 8;
 
 export type SessionMentionActor = { id: string; name: string; avatar?: string; roleSummary: string; parentActorId: string | null };
 export type SessionMentionCandidatesResponse = { projectId: string; projectName: string; actors: SessionMentionActor[] };
-export type SessionActorMentionRequest = { requestId: string; message: string; mentionedActorIds: string[] };
+/** `model`/`modelReasoningEffort` are the Composer's gear for this send; the host turn runs with them. */
+export type SessionActorMentionRequest = { requestId: string; message: string; mentionedActorIds: string[]; model?: string; modelReasoningEffort?: string };
 export type SessionActorMentionResponse = {
   round: { id: string; status: string; error: string | null; namedActorIds: string[]; workItemIds: string[] };
   turnIds: string[];
@@ -57,8 +58,10 @@ export function removeActorMention<T extends { id: string; name: string }>(text:
   return next;
 }
 
-export function sessionActorMentionPayload(requestId: string, message: string, actors: Array<{ id: string }>): SessionActorMentionRequest {
-  return { requestId, message, mentionedActorIds: [...new Set(actors.map(actor => actor.id))] };
+export function sessionActorMentionPayload(requestId: string, message: string, actors: Array<{ id: string }>,
+  gear?: { model?: string; effort?: string }): SessionActorMentionRequest {
+  return { requestId, message, mentionedActorIds: [...new Set(actors.map(actor => actor.id))],
+    ...(gear?.model ? { model: gear.model } : {}), ...(gear?.model && gear.effort ? { modelReasoningEffort: gear.effort } : {}) };
 }
 
 /** Composer hint only; execution is decided by the server. */

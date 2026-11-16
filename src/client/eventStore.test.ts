@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { EventStore, jsonValuesEqual, type WaitSubscription } from "./eventStore";
+import { BACKLOG_RESET_COOLDOWN_MS, EventStore, jsonValuesEqual, type WaitSubscription } from "./eventStore";
 
 test("versioned heartbeats retain omitted state and apply explicit deletions", async (t) => {
   const store = new EventStore();
@@ -42,6 +42,57 @@ test("backlog pages drain in the same poll without losing or duplicating events"
   assert.deepEqual(afters, ["0", "1", "2"]);
   assert.deepEqual(positions, [1, 2, 3]);
   assert.equal(store.getCursor(), 3);
+});
+
+test("a backlog reset skips the backlog, resumes from the snapshot cursor and pages during the cooldown", async (t) => {
+  const store = new EventStore();
+  store.reset(5);
+  const urls: URL[] = [];
+  const positions: number[] = [];
+  store.subscribeTo(["runner.done"], event => { positions.push(event.pos); });
+  const done = (pos: number) => ({ pos, eventId: String(pos), type: "runner.done", workspaceId: "one", sessionId: "session", turnId: "turn", payload: null, timestamp: "now" });
+  const payloads = [
+    { resetRequired: true, resetReason: "backlog", backlog: 900, nextPos: 905 },
+    // Events up to the snapshot cursor are replayed by the server only after it.
+    { events: [done(900), done(901)], nextPos: 901 }
+  ];
+  t.mock.method(globalThis, "fetch", async (url: string) => {
+    urls.push(new URL(url, "http://fixture"));
+    return Response.json(payloads.shift());
+  });
+  t.mock.method(console, "info", () => undefined);
+  assert.equal(await store.poll(), true);
+  assert.deepEqual(positions, [], "skipped events are not delivered one by one");
+  assert.equal(store.getCursor(), 5, "the cursor stays until the snapshot supplies one");
+  assert.equal(urls[0].searchParams.has("backlogReset"), false);
+  store.setWorkspaceSnapshot({}, { sessions: [], offset: 0, limit: 20, hasMore: false, nextOffset: null, projects: [] }, null, 900);
+  assert.equal(await store.poll(), false);
+  assert.equal(urls[1].searchParams.get("after"), "900");
+  assert.equal(urls[1].searchParams.get("backlogReset"), "0");
+  assert.deepEqual(positions, [901], "events at or before the snapshot cursor are not repeated");
+  assert.equal(store.getCursor(), 901);
+});
+
+test("the backlog cooldown expires so a later backlog can reset again", async (t) => {
+  const store = new EventStore();
+  store.reset(5);
+  const urls: URL[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string) => {
+    const parsed = new URL(url, "http://fixture");
+    urls.push(parsed);
+    return Response.json(parsed.searchParams.get("backlogReset") === "0"
+      ? { events: [], nextPos: 5 }
+      : { resetRequired: true, resetReason: "backlog", backlog: 900, nextPos: 905 });
+  });
+  t.mock.method(console, "info", () => undefined);
+  let now = 1_000_000;
+  t.mock.method(Date, "now", () => now);
+  await store.poll();
+  now += BACKLOG_RESET_COOLDOWN_MS - 1;
+  await store.poll();
+  now += 1;
+  await store.poll();
+  assert.deepEqual(urls.map(url => url.searchParams.get("backlogReset")), [null, "0", null]);
 });
 
 test("workspace snapshots invalidate in-flight pages and their state versions", async (t) => {

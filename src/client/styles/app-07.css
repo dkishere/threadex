@@ -442,6 +442,15 @@
   text-align: left;
 }
 
+.steer-event.pending {
+  opacity: 0.7;
+}
+
+.steer-event-status {
+  color: #6b7280;
+  font-size: 12px;
+}
+
 .steer-event pre {
   margin: 0;
   white-space: pre-wrap;

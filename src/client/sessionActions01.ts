@@ -59,6 +59,22 @@ export async function copySessionReference(ctx, workspaceId, id) {
     
 }
 
+export async function copyThreadexSessionUrl(ctx, workspaceId, id) {
+    const { buildCodexReference, showToast } = ctx;
+    const reference = buildCodexReference(workspaceId, id);
+    if (!navigator.clipboard) {
+        showToast("Clipboard is unavailable");
+        return;
+    }
+    try {
+        await navigator.clipboard.writeText(reference);
+        showToast("Threadex URL copied");
+    }
+    catch {
+        showToast("Could not copy Threadex URL");
+    }
+}
+
 export function selectedSessionReferences(records, buildCodexReference) {
     return records
         .map((record) => buildCodexReference(record.workspaceId, record.id))
@@ -404,11 +420,11 @@ export async function startChatTurn(ctx, message, turnAttachments, turnExecution
         setActiveTurnId(turnId);
         markTurnRunning(turnId);
         const displayExecutionMode = contextForkRequest ? "default" : turnExecutionMode;
-        const modelPreferences = currentModelPreferences();
-        const turnModel = selectedModel === AUTO_MODEL_VALUE
+        const modelPreferences = submittedModelPreferences;
+        const turnModel = modelPreferences.selectedModel === AUTO_MODEL_VALUE
             ? sessionAutoModel?.model ?? DEFAULT_MODEL
             : modelPreferences.selectedModel;
-        const turnReasoningEffort = selectedModel === AUTO_MODEL_VALUE
+        const turnReasoningEffort = modelPreferences.selectedModel === AUTO_MODEL_VALUE
             ? sessionAutoModel?.effort ?? "high"
             : modelPreferences.selectedEffort;
         const userMessage = {
@@ -418,7 +434,7 @@ export async function startChatTurn(ctx, message, turnAttachments, turnExecution
             turnId,
             model: turnModel,
             reasoningEffort: turnReasoningEffort,
-            autoModel: selectedModel === AUTO_MODEL_VALUE,
+            autoModel: modelPreferences.selectedModel === AUTO_MODEL_VALUE,
             createdAt: new Date().toISOString(),
             attachments: turnAttachments,
             forcePlan,
@@ -528,7 +544,7 @@ export function queuePrompt(ctx, message, mode, skills, forcePlan) {
 }
 
 export async function steerPrompt(ctx, message, steerAttachments, clearComposer, steerSkills, forcePlan) {
-    const { addSteerMessage, clearComposerInputDraft, clearComposerSessionLinks, currentRunningTurnId, enqueuePrompt, executionMode, isInactiveSteerResponse, isLikelyBackendDisconnect, isSteering, noteBackendDisconnect, noteBackendRequestSucceeded, parseResponseAnnotations, refreshSelectedSessionSnapshot, sessionIdRef, setAttachments, setComposerForcePlanNextPrompt, setComposerInput, setComposerResponseQuote, setIsSteering, setResponseQuotePopover, setSelectedSkills, setSlashTrigger, setStatus, showToast } = ctx;
+    const { addSteerMessage, clearComposerInputDraft, clearComposerSessionLinks, currentRunningTurnId, enqueuePrompt, executionMode, isInactiveSteerResponse, isLikelyBackendDisconnect, isSteering, noteBackendDisconnect, noteBackendRequestSucceeded, parseResponseAnnotations, refreshSelectedSessionSnapshot, sessionIdRef, setAttachments, setComposerForcePlanNextPrompt, setComposerInput, setComposerResponseQuote, setIsSteering, setResponseQuotePopover, setSelectedSkills, setSlashTrigger, setStatus, settleSteerMessage, showToast } = ctx;
         const turnId = currentRunningTurnId;
         const targetSessionId = sessionIdRef.current;
         if (!turnId || !targetSessionId || isSteering || isSubmissionSending(targetSessionId)) {
@@ -556,6 +572,8 @@ export async function steerPrompt(ctx, message, steerAttachments, clearComposer,
         setIsSteering(true);
         setStatus("Steering agent");
         const steerCreatedAt = new Date().toISOString();
+        // Show the steer at once; the runner can take seconds to accept it while the provider is busy.
+        addSteerMessage(targetSessionId, turnId, message, steerAttachments, steerCreatedAt, forcePlan, submissionId, true);
         try {
             const response = await fetch("/api/runner/steer", {
                 method: "POST",
@@ -563,6 +581,7 @@ export async function steerPrompt(ctx, message, steerAttachments, clearComposer,
                 body: JSON.stringify({
                     turnId,
                     sessionId: targetSessionId,
+                    commandId: submissionId,
                     message,
                     clientLayout: currentClientLayout(),
                     forcePlan,
@@ -583,11 +602,19 @@ export async function steerPrompt(ctx, message, steerAttachments, clearComposer,
             noteBackendRequestSucceeded();
             const savedAttachments = Array.isArray(payload?.attachments) ? payload.attachments : steerAttachments;
             removePendingSubmission(submissionId);
-            addSteerMessage(targetSessionId, turnId, message, savedAttachments, steerCreatedAt, forcePlan, typeof payload?.commandId === "string" ? payload.commandId : undefined);
+            const commandId = typeof payload?.commandId === "string" ? payload.commandId : submissionId;
+            if (commandId === submissionId) {
+                settleSteerMessage(targetSessionId, turnId, submissionId, { attachments: savedAttachments });
+            }
+            else {
+                settleSteerMessage(targetSessionId, turnId, submissionId, null);
+                addSteerMessage(targetSessionId, turnId, message, savedAttachments, steerCreatedAt, forcePlan, commandId);
+            }
             setStatus(typeof payload?.message === "string" ? payload.message : "Agent steered.");
             return "sent";
         }
         catch (error) {
+            settleSteerMessage(targetSessionId, turnId, submissionId, null);
             if (clearComposer) {
                 const restoredResponseAnnotations = parseResponseAnnotations(message);
                 setComposerInput((current) => current || restoredResponseAnnotations?.content || message);
@@ -611,7 +638,7 @@ export async function steerPrompt(ctx, message, steerAttachments, clearComposer,
     
 }
 
-export function addSteerMessage(ctx, sessionId, turnId, content, steerAttachments, createdAt = new Date().toISOString(), forcePlan = false, id = crypto.randomUUID()) {
+export function addSteerMessage(ctx, sessionId, turnId, content, steerAttachments, createdAt = new Date().toISOString(), forcePlan = false, id = crypto.randomUUID(), pending = false) {
     const { appendSteerSegment, sessionIdRef, setMessages } = ctx;
         if (sessionIdRef.current !== sessionId) {
             return;
@@ -624,7 +651,8 @@ export function addSteerMessage(ctx, sessionId, turnId, content, steerAttachment
             kind: "steer",
             createdAt,
             attachments: steerAttachments,
-            forcePlan
+            forcePlan,
+            ...(pending ? { pending: true } : {})
         };
         setMessages((current) => {
             const withTimelineSteer = current.map((message) => message.role === "assistant" && message.turnId === turnId
@@ -639,6 +667,34 @@ export function addSteerMessage(ctx, sessionId, turnId, content, steerAttachment
             return [...withTimelineSteer.slice(0, insertionIndex), steerMessage, ...withTimelineSteer.slice(insertionIndex)];
         });
     
+}
+
+/** Confirms an optimistic steer (clearing its pending state) or removes it when `patch` is null. */
+export function settleSteerMessage(ctx, sessionId, turnId, id, patch) {
+    const { sessionIdRef, setMessages } = ctx;
+        if (sessionIdRef.current !== sessionId) {
+            return;
+        }
+        const settle = (item) => {
+            if (!patch) return null;
+            const { pending: _pending, ...settled } = item;
+            return { ...settled, ...patch };
+        };
+        setMessages((current) => current.flatMap((message) => {
+            if (message.role === "user" && message.kind === "steer" && message.id === id) {
+                const settled = settle(message);
+                return settled ? [settled] : [];
+            }
+            if (message.role !== "assistant" || message.turnId !== turnId || !message.segments?.some((segment) => segment.id === `steer:${id}`)) {
+                return [message];
+            }
+            return [{ ...message, segments: message.segments.flatMap((segment) => {
+                if (segment.id !== `steer:${id}`) return [segment];
+                const settled = settle(segment);
+                return settled ? [settled] : [];
+            }) }];
+        }));
+
 }
 
 export function enqueuePrompt(ctx, message, kind, mode, skills, promptAttachments, contextFork, forcePlan, clearComposer = true, submissionId: string | undefined = undefined) {
@@ -658,7 +714,7 @@ export function enqueuePrompt(ctx, message, kind, mode, skills, promptAttachment
     const {
         activeWorkspaceIdRef, clearComposerInputDraft, clearComposerSessionLinks,
         isLikelyBackendDisconnect, noteBackendDisconnect, noteBackendRequestSucceeded,
-        refreshSelectedSessionSnapshot, sessionIdRef, queueRetryRef, showQueuedPromptReceipt, setAttachments,
+        refreshSelectedSessionSnapshot, sessionIdRef, queueRetryRef, showQueuedPromptReceipt, hideQueuedPromptReceipt, setAttachments,
         setComposerResponseQuote, setResponseQuotePopover, setSelectedSkills,
         setSlashTrigger, setStatus
     } = ctx;
@@ -677,6 +733,20 @@ export function enqueuePrompt(ctx, message, kind, mode, skills, promptAttachment
     queueRetryRef.current = { key: requestKey, id };
 
     beginSubmission(id, sessionId);
+    // The durable backup above is the rollback copy, so show the queued item and
+    // release the composer now instead of after the server round trip.
+    const receipt = { id, sessionId, content: message, attachments: promptAttachments, kind, contextFork };
+    showQueuedPromptReceipt({ ...receipt, pending: true });
+    if (clearComposer) {
+        clearComposerInputDraft();
+        setAttachments([]);
+        setComposerResponseQuote(null);
+        setResponseQuotePopover(null);
+        clearComposerSessionLinks();
+        setSelectedSkills([]);
+        setSlashTrigger(null);
+    }
+    setStatus(contextFork ? "Queueing child task handoff" : kind === "steer" ? "Queueing steer" : "Queueing prompt");
     return (async () => {
         try {
             const response = await fetch("/api/pending-turns", {
@@ -700,23 +770,17 @@ export function enqueuePrompt(ctx, message, kind, mode, skills, promptAttachment
                 throw new Error(payload?.error || `API returned ${response.status}`);
             }
             noteBackendRequestSucceeded?.();
-            showQueuedPromptReceipt({ id, sessionId, content: message, attachments: promptAttachments, kind, contextFork });
+            showQueuedPromptReceipt(receipt);
             if (queueRetryRef.current?.id === id) queueRetryRef.current = null;
             removePendingSubmission(id);
-            if (clearComposer) {
-                clearComposerInputDraft();
-                setAttachments([]);
-                setComposerResponseQuote(null);
-                setResponseQuotePopover(null);
-                clearComposerSessionLinks();
-                setSelectedSkills([]);
-                setSlashTrigger(null);
-            }
             setStatus(contextFork ? "Child task handoff queued" : kind === "steer" ? "Steer queued" : "Prompt queued");
-            await refreshSelectedSessionSnapshot?.(sessionId, id);
+            // Reconcile in the background so the next queue or steer is not held behind a full snapshot.
+            void Promise.resolve(refreshSelectedSessionSnapshot?.(sessionId, id)).catch(() => undefined);
             return true;
         }
         catch (error) {
+            // The saved backup now surfaces under "Delivery not confirmed" with Retry.
+            hideQueuedPromptReceipt?.(id);
             recordSubmissionError(id, error instanceof Error ? error.message : String(error));
             if (isLikelyBackendDisconnect?.(error)) noteBackendDisconnect?.();
             setStatus(`Queue failed: ${error instanceof Error ? error.message : "Unknown error"}`);

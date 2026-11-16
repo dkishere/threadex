@@ -53,7 +53,10 @@ export function useActorRoom(workspaceId: string, options: { enabled?: boolean; 
     controller.current = active;
     void refresh();
     const timer = window.setInterval(() => void refresh(), 2500);
-    return () => { active.abort(); if (controller.current === active) controller.current = null; window.clearInterval(timer); };
+    // A local decision (e.g. a blocker dismissed in another entry point) refreshes now rather than at the next poll.
+    const changed = (event: Event) => { if ((event as CustomEvent<{ workspaceId: string }>).detail?.workspaceId === workspaceId) void refresh(); };
+    window.addEventListener(ACTOR_ROOM_CHANGED, changed);
+    return () => { active.abort(); if (controller.current === active) controller.current = null; window.clearInterval(timer); window.removeEventListener(ACTOR_ROOM_CHANGED, changed); };
   }, [workspaceId, chat, enabled, refresh]);
   const current = same(state) ? state : { room: null, error: null, authRequired: false };
   return { room: current.room, error: current.error, authRequired: current.authRequired, refresh, setRoom: adopt };

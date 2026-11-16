@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ActorRoom, ActorRoomEvent, ActorRound, ActorWorkItem, DomainActor } from "../domainActors";
-import { actorDialogRounds, actorGroupRecipients,actorMentionPreview, actorOwnedSessions, actorOwnerExplanation, actorRoundWorkItems, actorStoppableTurns, actorTaskPresentation, actorTreeIds, actorWorkloadBadge } from "./actorRoomPresentation";
+import { actorDialogRounds, actorGroupRecipients, actorOwnedSessions, actorOwnerExplanation, actorRequestRecipients, actorRoundWorkItems, actorStoppableTurns, actorTaskParents, actorTaskPresentation, actorTreeIds, actorWorkloadBadge } from "./actorRoomPresentation";
 
 const treeActor = (id: string, parentActorId: string | null = null) => ({ id, name: id.toUpperCase(), parentActorId, rootActorId: parentActorId ?? id }) as DomainActor;
 const tree = [treeActor("a"), treeActor("a1", "a"), treeActor("a2", "a"), treeActor("b"), treeActor("b1", "b")];
@@ -70,6 +70,28 @@ test("owned sessions: roots by tree ownership, subs by execution, with history d
   assert.deepEqual(subHistory.map(entry => [entry.sessionId, entry.current, entry.executorActorId]), [["s-a1", false, "a1"]]);
 });
 
+test("owned sessions list hosted sub-agent tasks separately, under their host when it is listed", () => {
+  const hosted = (id: string, fields: Partial<ActorWorkItem> = {}) => work(id, { taskSessionId: "s-host", hostWorkItemId: "host",
+    nativeAgent: { name: id, provider: "claude" }, ...fields });
+  const workItems = [
+    work("other", { updated: "2026-10-23T12:00:00.000Z" }),
+    hosted("child-1", { ownerActorId: "a1", executorActorId: "a1", updated: "2026-10-23T11:00:00.000Z", status: "completed" }),
+    work("host", { taskSessionId: "s-host", updated: "2026-10-23T09:00:00.000Z" }),
+    hosted("child-2", { ownerActorId: "a2", executorActorId: "a2", updated: "2026-10-23T10:00:00.000Z" })
+  ];
+  const root = actorOwnedSessions({ workItems, actors: tree }, tree[0]);
+  assert.deepEqual(root.map(entry => [entry.id, entry.sessionId, entry.subagent, entry.nestedUnderHost, entry.status]), [
+    ["s-other", "s-other", false, false, "started"],
+    ["s-host", "s-host", false, false, "started"],
+    ["subagent:child-1", "s-host", true, true, "completed"],
+    ["subagent:child-2", "s-host", true, true, "started"]]);
+  // A sub-actor whose host is outside its list still sees its own sub-agent task, opening the host session.
+  const sub = actorOwnedSessions({ workItems, actors: tree }, tree[1]);
+  assert.deepEqual(sub.map(entry => [entry.id, entry.sessionId, entry.nestedUnderHost]), [["subagent:child-1", "s-host", false]]);
+  // Archiving the host session hides its sub-agent tasks too.
+  assert.deepEqual(actorOwnedSessions({ workItems, actors: tree, archivedSessionIds: ["s-host"] }, tree[0]).map(entry => entry.id), ["s-other"]);
+});
+
 test("group recipients put the actor first, deduplicate and require another actor", () => {
   assert.deepEqual(actorGroupRecipients({ id: "a" }, []), { ids: ["a"], ready: false, tooMany: false });
   assert.deepEqual(actorGroupRecipients({ id: "a" }, [{ id: "a" }]), { ids: ["a"], ready: false, tooMany: false });
@@ -87,8 +109,20 @@ test("workload badge always shows open work and only shows attention when needed
 
 test("mentions preserve longer-name precedence, direct sub actors and reject over eight", () => {
   const actors = ["Robin", "Robin 2", "UI", "A", "B", "C", "D", "E", "F"].map((name, index) => ({ id: String(index), name, parentActorId: index ? "0" : null }) as DomainActor);
-  assert.deepEqual(actorMentionPreview("Please @Robin 2 and @UI: give advice", actors).named.map(actor => actor.name), ["Robin 2", "UI"]);
-  assert.equal(actorMentionPreview(actors.map(actor => `@${actor.name}`).join(" "), actors).tooMany, true);
+  assert.deepEqual(actorRequestRecipients("Please @Robin 2 and @UI: give advice", actors).ids, ["1", "2"]);
+  assert.equal(actorRequestRecipients(actors.map(actor => `@${actor.name}`).join(" "), actors).tooMany, true);
+});
+
+test("a reply nominates the replied actor together with every @mention", () => {
+  const actors = [{ id: "e2e-workflows", name: "Homura Akemi · End-to-End Quality" }, { id: "local-dev-environment", name: "Maomao · Local Platform & Tooling" },
+    { id: "deployment-infrastructure", name: "Rei" }] as DomainActor[];
+  const prompt = "test the workers, with @Maomao · Local Platform & Tooling @Homura Akemi · End-to-End Quality";
+  assert.deepEqual(actorRequestRecipients(prompt, actors, "e2e-workflows").ids, ["e2e-workflows", "local-dev-environment"]);
+  assert.deepEqual(actorRequestRecipients("@Rei please help", actors, "e2e-workflows").ids, ["deployment-infrastructure", "e2e-workflows"]);
+  assert.deepEqual(actorRequestRecipients("follow up on this", actors, "e2e-workflows").ids, ["e2e-workflows"], "a bare reply stays direct");
+  assert.deepEqual(actorRequestRecipients("no mention", actors).ids, []);
+  const many = Array.from({ length: 8 }, (_, index) => ({ id: `m${index}`, name: `M${index}` }) as DomainActor);
+  assert.equal(actorRequestRecipients(many.map(actor => `@${actor.name}`).join(" "), [...many, ...actors], "e2e-workflows").tooMany, true);
 });
 
 test("claim and assignment never advertise started; require the matching start event", () => {
@@ -135,4 +169,19 @@ test("stoppable turns: only running dispatched tasks of visible rounds, newest a
   assert.deepEqual(actorStoppableTurns(items, []), []);
   assert.equal(actorTaskPresentation(items[3], []).label, "Stopped");
   assert.equal(actorTaskPresentation(items[4], []).label, "Waiting for start confirmation");
+});
+
+test("task parents nest handed-off follow-ups under the source task, siblings together, and stay flat without data", () => {
+  const items = [
+    work("homura", { taskSessionId: "s-homura" }),
+    work("maomao", { taskSessionId: "s-maomao", handoff: { sourceActorId: "homura", sourceSessionId: "s-homura" } }),
+    work("asuna", { handoff: { sourceActorId: "maomao", sourceSessionId: "s-maomao" } }),
+    work("rei", { handoff: { sourceActorId: "maomao", sourceSessionId: "s-maomao" } }),
+    work("child", { hostWorkItemId: "homura" }),
+    work("orphan", { handoff: { sourceActorId: "x", sourceSessionId: "s-gone" } }),
+  ];
+  assert.deepEqual([...actorTaskParents(items)], [["maomao", "homura"], ["asuna", "maomao"], ["rei", "maomao"], ["child", "homura"]]);
+  assert.equal(actorTaskParents(items.slice(0, 1)).size, 0);
+  const cycle = [work("x", { parentWorkItemId: "y" }), work("y", { parentWorkItemId: "x" })];
+  assert.ok(actorTaskParents(cycle).size < 2, "a cycle keeps one task reachable at top level");
 });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { developerInstructionRecordFromPayload, getWorkspaceTabSummary, mergeDeveloperInstructionRecords, promptDisplayMetadata, sessionTurnsToMessages, turnDurationMs } from "./sessionHelpers03";
+import { developerInstructionRecordFromPayload, getWorkspaceTabSummary, mergeDeveloperInstructionRecords, promptDisplayMetadata, sessionTurnsToMessages, snapshotSteerMessages, turnDurationMs } from "./sessionHelpers03";
 
 test("workspace activity excludes the current Manager while keeping ordinary tasks", () => {
   const summary = getWorkspaceTabSummary({ displaySessionTitle: (title: string) => title, shortId: (id: string) => id },
@@ -306,4 +306,16 @@ test("legacy context-fork duplicates inherit developer instructions from their m
     )?.developerInstructions,
     "[SERVER-PROVIDED CONTEXT FORK REQUEST]"
   );
+});
+
+test("Threadex-injected steers are hidden from snapshots while user steers stay", () => {
+  const steers = snapshotSteerMessages([
+    { id: "user-1", content: "Please keep the old API.", source: "user" },
+    { id: "legacy-1", content: "A steer from before sources were recorded." },
+    { id: "decision-1", content: "Threadex user intent decision abc (valid only for turn t, until it ends):\n{}", source: "intent-approval" },
+    { id: "decision-legacy", content: "Threadex user intent decision def (valid only for turn t, until it ends):\n{}" },
+    { id: "auto-1", content: "Automation update", source: "automation" }
+  ], "turn-1");
+
+  assert.deepEqual(steers.map((steer: { id: string }) => steer.id), ["user-1", "legacy-1"]);
 });

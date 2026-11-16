@@ -43,6 +43,10 @@ type LoginState = {
 
 export const CLAUDE_NO_LOAD_BALANCE = "Claude accounts are used for Claude models and can't join load balancing.";
 
+const CLAUDE_USAGE_AUTO_REFRESH_MS = 10 * 60_000;
+/** Shared by every mounted listing so the header and Settings do not refresh twice. */
+const autoRefreshedAt = new Map<string, number>();
+
 /** Shared Claude account listing for Settings › Accounts and the header account popover. */
 export function useClaudeAccounts(workspaceId: string | null, sessionId: string | null) {
   const [listing, setListing] = useState<Listing | null>(null);
@@ -62,6 +66,17 @@ export function useClaudeAccounts(workspaceId: string | null, sessionId: string 
   useEffect(() => {
     void load();
   }, [load]);
+
+  // Usage is only fetched on login or a manual refresh, so refresh logged-in accounts
+  // whose windows are unknown or already reset, at most once per throttle interval.
+  useEffect(() => {
+    const stale = (listing?.accounts ?? []).filter((account) => claudeUsageNeedsRefresh(account)
+      && Date.now() - (autoRefreshedAt.get(account.id) ?? 0) >= CLAUDE_USAGE_AUTO_REFRESH_MS);
+    if (stale.length === 0) return;
+    for (const account of stale) autoRefreshedAt.set(account.id, Date.now());
+    void Promise.allSettled(stale.map((account) => request(`/api/claude-accounts/${encodeURIComponent(account.id)}/refresh`, { method: "POST" })))
+      .then(() => load());
+  }, [listing, load]);
 
   async function run(id: string, operation: () => Promise<void>) {
     setBusyId(id);
@@ -289,7 +304,7 @@ export function ClaudeAccountsSection({ claude, onLogin }: { claude: ClaudeAccou
                   {limited && <span>Limit <strong>0%</strong><small>Reset: {formatQuotaWindowReset({ resetAt: quota?.limitResetsAt ?? null }, "relative")}</small></span>}
                   {!limited && quota?.fiveHour && <span>5hr <strong>{formatQuotaPercent(claudeQuotaWindow(quota.fiveHour))}</strong><small>Auto reset: {formatQuotaWindowReset({ resetAt: quota.fiveHour.resetsAt }, "relative")}</small></span>}
                   {!limited && quota?.weekly && <span>Weekly <strong>{formatQuotaPercent(claudeQuotaWindow(quota.weekly))}</strong><small>Reset: {formatQuotaWindowReset({ resetAt: quota.weekly.resetsAt }, "dateTime")}</small></span>}
-                  {!limited && !quota?.fiveHour && !quota?.weekly && <span>{account.loggedIn ? "Usage unavailable" : "—"}</span>}
+                  {!limited && !quota?.fiveHour && !quota?.weekly && <span title={quota?.reportText}>{account.loggedIn ? "Usage unavailable" : "—"}</span>}
                 </span>
               </button>
               <div className="claude-account-actions">
@@ -324,9 +339,22 @@ function claudeWindows(account: ClaudeAccount) {
   return [quota?.fiveHour, quota?.weekly].filter((window): window is QuotaWindow => Boolean(window));
 }
 
+function isQuotaWindowExpired(window: QuotaWindow, now: number) {
+  return window.resetsAt !== null && window.resetsAt <= now;
+}
+
+/** True when a logged-in account shows no current usage: no known percentage, or a window already reset. */
+export function claudeUsageNeedsRefresh(account: ClaudeAccount, now = Date.now()) {
+  if (!account.loggedIn) return false;
+  const windows = claudeWindows(account);
+  return windows.length === 0
+    || windows.every((window) => window.usedPercent === null)
+    || windows.some((window) => isQuotaWindowExpired(window, now));
+}
+
 export function formatClaudeRemaining(account: ClaudeAccount, now = Date.now()) {
   if (isClaudeLimited(account, now)) return "0%";
-  const used = claudeWindows(account).flatMap((window) => window.usedPercent === null ? [] : [window.usedPercent]);
+  const used = claudeWindows(account).flatMap((window) => window.usedPercent === null || isQuotaWindowExpired(window, now) ? [] : [window.usedPercent]);
   if (used.length === 0) return account.quotaError ? "Error" : "Unknown";
   return `${Math.round(Math.max(0, 100 - Math.max(...used)))}%`;
 }
@@ -369,8 +397,9 @@ async function request<T = unknown>(url: string, init: RequestInit = {}): Promis
 }
 
 /** Adapts a Claude window to the Codex quota-window shape so both popovers show remaining % and resets alike. */
-export function claudeQuotaWindow(window: QuotaWindow) {
-  return window.usedPercent === null
+export function claudeQuotaWindow(window: QuotaWindow, now = Date.now()) {
+  // A window past its reset no longer reflects current usage.
+  return window.usedPercent === null || isQuotaWindowExpired(window, now)
     ? null
     : { remaining: Math.max(0, Math.min(100, 100 - window.usedPercent)), resetAt: window.resetsAt };
 }

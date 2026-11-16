@@ -1,5 +1,8 @@
-.model-group-switch-dialog { max-width: 28rem; padding: 1.1rem 1.25rem; border: 1px solid var(--border, #444); border-radius: 12px; background: var(--panel, #1c1c1f); color: inherit; }
+.model-group-switch-dialog { max-width: 28rem; padding: 1.1rem 1.25rem; border: 1px solid var(--border, #cbd5e1); border-radius: 12px; background: var(--panel, #fff); color: var(--text, #18181b); }
 .model-group-switch-dialog::backdrop { background: rgb(0 0 0 / 0.5); }
 .model-group-switch-dialog h2 { margin: 0 0 0.5rem; font-size: 1rem; }
 .model-group-switch-dialog p { margin: 0 0 1rem; font-size: 0.875rem; line-height: 1.45; }
 .model-group-switch-actions { display: flex; justify-content: flex-end; gap: 0.5rem; }
+.model-group-switch-actions button { padding: 6px 10px; border: 1px solid #cbd5e1; border-radius: 6px; background: #f4f4f5; color: #18181b; cursor: pointer; }
+.model-group-switch-actions button[type="submit"] { border-color: #2563eb; background: #2563eb; color: #fff; }
+.model-group-switch-actions button:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }

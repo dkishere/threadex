@@ -1,4 +1,18 @@
 .responsive-layout { --sidebar-width: clamp(260px, 24vw, 320px); }
+/* Measure the session pane, including the Manager's split pane, not the viewport. */
+.chat:has(> .content-header .session-header-title) { container: session-header / inline-size; }
+.responsive-layout .chat > .content-header:has(.session-header-title) { flex-wrap: nowrap; gap: 8px; }
+.responsive-layout .chat > .content-header:has(.session-header-title) .content-header-heading { flex: 1 1 0; }
+.responsive-layout .chat > .content-header:has(.session-header-title) .content-header-actions { flex-wrap: nowrap; max-width: none; }
+@container session-header (max-width: 600px) {
+  .responsive-layout .chat > .content-header:has(.session-header-title) { flex-wrap: wrap; row-gap: 0; }
+  .responsive-layout .chat > .content-header:has(.session-header-title) .content-header-heading { flex-basis: 100%; }
+  .content-header .session-header-title { gap: 6px; }
+  .session-header-title > .session-owner-badges { max-width: min(140px, 28cqw); }
+  .content-header .session-header-id { flex: 0 0 22px; }
+  .content-header .session-header-id > span { display: none; }
+  .responsive-layout .chat > .content-header:has(.session-header-title) .content-header-actions { margin-left: auto; flex-wrap: wrap; }
+}
 .responsive-layout[data-left-open="false"] { --sidebar-width: 0px; }
 .responsive-layout[data-left-open="false"] .sidebar { display: none; }
 .responsive-layout .workspace-header { padding-left: 92px; }
@@ -12,7 +26,7 @@
 .layout-controls .layout-menu-toggle { display: none; }
 .session-sessions-tab { display: none; }
 .responsive-layout .chat { height: calc(100dvh - var(--workspace-header-height)); }
-.responsive-layout[data-middle-open="false"] .chat[data-session-tab] { grid-template-columns: minmax(0, 1fr); grid-template-rows: var(--chat-header-height) 0 minmax(0, 1fr) auto; }
+.responsive-layout[data-middle-open="false"] .chat[data-session-tab] { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(var(--chat-header-height), max-content) 0 minmax(0, 1fr) auto; }
 .responsive-layout[data-middle-open="false"] .session-view-tabs,
 .responsive-layout[data-middle-open="false"] .session-plan-view,
 .responsive-layout[data-middle-open="false"] .session-side-chat-view,
@@ -63,7 +77,7 @@
 
 @media (width < 1080px) {
   .responsive-layout { --tab-panel-width: max(280px, 38%); }
-  .responsive-layout[data-middle-open="true"] .chat[data-session-tab] { grid-template-columns: var(--tab-panel-width) minmax(0, 1fr); grid-template-rows: var(--chat-header-height) 40px minmax(0, 1fr) auto; }
+  .responsive-layout[data-middle-open="true"] .chat[data-session-tab] { grid-template-columns: var(--tab-panel-width) minmax(0, 1fr); grid-template-rows: minmax(var(--chat-header-height), max-content) 40px minmax(0, 1fr) auto; }
   .responsive-layout[data-middle-open="true"] .shell[data-session-tab="sessions"] .sidebar {
     position: fixed;
     inset: calc(var(--chat-header-height) + 40px) auto 0 0;
@@ -82,6 +96,9 @@
   .responsive-layout .session-view-tabs { height: 40px; min-height: 40px; }
   .responsive-layout .session-view-tabs button { min-height: 40px; padding: 9px 8px; }
   .responsive-layout .content-header { padding-left: 52px; padding-right: 52px; }
+  .responsive-layout .content-header:has(.session-header-title) { flex-wrap: wrap; padding-block: 6px; }
+  .responsive-layout .content-header:has(.session-header-title) .content-header-heading { flex: 1 1 320px; }
+  .responsive-layout .content-header:has(.session-header-title) .content-header-actions { max-width: 100%; flex-wrap: wrap; margin-left: auto; }
   .responsive-layout .content-header-actions { max-width: 35%; }
   .responsive-layout .messages .message.assistant,
   .responsive-layout .chat[data-side-chat-open="true"] > .messages-pane > .messages .message.assistant {

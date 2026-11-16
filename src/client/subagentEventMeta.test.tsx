@@ -70,6 +70,14 @@ test("an unresolved internal agent path falls back to its last segment", () => {
   assert.match(html, /<strong title="\/root\/actor_a2_9fd316">actor_a2_9fd316<\/strong>/);
 });
 
+test("a handoff child whose brief follows host notes still shows its actor, and without one reads as Actor handoff", () => {
+  const withNotes = render({ label: "actor_handoff_499f80", prompt: "Host notes first.\n[threadex-actor-assignment:actor_handoff_499f80]\nYou are domain actor 輸入操作與介面體驗 (threadex-composer-ui), root x." });
+  assert.match(withNotes, /subagent-event-avatar/);
+  assert.match(withNotes, /<strong[^>]*>Iris · 輸入操作與介面體驗<\/strong>/);
+  assert.match(render({ label: "actor_handoff_499f80" }), /<strong title="actor_handoff_499f80">Actor handoff<\/strong>/);
+  assert.equal(awaitsActorBrief("actor_handoff_499f80", []), true);
+});
+
 test("a collapsed Codex actor child reads its brief up front; other cards wait for expansion", () => {
   assert.equal(awaitsActorBrief("/root/actor_a2_9fd316", []), true);
   assert.equal(awaitsActorBrief("actor_a2_9fd316", []), true);

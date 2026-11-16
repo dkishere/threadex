@@ -62,13 +62,13 @@ export function useSessionActorMentions(sessionId: string | null, input: string)
     if (!current.actors.length) return `No workers in ${current.projectName}`;
     return null;
   }
-  async function send(targetSessionId: string, message: string): Promise<SessionActorMentionSendResult> {
+  async function send(targetSessionId: string, message: string, gear?: { model?: string; effort?: string }): Promise<SessionActorMentionSendResult> {
     if (mentioned.length > SESSION_ACTOR_MENTION_LIMIT) return { ok: false, error: `Address up to ${SESSION_ACTOR_MENTION_LIMIT} workers per prompt.` };
     const ids = mentioned.map(actor => actor.id);
-    const key = JSON.stringify([targetSessionId, message, ids]);
+    const key = JSON.stringify([targetSessionId, message, ids, gear?.model ?? null, gear?.effort ?? null]);
     // A retry of the same prompt reuses its request id so the server can deduplicate it.
     if (pendingRequest.current?.key !== key) pendingRequest.current = { key, requestId: crypto.randomUUID() };
-    const payload = sessionActorMentionPayload(pendingRequest.current.requestId, message, mentioned);
+    const payload = sessionActorMentionPayload(pendingRequest.current.requestId, message, mentioned, gear);
     setSending({ sessionId: targetSessionId, names: mentioned.map(actor => actor.name) });
     try {
       const response = await submitSessionActorMention(targetSessionId, payload);

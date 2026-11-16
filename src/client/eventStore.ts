@@ -144,6 +144,8 @@ type EventsResponse = {
   events?: RingEvent[];
   nextPos?: number;
   resetRequired?: boolean;
+  resetReason?: "evicted" | "backlog";
+  backlog?: number;
   statusMonitor?: WorkspaceStatusMonitor[];
   processMonitors?: ProcessMonitor[];
   waitEvents?: WaitEvent[];
@@ -154,6 +156,9 @@ type EventListener = (event: RingEvent) => void;
 
 const CURSOR_STORAGE_KEY = "threadex.event-cursor";
 const HELD_POLL_GRACE_MS = 10_000;
+// After a backlog reset, page through any backlog for a while instead of
+// reloading again, so a slow or failing snapshot cannot loop.
+export const BACKLOG_RESET_COOLDOWN_MS = 10_000;
 const emptySessionPage: SessionPageState = {
   sessions: [],
   offset: 0,
@@ -185,6 +190,7 @@ export class EventStore {
   private longPollUnsupported = false;
   private stateVersion = "";
   private snapshotGeneration = 0;
+  private lastBacklogResetAt = Number.NEGATIVE_INFINITY;
   private waitSubscriptionUpdates = new Map<string, WaitSubscription>();
 
   getState = () => this.state;
@@ -387,6 +393,7 @@ export class EventStore {
     const after = this.state.cursor;
     const params = new URLSearchParams({ after: String(after), view: "client" });
     if (this.stateVersion) params.set("stateVersion", this.stateVersion);
+    if (Date.now() - this.lastBacklogResetAt < BACKLOG_RESET_COOLDOWN_MS) params.set("backlogReset", "0");
     let payload: EventsResponse;
     if (waitMs > 0) {
       const controller = new AbortController();
@@ -417,6 +424,10 @@ export class EventStore {
     const workspaceId = readWorkspaceId(this.state.workspaceSnapshot);
     if (payload.resetRequired || (workspaceId && payload.workspaceId && payload.workspaceId !== workspaceId)) {
       this.stateVersion = "";
+      if (payload.resetReason === "backlog") {
+        this.lastBacklogResetAt = Date.now();
+        console.info(`Event backlog of ${payload.backlog ?? "many"} events; reloading the snapshot instead.`);
+      }
       return { resetRequired: true, hasMore: false };
     }
 

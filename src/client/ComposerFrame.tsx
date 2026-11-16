@@ -42,6 +42,8 @@ type ComposerGearSelectorProps = {
   autoModelValue?: string;
   autoEffort?: ModelReasoningEffort;
   disabled?: boolean;
+  inherited?: boolean;
+  onEnableOverride?: () => void;
   className?: string;
 };
 
@@ -163,6 +165,8 @@ export function ComposerGearSelector({
   autoModelValue,
   autoEffort,
   disabled = false,
+  inherited = false,
+  onEnableOverride,
   className = ""
 }: ComposerGearSelectorProps) {
   const classes = className ? `composer-gears ${className}` : "composer-gears";
@@ -240,6 +244,24 @@ export function ComposerGearSelector({
       window.visualViewport?.removeEventListener("scroll", positionMenu);
     };
   }, [isMenuOpen]);
+
+  if (inherited) return (
+    <aside className={classes} aria-label={label} data-state="inherited">
+      <button type="button" className="composer-gear-settings composer-gear-settings--inherited" style={{ opacity: 0.55 }}
+        aria-label="Override session model settings" disabled={disabled}
+        title={`${modelOptionLabel(activeGear.model)} · ${effortOptionLabel(activeGear.effort)}${fastMode ? " · Fast" : ""} · Inherited. Using the last turn's settings. Enable override to change them.`}
+        onClick={onEnableOverride}>
+        <Cog aria-hidden="true" />
+        <span className="composer-gear-inherited-summary">
+          <span className="composer-gear-inherited-model">{modelOptionLabel(activeGear.model)}</span>
+          <span className="composer-gear-inherited-details">
+            <span className="composer-gear-inherited-options">{effortOptionLabel(activeGear.effort)}{fastMode ? " · Fast" : ""}</span>
+            <span>· Inherited</span>
+          </span>
+        </span>
+      </button>
+    </aside>
+  );
 
   return (
     <aside ref={rootRef} className={classes} aria-label={label}>

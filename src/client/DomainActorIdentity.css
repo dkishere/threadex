@@ -9,3 +9,7 @@
 .domain-actor-identity-copy > strong { color: #26334b; font-size: 13px; font-weight: 650; overflow-wrap: anywhere; }
 .domain-actor-role { color: #52637a; font-weight: 500; }
 .domain-actor-identity-copy > small { color: #64748b; font-size: 11px; overflow-wrap: anywhere; }
+button.domain-actor-identity-link { padding: 2px 4px; border: 0; border-radius: 8px; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+button.domain-actor-identity-link:hover { background: rgba(124, 58, 237, .08); }
+button.domain-actor-identity-link:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
+.actor-room-unrelated .domain-actor-identity-link { flex: none; }

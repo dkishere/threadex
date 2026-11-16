@@ -1,18 +1,17 @@
-.transcript-history-navigation {
-  position: sticky;
-  top: 0;
-  z-index: 2;
-  display: flex;
+.transcript-history {
+  display: grid;
   flex: 0 0 auto;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
-  background: #fff;
-  border-bottom: 1px solid #e4e4e7;
+  justify-items: center;
+  gap: 4px;
+  padding: 12px 0;
   font-size: 12px;
 }
 
-.transcript-history-navigation button {
-  padding: 4px 8px;
+.transcript-history button {
+  padding: 4px 12px;
+}
+
+.transcript-history p {
+  margin: 0;
+  color: #71717a;
 }

@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
-import { AlertTriangle, Check, ExternalLink, MessageSquarePlus, OctagonAlert, SquarePen, X } from "lucide-react";
+import { AlertTriangle, BellOff, Check, ExternalLink, MessageSquarePlus, OctagonAlert, SquarePen, X } from "lucide-react";
 import { blockerComposerText, requestBlockerComposer } from "./blockerComposer";
 import { actorBlockerPendingDecision, type ActorBlocker, type ActorBlockerProposal } from "../actorBlockers";
 import { apiJson } from "./apiClient";
@@ -53,9 +53,50 @@ export function BlockerDecision({ blocker, proposal, onDecided }: {
   </div>;
 }
 
-export function ActorBlockerCard({ blocker, actorName, onOpenSession, onDecided, showDecision = true, compactActions = false }: {
+/** Dismiss a blocker at any level: closes it as dismissed on the server (history kept) after an inline confirmation.
+ * Separate from ack (local, keeps it active) and Reject (abandons one proposal). Dismissal is final, so it asks first. */
+export function BlockerDismiss({ blocker, onDismissed }: { blocker: ActorBlocker; onDismissed?: (blocker: ActorBlocker) => void }) {
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const wrap = useRef<HTMLDivElement>(null);
+  const start = useRef<HTMLButtonElement>(null);
+  const restoreFocus = useRef(false);
+  useEffect(() => { if (!confirming && restoreFocus.current) { restoreFocus.current = false; start.current?.focus(); } }, [confirming]);
+  function cancel() { restoreFocus.current = true; setConfirming(false); }
+  async function dismiss() {
+    if (busy) return;
+    setBusy(true); setError("");
+    try {
+      const updated = await apiJson<ActorBlocker>(`/api/domain-actors/${encodeURIComponent(blocker.workspaceId)}/blockers/${encodeURIComponent(blocker.id)}/action`,
+        { method: "POST", body: { action: "dismiss" } });
+      // The row leaves the list on refresh; keep focus inside the surrounding list instead of dropping it to the page.
+      const container = wrap.current?.closest<HTMLElement>(".task-blockers-panel, .project-blockers-modal, .actor-blockers-panel, .actor-blocker-list");
+      if (container) { if (!container.hasAttribute("tabindex")) container.tabIndex = -1; container.focus(); }
+      notifyActorRoomChanged(blocker.workspaceId);
+      onDismissed?.(updated);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      setBusy(false);
+    }
+  }
+  return <div className="actor-blocker-dismiss" ref={wrap} onKeyDown={event => {
+    if (confirming && event.key === "Escape") { event.preventDefault(); event.stopPropagation(); event.nativeEvent.stopImmediatePropagation(); cancel(); }
+  }}>
+    {confirming ? <span className="actor-blocker-dismiss-confirm" role="group" aria-label="Confirm dismissing this blocker">
+      <span className="actor-blocker-dismiss-prompt">Dismiss for every actor?</span>
+      <button type="button" className="secondary" disabled={busy} onClick={cancel}>Cancel</button>
+      <button type="button" className="secondary actor-blocker-dismiss-confirm-button" disabled={busy} autoFocus onClick={() => void dismiss()}
+        aria-label={`Confirm dismissing blocker: ${blocker.description}`}><BellOff aria-hidden="true" />{busy ? "Dismissing…" : "Dismiss"}</button>
+    </span> : <button ref={start} type="button" className="secondary actor-blocker-dismiss-button" onClick={() => setConfirming(true)}
+      aria-label={`Dismiss blocker: ${blocker.description}`} title="Close this blocker as dismissed (kept in history)"><BellOff aria-hidden="true" />Dismiss</button>}
+    {error && <p role="alert" className="actor-blocker-error">{error}</p>}
+  </div>;
+}
+
+export function ActorBlockerCard({ blocker, actorName, onOpenSession, onDecided, showDecision = true, showDismiss = true, compactActions = false }: {
   blocker: ActorBlockerView; actorName: ActorName; onOpenSession?: (sessionId: string) => void;
-  onDecided?: (blocker: ActorBlocker) => void; showDecision?: boolean; compactActions?: boolean;
+  onDecided?: (blocker: ActorBlocker) => void; showDecision?: boolean; showDismiss?: boolean; compactActions?: boolean;
 }) {
   const proposal = blocker.proposals.at(-1);
   const pending = actorBlockerPendingDecision(blocker);
@@ -92,6 +133,7 @@ export function ActorBlockerCard({ blocker, actorName, onOpenSession, onDecided,
       {onOpenSession && blocker.taskSessionId && <button type="button" className="secondary actor-blocker-open" aria-label="Go to session" title="Go to session" onClick={() => onOpenSession(blocker.taskSessionId)}>
         <ExternalLink aria-hidden="true" />{!compactActions && "Go to session"}</button>}
       {pending && showDecision && <BlockerDecision key={pending.id} blocker={blocker} proposal={pending} onDecided={onDecided} />}
+      {showDismiss && blocker.status !== "resolved" && blocker.status !== "dismissed" && <BlockerDismiss blocker={blocker} onDismissed={onDecided} />}
     </footer>
   </article>;
 }
@@ -154,6 +196,11 @@ function blockersPanelPlacement(trigger: HTMLElement): CSSProperties {
   return { position: "fixed", top, left, right: "auto", width, maxHeight: Math.max(160, Math.min(560, window.innerHeight - top - 8)) };
 }
 
+/** Esc inside a pending Dismiss confirmation cancels that confirmation instead of closing the surrounding popup. */
+function inDismissConfirm(event: KeyboardEvent) {
+  return event.target instanceof Element && !!event.target.closest(".actor-blocker-dismiss-confirm");
+}
+
 /** Chip with a click-to-open panel listing blockers; hidden when there are none. The count shows only unseen blockers. */
 export function BlockersButton({ blockers, actorName, scope, listLabel, onOpenSession }: {
   blockers: ActorBlockerView[]; actorName: ActorName; scope: string; listLabel: string; onOpenSession?: (sessionId: string) => void;
@@ -177,7 +224,7 @@ export function BlockersButton({ blockers, actorName, scope, listLabel, onOpenSe
   useEffect(() => {
     if (!open) return;
     function escape(event: KeyboardEvent) {
-      if (event.key !== "Escape") return;
+      if (event.key !== "Escape" || inDismissConfirm(event)) return;
       // Closing the panel must not reach the session's Esc-to-stop shortcut.
       event.preventDefault(); event.stopImmediatePropagation();
       setOpen(false); trigger.current?.focus();
@@ -217,7 +264,7 @@ export function ProjectBlockersButton({ blockers, actorName, onOpenSession }: {
   useEffect(() => {
     if (!open) return;
     function escape(event: KeyboardEvent) {
-      if (event.key !== "Escape") return;
+      if (event.key !== "Escape" || inDismissConfirm(event)) return;
       // Closing the dialog must not reach the session's Esc-to-stop shortcut.
       event.preventDefault(); event.stopImmediatePropagation(); close();
     }
@@ -277,10 +324,11 @@ export function BlockersTable({ blockers, actorName, label, onOpenSession, stack
               onClick={() => setExpanded(detailsOpen ? null : blocker.id)}>{pending ? "Review" : "Details"}</button>
             <button type="button" className="secondary" onClick={() => onOpenSession(blocker.taskSessionId)}>
               <ExternalLink aria-hidden="true" />Go to session</button>
+            <BlockerDismiss blocker={blocker} />
           </div></td>
         </tr>
         {detailsOpen && <tr id={detailsId} className="project-blockers-detail"><td colSpan={7}>
-          <ActorBlockerCard blocker={blocker} actorName={actorName} />
+          <ActorBlockerCard blocker={blocker} actorName={actorName} showDismiss={false} />
         </td></tr>}
       </Fragment>;
     })}</tbody>

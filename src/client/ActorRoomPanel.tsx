@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
-import { Brain, ChevronDown, ChevronRight, ExternalLink, Globe, Loader2, MessageCircle, Paperclip, Plus, Quote, RefreshCw, RotateCcw, Send, Square, Users, X } from "lucide-react";
+import { Brain, ChevronDown, ChevronRight, ExternalLink, Globe, Loader2, MessageCircle, MessageSquarePlus, Paperclip, Plus, Quote, RefreshCw, RotateCcw, Send, Square, Users, X } from "lucide-react";
 import { ChatMessageActions } from "./ChatMessageActions";
 import { ResponseAnnotationList } from "./ResponseAnnotationList";
 import { ResponseQuotePopover } from "./ResponseQuotePopover";
@@ -21,10 +21,10 @@ import { ComposerSuggestionMenu } from "./ComposerSuggestions";
 import type { ComposerSuggestion } from "./appTypes";
 import { InlineLinkComposer, type ComposerInlineLink, type InlineLinkComposerHandle } from "./InlineLinkComposer";
 import { MarkdownContent } from "./MarkdownContent";
-import { actorInProjectChat, actorRoundChatKey, splitActorPromptPageContext, UNASSIGNED_ACTOR_PROJECT, type ActorMemoryContent, type ActorResponseProfile, type ActorRound, type CreateDomainActor, type DomainActor } from "../domainActors";
+import { actorInProjectChat, actorRoundChatKey, isActorDirectChatRound, splitActorPromptPageContext, UNASSIGNED_ACTOR_PROJECT, type ActorMemoryContent, type ActorResponseProfile, type ActorRound, type CreateDomainActor, type DomainActor } from "../domainActors";
 import { DEFAULT_MODEL, MODEL_OPTIONS, modelEfforts, modelLabel, supportsUltraEffort } from "../modelCatalog";
 import { apiJson, ApiError } from "./apiClient";
-import { actorMentionPreview, actorOwnerExplanation, actorRoutingFailure, actorRoundWorkItems, actorStoppableTurns, actorTaskPresentation, type ActorDialogMode } from "./actorRoomPresentation";
+import { actorOwnerExplanation, actorRequestRecipients, actorRoutingFailure, actorRoundWorkItems, actorStoppableTurns, actorTaskParents, actorTaskPresentation, type ActorDialogMode } from "./actorRoomPresentation";
 import { isAuthRequired, useActorRoom, type ActorRoomState } from "./actorRoomState";
 import "./ActorRoomPanel.css";
 import { AttachmentList } from "./attachments";
@@ -33,12 +33,15 @@ import { attachmentFilesFromPaste } from "./composerPaste";
 import type { ActorAttachment, ActorTaskSelection, ActorWorkItem } from "../domainActors";
 import { ActorRoundtableCard, ActorRoundtableComposerPanel, ActorRoundtableReceiptCard, useActorRoundtableDraft, useActorRoundtables } from "./ActorRoundtables";
 import { groupChatEntries } from "./actorRoundtablePresentation";
+import { navigationUrl } from "./navigation";
+import { clearGroupFollowUpDraft, getGroupFollowUpDraft, groupFollowUpGuard, useGroupFollowUpDraft } from "./groupFollowUpDraft";
+import { newPickOwnerRequestId, pickOwnerErrorMessage, submitSessionPickOwner } from "./sessionPickOwner";
 
 const isLongActorText = (text: string) => text.length > 600 || text.split("\n").length > 8;
 const blankMemory = (): ActorMemoryContent => ({ rolePrompt: "", roleSummary: "", longTerm: "", rolling: "" });
 const memoryLabels: Record<keyof ActorMemoryContent, string> = { rolePrompt: "Role and instructions", roleSummary: "Domain summary", longTerm: "Long-term knowledge", rolling: "Recent progress and handover" };
 /** Without `actor` this is a project group chat (`chatKey`, default Unassigned); with `actor` it is the actor's unified timeline. */
-type Props = { workspaceId: string; approvalPolicy?: ActorRound["approvalPolicy"]; onOpenSession: (id: string) => void; actor?: DomainActor; roomState?: ActorRoomState; disableEscapeStop?: boolean;
+type Props = { workspaceId: string; approvalPolicy?: ActorRound["approvalPolicy"]; onOpenSession: (id: string) => void; onOpenActor?: (actorId: string) => void; actor?: DomainActor; roomState?: ActorRoomState; disableEscapeStop?: boolean;
   /** Group chat key: a project ID or UNASSIGNED_ACTOR_PROJECT. Ignored with `actor`. */
   chatKey?: string; chatName?: string };
 const NO_LINKS: ComposerInlineLink[] = [];
@@ -91,7 +94,7 @@ function replyAnnotation(reply: ReplyContext, workspaceId: string): ResponseAnno
   ].join("\n") };
 }
 
-export function ActorRoomPanel({ workspaceId, approvalPolicy, onOpenSession, actor: viewActor, roomState, disableEscapeStop = false, chatKey: chatKeyProp, chatName }: Props) {
+export function ActorRoomPanel({ workspaceId, approvalPolicy, onOpenSession, onOpenActor, actor: viewActor, roomState, disableEscapeStop = false, chatKey: chatKeyProp, chatName }: Props) {
   const base = `/api/domain-actors/${encodeURIComponent(workspaceId)}`;
   const chatKey = viewActor ? undefined : chatKeyProp || UNASSIGNED_ACTOR_PROJECT;
   const chatProjectId = chatKey === undefined || chatKey === UNASSIGNED_ACTOR_PROJECT ? null : chatKey;
@@ -186,7 +189,7 @@ export function ActorRoomPanel({ workspaceId, approvalPolicy, onOpenSession, act
   const actors = room?.actors ?? [];
   // A project group chat addresses only that project's workers (membership: root projectIds).
   const chatActors = chatKey === undefined ? actors : actors.filter(candidate => actorInProjectChat(actors, candidate.id, chatProjectId));
-  const preview = actorMentionPreview(prompt, chatActors);
+  const recipients = actorRequestRecipients(prompt, chatActors, replyContext?.actorId);
   const chatTitle = chatKey === undefined ? "" : `${chatName || (chatKey === UNASSIGNED_ACTOR_PROJECT ? "Unassigned" : chatKey)} group chat`;
   const actor = viewActor ? actors.find(candidate => candidate.id === viewActor.id) ?? viewActor : undefined;
   // A private dialog always addresses only its actor; @ mentions do not change the recipient.
@@ -198,7 +201,15 @@ export function ActorRoomPanel({ workspaceId, approvalPolicy, onOpenSession, act
   const roundtableMode = !viewActor && roundtableDraft.enabled;
   const replyTargetUnavailable = !!replyContext && !actors.some(candidate => candidate.id === replyContext.actorId);
   const roundtableBlocked = roundtableMode && (roundtableDraft.actors.length < 2 || files.attachments.length > 0);
-  const blocked = roundtableMode ? roundtableBlocked : replyTargetUnavailable || !actor && !replyContext && preview.tooMany;
+  const blocked = roundtableMode ? roundtableBlocked : replyTargetUnavailable || !actor && recipients.tooMany;
+  // A session badge turns the next send into a group follow-up: the group chat picks an owner for that session.
+  const followUp = useGroupFollowUpDraft();
+  const [followUpSending, setFollowUpSending] = useState(false);
+  const followUpInFlight = useRef(false);
+  const followUpRetry = useRef<{ sessionId: string; message: string; requestId: string } | null>(null);
+  const followUpGuard = followUp ? groupFollowUpGuard({ draft: followUp, chatProjectId, hasPromptText: !!prompt.trim(), attachmentCount: files.attachments.length,
+    roundtableMode, addressesActor: !!actor || recipients.ids.length > 0 }) : null;
+  const followUpBlockedReason = followUpGuard && !followUpGuard.ok ? followUpGuard.reason : null;
   const dialogReceipts = (actor ? [dialogKeys(workspaceId, actor, "individual"), dialogKeys(workspaceId, actor, "group")] : [keys])
     .flatMap(target => (receipts.current.get(target.pending) ?? readPending(target.pending)).map(item => ({ item, target })))
     .filter(({ item }) => !room?.rounds.some(round => round.requestId === item.requestId));
@@ -285,7 +296,7 @@ export function ActorRoomPanel({ workspaceId, approvalPolicy, onOpenSession, act
     setReplyRetryStates(current => ({ ...current, [key]: { retrying: true } }));
     let error: string | undefined;
     try {
-      await apiJson(`${base}/rounds/${encodeURIComponent(roundId)}/replies/${encodeURIComponent(actorId)}/retry`, { method: "POST", body: {} });
+      await apiJson(`${base}/rounds/${encodeURIComponent(roundId)}/replies/${encodeURIComponent(actorId)}/retry`, { method: "POST", body: { responseProfile: { model: activeGear.model, effort: activeGear.effort } } });
       await refresh();
     } catch (cause) { error = `Retry failed: ${cause instanceof Error ? cause.message : String(cause)}`; await refresh().catch(() => {}); }
     finally {
@@ -452,17 +463,46 @@ export function ActorRoomPanel({ workspaceId, approvalPolicy, onOpenSession, act
   }, [room, pending]);
   async function send(event?: FormEvent) {
     event?.preventDefault();
+    if (getGroupFollowUpDraft()) { await sendGroupFollowUp(); return; }
     if (roundtableMode) { await startRoundtable(); return; }
     if (!room || !chatActors.length || (!promptRef.current.trim() && !quotesRef.current.length && !files.attachments.length) || files.reading || blocked) return;
     const sent = keys;
     const reply = replyContextRef.current;
     const context = [...quotesRef.current, ...(reply ? [replyAnnotation(reply, workspaceId)] : [])];
-    const request: PendingRequest = { requestId: crypto.randomUUID(), approvalPolicy, userPrompt: context.length ? formatResponseAnnotationsPrompt(context, promptRef.current) : promptRef.current, ...(files.attachments.length ? { attachments: files.attachments } : {}), namedActorIds: actor ? [actor.id] : reply ? [reply.actorId] : preview.named.map(actor => actor.id), responseProfile: { model: activeGear.model, effort: activeGear.effort },
+    const request: PendingRequest = { requestId: crypto.randomUUID(), approvalPolicy, userPrompt: context.length ? formatResponseAnnotationsPrompt(context, promptRef.current) : promptRef.current, ...(files.attachments.length ? { attachments: files.attachments } : {}), namedActorIds: actor ? [actor.id] : actorRequestRecipients(promptRef.current, chatActors, reply?.actorId).ids, responseProfile: { model: activeGear.model, effort: activeGear.effort },
       ...(chatKey !== undefined ? { chatProjectId } : {}) };
     updatePending(sent, items => [...items, request]);
     setPrompt(""); setQuotes([]); setReplyContext(null); files.clear(); setMention(null); suggestions.dismiss(); setRequestError("");
     followReplies.current = true;
     await submitReceipt(sent, request);
+  }
+  async function sendGroupFollowUp() {
+    const draft = getGroupFollowUpDraft();
+    if (!draft || followUpInFlight.current || files.reading) return;
+    const guard = groupFollowUpGuard({ draft, chatProjectId, hasPromptText: !!promptRef.current.trim(), attachmentCount: files.attachments.length,
+      roundtableMode, addressesActor: !!actor || actorRequestRecipients(promptRef.current, chatActors, replyContextRef.current?.actorId).ids.length > 0 });
+    if (!guard.ok || chatProjectId === null) return;
+    const reply = replyContextRef.current;
+    const context = [...quotesRef.current, ...(reply ? [replyAnnotation(reply, workspaceId)] : [])];
+    const message = context.length ? formatResponseAnnotationsPrompt(context, promptRef.current) : promptRef.current;
+    // A retry after an uncertain network failure reuses the request ID so the server does not queue a second round.
+    const previous = followUpRetry.current;
+    const requestId = previous && previous.sessionId === draft.sessionId && previous.message === message ? previous.requestId : newPickOwnerRequestId();
+    followUpRetry.current = { sessionId: draft.sessionId, message, requestId };
+    followUpInFlight.current = true; setFollowUpSending(true); setRequestError("");
+    try {
+      await submitSessionPickOwner(draft.sessionId, { requestId, message, chatProjectId });
+      followUpRetry.current = null;
+      if (!mounted.current) return;
+      setPrompt(""); setQuotes([]); setReplyContext(null); setMention(null); suggestions.dismiss();
+      clearGroupFollowUpDraft(draft.sessionId);
+      followReplies.current = true;
+      void refresh();
+    } catch (cause) {
+      // The server answered, so this request ID is settled; only a lost connection may be retried under the same ID.
+      if (cause instanceof ApiError) followUpRetry.current = null;
+      if (mounted.current) { setAuthRequired(isAuthRequired(cause)); setRequestError(pickOwnerErrorMessage(cause)); }
+    } finally { followUpInFlight.current = false; if (mounted.current) setFollowUpSending(false); }
   }
   async function startRoundtable() {
     if ((!promptRef.current.trim() && !quotesRef.current.length && !replyContextRef.current) || files.reading || roundtableBlocked) return;
@@ -473,7 +513,9 @@ export function ActorRoomPanel({ workspaceId, approvalPolicy, onOpenSession, act
     // Like the session composer, the mode applies to one prompt and the cast is remembered.
     setPrompt(""); setQuotes([]); setReplyContext(null); setMention(null); suggestions.dismiss(); setRequestError(""); roundtableDraft.disable();
     followReplies.current = true;
-    const view = await roundtables.start({ message, actors: cast, ...(reply?.roundId ? { sourceRoundId: reply.roundId } : {}) });
+    // The session runs in this group chat's project, like a task started from it.
+    // The host response follows this chat's gear box, as the session composer's round table does.
+    const view = await roundtables.start({ message, actors: cast, hostProfile: { model: activeGear.model, effort: activeGear.effort }, ...(reply?.roundId ? { sourceRoundId: reply.roundId } : {}), ...(chatKey !== undefined ? { chatProjectId } : {}) });
     if (view?.sessionId.trim() && mounted.current) onOpenSession(view.sessionId);
   }
   async function submitReceipt(sent: DialogKeys, receipt: Receipt) {
@@ -531,13 +573,16 @@ export function ActorRoomPanel({ workspaceId, approvalPolicy, onOpenSession, act
     } finally { if (mounted.current) setSaving(false); }
   }
   const actorName = (id: string) => actors.find(actor => actor.id === id)?.name ?? id;
+  // Group chat only; an actor that no longer exists keeps the plain, non-clickable identity.
+  const openActorOf = (id: string) => !viewActor && onOpenActor && actors.some(actor => actor.id === id) ? onOpenActor : undefined;
   const renderRound = (round: ActorRound) => {
     if (!room) return null;
     const works = actorRoundWorkItems(room, round);
     const waiting = ["queued", "responding"].includes(round.status);
     // Group chat: tasks go into one block at the bottom, claims into one block, unrelated replies fold.
-    // An actor's own timeline keeps tasks and claims inside each reply.
+    // An actor's own timeline shows no tasks (its Sessions list carries them); a claim stays as a label on the reply.
     const grouped = !actor;
+    const directRound = isActorDirectChatRound(round);
     const claims = round.replies.filter(reply => reply.status === "claimed");
     const relatedIds = new Set([...claims.map(reply => reply.actorId), ...works.flatMap(work => [work.ownerActorId, work.executorActorId])]);
     const unrelated = (reply: ActorRound["replies"][number]) => grouped && !relatedIds.has(reply.actorId)
@@ -547,48 +592,15 @@ export function ActorRoomPanel({ workspaceId, approvalPolicy, onOpenSession, act
       .map((id, index) => ({ id, index, folded: (() => { const reply = round.replies.find(reply => reply.actorId === id); return !!reply && unrelated(reply); })() }))
       .sort((a, b) => Number(a.folded) - Number(b.folded) || a.index - b.index).map(item => item.id);
     const identityOf = (id: string) => actors.find(actor => actor.id === id) ?? round.actorSnapshots.find(actor => actor.id === id) ?? { id, name: actorName(id) };
-    // An actor's own timeline: full task card inside the reply. Task stop lives in group chat only.
-    const renderWork = (work: typeof works[number]) => {
-      const presentation = actorTaskPresentation(work, room.events);
-      const binding = room.rounds.find(source => source.id === work.roundId)?.taskBinding;
-      const cancelState = taskCancelStates[work.id];
-      const host = work.hostWorkItemId ? works.find(item => item.id === work.hostWorkItemId) : undefined;
-      const hosting = works.some(item => item.hostWorkItemId === work.id);
-      return <div key={work.id} className="actor-room-work" data-work-item-id={work.id} data-started={presentation.started || undefined} data-native-child={work.hostWorkItemId ? true : undefined}>
-        <span>{round.continuation?.workItem?.id === work.id ? "Existing task" : work.hostWorkItemId ? "Sub-agent task" : hosting ? "Integration task" : "Created task"}</span><strong>{presentation.label}</strong><p>Owner: {actorName(work.ownerActorId)}{work.executorActorId !== work.ownerActorId ? ` · Working actor: ${actorName(work.executorActorId)}` : ""} · {modelLabel(work.model)}</p>
-        {work.hostWorkItemId && <p className="actor-room-notice">Runs as a native sub-agent in {host ? actorName(host.executorActorId) : "the integration owner"}'s session; that session coordinates and verifies the split.</p>}
-        {hosting && <p className="actor-room-notice">Hosts this split: runs the other assignments as sub-agents and verifies the integrated result.</p>}
-        <p>{round.allocation?.assignments.find(item => item.id === work.allocationId)?.brief ?? work.delegatedTask ?? actorOwnerExplanation(round, actors)}</p>
-        {binding && <p>Project directory: {binding.cwd}</p>}
-        {!work.taskSessionId?.trim() && <p className="actor-room-notice">Session not available yet</p>}
-        <div className="actor-room-work-actions">
-        {work.taskSessionId?.trim() && <button type="button" className="secondary" onClick={() => onOpenSession(work.taskSessionId)}>{work.hostWorkItemId ? "Open host session" : "Open task"}</button>}
-        {work.status === "failed" && !work.cancelledAt && <button type="button" className="secondary actor-room-task-cancel" aria-label={`Cancel ${actorName(work.executorActorId)} task`} disabled={cancelState?.cancelling} onClick={() => void cancelTask(work.id)}>
-          {cancelState?.cancelling ? <Loader2 className="spin" aria-hidden="true" /> : <X aria-hidden="true" />}{cancelState?.cancelling ? "Cancelling…" : "Cancel task"}
-        </button>}
-        {work.dispatchError && (!work.hostWorkItemId || !work.dispatched) && !work.cancelledAt && <button type="button" className="secondary" disabled={!!retryingRound} onClick={() => void retryLaunch(round)}>{retryingRound === round.id ? "Retrying…" : "Retry task launch"}</button>}
-        </div>
-        {cancelState?.error && <p role="alert" className="actor-room-error">{cancelState.error}</p>}
-        {work.dispatchError && <p role="alert">{work.dispatchError}</p>}
-      </div>;
-    };
-    const renderClaim = (reply: ActorRound["replies"][number], ownedWork: typeof works) => <div className="actor-room-claim">
-      <strong>{reply.claimKind === "partial" ? `Partial claim · ${reply.claimScope}` : "Full claim"}</strong>
-      {!ownedWork.length && <span>No session for this claim</span>}
-      {ownedWork.length === 1 && ownedWork[0].taskSessionId?.trim() && <button type="button" className="secondary" onClick={() => onOpenSession(ownedWork[0].taskSessionId)}>Open claim session</button>}
-      {ownedWork.length > 1 && <span>Choose a created task below</span>}
-    </div>;
     // Group chat task block: one line per task (executor, kind, status, icon actions); details expand in place.
     // Status, open and stop act on a whole task (a host session covers its sub-agents), so they render once per task.
     const renderTaskControls = (work: typeof works[number]) => {
       const presentation = actorTaskPresentation(work, room.events);
       const turn = actorStoppableTurns([work], [{ id: work.roundId }])[0];
       const stopState = turn ? taskStopStates[taskStopKey(turn.sessionId, turn.turnId)] : undefined;
-      const openLabel = work.hostWorkItemId ? "Open host session" : "Open task";
       return <>
         <div className="actor-room-task-controls">
           <span className="actor-room-task-status" data-state={presentation.started ? "started" : undefined}>{work.taskSessionId?.trim() ? presentation.label : "Session not available yet"}</span>
-          {work.taskSessionId?.trim() && <button type="button" className="secondary" aria-label={openLabel} title={openLabel} onClick={() => onOpenSession(work.taskSessionId)}><ExternalLink aria-hidden="true" /></button>}
           {turn && <button type="button" className="secondary actor-room-task-stop" aria-label={`Stop ${actorName(work.executorActorId)} task`} title={`Stop ${actorName(work.executorActorId)} task${stopState?.stopping ? " · Stopping…" : ""}`} disabled={stopState?.stopping} onClick={() => void stopTask(turn)}>
             {stopState?.stopping ? <Loader2 className="spin" aria-hidden="true" /> : <Square aria-hidden="true" />}
           </button>}
@@ -605,9 +617,11 @@ export function ActorRoomPanel({ workspaceId, approvalPolicy, onOpenSession, act
       // How the working actor relates to the owner, so a non-stakeholder executor is explained.
       const executorParent = (actors.find(item => item.id === work.executorActorId) ?? round.actorSnapshots.find(item => item.id === work.executorActorId))?.parentActorId;
       const relation = work.executorActorId === work.ownerActorId ? "" : executorParent === work.ownerActorId
-        ? `Sub-actor of ${actorName(work.ownerActorId)}` : `Delegated by ${actorName(work.ownerActorId)}`;
+        ? `Sub-actor of ${actorName(work.ownerActorId)}` : `Delegated by ${actorName(work.handoff?.sourceActorId ?? work.ownerActorId)}`;
       const kind =round.continuation?.workItem?.id === work.id ? "Existing task" : work.hostWorkItemId ? "Sub-agent" : hosting ? "Integration" : "Task";
       const brief = round.allocation?.assignments.find(item => item.id === work.allocationId)?.brief ?? work.delegatedTask ?? actorOwnerExplanation(round, actors);
+      const taskTitle = (work.title?.trim() || brief).replace(/\s+/g, " ").trim();
+      const openLabel = work.hostWorkItemId ? "Open host session" : "Open task";
       const key = `task:${work.id}`;
       const open = !!expanded[key];
       const detailId = `actor-room-fold-${key.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
@@ -619,8 +633,8 @@ export function ActorRoomPanel({ workspaceId, approvalPolicy, onOpenSession, act
             <ChevronRight aria-hidden="true" />
             {/* The avatar is the working actor (whose session runs and whose task Stop stops); a different owner is named after "for". */}
             <DomainActorIdentity actor={identityOf(work.executorActorId)} detail={[relation, kind, modelLabel(work.model)].filter(Boolean).join(" · ")} />
-            {!open && <span className="actor-room-task-brief">{brief.replace(/\s+/g, " ").trim()}</span>}
           </button>
+          {work.taskSessionId?.trim() ? <a className="actor-room-task-title-link" href={navigationUrl({ workspaceId, sessionId: work.taskSessionId, groupChat: true, chat: chatKey })} aria-label={`${openLabel}: ${taskTitle}`} title={taskTitle} onClick={event => { if (event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) { event.preventDefault(); onOpenSession(work.taskSessionId); } }}>{taskTitle}</a> : <span className="actor-room-task-brief">{taskTitle}</span>}
           {withControls && renderTaskControls(work)}
           <div className="actor-room-work-actions">
             {work.status === "failed" && !work.cancelledAt && <button type="button" className="secondary actor-room-task-cancel" aria-label={`Cancel ${actorName(work.executorActorId)} task`} title={`Cancel ${actorName(work.executorActorId)} task${cancelState?.cancelling ? " · Cancelling…" : ""}`} disabled={cancelState?.cancelling} onClick={() => void cancelTask(work.id)}>
@@ -641,7 +655,14 @@ export function ActorRoomPanel({ workspaceId, approvalPolicy, onOpenSession, act
       </li>;
     };
     // Sub-agents sit under their host; an orphaned child (host not in this round) stays top level.
-    const topWorks = works.filter(work => !work.hostWorkItemId || !works.some(item => item.id === work.hostWorkItemId));
+    // Handed-off follow-ups nest under the task that handed them off; with no resolvable parent everything stays flat.
+    const taskParents = actorTaskParents(works);
+    const topWorks = works.filter(work => !taskParents.has(work.id));
+    const renderTaskTree = (work: typeof works[number], withControls: boolean): React.ReactNode[] => {
+      const children = works.filter(item => taskParents.get(item.id) === work.id);
+      return [renderTaskRow(work, withControls), ...(children.length ? [<li key={`${work.id}:children`} className="actor-room-task-children"><ul>{children.flatMap(child =>
+        renderTaskTree(child, !child.hostWorkItemId))}</ul></li>] : [])];
+    };
     const soleTask = topWorks.length === 1 ? topWorks[0] : undefined;
     const taskOnlyOwners = [...new Set(works.map(work => work.ownerActorId))].filter(owner => !round.replies.some(reply => reply.actorId === owner));
     const { page, text: promptText } = splitActorPromptPageContext(round.userPrompt);
@@ -668,9 +689,11 @@ export function ActorRoomPanel({ workspaceId, approvalPolicy, onOpenSession, act
           const bodyId = `actor-room-fold-${key.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
           const body = reply.text || "No reply text.";
           return <article className="side-chat-bubble actor-room-folded actor-room-unrelated" key={id} data-actor-id={id} data-reply-status={reply.status} data-collapsed={!open || undefined}>
-            <header><button type="button" className="actor-room-unrelated-toggle" aria-expanded={open} aria-controls={bodyId} onClick={() => toggleExpanded(key)}>
+            <header>{openActorOf(id) && <DomainActorIdentity actor={identityOf(id)} onOpen={openActorOf(id)} />}
+              <button type="button" className="actor-room-unrelated-toggle" aria-expanded={open} aria-controls={bodyId} onClick={() => toggleExpanded(key)}>
               <ChevronRight aria-hidden="true" />
-              <DomainActorIdentity actor={identityOf(id)} detail={reply.status === "stopped" ? "Stopped" : reply.inRole === false ? "Unrelated to my role" : "Not taking this"} />
+              {openActorOf(id) ? <small>{reply.status === "stopped" ? "Stopped" : reply.inRole === false ? "Unrelated to my role" : "Not taking this"}</small>
+                : <DomainActorIdentity actor={identityOf(id)} detail={reply.status === "stopped" ? "Stopped" : reply.inRole === false ? "Unrelated to my role" : "Not taking this"} />}
               {!open && <span className="actor-room-unrelated-summary">{body.replace(/\s+/g, " ").trim()}</span>}
             </button></header>
             <div id={bodyId} hidden={!open}>
@@ -680,25 +703,23 @@ export function ActorRoomPanel({ workspaceId, approvalPolicy, onOpenSession, act
             </div>
           </article>;
         }
-        if (!reply) return waiting || ownedWork.length ? <article className="side-chat-bubble" key={id} data-actor-id={id} data-reply-status={waiting ? "waiting" : "task"}>
-          <header><DomainActorIdentity actor={actors.find(actor => actor.id === id) ?? round.actorSnapshots.find(actor => actor.id === id) ?? { id, name: actorName(id) }} detail={waiting ? "Waiting for reply" : "Created tasks"} /></header>
-          {waiting && <div className="side-chat-answer">
+        // Without a reply only a pending reply shows; tasks live in the task block (group chat) or the actor's Sessions list.
+        if (!reply) return waiting ? <article className="side-chat-bubble" key={id} data-actor-id={id} data-reply-status="waiting">
+          <header><DomainActorIdentity actor={actors.find(actor => actor.id === id) ?? round.actorSnapshots.find(actor => actor.id === id) ?? { id, name: actorName(id) }} detail="Waiting for reply" onOpen={openActorOf(id)} /></header>
+          <div className="side-chat-answer">
             <div className="actor-room-reply-progress"><p className="side-chat-state" role="status"><Loader2 className="spin" aria-hidden="true" />Waiting for {actorName(id)}…</p>
               <button type="button" className="secondary actor-room-reply-stop" aria-label={`Stop ${actorName(id)} reply`} title={`Stop ${actorName(id)} reply${replyStop?.stopping ? " · Stopping…" : ""}`} disabled={replyStop?.stopping} onClick={() => void stopReply(round.id, id)}>
                 {replyStop?.stopping ? <Loader2 className="spin" aria-hidden="true" /> : <Square aria-hidden="true" />}{replyStop?.stopping ? "Stopping…" : !grouped && "Stop"}
               </button>
             </div>
             {replyStop?.error && <p role="alert" className="actor-room-error">{replyStop.error}</p>}
-          </div>}
-          {!waiting && <ChatMessageActions text="" replyLabel={`Reply to ${actorName(id)}`}
-            onReply={(!actor || actor.id === id) && actors.some(candidate => candidate.id === id) ? () => replyToMessage(id, round.id, "Created tasks", ownedWork) : undefined} />}
-          {!grouped && ownedWork.map(renderWork)}
+          </div>
         </article> : null;
         // Group chat claims stay open: a badge beside the name, one body (reply text, falling back to the scope).
         const groupedClaim = grouped && reply.status === "claimed";
         const claimLabel = reply.claimKind !== "partial" ? "Full claim" : reply.claimScope ? `Partial claim · ${reply.claimScope}` : "Partial claim";
         return <article className="side-chat-bubble" key={id} data-actor-id={id} data-reply-status={reply.status}>
-        <header><DomainActorIdentity actor={actors.find(actor => actor.id === reply.actorId) ?? round.actorSnapshots.find(actor => actor.id === reply.actorId) ?? { id: reply.actorId, name: actorName(reply.actorId) }} detail={`${reply.status === "stopped" ? "Stopped" : reply.status === "claimed" ? groupedClaim ? "" : "Offered to take this" : reply.status === "opinion" ? reply.intent === "work" && reply.inRole === false ? "Unrelated to my role" : "Opinion" : reply.status === "timeout" ? "Timed out" : "Reply failed"}${round.responseProfile ? ` · ${modelLabel(round.responseProfile.model)} · ${round.responseProfile.effort}` : reply.model ? ` · ${modelLabel(reply.model)}` : ""}`.replace(/^ · /, "")} />
+        <header><DomainActorIdentity actor={actors.find(actor => actor.id === reply.actorId) ?? round.actorSnapshots.find(actor => actor.id === reply.actorId) ?? { id: reply.actorId, name: actorName(reply.actorId) }} detail={`${reply.status === "stopped" ? "Stopped" : reply.status === "claimed" ? groupedClaim ? "" : directRound ? "Opened a task" : "Offered to take this" : reply.status === "opinion" ? reply.intent === "work" && reply.inRole === false ? "Unrelated to my role" : "Opinion" : reply.status === "timeout" ? "Timed out" : "Reply failed"}${round.responseProfile ? ` · ${modelLabel(round.responseProfile.model)} · ${round.responseProfile.effort}` : reply.model ? ` · ${modelLabel(reply.model)}` : ""}`.replace(/^ · /, "")} onOpen={openActorOf(reply.actorId)} />
           {groupedClaim && <span className="actor-room-claim-badge" data-claim-kind={reply.claimKind === "partial" ? "partial" : "full"} role="note" tabIndex={0}
             title={claimLabel} aria-label={claimLabel}>{reply.claimKind === "partial" ? "Partial claim" : "Claim"}</span>}</header>
         <div className="side-chat-answer"><MarkdownContent>{reply.text || reply.error || (groupedClaim && reply.claimScope) || (reply.status === "timeout" ? "No reply before the deadline." : "No reply text.")}</MarkdownContent></div>
@@ -710,8 +731,8 @@ export function ActorRoomPanel({ workspaceId, approvalPolicy, onOpenSession, act
           </button>
           {replyRetry?.error && <p role="alert" className="actor-room-error">{replyRetry.error}</p>}
         </>}
-        {!grouped && reply.status === "claimed" && renderClaim(reply, ownedWork)}
-        {!grouped && ownedWork.map(renderWork)}
+        {/* Actor chat opens a task directly; only group rounds shown here carry a claim. */}
+        {!grouped && !directRound && reply.status === "claimed" && <p className="actor-room-claim"><strong>{claimLabel}</strong></p>}
       </article>; })}
       {waiting && !speakerIds.length && <div className="actor-room-reply-progress"><p className="side-chat-state" role="status"><Loader2 className="spin" aria-hidden="true" />Choosing actors…</p>
         {!round.continuation?.workItem && renderRequestStop(round.requestId, "Stop choosing actors")}</div>}
@@ -731,10 +752,7 @@ export function ActorRoomPanel({ workspaceId, approvalPolicy, onOpenSession, act
           <strong className="actor-room-block-title">Tasks ({works.length})</strong>
           {soleTask && renderTaskControls(soleTask)}
         </div>
-        <ul className="actor-room-task-list">{topWorks.flatMap(work => {
-          const children = works.filter(item => item.hostWorkItemId === work.id);
-          return [renderTaskRow(work, !soleTask), ...(children.length ? [<li key={`${work.id}:children`} className="actor-room-task-children"><ul>{children.map(child => renderTaskRow(child, false))}</ul></li>] : [])];
-        })}</ul>
+        <ul className="actor-room-task-list">{topWorks.flatMap(work => renderTaskTree(work, !soleTask))}</ul>
         {taskOnlyOwners.map(owner => actors.some(candidate => candidate.id === owner) && <ChatMessageActions key={owner} text="" replyLabel={`Reply to ${actorName(owner)}`}
           onReply={() => replyToMessage(owner, round.id, "Created tasks", works.filter(work => work.ownerActorId === owner))} />)}
       </section>}
@@ -801,22 +819,15 @@ export function ActorRoomPanel({ workspaceId, approvalPolicy, onOpenSession, act
         {actor && room && <div id="actor-dialog-panel" role="region" tabIndex={0} aria-label={`${actor.name} timeline`} className="actor-dialog-panel">
           {!timeline.length && !dialogReceipts.length && <div className="side-chat-empty"><DomainActorIdentity actor={actor} /><span>No activity yet. Send a message to begin.</span></div>}
           {timeline.map(entry => <div key={entry.id} className="actor-timeline-entry" data-timeline-kind={entry.kind}
-            data-round-id={entry.kind === "conversation" ? entry.round.id : entry.kind === "task" ? entry.event.roundId : undefined}>
+            data-round-id={entry.kind === "conversation" ? entry.round.id : undefined}>
             <div className="actor-timeline-meta">
-              <span>{entry.kind === "conversation" ? entry.source === "group" ? "Group chat" : `Direct · ${actorName(entry.round.namedActorIds[0])}` : entry.kind === "conclusion" ? "Reviewed conclusion" : "Task activity"}</span>
+              <span>{entry.kind === "conversation" ? entry.source === "group" ? "Group chat" : `Direct · ${actorName(entry.round.namedActorIds[0])}` : "Reviewed conclusion"}</span>
               <time dateTime={entry.created}>{actorTimelineTime(entry.created)}</time>
             </div>
-            {entry.kind === "conversation" ? renderRound(entry.round) : entry.kind === "conclusion" ?
+            {entry.kind === "conversation" ? renderRound(entry.round) :
               <ActorConclusionMessages workspaceId={workspaceId} actor={actor} conclusions={[entry.conclusion]}
                 onRoom={(roomState ?? ownRoom).setRoom} onOpenSession={onOpenSession}
-                onReply={conclusion => replyToMessage(actor.id, room.workItems.find(work => work.id === conclusion.workItemId)?.roundId ?? "", conclusion.text, [{ id: conclusion.workItemId, taskSessionId: conclusion.taskSessionId, taskTurnId: conclusion.taskTurnId }])} /> :
-              <article className="actor-timeline-task" data-event-type={entry.event.type} data-work-item-id={entry.event.workItemId}>
-                <strong>{({ "task.started": "Task started", "task.turn_completed": "Task turn ended", "task.failed": "Task failed", "task.needs_user": "Task needs your input", "sh.completed": "Replies completed" })[entry.event.type]}</strong>
-                <span>{entry.event.actorIds.map(actorName).join(", ")}</span>
-                <p>{entry.event.roundId ? splitActorPromptPageContext(room.rounds.find(round => round.id === entry.event.roundId)?.userPrompt ?? "").text.slice(0, 180) : entry.event.workItemId}</p>
-                {entry.event.type === "task.turn_completed" && <small>Review is separate from task completion.</small>}
-                {entry.event.taskSessionId && <button type="button" className="secondary" onClick={() => onOpenSession(entry.event.taskSessionId!)}>Open task</button>}
-              </article>}
+                onReply={conclusion => replyToMessage(actor.id, room.workItems.find(work => work.id === conclusion.workItemId)?.roundId ?? "", conclusion.text, [{ id: conclusion.workItemId, taskSessionId: conclusion.taskSessionId, taskTurnId: conclusion.taskTurnId }])} />}
           </div>)}
           {pendingMessages}
         </div>}
@@ -856,6 +867,12 @@ export function ActorRoomPanel({ workspaceId, approvalPolicy, onOpenSession, act
           <button type="button" title="Remove quote" aria-label="Remove quote" onClick={() => setQuotes(quotesRef.current.filter((_, item) => item !== index))}><X aria-hidden="true" /></button>
         </div>)}
         <input ref={fileInputRef} type="file" multiple hidden aria-label="Attach files to actor message" onChange={event => { if (event.currentTarget.files) void files.add(event.currentTarget.files); event.currentTarget.value = ""; }} />
+        {followUp && <div className="composer-group-follow-up" role="group" aria-label="Group follow-up session" data-sending={followUpSending ? "true" : undefined}>
+          <span className="composer-group-follow-up-icon" aria-hidden="true"><MessageSquarePlus /></span>
+          <div><strong>Group follow-up</strong><span title={`${followUp.title} · ${followUp.projectName}`}>{followUp.title}</span></div>
+          <button type="button" title="Remove group follow-up session" aria-label={`Remove group follow-up session ${followUp.title}`} disabled={followUpSending}
+            onClick={() => clearGroupFollowUpDraft(followUp.sessionId)}><X aria-hidden="true" /></button>
+        </div>}
         {!!files.attachments.length && <AttachmentList attachments={files.attachments} onRemove={files.remove} />}
         {files.error && <p role="alert" className="actor-room-error">{files.error}</p>}
         {files.reading && <p role="status" className="side-chat-state">Preparing attachments…</p>}
@@ -878,10 +895,11 @@ export function ActorRoomPanel({ workspaceId, approvalPolicy, onOpenSession, act
           title={roundtableDraft.enabled ? "Round table is on for the next prompt only; it opens in a new session" : "Discuss the next prompt at a round table in a new session (one time)"}
           onClick={() => { void roundtableDraft.toggle(); composerRef.current?.focus(); }}>
           <Users aria-hidden="true" />{roundtableDraft.enabled && <span><span className="roundtable-toggle-label">Next prompt only</span><span className="roundtable-toggle-count" aria-hidden="true">1×</span></span>}
-        </button>}<span className="composer-fill" /><button type="button" className="composer-icon" aria-label="Clear" title="Clear" disabled={!prompt && !quotes.length && !replyContext && !files.attachments.length && !files.reading} onClick={() => { setPrompt(""); setQuotes([]); setReplyContext(null); files.clear(); setMention(null); suggestions.dismiss(); }}><X aria-hidden="true" /></button>{actor && stoppable.length > 0 && <button type="button" className="send-button stop-button actor-room-stop" aria-label="Stop" title={disableEscapeStop ? "Stop" : "Stop (Esc twice)"} disabled={stopping} onMouseDown={event => event.preventDefault()} onClick={() => void stopWork()}>{stopping ? <Loader2 className="spin" aria-hidden="true" /> : <Square aria-hidden="true" />}<span>{stopping ? "Stopping…" : "Stop"}</span></button>}<button type="submit" className="send-button" aria-label="Send" onMouseDown={event => event.preventDefault()} disabled={roundtableMode ? (!prompt.trim() && !quotes.length && !replyContext) || files.reading || blocked
+        </button>}<span className="composer-fill" /><button type="button" className="composer-icon" aria-label="Clear" title="Clear" disabled={!prompt && !quotes.length && !replyContext && !files.attachments.length && !files.reading} onClick={() => { setPrompt(""); setQuotes([]); setReplyContext(null); files.clear(); setMention(null); suggestions.dismiss(); }}><X aria-hidden="true" /></button>{actor && stoppable.length > 0 && <button type="button" className="send-button stop-button actor-room-stop" aria-label="Stop" title={disableEscapeStop ? "Stop" : "Stop (Esc twice)"} disabled={stopping} onMouseDown={event => event.preventDefault()} onClick={() => void stopWork()}>{stopping ? <Loader2 className="spin" aria-hidden="true" /> : <Square aria-hidden="true" />}<span>{stopping ? "Stopping…" : "Stop"}</span></button>}<button type="submit" className="send-button" aria-label={followUp ? "Send group follow-up" : "Send"} onMouseDown={event => event.preventDefault()} disabled={followUp ? followUpSending || files.reading || !followUpGuard?.ok : roundtableMode ? (!prompt.trim() && !quotes.length && !replyContext) || files.reading || blocked
             : !room || !chatActors.length || (!prompt.trim() && !quotes.length && !files.attachments.length) || files.reading || blocked}><Send aria-hidden="true" /></button></ComposerToolbar>
       </ComposerSurface></ComposerFrame>
-      {blocked && <div className="actor-room-mention-preview" aria-live="polite">{roundtableMode ? files.attachments.length ? "Round tables in a new session cannot take attachments yet. Remove them or turn off Round table." : "Choose at least 2 actors for the round table." : replyTargetUnavailable ? "This actor is no longer available. Cancel the reply to choose another recipient." : "Address up to 8 actors per message."}</div>}
+      {followUpBlockedReason && <div className="actor-room-mention-preview" aria-live="polite">{followUpBlockedReason}</div>}
+      {!followUp && blocked && <div className="actor-room-mention-preview" aria-live="polite">{roundtableMode ? files.attachments.length ? "Round tables in a new session cannot take attachments yet. Remove them or turn off Round table." : "Choose at least 2 actors for the round table." : replyTargetUnavailable ? "This actor is no longer available. Cancel the reply to choose another recipient." : "Address up to 8 actors per message."}</div>}
     </form>
     {selectionQuote && <ResponseQuotePopover quote={selectionQuote} onChange={setSelectionQuote} onAsk={() => quoteSelection(selectionQuote)} />}
     {editor && <div className="modal-backdrop actor-room-editor"><form ref={editorRef} role="dialog" aria-modal="true" aria-label={editor.actor ? `Edit ${editor.actor.name} memory` : "Create domain actor"} onKeyDown={event => {

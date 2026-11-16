@@ -1,6 +1,64 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { sortAccountsByLoadBalanceParticipation, startChatGptLogin, switchAccount } from "./sessionActions03.js";
+import { chooseFeaturedPromptTurnId, sortAccountsByLoadBalanceParticipation, startChatGptLogin, switchAccount, switchSession } from "./sessionActions03.js";
+
+test("featuring a turn does not flip back when its own reflow makes the neighbour slightly larger", () => {
+  // Two turns share a 708px viewport stuck to the bottom. The featured turn loses its
+  // extra left padding and gets shorter, so the other turn gains the same height.
+  const reflowShift = 18;
+  const visibleHeights = (featuredTurnId: string | undefined) => featuredTurnId === "B"
+    ? [{ turnId: "A", visibleHeight: 360 + reflowShift }, { turnId: "B", visibleHeight: 348 - reflowShift }]
+    : [{ turnId: "A", visibleHeight: 360 - reflowShift }, { turnId: "B", visibleHeight: 348 + reflowShift }];
+  let featured: string | undefined;
+  const history: Array<string | undefined> = [];
+  for (let frame = 0; frame < 10; frame++) {
+    featured = chooseFeaturedPromptTurnId(visibleHeights(featured), featured, 708);
+    history.push(featured);
+  }
+  assert.deepEqual(new Set(history.slice(1)).size, 1);
+});
+
+test("featured turn moves to another turn once it is clearly larger or the current one leaves the viewport", () => {
+  const turns = [{ turnId: "A", visibleHeight: 120 }, { turnId: "B", visibleHeight: 580 }];
+  assert.equal(chooseFeaturedPromptTurnId(turns, "A", 708), "B");
+  assert.equal(chooseFeaturedPromptTurnId(turns, "gone", 708), "B");
+  assert.equal(chooseFeaturedPromptTurnId(turns, undefined, 708), "B");
+  assert.equal(chooseFeaturedPromptTurnId([], "A", 708), undefined);
+});
+
+test("a failed session switch restores its model binding, while a superseded switch cannot restore it", async t => {
+  const sessionIdRef = { current: "A" };
+  const viewKeyRef = { current: 1 };
+  const restored: number[] = [];
+  const messages: unknown[] = [{ role: "user", content: "A" }];
+  let visibleMessages = messages;
+  let supersede = false;
+  const noop = () => {};
+  t.mock.method(globalThis, "fetch", async () => {
+    if (supersede) { sessionIdRef.current = "C"; viewKeyRef.current++; }
+    throw new Error("Switch unavailable");
+  });
+  const ctx = new Proxy({
+    sessionIdRef, viewKeyRef, explicitNewSessionRef: { current: false },
+    stickToMessageBottomRef: { current: false }, messages,
+    bumpViewKey: () => { viewKeyRef.current++; },
+    isCurrentViewKey: (key: number) => key === viewKeyRef.current,
+    currentComposerDraft: () => ({ input: "keep draft" }),
+    displaySessionTitle: (title: string) => title,
+    setMessages: (value: unknown[]) => { visibleMessages = value; },
+    restoreSessionComposerModel: (key: number) => {
+      assert.equal(sessionIdRef.current, "A");
+      restored.push(key);
+    }
+  }, { get: (target, key) => key in target ? Reflect.get(target, key) : noop });
+  await switchSession(ctx, { id: "B", title: "B" });
+  assert.deepEqual(restored, [2]);
+  assert.equal(visibleMessages, messages);
+  supersede = true;
+  await switchSession(ctx, { id: "B", title: "B" });
+  assert.deepEqual(restored, [2]);
+  assert.equal(sessionIdRef.current, "C");
+});
 
 test("puts load-balance candidates before other selectable accounts", () => {
   const accounts = [

@@ -142,8 +142,10 @@ export async function achieveSessionGoal(ctx, record) {
 }
 
 export async function forkFromAgentMessage(ctx, message) {
-    const { applySelectedSessionSnapshot, bumpViewKey, clearTodoPanelState, currentSessionIsRunning, isCurrentViewKey, messages, parentSessionTodo, scheduleLoadSessions, sessionId, sessionTodo, setForkingTurnId, setMessages, setParentSessionTodo, setQueuedPrompts, setSessionTodo, setStatus, setSwitchingSessionTitle, stickToMessageBottomRef, updateNavigationUrl, viewKeyRef } = ctx;
-        if (!sessionId || !message.turnId || message.turnStatus !== "done" || currentSessionIsRunning) {
+    const { applySelectedSessionSnapshot, bumpViewKey, clearTodoPanelState, isCurrentViewKey, messages, parentSessionTodo, scheduleLoadSessions, sessionId, sessionTodo, setForkingTurnId, setMessages, setParentSessionTodo, setQueuedPrompts, setSessionTodo, setStatus, setSwitchingSessionTitle, stickToMessageBottomRef, updateNavigationUrl, viewKeyRef } = ctx;
+        // A completed turn is a stable fork boundary even while a later turn runs:
+        // the fork gets its own native thread and never resumes the parent's.
+        if (!sessionId || !message.turnId || message.turnStatus !== "done") {
             return;
         }
         bumpViewKey();
