@@ -48,6 +48,29 @@ one use the active workspace.
 Use the smallest mutation that satisfies the user's request. Read the current
 list before a destructive replacement, and report the workspace affected.
 
+## Global MCP Servers and Skills
+
+Threadex keeps one global list of MCP servers and skill folders and injects it
+into every Codex and Claude Code turn it starts (new turns, resumes, retries and
+actor turns). Settings → MCP & skills edits the same data. Changes apply from the
+next turn. Threadex never writes the user's `~/.codex` or `~/.claude`.
+
+- `GET /api/settings/global-agent-tools` returns `{ config, redactedValue }`.
+  Every `env` and `headers` value is returned as `redactedValue`.
+- `PUT /api/settings/global-agent-tools` with `{ "config": { "mcpServers": [...], "skills": [...] } }`
+  replaces the whole list; read it first and send back the full document.
+  Sending `redactedValue` keeps the stored secret for that server and key.
+- MCP server: `{ "name", "transport": "stdio", "command", "args", "env" }` or
+  `{ "name", "transport": "http", "url", "headers" }`, plus optional
+  `"enabled"` and `"providers": ["codex", "claude"]`. Names `codex_image` and
+  `session_inspector` are reserved.
+- Skill source: `{ "path": "/absolute/dir" }` (one skill directory with
+  `SKILL.md`, or a directory of skill directories), plus optional `enabled` and
+  `providers`.
+
+Plan and read-only turns load the skills but not the MCP servers. Put secrets in
+`env` or `headers`, never in `args`. Never print secret values back to the user.
+
 ## Workspace Manager
 
 Workspace chat is a persistent manager session per workspace. It communicates with
@@ -294,7 +317,10 @@ creates a worker with initial memory and an optional existing root parent.
 saves role/memory separately through `PATCH .../:actorId/memory` with
 `expectedVersion`, `sourceEventId` and all four memory fields. On 409, retain the
 draft and reread/merge before retrying. These workspace settings do not modify
-the server-wide consultant library or change existing worker parent bindings.
+the server-wide consultant library. Signed-in settings clients change hierarchy through
+`POST /api/domain-actors/:workspaceId/actors/:actorId/hierarchy` with
+`parentActorId` (a destination root ID, or null to promote), `expectedParentActorId`
+and `expectedRootActorId` from the current actor record.
 
 Reusable actors (Settings → Agent actors) are server-wide, shared across
 workspaces, and used by round tables and the Side chat room. Use
@@ -340,24 +366,47 @@ See `docs/consultant-api.md` in the Threadex repository for backend integration.
 
 Domain actor trees are managed through the Threadex CLI invocation supplied in
 the runner instructions (`node scripts/session-inspector.mjs` inside this
-repository), not the HTTP endpoints above. Actor commands require a running task
-with a system-owned actor binding. The runner supplies session, turn and
+repository), not the HTTP endpoints above. The runner supplies session, turn and
 capability; do not fabricate them or bypass unavailable commands with direct
 HTTP. Use `help <command>` for schemas.
 
+Every ordinary task turn, with or without an actor binding, can use
+`actor_list`, `actor_read_memory` and `actor_create_root`. Its own workspace's
+roster and actor memory are always readable. Another workspace is reachable
+with `workspaceId` (or `allWorkspaces` on `actor_list`) only when one of the
+user's own messages in this task names that workspace, or for reads, that
+actor; creating a root there requires the workspace itself to be named. Tree
+management, steering, handoff and assignment still require a system-owned actor
+binding.
+
 For a user-requested new project/root actor, use `actor_list` to check for an
 existing actor, then `actor_create_root` with name, model and initial memory.
-Both root and sub-actor tasks may create a root in their bound workspace. The
-server fixes its parent to null and inherits the caller's allowed models; callers
-cannot supply another workspace or expand permissions. Creation does not start
-work or authorize delegation. Verify with `actor_list`; after an uncertain result,
-list before retrying to avoid duplicates. Do not request user login credentials.
+To copy memory from existing actors at the user's request, read it with
+`actor_read_memory` (actorId, plus workspaceId for another workspace) and put
+the selected text in the new actor's initial memory. The server fixes the new
+root's parent to null. An actor caller's allowed models are inherited; a task
+without an actor binding gives the new root only its chosen model, which the
+user can widen in Settings. Creation does not start work or authorize
+delegation. Verify with `actor_list`; after an uncertain result, list before
+retrying to avoid duplicates. Do not request user login credentials.
 
 Read `actor_tree_status` to discover your actor, allowed models, children and
 work items. A root uses `actor_create_sub` to create a direct child with a name,
 permitted model and initial memory. Supply the requested role and known context;
 leave unknown knowledge empty. The server chooses the parent and inherits its
 model permissions. Only one sub-actor level is supported.
+
+For a requested hierarchy change, a root may use `actor_reparent` on its direct
+child. Read `actor_list` for the current parent and root IDs, then
+provide those as `expectedParentActorId` and `expectedRootActorId` with the new
+`parentActorId`; null promotes a child. IDs and memory remain intact. Destination
+must be a root in the same project and cannot expand model permissions. A root
+with children cannot be demoted because only one sub-actor level is supported.
+The bound root management work is exempt when managing its direct child; any
+other active or pending work in either affected tree still returns a conflict.
+Stale hierarchy also conflicts: reread and resolve busy work before retrying.
+To demote a root itself, use signed-in settings when the tree is idle. The
+operation does not cancel old work.
 
 `actor_update_sub` changes a direct child's name or default model, not its
 parent, permissions or memory. Creation does not start work. If creation has an

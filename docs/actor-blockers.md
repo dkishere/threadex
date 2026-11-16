@@ -37,6 +37,38 @@ can only be proposed; `attempting` is refused until the user approves that
 proposal. Cancelling a failed task
 dismisses its blockers.
 
+## Reminders, not gates
+
+Blockers remind the user that a problem needs solving; they never stop the
+agent. Authorization stays with the approval and intention-approval tools.
+
+- Ask in place, not through a blocker: a task that needs the user's choice or
+  clarification first uses its brief, attachments and browser bridge captures,
+  proceeds on a reasonable low-risk default when one exists, and otherwise asks
+  in the same turn with its native ask-user-input tool (Claude
+  `AskUserQuestion`; Codex `request_user_input_async` while it still has
+  independent work, otherwise `request_user_input`, because an async question
+  is cancelled when its turn ends). `actor_report_blocker` is for what an
+  answer cannot resolve: a repair, another actor's work or owner coordination.
+  Routing a question through the owner costs an extra turn.
+- When the owner assesses `needs_user` while the task session already has an
+  open native question, nothing is asked again: the blocker is kept as a
+  `remind` with the reason in its history.
+
+- The owner assessment classifies a blocker as `needs_user`, `require_fix` or
+  `remind`. `remind` covers a wait on another task, work still in progress, an
+  external recovery, or a choice with an obvious low-risk default; it asks
+  nothing, gets no proposal and is not escalated by the proposal deadline.
+- A `needs_user` question is delivered to the original task and raises Needs
+  you while it can still be answered, but it does not change the task's status,
+  hold dependent work, block completion review, or stop the actor from
+  proposing, attempting or resolving the blocker.
+- Automatic closes (for example a later `runner.result` clearing a
+  `task_error`) skip a blocker whose question still waits, so the reminder is
+  kept until the actor or user closes it.
+- Work items still in `needs_user` from decisions recorded before this change
+  keep their status until the user dismisses or answers those decisions.
+
 ## Context delivery
 
 `actorBlockerContext` gives each actor at most 5 own active blockers and 5
@@ -83,7 +115,9 @@ Data arrives through the existing room endpoint and room-change notifications:
 - `GET /api/domain-actors/blockers/pending` →
   `{ blockers: Array<ActorBlocker & { ownerActorName?, taskSessionTitle? }> }`
   across every workspace, newest `updated` first, overdue escalation applied.
-  Only blockers whose pending decision is non-null are returned.
+  Only blockers whose pending decision is non-null are returned. The workspace
+  tab action notifications (bell) do not list blocker solutions; proposals are
+  decided from the task session and the actor views below.
 - Approve: records `proposal.approval = { by: "user", at, note? }` and a
   history entry; the blocker status is unchanged (`solution_proposed` or
   `escalated`). The proposal shows `[approved by user]` in actor context, which
@@ -92,10 +126,15 @@ Data arrives through the existing room endpoint and room-change notifications:
   Only then may the actor report `attempting` for exactly that proposal; it
   stays bound by every existing permission and approval. Approval does not
   queue a new task turn by itself.
-- Reject: the proposal gets `outcome: "rejected"`; a non-escalated blocker
-  escalates to the workspace (`proposal_rejected`, group-chat notice), a
-  self-clearing wait reopens, an escalated blocker stays escalated and keeps
-  collecting proposals from any actor.
+- Reject: the proposal gets `outcome: "rejected"` and the rejection is only
+  noted: the blocker moves to `dismissed` (history keeps `rejected` and the
+  user's note; an escalated one also gets a dismissed notice). No owner
+  reassessment, escalation, new user question or Needs-you state follows; only
+  a new user request reopens the work. A self-clearing wait reopens because it
+  ends on its own. A failed handoff or a system authorization denial is not a
+  user rejection. Escalations recorded earlier with `proposal_rejected` stay
+  visible to the user for cleanup but are excluded from actor context and never
+  request an owner assessment.
 - Live updates: blocker changes call the service `notify` hook, which the API
   server does not wire to the central event stream; they do **not** advance the
   client event cursor. Poll the pending endpoint (or the room) and refresh

@@ -1,11 +1,37 @@
 ---
 name: threadex-concurrent
-description: Coordinate Threadex Concurrent workers and main using group-local IDs, teammate messages, dependency follow-ups, and automatic result return. Use when participating in an existing Threadex Concurrent group.
+description: Coordinate Threadex Concurrent workers and main using group-local IDs, teammate messages, dependency follow-ups, and automatic result return. Use when participating in a Threadex Concurrent group, or as main when delegating work to workers on any model or provider.
 ---
 
 # Threadex Concurrent
 
 Threadex injects this entire skill into participating runners automatically, including fresh workers and follow-up turns. This injected copy counts as reading the skill: do not open or `cat` its file. Your injected identity and roster identify your group, local ID, main session and teammates; refresh live state with `concurrent_status` on the session-inspector CLI before routing work.
+
+## Delegate as main
+
+Main can create workers itself with the session-inspector CLI when the user asks for delegation, parallel work or another model or provider. Workers may run any model, including the other provider (Claude or Codex); the session becomes main of a new group if it has none.
+
+1. `concurrent_spawn` with a stable `requestId`, a complete `task`, and an explicit `model`/`modelReasoningEffort` chosen with the guide below. The worker sees main's history only up to the latest completed turn, never the current turn, so the brief must state the objective, the files the worker owns, constraints and the expected result. Give parallel writers disjoint files: all workers share the project directory and there is no merge.
+2. Continue independent work, then call `concurrent_wait` (`mode: "all"` by default, or `"any"`; optional `localIds`, `timeoutSeconds` up to 540, with the shell timeout set above it). It blocks inside your turn and returns each settled worker's conclusion and change list. Results returned there are not delivered again; a result already being steered to you arrives as a message instead. On `timedOut`, call it again or continue.
+3. Correct a running worker with `concurrent_send`, and stop one with `concurrent_stop`. Integrate and verify the returned work yourself; a worker's report is evidence, not proof.
+
+Use `wait_for_task_end` only for unrelated tasks. If you end your turn instead of waiting, results arrive later as queued messages, as for any main.
+
+## Pick the worker model
+
+Always pass `model` explicitly. If you omit it, the worker uses main's model, which is often stronger than the work needs. Choose the model by the strongest requirement of the work, not by quota savings, and do not split complex work just to justify a cheaper model. The rows below match tiers across providers:
+
+| Workload | Codex | Claude |
+| --- | --- | --- |
+| Mechanical work with explicit targets, methods and outcomes; routine commands, known checks, specified lookups | `gpt-6-luna` | `claude-haiku-5-5` |
+| Routine small development, lookups and ordinary debugging; never prompt work | `gpt-6.1-terra` | `claude-sonnet-5-5` |
+| Default implementation worker: substantive features and UI work, regression tests, specified migrations, bounded reviews, log or root-cause investigation, performance and prompt work | `gpt-6.1-sol` | `claude-opus-5-5` or `claude-fable-5-2` |
+| Exception tier: unresolved architecture or security analysis, difficult reasoning, or a failure the default tier already showed | `gpt-6-astra` | `claude-fable-5-2` |
+
+- Do not use superseded models: `gpt-6-sol` (use `gpt-6.1-sol`), `gpt-5.5`, `gpt-5.4` and `gpt-5.4-mini`. `gpt-5.6-terra` is an old alias of Luna; use `gpt-6.1-terra` for Terra work.
+- Choose the provider the user names. Otherwise prefer the other provider for an independent review or second opinion, and the same provider when the worker must follow your toolchain closely.
+- Effort: `low` for mechanical work, `medium` for settled implementation, and higher only for a concrete reasoning difficulty. Claude models accept `low` to `max`; Codex Luna, Terra, Sol and Astra also accept `ultra`.
+- For routine rework, give targeted feedback at the same tier first. Move up one tier (Luna → Terra → Sol → Astra, or Haiku → Sonnet → Opus/Fable) only after an observed failure, and say why the lower tier was insufficient.
 
 ## Talk to teammates
 
@@ -31,7 +57,7 @@ Call `concurrent_send` with these arguments (substitute the real teammate and re
 - Use `wait: false` for a correction, nonblocking information, or a follow-up whose result you do not need before finishing.
 - Reuse the same `requestId` and payload on retries. A genuinely new request needs a new ID. A running teammate receives steer; an idle teammate receives a queued turn. Delivery does not mean completion.
 - If delivery is uncertain, report it to main for transcript review; do not resend under a new ID. Respect rejected cycles and stopped workers; do not bypass them by inventing another request.
-- Workers share the directory. Coordinate ownership of overlapping files before editing; there is no automatic merge. Only main creates workers. Keep later user requests in their receiving session unless an intra-group dependency requires communication.
+- Workers share the directory. Coordinate ownership of overlapping files before editing; there is no automatic merge. Only main creates workers, from the panel or with `concurrent_spawn`. Keep later user requests in their receiving session unless an intra-group dependency requires communication.
 
 ## Return work
 

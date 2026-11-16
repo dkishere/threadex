@@ -30,8 +30,9 @@ Threadex can run a session turn on Claude instead of Codex. Pick **Claude Opus 5
 
 - Ordinary turns use `data/claude-homes/<workspace-hash>/<auth-home-hash>` as `CLAUDE_CONFIG_DIR`. Two workspaces using the same login have separate settings, native transcripts, memory and plugin state. Switching accounts also selects a separate native home. This separates agent state; it does not create a Git worktree or duplicate project files.
 - Only the Claude OAuth credential is copied from the selected account (or default login). Account settings, hooks, MCP configuration, `CLAUDE.md` and project history are not copied. The workspace home supplies user settings; project/local settings still belong to the session's project. A refreshed credential is synchronized back only while the source login is unchanged, so logout, relogin and another runner's refresh take precedence. Credentials stay out of runner job files and events.
+- Refresh tokens rotate, and a workspace home is shared by that workspace's overlapping turns. Each home records a one-way fingerprint of the source login it was seeded from (`.threadex-auth-seed`). When a turn starts and the home holds a newer refresh of that same source login, Threadex promotes it to the source instead of overwriting it. That refresh may come from a still-running turn, or from a runner killed before it synchronized. Running turns also synchronize every 60 seconds, not only at the end. Without this, an overlapping turn discarded the only valid refresh token and the login appeared to expire.
 - Native thread lookup includes the execution home and cwd. Existing account-home threads are not adopted into a new workspace home: the first isolated turn starts a native thread with the saved Threadex conversation, including user follow-ups. Original history remains available.
-- `workspace-write` enables Claude's native Bash sandbox with startup failure if sandboxing is unavailable. File tools have a separate `PreToolUse` path check, including symlink resolution and protected agent/Git configuration. `never` approval cannot bypass these boundaries. With interactive approvals, a specific out-of-bounds edit or unsandboxed command requires approval; `read-only` refuses mutations. `danger-full-access` is the explicit unrestricted mode. External network stays denied, but `workspace-write` allows loopback (`allowLocalBinding`) so local test databases and dev servers work without approval. This is an accepted risk: loopback also reaches Threadex's own API, which trusts direct local requests and so lets a writable turn approve its own escalations, and Threadex's Postgres. `read-only` keeps loopback closed. As with Codex, these are tool execution boundaries, not separate OS users or containers; MCP servers retain their own authority.
+- `workspace-write` enables Claude's native Bash sandbox with startup failure if sandboxing is unavailable. File tools have a separate `PreToolUse` path check, including symlink resolution and protected agent/Git configuration. With interactive approvals, a specific out-of-bounds edit or unsandboxed command requires approval; `read-only` refuses mutations. `danger-full-access` is the explicit unrestricted mode; approval `never` ("Full access") selects it for Codex and Claude turns unless the operator configured a `read-only` sandbox, because a sandboxed turn that can never ask cannot reach Docker, the network or paths outside cwd. Planning turns stay read-only. External network stays denied, but `workspace-write` allows loopback (`allowLocalBinding`) so local test databases and dev servers work without approval. This is an accepted risk: loopback also reaches Threadex's own API, which trusts direct local requests and so lets a writable turn approve its own escalations, and Threadex's Postgres. `read-only` keeps loopback closed. As with Codex, these are tool execution boundaries, not separate OS users or containers; MCP servers retain their own authority.
 - Background helpers use temporary authentication-only homes, removed afterwards. Persistent side chats have private homes keyed by the workspace, logical session and authentication source; they never persist transcripts in the account home.
 
 The sandbox API and settings precedence follow the [Claude Agent SDK reference](https://platform.claude.com/docs/en/agent-sdk/typescript) and [Claude sandbox documentation](https://code.claude.com/docs/en/sandboxing). Use a current SDK with `failIfUnavailable` and `managedSettings` support. Native Windows needs WSL2 or another supported sandbox environment.
@@ -50,7 +51,7 @@ Focused verification: `node --import tsx --test src/server/claudeHome.test.ts sr
 | --- | --- |
 | Approval `on-request` / `untrusted` | `permissionMode: "default"`; tool prompts appear as Threadex approval cards |
 | Approval `granular` | Claude `auto` classification, falling back to `acceptEdits` when unavailable; workspace boundaries remain enforced |
-| Approval `never` | `acceptEdits`; tools run within the sandbox, boundary escalation is denied |
+| Approval `never` ("Full access") | `acceptEdits` with the sandbox disabled (`danger-full-access`); nothing asks for approval |
 | Plan mode, force-plan, read-only sandbox | `plan`; mutating tools are refused and `ExitPlanMode` publishes the plan as the reply |
 | `AskUserQuestion` | Threadex user-input card |
 | Approve session | Rule kept for this Claude session only (never written to settings files) |
@@ -63,6 +64,14 @@ Focused verification: `node --import tsx --test src/server/claudeHome.test.ts sr
 | `THREADEX_CLAUDE_USE_API_KEY=1` | Keep `ANTHROPIC_API_KEY` for Claude runs (by default it is removed so the subscription login is used) |
 | `THREADEX_CLAUDE_CONFIG_DIR` | Default authentication source when no Threadex Claude account is selected; ordinary turns still use their workspace execution home |
 | `THREADEX_CLAUDE_PATH` | Claude Code executable for logins and runs (default: `claude` on `PATH` for login/status, the SDK's bundled binary for runs) |
+
+## Deferred: long-lived login token
+
+Status: deferred. First observe whether the refresh-token synchronization fix above stops the frequent login expiry. Revisit this option only if logins still expire.
+
+- `claude setup-token` creates a long-lived OAuth token (about one year) that does not rotate. This removes the refresh race entirely. To use it, set `CLAUDE_CODE_OAUTH_TOKEN` in the Threadex server environment.
+- It currently applies only to the default login (no Threadex Claude account selected). `claudeEnvironment` removes `CLAUDE_CODE_OAUTH_TOKEN` for account-bound turns so each account's own login wins. Using it there needs a design for storing a token per account.
+- The token is a long-lived bearer secret. Keep it in a mode-600 local env file or launchd configuration, never in the repository or runner job files. Revoke it from claude.ai if it is exposed.
 
 ## Not yet supported on Claude
 

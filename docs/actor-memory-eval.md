@@ -29,6 +29,10 @@ unit tests check the guidance, not whether that model follows it.
 cases: a one-off fix, a user decision alongside an unapproved actor proposal, a
 recurring issue promoted from rolling, a verification method, a decision that
 supersedes another in the same scope, and an unrelated stakeholder event.
+Cases whose `context.relation` is `digest` carry `summaries` instead of `event`
+and generate the [collective memory digest](domain-actors.md#collective-memory-digest)
+prompt (`actorMemoryDigestPrompt`): `digest-supersede`,
+`digest-rolling-completed`, `digest-rolling-open` and `digest-foreign-details`.
 
 Generate the current production maintenance prompt for a case:
 

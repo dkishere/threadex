@@ -33,7 +33,7 @@ authentication.
 | GET | `/actors/summary` | Entries include `projectIds` (roots). New `groups: ActorProjectGroup[]`; absent only if the project registry could not be read. |
 | PATCH | `/actors/:actorId` | Accepts `{ projectIds: string[] }` for a root worker. Each ID must be registered in this workspace, except IDs the worker already has. `[]` unassigns. Sub-actors are rejected. |
 | GET | `/room?chat=<key>` | `rounds` holds only the group rounds of that chat (`key` = project ID or `unassigned`); individual rounds are omitted. Without `chat` the full room is returned (actor views, unchanged). |
-| POST | `/requests` | Body accepts `chatProjectId: string \| null` (absent = `null` = Unassigned chat). In a project chat, named actors must be members and the task binding is that project (`newSessionProjectId` defaults to it; another project is rejected). Ignored for an individual request (exactly one named actor). Retries resend the round's `chatProjectId`. |
+| POST | `/requests` | Body accepts `chatProjectId: string \| null` (absent = `null` = Unassigned chat). In a project group chat, named actors must be members. A new task inherits the source project (`newSessionProjectId` defaults to it; another project is rejected), including when exactly one actor is named. Individual rounds remain outside group-chat partitions. Retries preserve their saved selection and binding. |
 
 Registered projects for an assignment picker come from the existing
 `GET /api/workspaces/projects?workspaceId=` (`{ workspaceId, projects: {id, name}[] }`).

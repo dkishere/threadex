@@ -51,7 +51,8 @@ and approval policy still follow the existing workspace/session launch path.
   choice is remembered per workspace in sessionStorage
   `threadex.sidebarView:<workspaceId>`. Each actor row shows workload "Open N"
   and, when non-zero, "Needs you M" (open = claimed/assigned/started work items,
-  needs you = needs_user/failed; root rows roll up their tree and sub-actors count
+  needs you = needs_user/failed; a blocker question that expired or ended unanswered
+  stops counting until the actor asks again; root rows roll up their tree and sub-actors count
   only work they execute, see Per-actor workload summary). The list keeps an
   "All actors" entry that opens the Manager room. Only domain actors appear in
   the list; the server-wide Agent actors library (Round table / Side chat
@@ -105,14 +106,49 @@ not turn an opinion request into an instruction to execute. Multiple named actor
 bypass SH selection but retain claim arbitration. Zero claims display the SH
 responses and wait for the user, without synthesis or work fallback. One claim
 needs no arbitration. Multiple full claims use Decision, and only the selected owner
-may start the initial work. Full claims beat partial claims. A sole partial claimant
-receives the entire canonical request. Multiple partial claims without a full claim
-trigger the partitioning flow below. Explicitly authorized parallel delegation can then
+may start the initial work. Decision picks the owner by the business domain whose
+behavior the request specifies; a named development method or vehicle (for example
+"mock this in ABC first", tests, dev-env) does not make that vehicle's actor the
+owner unless the vehicle itself is being changed, and a mock or prototype of a
+requirement belongs to that requirement's domain. Such actors claim partial and join
+as stakeholders. Full claims beat partial claims for ownership. In an automatic round
+(no named actor, no session target) the winning full claim keeps its own brief, title,
+model proposal and session reuse, but its brief also lists every other claim and the
+work is `ownerLed`, so it may delegate claimed portions without a separate parallelism
+request. A sole partial claimant
+receives the entire canonical request, subject to the coverage check below. Automatic
+multiple partial claims select one owner; the owner receives the shared canonical
+requirements and advisory claim briefs, and decides from the claims' overlap and the
+workload: distinct, low-overlap, substantial portions go to their claimants (preferred
+over generic native sub-agents) while the owner integrates and verifies; heavily
+overlapping, tightly coupled or small work runs directly. The owner reports whether it
+delegated and why. The server persists `ownerLed`; runner instructions
+explicitly allow this owner to execute across stakeholder domains, overriding generic
+role-domain exclusions without expanding user authorization or tool permissions.
+Model selection assesses the combined workload, not the chosen actor's partial model
+proposal; the title derives from the whole request. Claims alone do not require native children.
+If owner arbitration is uncertain or its Decision fails, a deterministic owner is
+selected and `ownerFallback` records why; never silently restore a forced split. A sole partial claim with uncovered work
+is still limited to its claim: it has not been assigned whole-request ownership.
+A failed coverage Decision counts as uncovered work, so picking adds stakeholders
+or the claimant executes only its scope; it never blocks the claim.
+Explicit multi-actor requests and saved allocations retain the partitioning flow below.
+Completion feedback still reaches the owner, executor and engaged stakeholders,
+including stakeholders from earlier picking passes. Explicitly authorized parallel delegation can then
 create scoped child work as described below. Retain every SH response. Track claimed, assigned and started
 separately; only an actual `task.started` event enables the started highlight.
 
 Resolve full-claim ownership before selecting the execution model. Only the
-winning claim needs a model Decision; losing claims retain their replies without
+winning claim needs a model Decision except on the direct-opening route: one SH
+with a full claim creates the task from its prepared brief without a workflow or
+model Decision, using its permitted proposed model, or the permitted executor default
+when no model was proposed. A forbidden proposal or incompatible default requires a
+model-only Decision; never silently choose the cheapest allowed model. Empty model
+intersections fail closed. Historical tasks do not disable this shortcut: only eligible
+continuation candidates trigger a session Decision. Group fast track is retained.
+`workflowDecisionSkipped` records deliberate omission so the runner does not call it
+an incomplete Decision or demand a separate suitability explanation.
+Losing claims retain their replies without
 spending an execution-model call. Partial allocations still select models for
 every assigned executor before any work dispatches. A claim's saved sub-actor
 executor is passed directly to task start, without a parent execution turn or
@@ -126,7 +162,7 @@ Claims carry `claimKind` (`full` or `partial`) and a concrete `claimScope` for
 partial offers. Legacy claims without a kind remain full claims. Partial offers
 never limit the scope when one claimant receives the whole job.
 
-Multiple partial claimants trigger an isolated planning call using the existing
+Explicit multi-actor partial claims trigger an isolated planning call using the existing
 Sonnet-paired workload tier (6.1 Terra / Sonnet) in the initiating prompt's provider group.
 Actor defaults do not choose that group. The planner inventories canonical user
 messages, resolves overlapping claims and conflicts, assigns uncovered work,
@@ -138,12 +174,18 @@ planner now returns exact source quotes; the server computes UTF-16 offsets rath
 than asking the model to count characters. Saved numeric-span plans remain valid.
 Validation failures include specific source, ownership, dependency or review
 diagnostics. The planner gets one repair attempt with those diagnostics; a second
-invalid response retains the concrete reason and creates no work. Transport errors
+invalid response, a transport error or an unavailable planner saves the concrete reason
+as `allocationFallback` and routes the claims owner-led instead of blocking them. Transport errors
 and explicit unresolved planning constraints do not trigger this repair loop. Structured output is requested from helpers that
 support it, and all returned plans still pass server validation. The
 structural check is deterministic; the interpretation of requirements and conflict
 resolution remains model-based. Private context that cannot be shared across all
-claimants blocks splitting with a request to restate it in a group follow-up.
+claimants never splits and never blocks the claims: they route owner-led, and only a
+claimant whose tree may read every selected round can own the request. If no claimant
+can, the selected owner runs without the rounds it may not read. Another claimant's
+prepared brief reaches the owner (owner-led or a full claim's peer advice) only when
+the owner may read every round that claimant selected. `privateContextRouting`
+records the eligible owners, excluded rounds and withheld briefs.
 Sharing eligibility uses the round's privacy and frozen history boundary, not the
 two-replies-per-peer prompt admission limit. A group requirement selected by one
 claimant can therefore constrain every assigned actor even when it was omitted
@@ -212,7 +254,7 @@ Each host turn rebuilds the children from the room and reissues their credential
   actor.
 
 The server projects child lifecycle from the host session's subagent items. These
-are Claude Agent cards keyed by `subagent_type`, and Codex activity paths, briefs
+are Claude Agent cards keyed by `subagent_type` (or an in-place brief's marker), and Codex activity paths, briefs
 and child thread states. Start, completion and failure are recorded on the child's
 own work item, actor events and memory feedback. A completed child gets its own
 completion review against its result. A child still unfinished when its host turn
@@ -221,6 +263,24 @@ Stopping the host stops its running children. A child that never started before
 its host turn ended (for example, its permission was revoked after the host was
 queued but before the runner defined it) becomes failed and undispatched, so a
 retry can recover it.
+
+A hosted `actor_handoff` creates a native child of the caller's task and starts it
+in the calling turn. The child is dispatched in that turn, and the tool result's
+`start` holds its brief: the assignment marker followed by the child's identity,
+memory and task. A Codex host passes it to `spawn_agent`. A Claude host passes it
+to the Agent tool as a `general-purpose` agent with the child's model alias and
+effort, because the SDK cannot add agent definitions during a turn. The
+PreToolUse hook forces such a marked launch into the foreground, removes
+`isolation` and `name`, and refuses it from inside a sub-agent. The server
+attributes the Agent card to the child by the marker at the start of its prompt.
+Such a child has no credential of its own, so, like a Codex child, it is told not to
+call actor tools. Its next host turns define it with its own credential. When the
+calling turn cannot start the child, the existing queued follow-up host turn
+(`native-handoff:` recovery) launches it instead: a call without the calling turn,
+or a Claude child model that no Agent alias runs exactly (a guard: Claude
+children currently run Haiku, Sonnet or Opus, which all have one). A child the calling turn never starts is failed and
+undispatched when that turn ends, and a retry launches it through the follow-up
+turn. Only one of the two paths ever starts it.
 
 Retrying the same request after restoring a child's permission recovers it
 without relaunching the host:
@@ -325,6 +385,20 @@ actors, a scoped task for each, and a stable batch request ID. This includes oth
 root actors; it does not grant actor-registry management outside the caller's
 tree. `actor_list` exposes a bounded roster for collaborator discovery.
 
+## Actor registry from any task (2026-11-04)
+
+An ordinary task turn without an actor binding receives a per-turn capability
+that opens only `actor_list`, `actor_read_memory` (by `actorId`) and
+`actor_create_root`. Its own workspace is always readable. Actor tasks share the
+same implementation for these three tools. In both cases another workspace
+(`workspaceId`) is reachable only when one of the task's own user messages names
+that workspace, or for reads that actor; creating a root there needs the
+workspace itself named. Actor-written briefs and memory never count. A root
+created by an actor inherits its allowed models; one created by a task without an
+actor may run only its chosen model. Tree management, steering, handoff and
+assignment still require a system-owned binding. Workspace-manager, side chat,
+Grill and planner turns get no registry capability.
+
 The server saves the original user messages, proposed tasks, actor/model snapshots
 and a leased batch receipt before inference. A durable `model_select` Decision
 checks explicit user intent for concurrent work and the scope of every task, and
@@ -356,7 +430,13 @@ that group, subject to existing owner/executor permissions. Candidates are
 Haiku/Sonnet/Opus or Luna/6.1 Terra/Sol/Astra. 6.1 Terra is the Sonnet pair and,
 like Sonnet, is below the prompt-work floor; the Sol tier prefers 6.1 Sol, with older
 permitted models as fallbacks within the same tier (2026-10-26). No permitted tier means a
-routing failure, never a provider switch. Requests without a response profile use
+routing failure, never a provider switch. The one exception is a model the user
+names ("用astra", "use opus"), in the current message or a selected earlier round:
+it runs whenever owner and executor allow it, even outside the composer's group,
+except for a session @mention, which stays in its session's provider. A named model
+the actors do not allow fails explicitly when it is in the current message; when it
+is inherited from an earlier round, Decision selects instead (2026-11-10).
+Requests without a response profile use
 the application default group. Actor model fields remain for persisted-data
 compatibility and memory maintenance, but do not bind chat or execution selection.
 Actor creation and the actor list no longer present a fixed model identity.
@@ -430,6 +510,16 @@ stakeholder instructions describe a private conversation between the user and
 the actor tree for individual rounds. Follow-up task turns do not carry room
 conversation history and are unaffected.
 
+Actor chat (an individual round that is neither a session @mention nor a
+cross-workspace handoff, `isActorDirectChatRound`) has no picking. The actor
+replies with an opinion or opens a task itself (`openTask`, stored as a full
+`claimed` reply without `claimScope`); it never offers a claim, a partial scope
+or waits for Decision to choose an owner. Work outside its role is declined as
+an opinion naming a better-suited actor, unless the user explicitly asks this
+actor to do it, in which case it opens the task. The actor view labels such a
+reply "Opened a task" and shows no claim label. Group chat keeps the claim,
+coverage and owner Decision flow unchanged.
+
 ### Per-actor workload summary
 
 `GET /api/domain-actors/:workspaceId/actors/summary` requires a signed-in user
@@ -502,6 +592,67 @@ notifications reach the original SH but do not authorize more work. Capture a
 token-usage baseline including model, token classes and context window before
 comparing qualified-work cost and user interventions.
 
+### Collective memory digest
+
+Event maintenance only reaches the executor, owner and round stakeholders of an
+actor event. Work that changes an actor's domain without making it a stakeholder,
+ordinary (non-actor) sessions and `actor_reorganize` changes never reach it, and a
+single-event rewrite can keep superseded entries or drop still-open rolling
+todos. The digest (`src/server/actorMemoryDigest.ts`,
+`DomainActorService.digestMemory`) catches each actor up per project:
+
+- **Projects.** A session belongs to the registered project whose most specific
+  root contains its cwd (the Composer @mention rule, `sessionMentionProject`);
+  an unresolved or ambiguous cwd is Unassigned (`UNASSIGNED_ACTOR_PROJECT`). A
+  project's actors are every root and sub-actor whose root lists it in
+  `projectIds`; the Unassigned digest reaches every actor.
+- **Trigger.** A periodic tick (`MEMORY_DIGEST_TICK_MS`, 2 minutes) checks every
+  workspace. A project is due when at least `MEMORY_DIGEST_MIN_TURNS` (20) turns
+  of any session finished after its watermark **and** it has been idle for
+  `MEMORY_DIGEST_IDLE_MS` (15 minutes): no running or queued turn (a stopped
+  turn waiting for a manual retry does not count) and its last turn activity at
+  least that long ago. A busy project simply waits for a later tick. Turn
+  activity is `coalesce(runner_heartbeat, runner_started, created)` at
+  millisecond precision. One digest per project runs at a time in a process.
+  `THREADEX_MEMORY_DIGEST_MIN_TURNS` and `THREADEX_MEMORY_DIGEST_IDLE_MINUTES`
+  override the thresholds. The tick is opt-in with `THREADEX_MEMORY_DIGEST=1`
+  until the digest has been verified on live rooms; remove that switch then.
+- **Watermarks.** `ActorRoom.memoryDigests.projects[projectKey].watermark` is the
+  last activity time of the newest digested turn. A project first seen starts at
+  the current time, so earlier history is never digested. A running batch is
+  saved as `pending` (its new watermark and the turn summaries made so far) and
+  resumes after a restart without re-summarizing; the watermark advances when
+  every actor of the batch has been attempted.
+- **Step 1, turn summaries.** Each finished turn gets two or three sentences
+  (what was done, what was decided, what is unfinished) from the summariser's
+  Luna model, saved with its `sessionId`, `turnId`, completion time and
+  `changed_files`.
+- **Step 2, selection.** Each actor receives every summary of a turn it has not
+  already maintained memory from as executor, owner or stakeholder: a turn is
+  processed when a room event with that `taskTurnId`, in that session or a work
+  item executed there (`taskSessionId`/`executionHistory`), is in the actor's
+  `memory.sourceEventIds`. A recorded maintenance failure does not count. There
+  is no count limit; with no new summary the actor is skipped.
+- **Step 3, rewrite.** `actorMemoryDigestPrompt` runs on the Terra tier: 6.1 Terra
+  (`gpt-6.1-terra`) for Codex actors, Sonnet for Claude-model actors, with
+  `context.relation` `digest`. It keeps only what affects the actor's
+  responsibilities, rewrites or deletes entries a summary supersedes or
+  contradicts, removes rolling todos shown completed or obsolete and keeps open
+  ones, never copies other actors' task details, cites one source (`sessionId`)
+  per entry and returns memory unchanged when nothing applies. `rolePrompt` and
+  `roleSummary` are never part of the response and never change.
+- **Write.** Same guards as event maintenance: the per-actor write queue,
+  `rejectedMemoryField`, version CAS with three attempts, and failures recorded in
+  `memoryErrors` (final). The source event ID is
+  `digest:<projectKey>:<watermark>`. Unchanged memory is not written. Each write
+  saves an `ActorMemoryDigestRecord` (sources, `before`/`after` `longTerm` and
+  `rolling`) in `memoryDigests.records` in the same transaction; each actor keeps
+  its newest `MEMORY_DIGEST_RECORD_LIMIT` (20).
+
+The digest cases of `src/server/fixtures/actorMemory.eval.json` (relation
+`digest`, with `summaries` instead of `event`) cover superseded entries,
+completed and still-open rolling todos, and other actors' details.
+
 Existing Decision behavior is retained: Jev-only default, explicitly configured
 per-purpose backend order, direct LLM adapter and existing audit/usage boundary.
 Do not rewrite it to the older draft's default fallback or category runner. When
@@ -509,6 +660,25 @@ removing category code, preserve its authenticated background JSON capability by
 generalizing `runCategoryTask`; do not delete that capability with category UI.
 
 ## Task workflow preferences
+
+Managed mode lets the owner choose direct execution or delegation; it does not
+require a sub-agent. Compare total cost including handoff, review and rework,
+speed, context isolation and independent verification. Same-tier workers can be
+useful for context isolation without parallel execution. A lower worker price alone
+does not establish a saving. Keep existing completion feedback to stakeholders.
+
+When domain boundaries are clear and the work is substantial or complex, the owner
+should split bounded responsibilities and retain integration and verification.
+Small work, unclear boundaries or tightly coupled edits favor direct execution.
+Whole-request ownership permits in-scope actor delegation without a separate user
+request for parallelism; the server still checks each task's scope and permissions.
+Exclusive permissions or knowledge are not prerequisites for delegation.
+
+Explicit affirmative user execution directives such as `with astra XH managed`
+or `用 astra xh` lock the supported model and effort before workload routing.
+Only canonical user messages supply these directives, never stakeholder briefs.
+Unsupported or forbidden profiles fail visibly instead of silently downgrading.
+Profile changes bypass group fast track so a continuation receives the new settings.
 
 Actor planning and task execution guidance prioritizes considering Managed mode
 for larger tasks that can be decomposed and coordinated with clear ownership,
@@ -537,7 +707,10 @@ selected, visible context rounds. Candidates retain the same owner and executor,
 compatible approval policy and current model permissions. A durable Decision
 under the model-selection policy chooses continuation or separate work from the
 actual objective and brief; a model change alone does not require a new session.
-The round saves that decision and its delivery snapshot. Continuations use the
+The round saves that decision and its delivery snapshot. A failed, thrown or invalid
+session Decision never blocks a valid claim: the work dispatches to a new task
+session and `continuation.newSessionFallback` records `decision_failed` or
+`invalid_choice` next to the retained Decision. Continuations use the
 task-reference update path with a stable turn identity and carry the latest
 canonical request and prepared brief. Before delivery, recheck project/CWD,
 actor binding, permissions and idle state; the queue insertion also rejects a
@@ -546,6 +719,19 @@ explicit retryable error and never falls back to a duplicate task. Retry the
 same request after the cause is resolved. The reply displays an Existing task
 link using its live state. Split assignments, new attachments and executor
 changes keep the separate-task path. `actor_steer` remains coordination only.
+
+### Prompting another session from an actor
+
+The raw `prompt_session` command stays hidden from actor sessions because it
+bypasses the actor tree binding. `actor_prompt_session` (`sessionId`, `message`,
+optional `model` and `modelReasoningEffort`) replaces it: the server refuses
+the caller's own session and native sub-agents, and requires the user's own
+message to name a session in another workspace. There is no Decision gate:
+the tool description tells the actor to prompt another session only when the
+user asks. The runner sends the prompt as a normal inter-actor turn (queued
+when the target is running).
+Decisions are saved per exact messages and prompt, so a clarified request is
+judged afresh.
 
 ## Persistence, recovery and current limits
 
@@ -599,6 +785,11 @@ Decision with the round and claimant as its stable audit identity, choosing from
 the owner/executor system allowlist intersection. Save the result and audit on
 the reply after ownership arbitration and before work reservation. A single named actor
 bypasses actor selection, but still needs model selection when claiming work.
+A failed or invalid model Decision never blocks a valid claim: the claimant's permitted
+proposal (not in owner-led rounds), else the executor's permitted default, else the
+strongest permitted model runs, and the reply records `modelFallback`. Only an empty
+permitted intersection, or a current-message model directive that is not permitted,
+still stops dispatch.
 Claim, reassignment and parallel-work selection share a capability-first rubric:
 evaluate the full assigned workload and integration/correctness risks before
 cost. Lightweight models require small, clear, self-contained low-risk work;

@@ -523,13 +523,29 @@ Example registration:
 }
 ```
 
-Completed executable monitors remain available for restart;
+Monitors default to `removeOnExit: true`: a finished, stopped, failed or timed-out
+monitor stays listed with its exit status and captured log for 10 minutes
+(`PROCESS_MONITOR_COMPLETED_RETENTION_MS`), then the record and its internal log
+are removed. Its durable `process.exited` event keeps the result. Use this default
+for tests, builds and other one-off jobs; set `removeOnExit: false` only for a
+long-running service that should keep its Restart control after it stops. When a
+service monitor starts, finished service monitors in the same workspace whose
+`entryPoints` share its host and port (loopback aliases count as one host) are
+removed, so relaunching a dev server keeps one monitor per endpoint.
+Before an agent adds a monitor, Threadex compares it with live monitors,
+registered commands and retained services in the workspace: a shared endpoint or
+identical launch matches directly, and the `process_monitor_duplicate` Decision
+judges the rest. A match is rejected with the similar monitors so the agent reuses
+one; to add another anyway, the agent must ask the user and retry with
+`similarMonitorApproval` (every similar id plus the user's reply), which is
+recorded on the `process.monitor.changed` event. A failed Decision does not block
+the launch. Monitors started from the UI are not checked.
 Interpreter executable monitors (`node`, shells, Python, and similar) must include
 the script or command options in `args`. Labels are display-only and do not find a
 process. PID-only monitors are temporary, store no launch args, cannot restart,
 and disappear when that exact PID exits. Pair a live PID with exactly one launch
-spec (`exe` plus `args`, `dockerImage`, or `command`) to retain it after exit and
-make it restartable without interrupting it; `adopt` provides the same upgrade path
+spec (`exe` plus `args`, `dockerImage`, or `command`) to make it restartable
+without interrupting it; `adopt` provides the same upgrade path
 for an existing PID-only monitor. The Threadex API server uses an external
 supervisor. Its built-in monitor exposes Restart whenever a supervisor or restart
 control is available; the action is data-driven by monitor metadata rather than the

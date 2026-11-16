@@ -22,6 +22,41 @@ policy, attachments and skills. Main remains the coordinator and keeps its own
 context. All workers share the project directory; detected concurrent edits to
 the same file appear in the panel and roster. This is not a file merge service.
 
+## Agent delegation
+
+Main's agent can create workers itself, so a Claude or Codex session can use the
+other provider as its sub-agent without the user switching sessions. Any ordinary
+task session's runner exposes `concurrent_spawn`, `concurrent_wait` and
+`concurrent_stop` on the session-inspector CLI, alongside `concurrent_status`
+and `concurrent_send`. Side chats, Grill, planners, domain actors and Manager
+sessions do not get them. The commands are pre-approved like other
+session-inspector reads, so they do not create approval cards; each worker keeps
+its own sandbox and approval policy. The standing runner instructions allow
+spawning only when the user asks for delegation, parallel work or another model
+or provider.
+
+- `concurrent_spawn` posts `fork` with `origin: "agent"` and `spawnTurnId`, and
+  creates the group if the session has none. The context boundary is main's
+  latest completed turn, never the running one. During main's first turn there is
+  no boundary, so the worker starts from its brief alone (`sourceTurnId: null`).
+  The timeline shows the worker under `spawnTurnId`, the turn that delegated it.
+- `concurrent_wait` keeps main inside its turn. Each CLI poll (`wait`) renews a
+  15-second `mainWait` hold. The hold stops the pulse from steering worker
+  results into main, and the poll claims the awaited workers' pending results
+  for main's running turn and returns them. A claimed result is marked delivered
+  to that turn, so it is never steered again; when the turn ends, `collect()`
+  completes it like any other delivery. A result that was already steering
+  still arrives as a message. When the tool returns, `endWait` releases the
+  hold. A crashed CLI stops renewing it, and steering resumes once it expires.
+  A worker counts as settled when it is stopped, or idle with a recorded result
+  for its latest turn.
+- Worker model choice follows the cross-provider table in the skill's "Pick the
+  worker model" section. A condensed copy is in the `concurrent_spawn` `model`
+  description, because a main without a group does not have the skill injected.
+  Both copies mirror the tiers in `src/managedMode.ts`; update all three together.
+- If main ends its turn instead of waiting, results queue as ordinary messages.
+  `wait_for_task_end` remains for dependencies on unrelated tasks.
+
 ## Native capability evidence
 
 The installed Codex app-server JSON schema and metadata-only RPC probes on
@@ -128,6 +163,9 @@ crash window that provides no transactional receipt.
   agent calls include their source `turnId`.
 - `POST …/:sessionId/control`: `localId`, `stopped`.
 - `POST …/:sessionId/resolveDelivery`: message `id`, `action: delivered | cancel`.
+- `POST …/:sessionId/wait`: main's running `turnId`, optional `localIds`; returns
+  `members` (with `settled`), claimed `results` and `notices`.
+- `POST …/:sessionId/endWait`: `turnId`; releases the wait hold.
 
 Retry the same operation with its original request ID. Changing its payload
 requires a new request ID. These endpoints use the existing local API security
