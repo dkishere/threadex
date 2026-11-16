@@ -94,6 +94,35 @@ async function fixture(page: Page, initialActors = [actor("product", "Product")]
   return { room, calls, created, roundtables, roundtableCalls, failNextRoundtable: () => { failRoundtableOnce = true; }, failNextRequest: () => { rejectRequestOnce = true; }, conflictNextMemory: () => { conflictOnce = true; }, recoverNextLaunch: () => { recoverLaunch = true; } };
 }
 
+test("group reply Retry sends the current gear on every attempt", async ({ page }) => {
+  const state = await fixture(page);
+  const saved = round(state.room, { workspaceId: "actors-test", requestId: "retry-gears", userPrompt: "Retry model" });
+  saved.stakeholderIds = ["product"];
+  saved.responseProfile = { model: "claude-sonnet-5-5", effort: "medium" };
+  saved.replies = [{ actorId: "product", status: "error", text: "", error: "Claude plan limit reached" }];
+  state.room.rounds.push(saved); state.room.revision++;
+  const retries: unknown[] = [];
+  await page.route(`**/rounds/${saved.id}/replies/product/retry`, route => {
+    retries.push(route.request().postDataJSON());
+    return route.fulfill({ json: saved });
+  });
+  await refreshRoom(page);
+  const configure = page.getByRole("button", { name: "Configure model gears" });
+  for (const model of ["gpt-6.1-sol", "gpt-6-luna"]) {
+    await configure.click();
+    await page.getByRole("combobox", { name: "Gear 2 model", exact: true }).selectOption(model);
+    await page.getByRole("combobox", { name: "Gear 2 effort", exact: true }).selectOption("high");
+    await configure.click();
+    await page.getByRole("radio", { name: /Gear 2/ }).locator("..").click();
+    const retry = page.getByRole("button", { name: "Retry Product reply", exact: true });
+    await retry.click();
+    await expect.poll(() => retries.length).toBe(model === "gpt-6.1-sol" ? 1 : 2);
+    await expect(retry).toBeEnabled();
+    expect(retries.at(-1)).toEqual({ responseProfile: { model, effort: "high" } });
+  }
+  expect(saved.responseProfile.model).toBe("claude-sonnet-5-5");
+});
+
 for (const status of ["queued", "responding"] as const) test(`group chat ${status} reply Stop targets a round and actor, with retry and a usable narrow composer`, async ({ page }) => {
   const state = await fixture(page, [actor("product", "Product"), actor("platform", "Platform")]);
   for (const requestId of ["one", "two"]) {
@@ -336,6 +365,17 @@ for (const width of [375, 1440]) {
   }
 }
 
+test("group Reply with @mentions nominates the replied actor and every mentioned actor", async ({ page }) => {
+  const state = await fixture(page, [actor("product", "Product"), actor("platform", "Platform")]);
+  state.room.rounds.push(round(state.room, { workspaceId: "actors-test", requestId: "reply-mentions", userPrompt: "Original work" }));
+  state.room.revision++; await refreshRoom(page);
+  await page.locator('.side-chat-bubble[data-actor-id="product"]').getByRole("button", { name: "Reply to Product", exact: true }).click();
+  await page.getByRole("textbox", { name: "Message actors" }).fill("Work on this together with @Platform");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect.poll(() => state.calls.length).toBe(1);
+  expect(state.calls[0].namedActorIds).toEqual(["platform", "product"]);
+});
+
 test("Reply without a task can be cancelled, replaced or cleared without changing the draft", async ({ page }) => {
   const state = await fixture(page, [actor("product", "Product"), actor("platform", "Platform")]);
   const saved = round(state.room, { workspaceId: "actors-test", requestId: "reply-no-task", userPrompt: "A question" });
@@ -465,7 +505,9 @@ for (const individual of [false, true]) {
       await stop.focus();
       await page.keyboard.press("Enter");
     }
-    await expect(page.getByText("Stopped", { exact: true })).toBeVisible();
+    // The actor timeline shows no task status; its Sessions list carries it.
+    if (individual) await expect(page.locator("#actor-dialog-panel").getByText("Stopped", { exact: true })).toHaveCount(0);
+    else await expect(page.getByText("Stopped", { exact: true })).toBeVisible();
     await expect(stop).toHaveCount(0);
     await expect(page.getByRole("alert")).toHaveCount(0);
     await expect(input).toHaveText("Edited while stopping");
@@ -770,7 +812,7 @@ test("assigned waits for actual start event then shows owner model and task navi
   await expect(taskLine.locator(".actor-room-task-toggle")).toContainText("Task · Sonnet 5.5");
   await taskLine.getByRole("button", { expanded: false }).click();
   await expect(taskLine.getByText("Owner: Platform", { exact: true })).toBeVisible();
-  await expect(page.getByText("Platform was selected over Product", { exact: false })).toBeVisible();
+  await expect(taskLine.locator(".actor-room-task-detail").getByText("Platform was selected over Product", { exact: false })).toBeVisible();
   await expect(page.getByText("Timed out", { exact: true })).toBeVisible();
   state.room.workItems[0].status = "started"; state.room.revision++;
   await refreshRoom(page);
@@ -780,13 +822,13 @@ test("assigned waits for actual start event then shows owner model and task navi
   await refreshRoom(page);
   await expect(page.locator('[data-started="true"]')).toBeVisible();
   await expect(page.getByText("Started", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "Open task" }).scrollIntoViewIfNeeded();
+  await page.getByRole("link", { name: /^Open task/ }).scrollIntoViewIfNeeded();
   await page.screenshot({ path: "/private/tmp/threadex-actor-room-started.png" });
   await page.setViewportSize({ width: 390, height: 844 });
   const bounds = await page.getByRole("region", { name: "Workspace manager chat", exact: true }).boundingBox();
   expect(bounds!.x).toBeGreaterThanOrEqual(0); expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(390);
   await page.screenshot({ path: "/private/tmp/threadex-actor-room-mobile.png" });
-  await page.getByRole("button", { name: "Open task" }).click();
+  await page.getByRole("link", { name: /^Open task/ }).click();
   await expect(page.locator("body")).toHaveAttribute("data-opened-session", "task-session");
 });
 
@@ -803,12 +845,12 @@ test("a single request shows parent and parallel work with independent task navi
   }
   state.room.revision++;
   await refreshRoom(page);
-  await expect(page.getByRole("button", { name: "Open task" })).toHaveCount(2);
+  await expect(page.getByRole("link", { name: /^Open task/ })).toHaveCount(2);
   const child = page.locator(".actor-room-work").filter({ hasText: "Build the API" });
   // Platform is a root actor, not Product's sub-actor: the line names the delegation.
   await expect(child).toContainText("Working actor: Platform (delegated) · Owner: Product");
   await expect(child.locator(".actor-room-task-toggle")).toContainText("Delegated by Product");
-  await child.getByRole("button", { name: "Open task" }).click();
+  await child.getByRole("link", { name: /^Open task/ }).click();
   await expect(page.locator("body")).toHaveAttribute("data-opened-session", "session-child");
 });
 
@@ -1326,7 +1368,7 @@ test("individual actor offers sub-actor creation with the selected parent and ca
   expect(s.calls).toHaveLength(0);
 });
 
-test("actor timeline interleaves sources and task events, keeps replay unique and updates live", async ({ page }) => {
+test("actor timeline lists conversations only and leaves task events to the Sessions list", async ({ page }) => {
   const s = await shellFixture(page);
   s.room.rounds = [];
   s.room.workItems = [];
@@ -1342,16 +1384,15 @@ test("actor timeline interleaves sources and task events, keeps replay unique an
   s.room.revision++;
   await refreshRoom(page);
   const entries = page.locator(".actor-timeline-entry");
-  await expect(entries).toHaveCount(4);
-  expect(await entries.evaluateAll(nodes => nodes.map(node => node.getAttribute("data-timeline-kind")))).toEqual(["conversation", "task", "task", "conversation"]);
+  await expect(entries).toHaveCount(2);
+  expect(await entries.evaluateAll(nodes => nodes.map(node => node.getAttribute("data-timeline-kind")))).toEqual(["conversation", "conversation"]);
   await expect(entries.first()).toContainText("Group chat");
   await expect(entries.last()).toContainText("Direct · Planner");
-  await expect(entries).toHaveCount(4);
   s.room.events.push({ ...s.room.events[0], id: "replay" }, { ...s.room.events[0], id: "end-a", type: "task.turn_completed", created: at(4) });
   s.room.revision++;
   await refreshRoom(page);
-  await expect(entries).toHaveCount(5);
-  await expect(entries.last()).toContainText("Task turn ended");
+  await expect(entries).toHaveCount(2);
+  await expect(page.locator("#actor-dialog-panel")).not.toContainText("Task turn ended");
   await expect(page.locator(".actor-conclusion")).toHaveCount(0);
   expect(s.errors).toEqual([]);
 });
@@ -1762,6 +1803,25 @@ test("a group chat opened beside a task session keeps the project chat key in th
   expect(s.errors).toEqual([]);
 });
 
+test("a round table opened in a project group chat is started in that project", async ({ page }) => {
+  const s = await shellFixture(page, "#view=workspace-chat&chat=backend", { projects: true });
+  const starts: StartActorRoundtable[] = [];
+  await page.route("**/api/settings/roundtable-actors", route => route.fulfill({ json: consultantLibrary }));
+  await page.route("**/api/domain-actors/actors-test/roundtables**", route => {
+    if (route.request().method() !== "POST") return route.fulfill({ json: { roundtables: [] } });
+    starts.push(route.request().postDataJSON());
+    return route.fulfill({ status: 400, json: { error: "stop here" } });
+  });
+  const chat = page.getByRole("region", { name: "Workspace manager chat" });
+  await expect(chat.getByRole("heading", { name: "Backend group chat" })).toBeVisible();
+  await chat.getByRole("button", { name: "Round table mode", exact: true }).click();
+  await s.input.fill("Backend round table");
+  await s.send.click();
+  await expect.poll(() => starts.length).toBe(1);
+  expect(starts[0]).toMatchObject({ message: "Backend round table", chatProjectId: "backend" });
+  expect(s.requests).toHaveLength(0);
+});
+
 const consultantLibrary = { revision: 1, actors: [
   { type: "consultant", id: "critic", name: "Critic", model: DEFAULT_MODEL, effort: "high", rolePrompt: "Find the risks", isDefault: true },
   { type: "consultant", id: "builder", name: "Builder", model: DEFAULT_MODEL, effort: "high", rolePrompt: "Find the simplest path", isDefault: true },
@@ -1789,7 +1849,9 @@ for (const width of [1280, 390]) test(`group chat round table opens a new sessio
   expect(state.roundtableCalls).toHaveLength(1);
   expect(state.roundtableCalls[0]).toMatchObject({ message: "Should we split the billing service?" });
   expect(state.roundtableCalls[0].actors.map(item => item.name)).toEqual(["Critic", "Builder", "User advocate"]);
-  expect(Object.keys(state.roundtableCalls[0]).sort()).toEqual(["actors", "message", "requestId"]);
+  expect(Object.keys(state.roundtableCalls[0]).sort()).toEqual(["actors", "chatProjectId", "message", "requestId"]);
+  // The session is bound to the group chat's project; this is the Unassigned chat.
+  expect(state.roundtableCalls[0].chatProjectId).toBeNull();
   // No in-place group chat round is created; the mode turns off after one prompt.
   expect(state.calls).toHaveLength(0);
   await expect(toggle).toHaveAttribute("aria-pressed", "false");

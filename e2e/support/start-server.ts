@@ -2,7 +2,7 @@ import { mkdirSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { openPostgresSessionConnection, postgresSchemaFromStoreId } from "../../src/server/sessionDb.js";
 import { SessionStore } from "../../src/server/sessionStore.js";
-import { scenarioSessions, seededSessions } from "./scenarios.js";
+import { promptOriginScenario, scenarioSessions, seededSessions, transcriptHistoryScenario } from "./scenarios.js";
 
 const root = resolve(import.meta.dirname, "../..");
 const dataDir = resolve(process.env.SESSION_DATA_DIR ?? resolve(root, ".e2e-data"));
@@ -171,6 +171,31 @@ for (const account of [
   }]);
 }
 await store.deleteAccount("e2e-profile-deleted-account");
+
+await store.upsertWorkspace({ id: promptOriginScenario.workspaceId, name: "Prompt Origins", codexHome: resolve(dataDir, "prompt-origin-codex-home"), cwd: root });
+for (const session of [promptOriginScenario.source, promptOriginScenario.session]) {
+  await store.upsertSession({ id: session.id, threadId: `thread-${session.id}`, workspaceId: promptOriginScenario.workspaceId, cwd: root,
+    title: session.title, description: "Prompt origin highlight fixture" });
+}
+await store.recordSessionTurn({ id: `${promptOriginScenario.source.id}-turn`, sessionId: promptOriginScenario.source.id,
+  userInput: "Source prompt", agentResponse: "Source response", tokenIn: 10, tokenOut: 20, status: "done" });
+for (const [index, item] of ([
+  ["user", "Typed by the user", undefined],
+  ["dispatch", "Dispatched from a Decision", { kind: "inter-actor", trigger: "decision-dispatch", sourceActorId: "e2e-executor", sourceActorName: "Executor Actor", dispatcherActorId: "e2e-owner", sourceRoundId: "round-1" }],
+  ["message", "Sent from another session", { kind: "inter-actor", trigger: "session-tool", sourceActorId: "e2e-sender", sourceActorName: "Sender Actor", sourceSessionId: promptOriginScenario.source.id }]
+] as const).entries()) {
+  await store.recordSessionTurn({ id: `${promptOriginScenario.session.id}-${item[0]}`, sessionId: promptOriginScenario.session.id, userInput: item[1],
+    agentResponse: `Response ${index + 1}`, tokenIn: 10, tokenOut: 20, status: "done", ...(item[2] ? { requestMetadata: { promptOrigin: item[2] } } : {}) });
+}
+
+await store.upsertWorkspace({ id: transcriptHistoryScenario.workspaceId, name: "Transcript History", codexHome: resolve(dataDir, "transcript-history-codex-home"), cwd: root });
+await store.upsertSession({ id: transcriptHistoryScenario.session.id, threadId: `thread-${transcriptHistoryScenario.session.id}`,
+  workspaceId: transcriptHistoryScenario.workspaceId, cwd: root, title: transcriptHistoryScenario.session.title, description: "Load earlier transcript fixture" });
+for (let index = 1; index <= transcriptHistoryScenario.turnCount; index += 1) {
+  await store.recordSessionTurn({ id: `${transcriptHistoryScenario.session.id}-turn-${index}`, sessionId: transcriptHistoryScenario.session.id,
+    userInput: `History prompt ${index}`, agentResponse: `History response ${index}\n${"Fixture content keeps each turn tall.\n".repeat(6)}`,
+    tokenIn: 10, tokenOut: 20, status: "done" });
+}
 
 await store.switchSession(scenarioSessions.bootstrap.id);
 await store.close();

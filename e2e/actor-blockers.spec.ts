@@ -56,6 +56,12 @@ async function fixture(page: Page, options: { blockers?: ActorBlocker[]; url?: s
       const body = req.postDataJSON() as Decision["body"];
       state.decisions.push({ path, body });
       const item = state.blockers.find(entry => entry.id === decodeURIComponent(action[2]));
+      if (body.action === "dismiss") {
+        // Terminal and idempotent, like the server: the record stays with status "dismissed".
+        if (!item) return json({ error: "No such blocker" }, 404);
+        if (item.status !== "dismissed") { const at = new Date().toISOString(); item.status = "dismissed"; item.closedAt = at; item.updated = at; room.revision++; }
+        return json(item);
+      }
       const proposal = item?.proposals.find(entry => entry.id === body.proposalId);
       if (!item || !proposal) return json({ error: "No such proposal" }, 404);
       const at = new Date().toISOString();
@@ -90,14 +96,6 @@ async function fixture(page: Page, options: { blockers?: ActorBlocker[]; url?: s
   return { state, errors, menu, chip, bell, titles, room };
 }
 
-/** Presses Tab until the focused element matches, so the keyboard path is proven rather than assumed. */
-async function tabTo(page: Page, matches: (el: Element) => boolean, limit = 12) {
-  for (let i = 0; i < limit; i++) {
-    await page.keyboard.press("Tab");
-    if (await page.evaluate(`(${matches.toString()})(document.activeElement)`)) return;
-  }
-  throw new Error("Focus never reached the expected control");
-}
 async function inViewport(page: Page, target: Locator, width: number) {
   const box = await target.boundingBox();
   expect(box).not.toBeNull();
@@ -275,107 +273,243 @@ test("project: group chat hides the section when no active blocker is escalated"
   expect(errors).toEqual([]);
 });
 
-for (const width of [1440, 390]) test(`notifications: bell counts blockers, stays closed, approves and navigates at ${width}px`, async ({ page }) => {
+for (const width of [1440, 390]) test(`notifications: workspace tab bell never lists blocker solutions at ${width}px`, async ({ page }) => {
   await page.setViewportSize({ width, height: width === 1440 ? 1000 : 844 });
-  const { state, errors, menu, bell } = await fixture(page);
+  const pendingPolls: string[] = [];
+  page.on("request", request => { if (new URL(request.url()).pathname === "/api/domain-actors/blockers/pending") pendingPolls.push(request.url()); });
+  const { errors, menu, bell } = await fixture(page);
   await menu();
-  await expect(bell).toHaveAccessibleName("Alpha actions (1 pending)");
-  // Nothing opens by itself, even after the poll has had time to run again.
+  // A proposal awaits approval, but blocker solutions are decided in their task session, not the workspace tab.
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await page.waitForTimeout(400);
-  await expect(page.locator("dialog[open]")).toHaveCount(0);
-  await expect(page.getByRole("dialog")).toHaveCount(0);
-  await bell.click();
-  const dropdown = page.getByRole("dialog", { name: "Alpha actions", exact: true });
-  const item = dropdown.locator('button[data-kind="blocker"]');
-  await expect(item).toHaveCount(1);
-  await expect(item).toContainText("Blocker solution needs approval");
-  await expect(item).toContainText(approvalBlocker().description);
-  await expect(item).toContainText("Release notes");
-  if (width === 390) await inViewport(page, dropdown, width);
-  await item.click();
-  const modal = page.getByRole("dialog", { name: "Blocker solution needs approval", exact: true });
-  await expect(modal).toBeVisible();
-  await expect(modal.locator(`article[data-blocker-id="${APPROVAL_ID}"]`)).toBeVisible();
-  await expect(modal.getByText("Rewrite the release notes from the merged pull requests.")).toBeVisible();
-  await expect(modal.locator("dd").filter({ hasText: "Reviewer" })).toBeVisible();
-  if (width === 390) await inViewport(page, modal, width);
-  // Go to session navigates and closes the dialog without deciding.
-  await modal.getByRole("button", { name: "Go to session", exact: true }).click();
-  await expect(page).toHaveURL(new RegExp(`workspaceId=${WS}&sessionId=${APPROVAL_SESSION}`));
-  await expect(page.locator(".content-header h1")).toHaveText("Release notes");
-  await expect(page.locator("dialog[open]")).toHaveCount(0);
+  await expect(bell).toBeHidden();
+  await expect(page.getByText("Blocker solution needs approval")).toHaveCount(0);
+  await expect(page.locator('.workspace-action-item[data-kind="blocker"]')).toHaveCount(0);
+  expect(pendingPolls).toEqual([]);
+  expect(errors).toEqual([]);
+});
+
+// ---- Dismiss ----
+const escalatedApprovalBlocker = () => ({ ...approvalBlocker(), status: "escalated" as const, escalation: { reason: "no_proposal_timeout" as const, at: timestamp } });
+const dismissButton = (scope: Locator) => scope.getByRole("button", { name: /^Dismiss blocker:/ });
+const confirmGroup = (scope: Locator) => scope.getByRole("group", { name: "Confirm dismissing this blocker" });
+const confirmButton = (scope: Locator) => scope.getByRole("button", { name: /^Confirm dismissing blocker:/ });
+async function dismissVia(scope: Locator) { await dismissButton(scope).click(); await confirmButton(scope).click(); }
+/** Reads the room through the (mocked) API, as the app does, so the assertion covers what a refetch would see. */
+async function roomBlockers(page: Page) {
+  return page.evaluate(async ws => (await (await fetch(`/api/domain-actors/${ws}/room`)).json()).blockers as Array<{ id: string; status: string }>, WS);
+}
+async function expectKept(page: Page, id: string) {
+  const stored = (await roomBlockers(page)).find(item => item.id === id);
+  expect(stored?.status).toBe("dismissed");
+}
+
+test("dismiss: toolbar workspace blockers dialog removes the row, updates the badge, keeps history and survives reload", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  const { state, errors } = await fixture(page, { blockers: [realBlocker(), escalatedApprovalBlocker()] });
+  const trigger = page.getByRole("button", { name: /^Workspace blockers:/ });
+  await expect(trigger).toHaveAccessibleName(/: 2 active blockers, 2 escalated/);
+  await trigger.click();
+  const dialog = page.getByRole("dialog", { name: "Workspace blockers" });
+  await expect(dialog.locator("tbody tr[data-blocker-id]")).toHaveCount(2);
+  // The expanded detail card never carries its own Dismiss.
+  await dialog.locator(`tr[data-blocker-id="${REAL_ID}"]`).getByRole("button", { name: "Details" }).click();
+  await expect(dialog.locator("tr.project-blockers-detail article.actor-blocker-card")).toHaveCount(1);
+  await expect(dialog.locator("tr.project-blockers-detail").getByRole("button", { name: /Dismiss/ })).toHaveCount(0);
+  await expect(dismissButton(dialog)).toHaveCount(2);
+  const row = dialog.locator(`tr[data-blocker-id="${REAL_ID}"]`);
+  await dismissButton(row).click();
+  await expect(confirmGroup(row)).toBeVisible();
   expect(state.decisions).toEqual([]);
-  await menu(); await expect(bell).toHaveAccessibleName("Alpha actions (1 pending)");
-  await bell.click(); await item.click();
-  await modal.getByRole("button", { name: "Approve this proposal" }).click();
-  await expect(modal.getByRole("status")).toContainText("recorded or is no longer pending");
-  await expect(modal.locator("article.actor-blocker-card")).toHaveCount(0);
-  expect(state.decisions).toEqual([{ path: `/api/domain-actors/${WS}/blockers/${APPROVAL_ID}/action`, body: { action: "approve", proposalId: "proposal-1" } }]);
-  await expect(bell).toBeHidden();
+  await confirmButton(row).click();
+  await expect(row).toHaveCount(0);
+  await expect(dialog.locator("tbody tr[data-blocker-id]")).toHaveCount(1);
+  await expect(trigger).toHaveAccessibleName(/: 1 active blocker, 1 escalated/);
+  expect(state.decisions).toEqual([{ path: `/api/domain-actors/${WS}/blockers/${REAL_ID}/action`, body: { action: "dismiss" } }]);
+  await expectKept(page, REAL_ID);
+  await page.reload();
+  await expect(page.getByRole("button", { name: /^Workspace blockers:/ })).toHaveAccessibleName(/: 1 active blocker, 1 escalated/);
+  await page.getByRole("button", { name: /^Workspace blockers:/ }).click();
+  await expect(page.getByRole("dialog", { name: "Workspace blockers" }).locator(`tr[data-blocker-id="${REAL_ID}"]`)).toHaveCount(0);
+  await expect(page.getByRole("dialog", { name: "Workspace blockers" }).locator(`tr[data-blocker-id="${APPROVAL_ID}"]`)).toHaveCount(1);
+  // Dismissing the last escalated blocker empties the dialog and hides the toolbar entry.
+  await dismissVia(page.getByRole("dialog", { name: "Workspace blockers" }).locator(`tr[data-blocker-id="${APPROVAL_ID}"]`));
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /^Workspace blockers:/ })).toHaveCount(0);
+  await expectKept(page, APPROVAL_ID);
+  expect((await roomBlockers(page)).length).toBe(2);
+  expect(errors).toEqual([]);
+});
+
+test("dismiss: actor view Blockers tab removes the row and survives reload", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  const second = blocker({ id: "blocker_composer_second", taskSessionId: CLEAN_SESSION, ownerActorId: COMPOSER, executorActorId: COMPOSER, status: "open", description: "Composer needs a design token decision." });
+  const { state, errors } = await fixture(page, { blockers: [realBlocker(), second, approvalBlocker()] });
+  const row = (id: string) => page.locator(`nav#sidebar-panel-actors button.actor-list-row[data-actor-id="${id}"]`);
+  await row(COMPOSER).click();
+  const blockersTab = page.getByRole("tab", { name: /^Blockers/ });
+  await blockersTab.click();
+  const list = page.getByRole("tabpanel", { name: /^Blockers/ });
+  await expect(list.locator("tbody tr[data-blocker-id]")).toHaveCount(2);
+  await expect(blockersTab.locator(".actor-blockers-tab-count")).toHaveCount(0);
+  const target = list.locator(`tr[data-blocker-id="${REAL_ID}"]`);
+  await dismissVia(target);
+  await expect(target).toHaveCount(0);
+  await expect(list.locator("tbody tr[data-blocker-id]")).toHaveCount(1);
+  await expect(list.locator(`tr[data-blocker-id="${second.id}"]`)).toBeVisible();
+  await expect(blockersTab.locator(".actor-blockers-tab-count")).toHaveCount(0);
+  // Other actors are untouched.
+  await expect(page.locator(`nav#sidebar-panel-actors button.actor-list-badge[data-kind="blocker"][data-actor-id="${REVIEWER}"]`)).toHaveText("Blocked 1");
+  expect(state.decisions.map(d => d.body)).toEqual([{ action: "dismiss" }]);
+  await expectKept(page, REAL_ID);
+  await page.reload();
+  await row(COMPOSER).click();
+  await page.getByRole("tab", { name: /^Blockers/ }).click();
+  const after = page.getByRole("tabpanel", { name: /^Blockers/ });
+  await expect(after.locator("tbody tr[data-blocker-id]")).toHaveCount(1);
+  await expect(after.locator(`tr[data-blocker-id="${REAL_ID}"]`)).toHaveCount(0);
+  await dismissVia(after.locator(`tr[data-blocker-id="${second.id}"]`));
+  await expect(after.locator("tbody tr[data-blocker-id]")).toHaveCount(0);
+  await expectKept(page, second.id);
+  expect(errors).toEqual([]);
+});
+
+test("dismiss: task header popup dismisses a non-escalated blocker and leaves Approve/Reject intact", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  const { state, errors, chip } = await fixture(page, { url: `/?workspaceId=${WS}&sessionId=${APPROVAL_SESSION}` });
+  await expect(page.locator(".content-header h1")).toHaveText("Release notes");
+  await chip.click();
+  const panel = page.getByRole("region", { name: "Task blockers", exact: true });
+  await expect(panel.getByRole("button", { name: "Approve this proposal" })).toBeVisible();
+  await expect(panel.getByRole("button", { name: "Reject this proposal" })).toBeVisible();
+  await expect(dismissButton(panel)).toHaveCount(1);
+  await dismissButton(panel).click();
+  await expect(confirmGroup(panel)).toBeVisible();
+  await expect(panel.getByRole("button", { name: "Approve this proposal" })).toBeVisible();
+  await expect(panel.getByRole("button", { name: "Reject this proposal" })).toBeVisible();
+  await confirmGroup(panel).getByRole("button", { name: "Cancel", exact: true }).click();
+  expect(state.decisions).toEqual([]);
+  // Reject behaves as before and the card (now escalated) still offers Dismiss.
+  await panel.getByRole("button", { name: "Reject this proposal" }).click();
+  await panel.getByRole("button", { name: "Confirm rejecting this proposal" }).click();
+  await expect.poll(() => state.decisions.map(d => d.body)).toEqual([{ action: "reject", proposalId: "proposal-1" }]);
+  await expect(panel.getByRole("button", { name: "Approve this proposal" })).toHaveCount(0);
+  await expect(dismissButton(panel)).toHaveCount(1);
+  await dismissVia(panel);
+  await expect(chip).toHaveCount(0);
+  await expect(panel).toHaveCount(0);
+  expect(state.decisions.at(-1)?.body).toEqual({ action: "dismiss" });
+  await expectKept(page, APPROVAL_ID);
+  expect(errors).toEqual([]);
+});
+
+test("dismiss: group chat escalated list dismisses and the toolbar badge follows", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  const { errors } = await fixture(page, { blockers: [realBlocker(), escalatedApprovalBlocker()] });
+  const trigger = page.getByRole("button", { name: /^Workspace blockers:/ });
+  await expect(trigger).toHaveAccessibleName(/: 2 active blockers, 2 escalated/);
+  await page.locator("nav#sidebar-panel-actors .actor-list-room").click();
+  const section = page.locator('section[aria-label="Escalated workspace blockers"]');
+  await expect(section.locator("article.actor-blocker-card")).toHaveCount(2);
+  const card = section.locator(`article[data-blocker-id="${REAL_ID}"]`);
+  await dismissVia(card);
+  await expect(card).toHaveCount(0);
+  await expect(section.locator("article.actor-blocker-card")).toHaveCount(1);
+  await expect(trigger).toHaveAccessibleName(/: 1 active blocker, 1 escalated/);
+  await expectKept(page, REAL_ID);
+  await dismissVia(section.locator(`article[data-blocker-id="${APPROVAL_ID}"]`));
+  await expect(section).toHaveCount(0);
+  await expect(trigger).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
+test("dismiss: Escape cancels only the confirmation, Cancel restores focus to Dismiss", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  const { state, errors, chip } = await fixture(page, { url: `/?workspaceId=${WS}&sessionId=${REAL_SESSION}` });
+  await chip.click();
+  const panel = page.getByRole("region", { name: "Task blockers", exact: true });
+  const dismiss = dismissButton(panel);
+  await dismiss.click();
+  await expect(confirmGroup(panel)).toBeVisible();
+  await expect(confirmButton(panel)).toBeFocused();
   await page.keyboard.press("Escape");
-  await expect(page.locator("dialog[open]")).toHaveCount(0);
-  expect(errors).toEqual([]);
-});
-
-test("notifications: rejecting with a reason sends the note and drops the item", async ({ page }) => {
-  await page.setViewportSize({ width: 1440, height: 1000 });
-  const { state, errors, bell, menu } = await fixture(page);
-  await menu();
-  await expect(bell).toHaveAccessibleName("Alpha actions (1 pending)");
-  await bell.click();
-  await page.getByRole("dialog", { name: "Alpha actions", exact: true }).locator('button[data-kind="blocker"]').click();
-  const modal = page.getByRole("dialog", { name: "Blocker solution needs approval", exact: true });
-  await modal.getByRole("button", { name: "Reject this proposal" }).click();
-  const reason = modal.getByRole("textbox", { name: "Reason for rejecting (optional)" });
-  await expect(reason).toBeFocused();
-  await reason.fill("  Too broad for this release.  ");
-  await modal.getByRole("button", { name: "Confirm rejecting this proposal" }).click();
-  await expect(modal.getByRole("status")).toContainText("recorded or is no longer pending");
-  expect(state.decisions.map(d => d.body)).toEqual([{ action: "reject", proposalId: "proposal-1", note: "Too broad for this release." }]);
-  const stored = state.blockers.find(item => item.id === APPROVAL_ID)!;
-  expect(stored.proposals[0].outcome).toBe("rejected"); expect(stored.status).toBe("escalated");
-  await expect(bell).toBeHidden();
-  expect(errors).toEqual([]);
-});
-
-test("notifications: reject without a reason omits the note, and Cancel returns to the choice", async ({ page }) => {
-  await page.setViewportSize({ width: 1440, height: 1000 });
-  const { state, errors, bell, menu } = await fixture(page);
-  await menu();
-  await bell.click();
-  await page.getByRole("dialog", { name: "Alpha actions", exact: true }).locator('button[data-kind="blocker"]').click();
-  const modal = page.getByRole("dialog", { name: "Blocker solution needs approval", exact: true });
-  await modal.getByRole("button", { name: "Reject this proposal" }).click();
-  await modal.getByRole("button", { name: "Cancel", exact: true }).click();
-  await expect(modal.getByRole("button", { name: "Approve this proposal" })).toBeVisible();
-  await expect(modal.getByRole("textbox")).toHaveCount(0);
-  await modal.getByRole("button", { name: "Reject this proposal" }).click();
-  await modal.getByRole("button", { name: "Confirm rejecting this proposal" }).click();
-  await expect(modal.getByRole("status")).toBeVisible();
-  expect(state.decisions.map(d => d.body)).toEqual([{ action: "reject", proposalId: "proposal-1" }]);
-  expect(errors).toEqual([]);
-});
-
-test("notifications: keyboard-only approve", async ({ page }) => {
-  await page.setViewportSize({ width: 1440, height: 1000 });
-  const { state, errors, bell, menu } = await fixture(page);
-  await menu();
-  await expect(bell).toHaveAccessibleName("Alpha actions (1 pending)");
-  await bell.focus(); await page.keyboard.press("Enter");
-  const dropdown = page.getByRole("dialog", { name: "Alpha actions", exact: true });
-  await expect(dropdown).toBeFocused();
-  await tabTo(page, el => (el as HTMLElement).dataset.kind === "blocker");
-  await page.keyboard.press("Enter");
-  const modal = page.getByRole("dialog", { name: "Blocker solution needs approval", exact: true });
-  await expect(modal).toBeVisible();
-  await tabTo(page, el => el.getAttribute("aria-label") === "Approve this proposal");
-  expect(await modal.evaluate(el => el.contains(document.activeElement))).toBe(true);
-  await page.keyboard.press("Enter");
-  await expect(modal.getByRole("status")).toContainText("recorded or is no longer pending");
-  expect(state.decisions.map(d => d.body)).toEqual([{ action: "approve", proposalId: "proposal-1" }]);
+  await expect(confirmGroup(panel)).toHaveCount(0);
+  await expect(panel).toBeVisible();
+  await expect(chip).toHaveAttribute("aria-expanded", "true");
+  await expect(dismiss).toBeFocused();
+  // Cancel button path.
+  await dismiss.click();
+  await confirmGroup(panel).getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(confirmGroup(panel)).toHaveCount(0);
+  await expect(dismiss).toBeFocused();
+  await expect(panel).toBeVisible();
+  // With no confirmation pending, Escape still closes the popup.
   await page.keyboard.press("Escape");
-  await expect(page.locator("dialog[open]")).toHaveCount(0);
-  await expect(bell).toBeHidden();
+  await expect(panel).toHaveCount(0);
+  expect(state.decisions).toEqual([]);
+  expect(errors).toEqual([]);
+});
+
+// Escape inside the toolbar dialog follows the same rule.
+test("dismiss: Escape in a confirmation keeps the workspace blockers dialog open", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  const { state, errors } = await fixture(page, { blockers: [realBlocker(), escalatedApprovalBlocker()] });
+  await page.getByRole("button", { name: /^Workspace blockers:/ }).click();
+  const dialog = page.getByRole("dialog", { name: "Workspace blockers" });
+  const row = dialog.locator(`tr[data-blocker-id="${REAL_ID}"]`);
+  await dismissButton(row).click();
+  await expect(confirmGroup(row)).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(confirmGroup(row)).toHaveCount(0);
+  await expect(dialog).toBeVisible();
+  await expect(dismissButton(row)).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  expect(state.decisions).toEqual([]);
+  expect(errors).toEqual([]);
+});
+
+test("dismiss: narrow viewport keeps Dismiss and its confirmation reachable without horizontal overflow", async ({ page }) => {
+  const width = 390;
+  await page.setViewportSize({ width, height: 800 });
+  const { state, errors } = await fixture(page, { blockers: [realBlocker(), escalatedApprovalBlocker()] });
+  const noOverflow = async () => expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.getByRole("button", { name: "Toggle middle panel" }).click();
+  await page.getByRole("button", { name: /^Workspace blockers:/ }).click();
+  const dialog = page.getByRole("dialog", { name: "Workspace blockers" });
+  const row = dialog.locator(`tr[data-blocker-id="${REAL_ID}"]`);
+  const dismiss = dismissButton(row);
+  await dismiss.scrollIntoViewIfNeeded();
+  await inViewport(page, dismiss, width);
+  await noOverflow();
+  await dismiss.click();
+  await expect(confirmGroup(row)).toBeVisible();
+  await inViewport(page, confirmGroup(row), width);
+  await inViewport(page, confirmButton(row), width);
+  await inViewport(page, confirmGroup(row).getByRole("button", { name: "Cancel", exact: true }), width);
+  await noOverflow();
+  await confirmButton(row).click();
+  await expect(row).toHaveCount(0);
+  expect(state.decisions.map(d => d.body)).toEqual([{ action: "dismiss" }]);
+  await noOverflow();
+  expect(errors).toEqual([]);
+});
+
+test("dismiss: narrow task header popup shows a usable Dismiss and confirmation", async ({ page }) => {
+  const width = 390;
+  await page.setViewportSize({ width, height: 800 });
+  const { state, errors, chip } = await fixture(page, { url: `/?workspaceId=${WS}&sessionId=${REAL_SESSION}` });
+  await chip.click();
+  const panel = page.getByRole("region", { name: "Task blockers", exact: true });
+  const dismiss = dismissButton(panel);
+  await dismiss.scrollIntoViewIfNeeded();
+  await inViewport(page, dismiss, width);
+  await dismiss.click();
+  await inViewport(page, confirmGroup(panel), width);
+  await inViewport(page, confirmButton(panel), width);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await confirmButton(panel).click();
+  await expect(chip).toHaveCount(0);
+  expect(state.decisions.map(d => d.body)).toEqual([{ action: "dismiss" }]);
   expect(errors).toEqual([]);
 });

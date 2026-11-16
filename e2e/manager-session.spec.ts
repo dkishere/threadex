@@ -19,7 +19,7 @@ async function shellFixture(page: Page, search = "view=actor&actorId=root-1") {
   const baseRound = round(room, { workspaceId: "actors-test", requestId: "seed", userPrompt: "Seed request" });
   room.rounds.push(baseRound);
   const item = (id: string, ownerActorId: string, executorActorId: string, status: "started" | "needs_user", updated: string, history: Array<{ executorActorId: string; taskSessionId: string }> = []) => ({
-    id, roundId: baseRound.id, ownerActorId, executorActorId, model: DEFAULT_MODEL, dispatchKey: id, taskSessionId: `sess-${id}`, taskTurnId: `turn-${id}`, status,
+    id, roundId: baseRound.id, ownerActorId, executorActorId, model: DEFAULT_MODEL, title: id === "started" ? `Task title ${"long ".repeat(40)}` : `Task title ${id}`, delegatedTask: `Different brief for ${id}`, dispatchKey: id, taskSessionId: `sess-${id}`, taskTurnId: `turn-${id}`, status,
     dispatchError: null, created: timestamp, updated, dispatched: true, dispatchLease: null, executionRevision: 0, assignmentRequests: [],
     executionHistory: history.map(entry => ({ ...entry, model: DEFAULT_MODEL, taskTurnId: "old-turn", dispatchKey: "old", dispatched: true, status: "failed" as const }))
   });
@@ -91,7 +91,7 @@ for (const width of [1440, 900, 390]) {
     await expect(helper.locator(".actor-room-claim-badge")).toHaveAttribute("aria-label", "Full claim");
     await expect(helper.locator(".side-chat-answer")).toHaveText("Offer from sub-1");
     await expect(helper.getByRole("button", { expanded: false })).toHaveCount(0);
-    // A long brief ellipsizes inside the task block instead of widening it past the chat.
+    // A long title ellipsizes inside the task block instead of widening it past the chat.
     const tasks = page.locator(".manager-conversation .actor-room-tasks");
     expect(await tasks.evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
     await expect(planner).toHaveCount(2);
@@ -101,7 +101,7 @@ for (const width of [1440, 900, 390]) {
     await expect(reviewer.getByText("Session not available yet")).toBeVisible();
     await expect(reviewer.getByRole("button", { name: "Open task", exact: true })).toHaveCount(0);
     await expect(helper.locator(".actor-room-claim")).toHaveCount(0);
-    await expect(helper.getByRole("button", { name: /Open/ })).toHaveCount(0);
+    await expect(helper.getByRole("button", { name: "Open task", exact: true })).toHaveCount(0);
     await expect(page.locator(".manager-conversation .actor-room-work")).toHaveCount(3);
     await s.input.fill("Keep this draft while reading tasks");
     const editor = await s.input.elementHandle();
@@ -110,20 +110,45 @@ for (const width of [1440, 900, 390]) {
       const id = new URL(route.request().url()).pathname.split("/")[3];
       return route.fulfill({ json: { session: { id, workspaceId: "actors-test", title: `Session ${id}`, threadId: null }, turns: [{ id: `turn-${id}`, sessionId: id, userInput: "Task question", agentResponse: `Task answer ${id}`, status: "done", created: timestamp, updated: timestamp, tokenIn: 0, tokenOut: 0, accountId: null }] } });
     });
-    const task = (id: string) => planner.and(page.locator(`[data-work-item-id="${id}"]`)).getByRole("button", { name: "Open task", exact: true });
+    const task = (id: string) => planner.and(page.locator(`[data-work-item-id="${id}"]`)).getByRole("link", { name: /^Open task/ });
+    const toggle = planner.and(page.locator('[data-work-item-id="started"]')).locator(".actor-room-task-toggle");
+    await expect(task("started")).toHaveText(`Task title ${"long ".repeat(40).trim()}`);
+    await expect(tasks.getByRole("button", { name: "Open task", exact: true })).toHaveCount(0);
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
     await task("started").click();
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
     const panel = page.locator(".manager-details > .session-main-block");
     await expect(panel.getByText("Task answer sess-started", { exact: true })).toBeVisible();
     await expect(page.locator(".manager-details iframe")).toHaveCount(0);
     expect(page.frames()).toHaveLength(1);
     await panel.locator(".composer [contenteditable=true]").fill("Only started session draft");
+    const sessionEditor = await panel.locator(".composer [contenteditable=true]").elementHandle();
+    const expand = panel.getByRole("button", { name: "Expand session" });
+    await expand.focus(); await expand.press("Enter");
+    const restore = panel.getByRole("button", { name: "Restore manager layout" });
+    await expect(restore).toBeFocused();
+    await expect(page.locator(".manager-conversation")).toBeHidden();
+    await expect(panel.getByRole("tab", { name: "Turns" })).toBeVisible();
+    await panel.getByRole("tab", { name: "Turns" }).focus();
+    await panel.getByRole("tab", { name: "Turns" }).press("ArrowRight");
+    await expect(panel.getByRole("tab", { name: "Side chat" })).toBeFocused();
+    await expect(panel.locator("#session-panel-side-chat")).toBeVisible();
+    await panel.getByRole("tab", { name: "Turns" }).click();
+    await expect(panel.locator("#session-panel-turns")).toBeVisible();
+    await expect(panel.locator(".composer [contenteditable=true]")).toHaveText("Only started session draft");
+    expect(await sessionEditor!.evaluate(node => node.isConnected)).toBe(true);
+    await restore.focus(); await restore.press("Enter");
+    await expect(expand).toBeFocused();
+    await expect(panel.getByRole("tab", { name: "Turns", includeHidden: true })).toBeHidden();
+    await expect(panel.locator(".composer [contenteditable=true]")).toHaveText("Only started session draft");
     await expect(page.locator(".workspace-manager-dashboard")).toBeHidden();
-    await expect(page).toHaveURL(/sessionId=sess-started#view=workspace-chat$/);
+    await expect(page).toHaveURL(/sessionId=sess-started#view=workspace-chat(?:&|$)/);
     if (width < 768) await page.getByRole("button", { name: "Chat", exact: true }).click();
     await expect(s.input).toHaveText("Keep this draft while reading tasks");
     expect(await editor!.evaluate(node => node.isConnected)).toBe(true);
     await task("needs").focus(); await task("needs").press("Enter");
     await expect(panel.getByText("Task answer sess-needs", { exact: true })).toBeVisible();
+    await expect(planner.and(page.locator('[data-work-item-id="needs"]')).locator(".actor-room-task-toggle")).toHaveAttribute("aria-expanded", "false");
     await expect(panel.getByText("Task answer sess-started", { exact: true })).toHaveCount(0);
     await expect(panel.locator(".composer [contenteditable=true]")).not.toContainText("Only started session draft");
     const composer = panel.locator(".composer");
@@ -189,7 +214,7 @@ test("embedded full composer sends attachments and suggestions to its selected s
     await route.fulfill({ contentType: "text/event-stream", body: `event: result\ndata: ${JSON.stringify({ sessionId: body.sessionId, turnId: body.turnId, reply: "Submission received", elapsedMs: 1 })}\n\nevent: done\ndata: {"ok":true}\n\n` });
   });
   await s.input.fill("Actor draft stays here");
-  await page.locator('.manager-conversation [data-work-item-id="started"]').getByRole("button", { name: "Open task", exact: true }).click();
+  await page.locator('.manager-conversation [data-work-item-id="started"]').getByRole("link", { name: /^Open task/ }).click();
   const frame = page.locator(".manager-details > .session-main-block");
   const composer = frame.locator("form.composer");
   const editor = composer.getByRole("textbox", { name: "Message", exact: true });
@@ -219,7 +244,7 @@ test("running session keeps queue and steer controls and closing never stops its
   } }));
   const stops: string[] = [];
   page.on("request", request => { if (new URL(request.url()).pathname === "/api/runner/stop") stops.push(request.postData() ?? ""); });
-  await page.locator('.manager-conversation [data-work-item-id="started"]').getByRole("button", { name: "Open task", exact: true }).click();
+  await page.locator('.manager-conversation [data-work-item-id="started"]').getByRole("link", { name: /^Open task/ }).click();
   const frame = page.locator(".manager-details > .session-main-block");
   const composer = frame.locator("form.composer");
   await expect(composer.getByRole("button", { name: "Stop agent", exact: true })).toBeVisible();
@@ -244,16 +269,15 @@ test("running session keeps queue and steer controls and closing never stops its
   await expect(page.locator(".workspace-manager-dashboard")).toBeVisible();
   expect(stops).toEqual([]);
   // Explicit controls remain available after returning to the dashboard.
-  await page.locator('.manager-conversation [data-work-item-id="started"]').getByRole("button", { name: "Open task", exact: true }).click();
+  await page.locator('.manager-conversation [data-work-item-id="started"]').getByRole("link", { name: /^Open task/ }).click();
   await expect(composer.getByRole("button", { name: "Steer", exact: true })).toBeVisible();
   await composer.getByRole("button", { name: "Clear", exact: true }).click();
   await expect(composer.getByRole("button", { name: "Stop agent", exact: true })).toBeVisible();
   const stopped = page.waitForRequest(request => new URL(request.url()).pathname === "/api/runner/stop");
   await composer.getByRole("button", { name: "Stop agent", exact: true }).click();
   expect((await stopped).postDataJSON()).toEqual({ turnId: "running-turn", sessionId: "sess-started" });
-  const actorStop = page.locator(".manager-conversation").getByRole("button", { name: "Stop", exact: true });
-  await expect(actorStop).toHaveAttribute("title", "Stop");
-  await actorStop.click();
+  await page.locator(".manager-conversation").getByRole("button", { name: "Stop Planner helper task" }).click();
+  await page.locator(".manager-conversation").getByRole("button", { name: "Stop Reviewer task" }).click();
   await expect.poll(() => stops.map(body => JSON.parse(body).turnId).sort()).toEqual(["running-turn", "turn-other", "turn-started"]);
   expect(s.errors).toEqual([]);
 });
@@ -288,7 +312,7 @@ for (const width of [1440, 390]) test(`right task session shows its own queued p
     return route.fulfill({ json: { ok: true } });
   });
 
-  const openTask = (id: string) => page.locator(`.manager-conversation [data-work-item-id="${id}"]`).getByRole("button", { name: "Open task", exact: true });
+  const openTask = (id: string) => page.locator(`.manager-conversation [data-work-item-id="${id}"]`).getByRole("link", { name: /^Open task/ });
   await openTask("started").click();
   const details = page.locator(".manager-details > .session-main-block");
   const composer = details.locator("form.composer");
@@ -370,10 +394,10 @@ test("standalone running session still supports the double Escape stop shortcut"
 test("native session navigation returns to the dashboard and the standalone block retains its controls", async ({ page }) => {
   const s = await shellFixture(page, "view=workspace-chat");
   await page.route("**/api/sessions/sess-started/snapshot", route => route.fulfill({ json: { session: { id: "sess-started", workspaceId: "actors-test", title: "Shared main block" }, turns: [] } }));
-  const open = page.locator('.manager-conversation [data-work-item-id="started"]').getByRole("button", { name: "Open task", exact: true });
+  const open = page.locator('.manager-conversation [data-work-item-id="started"]').getByRole("link", { name: /^Open task/ });
   await open.click();
   await expect(page.locator(".session-main-block .content-header h1")).toHaveText("Shared main block");
-  await page.getByRole("button", { name: "All workers", exact: false }).click();
+  await page.getByRole("button", { name: "Unassigned group chat", exact: true }).click();
   await expect(page.locator(".workspace-manager-dashboard")).toBeVisible();
   await expect(page.locator(".session-main-block")).toHaveCount(0);
   await open.click();
@@ -401,7 +425,7 @@ test("global session list leaves Manager previews and keeps URL, reload and hist
     return route.fulfill({ json: { session, turns: [] } });
   });
   await page.reload();
-  await expect(page).toHaveURL(/#view=workspace-chat$/);
+  await expect(page).toHaveURL(/#view=workspace-chat&chat=unassigned$/);
   const managerUrl = page.url();
   const row = (id: string) => page.locator(`button.session-row[data-session-id="${id}"]`);
   const checkSession = async (index: number) => {
@@ -418,9 +442,9 @@ test("global session list leaves Manager previews and keeps URL, reload and hist
   await expect(page.locator(".workspace-manager-dashboard")).toBeVisible();
   // A previous claim/task preview must not capture subsequent global navigation,
   // even when the user selects the very same session from the list.
-  await page.locator('.manager-conversation [data-work-item-id="started"]').getByRole("button", { name: "Open task", exact: true }).click();
+  await page.locator('.manager-conversation [data-work-item-id="started"]').getByRole("link", { name: /^Open task/ }).click();
   await expect(page.locator(".manager-details .content-header h1")).toHaveText("Global started");
-  await expect(page).toHaveURL(/sessionId=sess-started#view=workspace-chat$/);
+  await expect(page).toHaveURL(/sessionId=sess-started#view=workspace-chat&chat=unassigned$/);
   const taskUrl = page.url();
   await page.reload();
   await expect(page).toHaveURL(taskUrl);
@@ -449,14 +473,14 @@ test("global session list leaves Manager previews and keeps URL, reload and hist
   // Opening the room over a normal session clears the session and shows the dashboard.
   await page.getByRole("tab", { name: "Workers", exact: false }).click();
   const beforeOpen = await page.evaluate(() => history.length);
-  await page.getByRole("button", { name: "All workers", exact: false }).click();
+  await page.getByRole("button", { name: "Unassigned group chat", exact: true }).click();
   await expect(page).toHaveURL(managerUrl);
   await expect(page.locator(".workspace-manager-dashboard")).toBeVisible();
   expect(await page.evaluate(() => history.length)).toBe(beforeOpen + 1);
   // A task opened inside the room keeps a combined deep link across reload.
-  const openNeeds = page.locator('.manager-conversation [data-work-item-id="needs"]').getByRole("button", { name: "Open task", exact: true });
+  const openNeeds = page.locator('.manager-conversation [data-work-item-id="needs"]').getByRole("link", { name: /^Open task/ });
   await openNeeds.click();
-  await expect(page).toHaveURL(/sessionId=sess-needs#view=workspace-chat$/);
+  await expect(page).toHaveURL(/sessionId=sess-needs#view=workspace-chat&chat=unassigned$/);
   await expect(page.locator(".manager-details .content-header h1")).toHaveText("Global needs");
   const combinedUrl = page.url();
   await page.reload();
@@ -476,7 +500,7 @@ test("global session list leaves Manager previews and keeps URL, reload and hist
   // A pasted combined deep link also preserves the selected turn.
   await page.goto(`${combinedUrl.replace("#", "&turnId=turn-focus#")}`);
   await expect(page.locator(".manager-details .content-header h1")).toHaveText("Global needs");
-  await expect(page).toHaveURL(/sessionId=sess-needs&turnId=turn-focus#view=workspace-chat$/);
+  await expect(page).toHaveURL(/sessionId=sess-needs&turnId=turn-focus#view=workspace-chat&chat=unassigned$/);
   expect(s.errors).toEqual([]);
 });
 
@@ -489,7 +513,7 @@ test("manager ignores a late session response and recovers from a missing sessio
     await delayed;
     await route.fulfill({ json: { session: { id: "sess-started", workspaceId: "actors-test", title: "Late session" }, turns: [] } }).catch(() => {});
   });
-  const open = (id: string) => page.locator(`.manager-conversation [data-work-item-id="${id}"]`).getByRole("button", { name: "Open task", exact: true });
+  const open = (id: string) => page.locator(`.manager-conversation [data-work-item-id="${id}"]`).getByRole("link", { name: /^Open task/ });
   await open("started").click();
   await open("needs").click();
   const panel = page.getByRole("region", { name: "Task session", exact: true });
@@ -518,14 +542,24 @@ test("a reloaded group chat + session link keeps the composer and explains an en
   await expect(details.locator("form.composer")).toBeVisible();
   await expect(details.locator(".composer-ended-notice")).toHaveCount(0);
   const member = (localId: string, sessionId: string) => ({ localId, sessionId, task: "Steered", sourceSessionId: sessionId, sourceTurnId: null, fork: null, model: DEFAULT_MODEL, effort: "medium", stopped: false, observed: {} });
-  // Actor steering records its target as a worker of an actor_tree_* coordination group.
+  // Actor steering records its target in an actor_tree_* coordination group; that is not Concurrent work.
   group = { id: "actor_tree_test", workspaceId: "actors-test", mainSessionId: "sess-main", revision: 1, created: timestamp, updated: timestamp, lease: null,
     members: [member("main", "sess-main"), member("sess-started", "sess-started")], messages: [], results: [],
     activity: { main: { status: "idle" }, "sess-started": { status: "idle" } } };
   await page.reload();
   await expect(details.locator(".content-header h1")).toHaveText("Linked task");
+  await expect(details.locator("form.composer")).toBeVisible();
+  await expect(details.locator(".composer-ended-notice")).toHaveCount(0);
+  group = { ...group as object, id: "collab_test" };
+  await page.reload();
+  await expect(details.locator(".content-header h1")).toHaveText("Linked task");
   await expect(details.locator(".composer-ended-notice")).toHaveText("This Concurrent worker has ended and cannot accept new prompts.");
   await expect(details.locator("form.composer")).toBeHidden();
+  // The notice takes the composer's place below the transcript, not the empty row above it.
+  const noticeBox = (await details.locator(".composer-ended-notice").boundingBox())!;
+  const messagesBox = (await details.locator(".messages-pane > .messages").boundingBox())!;
+  expect(noticeBox.y).toBeGreaterThanOrEqual(messagesBox.y + messagesBox.height - 1);
+  await expect(details.locator(".composer-ended-notice")).toBeInViewport();
   expect(s.errors).toEqual([]);
 });
 
@@ -544,12 +578,12 @@ test("a claim and dashboard card open their exact session and a foreign workspac
   await page.reload();
   await s.input.fill("Preserved draft");
   const url = page.url();
-  await page.locator('.manager-conversation [data-work-item-id="started"]').getByRole("button", { name: /^Open (task|host session)$/ }).click();
+  await page.locator('.manager-conversation [data-work-item-id="started"]').getByRole("link", { name: /^Open task/ }).click();
   const panel = page.locator(".manager-details > .session-main-block");
   await expect(panel.locator(".content-header h1")).toHaveText("Exact sess-started");
   await expect(panel.locator(".composer [contenteditable=true]")).toBeVisible();
   // Reopening the current task refreshes it rather than leaving a loading panel.
-  await page.locator(".manager-conversation").getByRole("button", { name: "Open task", exact: true }).click();
+  await page.locator(".manager-conversation .actor-room-tasks").getByRole("link", { name: /^Open task/ }).click();
   await expect(panel.locator(".content-header h1")).toHaveText("Exact sess-started");
   await page.screenshot({ path: "/private/tmp/threadex-manager-session.png" });
   await page.locator(".manager-details").getByRole("button", { name: "Close session and show dashboard" }).click();
@@ -601,10 +635,11 @@ for (const width of [1440, 390]) test(`group chat round table opens its own sess
   await s.input.fill("Should we split billing?");
   await s.send.click();
   // Left: the group chat with a reference card; right: the new session with the existing transcript UI.
-  await expect(page).toHaveURL(/sessionId=rt-session#view=workspace-chat$/);
+  await expect(page).toHaveURL(/sessionId=rt-session#view=workspace-chat&chat=unassigned$/);
   const panel = page.locator(".manager-details > .session-main-block");
   await expect(panel.getByText("Round table answer in its own session", { exact: true })).toBeVisible();
   expect(starts).toHaveLength(1);
+  expect(starts[0].chatProjectId).toBeNull();
   expect(s.requests).toHaveLength(0);
   // Inside the split the chat is already beside the session, so the source link is not repeated.
   await expect(panel.getByRole("button", { name: "Open group chat that started this round table" })).toHaveCount(0);
@@ -638,10 +673,33 @@ for (const width of [1440, 390]) test(`group chat round table opens its own sess
   const source = page.getByRole("button", { name: "Open group chat that started this round table" });
   await expect(source).toBeVisible();
   await source.click();
-  await expect(page).toHaveURL(/sessionId=rt-session#view=workspace-chat$/);
+  await expect(page).toHaveURL(/sessionId=rt-session#view=workspace-chat&chat=unassigned$/);
   await expect(page.locator(".manager-workspace")).toHaveCount(1);
   if (width < 768) await page.getByRole("button", { name: "Chat", exact: true }).click();
   await expect(chat.locator("button.actor-roundtable-card")).toBeVisible();
   expect(await page.locator(".manager-workspace").evaluate(node => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
+  expect(s.errors).toEqual([]);
+});
+
+test("a group chat task opens with the main view's loading state and lands at the transcript bottom", async ({ page }) => {
+  const s = await shellFixture(page, "view=workspace-chat");
+  let release!: () => void;
+  const delayed = new Promise<void>(resolve => { release = resolve; });
+  const turns = Array.from({ length: 12 }, (_, index) => ({ id: `turn-${index}`, sessionId: "sess-started", userInput: `Question ${index}`,
+    agentResponse: `Answer ${index}\n\n${"Long paragraph line. ".repeat(80)}`, status: "done", created: timestamp, updated: timestamp, tokenIn: 0, tokenOut: 0, accountId: null }));
+  await page.route("**/api/sessions/sess-started/snapshot", async route => {
+    await delayed;
+    await route.fulfill({ json: { session: { id: "sess-started", workspaceId: "actors-test", title: "Long task", threadId: null }, turns } }).catch(() => {});
+  });
+  await page.locator('.manager-conversation [data-work-item-id="started"]').getByRole("link", { name: /^Open task/ }).click();
+  const details = page.locator(".manager-details");
+  // Same spinner and heading as opening a session from the session list.
+  await expect(details.locator(".empty[role=status]")).toContainText("Loading session");
+  await expect(details.locator(".empty[role=status] .spin")).toBeVisible();
+  release();
+  const messages = details.locator(".session-main-block .messages-pane > .messages");
+  await expect(details.getByText("Answer 11", { exact: true })).toBeVisible();
+  await expect.poll(() => messages.evaluate(node => node.scrollHeight - node.clientHeight - node.scrollTop)).toBeLessThanOrEqual(2);
+  expect(await messages.evaluate(node => node.scrollHeight > node.clientHeight * 2)).toBe(true);
   expect(s.errors).toEqual([]);
 });

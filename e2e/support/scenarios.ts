@@ -14,6 +14,20 @@ export const scenarioSessions = {
   modelGears: { id: "local_e2e-model-gears", title: "Local Model Gears" }
 } as const;
 
+/** A transcript longer than one window, in its own workspace so session counts stay fixed. */
+export const transcriptHistoryScenario = {
+  workspaceId: "e2e-transcript-history",
+  session: { id: "e2e-transcript-history", title: "Transcript History" },
+  turnCount: 53
+} as const;
+
+/** Seeded in its own workspace so the default workspace's session counts stay fixed. */
+export const promptOriginScenario = {
+  workspaceId: "e2e-prompt-origin",
+  session: { id: "e2e-prompt-origin", title: "Prompt Origins" },
+  source: { id: "e2e-prompt-origin-source", title: "Prompt Origin Source" }
+} as const;
+
 export const seededSessions = [
   ...Array.from({ length: 12 }, (_, index) => ({
     id: `e2e-filler-${String(index + 1).padStart(2, "0")}`,
