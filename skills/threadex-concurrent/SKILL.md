@@ -19,16 +19,16 @@ Use `wait_for_task_end` only for unrelated tasks. If you end your turn instead o
 
 ## Pick the worker model
 
-Always pass `model` explicitly. If you omit it, the worker uses main's model, which is often stronger than the work needs. Choose the model by the strongest requirement of the work, not by quota savings, and do not split complex work just to justify a cheaper model. The rows below match tiers across providers:
+Always pass `model` explicitly. If you omit it, the worker uses main's model, which is often stronger than the work needs. Choose the workload tier by the strongest requirement of the work, not by quota savings, and do not split complex work just to justify a cheaper model. Use `session-inspector help concurrent_spawn` to read the current model IDs for each tier and provider.
 
 | Workload | Codex | Claude |
 | --- | --- | --- |
-| Mechanical work with explicit targets, methods and outcomes; routine commands, known checks, specified lookups | `gpt-6-luna` | `claude-haiku-5-5` |
-| Routine small development, lookups and ordinary debugging; never prompt work | `gpt-6.1-terra` | `claude-sonnet-5-5` |
-| Default implementation worker: substantive features and UI work, regression tests, specified migrations, bounded reviews, log or root-cause investigation, performance and prompt work | `gpt-6.1-sol` | `claude-opus-5-5` or `claude-fable-5-2` |
-| Exception tier: unresolved architecture or security analysis, difficult reasoning, or a failure the default tier already showed | `gpt-6-astra` | `claude-fable-5-2` |
+| Mechanical work with explicit targets, methods and outcomes; routine commands, known checks, specified lookups | Luna | Haiku |
+| Routine small development, lookups and ordinary debugging; never prompt work | Terra | Sonnet |
+| Default implementation worker: substantive features and UI work, regression tests, specified migrations, bounded reviews, log or root-cause investigation, performance and prompt work | Sol | Opus or Fable |
+| Exception tier: unresolved architecture or security analysis, difficult reasoning, or a failure the default tier already showed | Astra | Fable |
 
-- Do not use superseded models: `gpt-6-sol` (use `gpt-6.1-sol`), `gpt-5.5`, `gpt-5.4` and `gpt-5.4-mini`. `gpt-5.6-terra` is an old alias of Luna; use `gpt-6.1-terra` for Terra work.
+- Use the recommended ID from the tool help for each tier. `gpt-5.6-terra` is an old alias of Luna.
 - Choose the provider the user names. Otherwise prefer the other provider for an independent review or second opinion, and the same provider when the worker must follow your toolchain closely.
 - Effort: `low` for mechanical work, `medium` for settled implementation, and higher only for a concrete reasoning difficulty. Claude models accept `low` to `max`; Codex Luna, Terra, Sol and Astra also accept `ultra`.
 - For routine rework, give targeted feedback at the same tier first. Move up one tier (Luna → Terra → Sol → Astra, or Haiku → Sonnet → Opus/Fable) only after an observed failure, and say why the lower tier was insufficient.

@@ -11,8 +11,8 @@ import { InlineLinkComposer, type ComposerInlineLink, type InlineLinkComposerHan
 import { MarkdownContent } from "./MarkdownContent";
 import { EFFORT_OPTIONS, MODEL_OPTIONS, ULTRA_EFFORT_OPTIONS } from "./appConstants";
 import type { ChatMessage } from "./appTypes";
-import { formatResponseAnnotationsPrompt, type ResponseAnnotation } from "./responseAnnotations";
-import { annotationLabel } from "./ResponseAnnotationList";
+import { formatResponseAnnotationsPrompt, parseResponseAnnotations, type ResponseAnnotation } from "./responseAnnotations";
+import { ResponseAnnotationList, annotationLabel } from "./ResponseAnnotationList";
 import { RoundtableLibraryPopup } from "./Roundtable";
 import { askSession, controlSideChat, loadSideChatState, type SessionSideChat } from "./sessionApi";
 import { buildSideChatRounds, type OutgoingSideChatReply } from "./sideChatRounds";
@@ -42,8 +42,9 @@ type SideChatPanelProps = {
   sessionReady: boolean;
   workspaceId?: string;
   CompletedTurn: CompletedTurnComponent;
-  annotation?: ResponseAnnotation | null;
-  onClearAnnotation?: () => void;
+  annotations?: ResponseAnnotation[];
+  onRemoveAnnotation?: (index: number) => void;
+  onClearAnnotations?: () => void;
   onRunningChange?: (running: boolean) => void;
 };
 
@@ -51,8 +52,20 @@ type MentionState = { start: number; end: number; query: string; index: number }
 
 // Stable: a new array each render would re-sync the editor from a value that can lag behind typing.
 const NO_LINKS: ComposerInlineLink[] = [];
+const NO_ANNOTATIONS: ResponseAnnotation[] = [];
 
 const rosterKey = (sessionId: string) => `threadex.sideChatActors:${sessionId}`;
+
+// Annotation questions carry an injected protocol wrapper and JSON; show them like the session timeline's agent block does (reference cards, then the request).
+function SideChatQuestion({ question }: { question: string }) {
+  const annotations = parseResponseAnnotations(question);
+  return (
+    <div className="side-chat-question">
+      {annotations && <ResponseAnnotationList annotations={annotations.annotations} />}
+      {(annotations ? annotations.request : question) && <MarkdownContent>{annotations ? annotations.request : question}</MarkdownContent>}
+    </div>
+  );
+}
 
 function readRoster(sessionId: string): RoundtableActor[] {
   try {
@@ -67,7 +80,7 @@ function saveRoster(sessionId: string, actors: RoundtableActor[]) {
   try { localStorage.setItem(rosterKey(sessionId), JSON.stringify(actors)); } catch { /* The in-memory roster still works. */ }
 }
 
-export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady, workspaceId, CompletedTurn, annotation, onClearAnnotation, onRunningChange }: SideChatPanelProps) {
+export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady, workspaceId, CompletedTurn, annotations = NO_ANNOTATIONS, onRemoveAnnotation, onClearAnnotations, onRunningChange }: SideChatPanelProps) {
   const [messages, setMessages] = useState<SessionSideChat[]>([]);
   const [outgoing, setOutgoing] = useState<OutgoingSideChatReply[]>([]);
   const [input, setInput] = useState("");
@@ -99,8 +112,8 @@ export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady,
   }, [gearProfiles, activeGearIndex]);
 
   useEffect(() => {
-    if (annotation) window.requestAnimationFrame(() => composerRef.current?.focus());
-  }, [annotation]);
+    if (annotations.length) window.requestAnimationFrame(() => composerRef.current?.focus());
+  }, [annotations]);
 
   function updateGearProfile(index: number, patch: Partial<ComposerGearProfile>) {
     setGearProfiles((current) => current.map((gear, gearIndex) => {
@@ -223,7 +236,7 @@ export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady,
   function submit(event?: FormEvent) {
     event?.preventDefault();
     const text = input.trim();
-    const question = annotation ? formatResponseAnnotationsPrompt([annotation], text) : text;
+    const question = annotations.length ? formatResponseAnnotationsPrompt(annotations, text) : text;
     if (!question || isSending || isLoading || !sessionReady) return;
     const roundId = crypto.randomUUID();
     const addressed = mentionedActors(text, actors);
@@ -239,7 +252,7 @@ export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady,
     })));
     setInput("");
     setMention(null);
-    onClearAnnotation?.();
+    onClearAnnotations?.();
     window.requestAnimationFrame(() => composerRef.current?.focus());
   }
 
@@ -338,7 +351,7 @@ export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady,
           </div>
         ) : rounds.map((round) => (
           <section className="side-chat-exchange" key={round.id}>
-            {round.question !== null && <div className="side-chat-question"><MarkdownContent>{round.question}</MarkdownContent></div>}
+            {round.question !== null && <SideChatQuestion question={round.question} />}
             {round.items.map((item) => {
               if (item.kind === "outgoing") {
                 const { reply } = item;
@@ -439,15 +452,15 @@ export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady,
               </button>)}
               {mentionOptions.length === 0 && <span className="slash-suggestions-empty">No matching actors</span>}
             </div>}
-            {annotation && <div className="composer-response-quote" aria-label={annotationLabel(annotation)}>
+            {annotations.map((annotation, index) => <div className="composer-response-quote" aria-label={annotationLabel(annotation)} key={`${index}:${annotation.text}`}>
               <span className="composer-response-quote-icon" aria-hidden="true"><Quote /></span>
               <div>
                 <strong>{annotationLabel(annotation)}</strong>
                 <span>{annotation.text}</span>
                 {annotation.annotation && <small>{annotation.annotation}</small>}
               </div>
-              <button type="button" onClick={onClearAnnotation} aria-label="Remove annotation"><X aria-hidden="true" /></button>
-            </div>}
+              <button type="button" onClick={() => onRemoveAnnotation?.(index)} aria-label="Remove annotation"><X aria-hidden="true" /></button>
+            </div>)}
             <InlineLinkComposer
               ref={composerRef}
               value={input}
@@ -463,10 +476,10 @@ export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady,
             />
             <ComposerToolbar>
               <span className="composer-fill" />
-              <button className="composer-icon" type="button" onClick={() => { setInput(""); setMention(null); onClearAnnotation?.(); }} disabled={!input && !annotation} title="Clear" aria-label="Clear">
+              <button className="composer-icon" type="button" onClick={() => { setInput(""); setMention(null); onClearAnnotations?.(); }} disabled={!input && !annotations.length} title="Clear" aria-label="Clear">
                 <X aria-hidden="true" />
               </button>
-              <button className="send-button" type="submit" disabled={(!input.trim() && !annotation) || isLoading || isSending || !sessionReady} title="Send" aria-label="Send">
+              <button className="send-button" type="submit" disabled={(!input.trim() && !annotations.length) || isLoading || isSending || !sessionReady} title="Send" aria-label="Send">
                 {isSending ? <Loader2 className="spin" aria-hidden="true" /> : <Send aria-hidden="true" />}
               </button>
             </ComposerToolbar>

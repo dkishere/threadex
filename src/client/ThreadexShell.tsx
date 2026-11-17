@@ -3,6 +3,7 @@ import { DEFAULT_MODEL, crossesModelGroup } from "../modelCatalog";
 import { ModelGroupSwitchDialog } from "./ModelGroupSwitchDialog";
 import { SessionLoadingIndicator } from "./SessionLoadingIndicator";
 import { effectiveSessionComposerModel, enableSessionComposerOverride, inheritSessionComposerModel, roundtableSessionModelPreferences, sessionModelConfirmationMatches } from "./sessionComposerModel";
+import { readSessionGearOverride, saveSessionGearOverride, readWorkspaceGearPreferences, saveWorkspaceGearPreferences } from "./workspaceGearPreferences";
 import { ActorAvatar } from "./ActorAvatar";
 import { promptOriginTriggerLabel } from "./promptOrigin";
 import { CurrentDomainActorsProvider } from "./CurrentDomainActorsContext";
@@ -235,6 +236,9 @@ export function ThreadexShell(ctx) {
     const [, refreshSessionComposerModel] = useState(0);
     function setSessionComposerModel(value) {
         sessionComposerModelRef.current = value;
+        // A view-key bump clears the live binding while navigation is pending.
+        // Keep the stored selection until the destination snapshot is known.
+        if (value) saveSessionGearOverride(value.override ? { sessionId: value.sessionId, activeGearIndex: value.override.activeGearIndex } : null);
         refreshSessionComposerModel(revision => revision + 1);
     }
     function setComposerSubmissionStatus(value) {
@@ -357,9 +361,9 @@ export function ThreadexShell(ctx) {
         setSessionTab((current) => ["sessions", "dashboard", "actor-sessions"].includes(current.value) ? current : { ...current, value: "sessions" });
     }, [compactLayout]);
     const [responseQuotePopover, setResponseQuotePopover] = useState(null);
-    const [sideChatAnnotation, setSideChatAnnotation] = useState(null);
+    const [sideChatAnnotations, setSideChatAnnotations] = useState([]);
     const [sideChatRunning, setSideChatRunning] = useState(false);
-    useReactEffect(() => setSideChatAnnotation(null), [sessionId]);
+    useReactEffect(() => setSideChatAnnotations([]), [sessionId]);
     const [composerSessionLinks, setComposerSessionLinks] = useState([]);
     const [queuedPromptsBySession, setQueuedPromptsBySession] = useState(() => restoredSession?.queuedPromptsBySession ?? {});
     const [composerMode, setComposerMode] = useState("queue");
@@ -738,6 +742,7 @@ export function ThreadexShell(ctx) {
     }
     function persistModelPreferences(preferences) {
         const targetWorkspaceId = modelPreferencesWorkspaceIdRef.current;
+        saveWorkspaceGearPreferences(targetWorkspaceId, preferences);
         if (!targetWorkspaceId || persistedModelPreferencesWorkspaceIdRef.current !== targetWorkspaceId) {
             writePendingModelPreferences(targetWorkspaceId, preferences);
             return;
@@ -753,9 +758,10 @@ export function ThreadexShell(ctx) {
         modelPreferencesWorkspaceIdRef.current = targetWorkspaceId;
         modelPreferencesHydratedRef.current = true;
         const pendingPreferences = readPendingModelPreferences(targetWorkspaceId);
+        const savedGears = readWorkspaceGearPreferences(targetWorkspaceId);
         const normalized = normalizeSessionModelPreferences(keepPreBootstrapEdits
             ? livePreferences
-            : pendingPreferences ?? preferences);
+            : pendingPreferences ?? savedGears ?? preferences);
         if (keepPreBootstrapEdits) {
             writePendingModelPreferences(targetWorkspaceId, normalized);
         }
@@ -1763,7 +1769,12 @@ export function ThreadexShell(ctx) {
         appActions02.applySelectedSessionSnapshot({ activeTurnIdRef, applyModelPreferencesState, composerDraftSessionIdRef, composerInputEditRevisionRef, displaySessionTitle, eventStore, explicitNewSessionRef, modelPreferencesHydratedRef, modelPreferencesWorkspaceIdRef, moveStoredComposerDraft, persistedModelPreferencesWorkspaceIdRef, queueModelPreferencesSave, readPendingModelPreferences, replaceComposerDraftForSession, sessionIdRef, sessionTurnsToMessages: sessionSnapshotMessages, setActiveSessionId, setActiveTurnId, setMessages, setResumeThreadId, setRunningTurnIds, setSessionAutoModel, setSessionId, setSessionTodo, setThreadId }, payload);
         if (payload.session) {
             const preferences = currentModelPreferences();
-            setSessionComposerModel(inheritSessionComposerModel(sessionComposerModelRef.current, payload.session.id, viewKeyRef.current, payload.turns ?? [], { model: preferences.selectedModel, effort: preferences.selectedEffort, fastMode: preferences.fastMode }));
+            let sessionModel = inheritSessionComposerModel(sessionComposerModelRef.current, payload.session.id, viewKeyRef.current, payload.turns ?? [], { model: preferences.selectedModel, effort: preferences.selectedEffort, fastMode: preferences.fastMode });
+            const restoredOverride = readSessionGearOverride();
+            if (sessionModel && restoredOverride?.sessionId === payload.session.id) {
+                sessionModel = enableSessionComposerOverride(sessionModel, preferences.gearProfiles, restoredOverride.activeGearIndex);
+            }
+            setSessionComposerModel(sessionModel);
         }
     }
     async function loadEarlierManagerMessages() {
@@ -1799,7 +1810,7 @@ export function ThreadexShell(ctx) {
     }
     function clearTodoPanelState() { return appActions02.clearTodoPanelState({ setParentSessionTodo, setSessionTodo }); }
     function applyTodoSnapshotForSession(targetSessionId, todo) { return appActions02.applyTodoSnapshotForSession({ sessionIdRef, setSessionTodo }, targetSessionId, todo); }
-    async function handleDurableEvent(event) { return appActions02.handleDurableEvent({ activeTurnIdRef, applyDeveloperInstructionsToTurn, approvalEventToLiveItem, eventStore, finalizeTerminalAssistantMessage, isCodexTurnCompletedEvent, loadWorkspaceSnapshot, markTurnFinished, readRecord, readStringField, reconnectRunner, reconnectingTurnIdsRef, refreshSelectedSessionSnapshot, removePendingApprovalItem, scheduleLoadSessions, sessionIdRef, setActiveTurnId, setMessages, setPendingApprovalItems, setPendingApprovalSessionIds, setSessionExecutionStatuses, setSessionTodo, streamTargetsRef, upsertPendingApprovalItem, viewKeyRef }, event); }
+    async function handleDurableEvent(event) { return appActions02.handleDurableEvent({ activeTurnIdRef, applyDeveloperInstructionsToTurn, applyLiveItemToMessage, approvalEventToLiveItem, eventStore, finalizeTerminalAssistantMessage, isCodexTurnCompletedEvent, loadWorkspaceSnapshot, markTurnFinished, readRecord, readStringField, reconnectRunner, reconnectingTurnIdsRef, refreshSelectedSessionSnapshot, removePendingApprovalItem, scheduleLoadSessions, sessionIdRef, setActiveTurnId, setMessages, setPendingApprovalItems, setPendingApprovalSessionIds, setSessionExecutionStatuses, setSessionTodo, streamTargetsRef, upsertPendingApprovalItem, viewKeyRef }, event); }
     async function loadWorkspaces() { return appActions02.loadWorkspaces({ isLikelyBackendDisconnect, noteBackendDisconnect, noteBackendRequestSucceeded, setActiveWorkspace, setStatus, setWorkspaceList }); }
     async function loadAccounts() { return appActions02.loadAccounts({ applyAccountPayload, isLikelyBackendDisconnect, noteBackendDisconnect, noteBackendRequestSucceeded, setStatus }); }
     async function refreshApprovalState() { return appActions02.refreshApprovalState({ approvalRecordToLiveItem, isApprovalLiveItem, isLikelyBackendDisconnect, noteBackendDisconnect, readRecord, setPendingApprovalItems, setPendingApprovalSessionIds }); }
@@ -2278,13 +2289,16 @@ export function ThreadexShell(ctx) {
     function activateGearProfile(index) {
         if (sessionModel?.override) {
             setSessionComposerModel({ ...sessionModel, override: { ...sessionModel.override, activeGearIndex: index } });
-            return;
         }
         return appActions05.activateGearProfile({ activeGearIndex, modelPreferencesEditRevisionRef, setActiveGearIndex }, index);
     }
     function updateGearProfile(index, update) {
-        const setProfiles = sessionModel?.override ? (updater) => setSessionComposerModel({ ...sessionModel, override: { ...sessionModel.override, gears: updater(sessionModel.override.gears) } }) : setGearProfiles;
-        return appActions05.updateGearProfile({ AUTO_MODEL_VALUE, modelPreferencesEditRevisionRef: sessionModel ? { current: 0 } : modelPreferencesEditRevisionRef, setGearProfiles: setProfiles, supportsUltraEffort }, index, update);
+        const setProfiles = sessionModel?.override ? (updater) => {
+            const gears = updater(sessionModel.override.gears);
+            setSessionComposerModel({ ...sessionModel, override: { ...sessionModel.override, gears } });
+            setGearProfiles(current => current.map((gear, gearIndex) => gearIndex === index ? gears[index] : gear));
+        } : setGearProfiles;
+        return appActions05.updateGearProfile({ AUTO_MODEL_VALUE, modelPreferencesEditRevisionRef, setGearProfiles: setProfiles, supportsUltraEffort }, index, update);
     }
     function handleEditorPaste(event) { return appActions05.handleEditorPaste({ MAX_ATTACHMENTS, addFiles, addPastedBrowserBridgeContext, addPastedText, addPastedTurnIssueContext, attachments, parseBrowserBridgeContext, parseTurnIssueContext, setStatus, shouldCompactPastedText }, event); }
     function handleEditorKeyDown(event) {
@@ -2779,7 +2793,7 @@ managerMode && managerHistoryOpen && compactLayout && _jsx("button", { className
         if (next >= 0) { event.preventDefault(); tabs[next].focus(); tabs[next].click(); }
     }, "aria-busy": value === "side-chat" && sideChatRunning ? true : undefined, children: [label, value === "side-chat" && sideChatRunning && _jsx(Loader2, { className: "spin", "aria-label": "Waiting for side chat reply", size: 14 })]
 }, value)) }),
-        !managerMode && sessionId && _jsx("div", { className: "session-side-chat-view", id: "session-panel-side-chat", role: "tabpanel", "aria-labelledby": "session-tab-side-chat", hidden: activeSessionTab !== "side-chat", children: _jsx(SideChatPanel, { active: activeSessionTab === "side-chat", codexSessionId: threadId ?? undefined, sessionId, sessionReady: activeSession?.id === sessionId, workspaceId: activeWorkspace?.id, CompletedTurn, annotation: sideChatAnnotation, onClearAnnotation: () => setSideChatAnnotation(null), onRunningChange: setSideChatRunning }, sessionId) }),
+        !managerMode && sessionId && _jsx("div", { className: "session-side-chat-view", id: "session-panel-side-chat", role: "tabpanel", "aria-labelledby": "session-tab-side-chat", hidden: activeSessionTab !== "side-chat", children: _jsx(SideChatPanel, { active: activeSessionTab === "side-chat", codexSessionId: threadId ?? undefined, sessionId, sessionReady: activeSession?.id === sessionId, workspaceId: activeWorkspace?.id, CompletedTurn, annotations: sideChatAnnotations, onRemoveAnnotation: (index) => setSideChatAnnotations((current) => current.filter((_, item) => item !== index)), onClearAnnotations: () => setSideChatAnnotations([]), onRunningChange: setSideChatRunning }, sessionId) }),
 managerMode && managerHistoryOpen && _jsx(WorkspaceManagerDashboard, { hidden: activeSessionTab !== "dashboard", workspaceId: activeWorkspace?.id, dashboard: managerDashboard, onOpenTask: (targetSessionId) => void switchToSessionById(targetSessionId, { label: "task" }) }),
 
 !managerMode && hasPlanTab && _jsx("div", { className: "session-plan-view", id: "session-panel-plan", role: "tabpanel", "aria-labelledby": "session-tab-plan", hidden: activeSessionTab !== "plan", children: _jsx(TodoPanel, { todo: visibleSessionTodo, sessionExecutionStatuses: sessionExecutionStatuses, pendingApprovalSessionIds: pendingApprovalSessionIdSet, onOpenSession: (targetSessionId) => void switchToSessionById(targetSessionId, { label: "subtask" }), onPause: setTodoPaused, onCreateItem: createTodoItem, onUpdateItem: updateTodoItem, onSetContext: setTodoContext, onComment: addTodoComment, onResolveChallenge: resolveTodoChallenge }) }),
@@ -3009,7 +3023,7 @@ _jsxs("div", { ref: messageScrollIndicatorRef, className: "message-scroll-indica
                                                         left: hoveredProcessMonitor.left,
                                                         maxHeight: `calc(100vh - ${hoveredProcessMonitor.bottom + 16}px)`
                                                     }, onMouseEnter: cancelHoveredProcessMonitorClose, children: [_jsxs("div", { className: "thread-status-popover-header", children: [_jsx("span", { className: "process-monitor-dot", "data-status": monitor.status, "aria-hidden": "true" }), _jsx("strong", { children: capitalize(monitor.status) })] }), _jsx("span", { className: "thread-status-title", children: monitor.label }), _jsxs("div", { className: "thread-status-meta", children: [_jsx(TerminalSquare, { "aria-hidden": "true" }), _jsx("span", { children: launchLabel })] }), _jsxs("div", { className: "thread-status-meta", children: [_jsx(Folder, { "aria-hidden": "true" }), _jsx("span", { children: monitor.cwd })] }), monitor.logFile && (_jsxs("div", { className: "thread-status-meta", children: [_jsx(FileText, { "aria-hidden": "true" }), _jsxs("span", { title: monitor.logFile, children: ["Log: ", monitor.logFile] })] })), monitor.pid && (_jsxs("div", { className: "thread-status-meta", children: [_jsx(Cpu, { "aria-hidden": "true" }), _jsxs("span", { children: ["PID ", monitor.pid] })] })), entryPoints.length > 0 && (_jsx("div", { className: "process-monitor-entry-points", children: entryPoints.map((entryPoint) => (_jsxs("a", { className: "process-monitor-entry-link", href: entryPoint, target: "_blank", rel: "noreferrer", title: `Open ${entryPoint}`, children: [_jsx(ExternalLink, { "aria-hidden": "true" }), _jsx("span", { children: entryPoint })] }, entryPoint))) })), monitor.wakePrompt && (_jsxs("div", { className: "thread-status-meta", children: [_jsx(Clock3, { "aria-hidden": "true" }), _jsxs("span", { children: ["Wake-up: ", monitor.wakeStatus] })] })), monitor.error && _jsx("small", { className: "process-monitor-error", children: monitor.error }), monitor.readOnly && _jsx("small", { children: monitor.restartable ? "Restartable via local supervisor" : "Managed externally" }), _jsxs("div", { className: "process-monitor-popover-actions", children: [_jsxs("button", { type: "button", onClick: () => void openProcessMonitorLog(latestCommandRun ?? monitor), disabled: isBusy || (monitor.status === "available" && !latestCommandRun), title: monitor.status === "available" ? latestCommandRun ? "View latest run output" : "No run output yet" : "View process output", children: [_jsx(FileText, { "aria-hidden": "true" }), "Logs"] }), _jsxs("button", { type: "button", onClick: () => void restartProcessMonitor(monitor), disabled: isBusy || (!monitor.managed && !monitor.restartable) || (monitor.readOnly && !monitor.restartable), title: monitor.restartable ? "Restart via supervisor" : monitor.readOnly ? "This process is restarted by its external supervisor" : monitor.status === "available" ? "Run command" : monitor.managed ? "Restart process" : "PID monitors cannot be restarted", children: [_jsx(RotateCcw, { className: processMonitorAction === `restart:${monitor.id}` ? "spin" : undefined, "aria-hidden": "true" }), monitor.status === "available" ? "Run" : "Restart"] }), _jsxs("button", { type: "button", onClick: () => void stopProcessMonitor(monitor), disabled: isBusy || monitor.readOnly || !monitor.pid || (monitor.status !== "running" && monitor.status !== "starting"), title: monitor.readOnly ? "Built-in processes cannot be stopped here" : monitor.pid ? "Stop process and keep monitor" : "No running process to stop", children: [_jsx(Square, { className: processMonitorAction === `stop:${monitor.id}` ? "spin" : undefined, "aria-hidden": "true" }), "Stop"] }), _jsxs("button", { type: "button", "data-danger": "true", onClick: () => void removeProcessMonitor(monitor), disabled: isBusy || monitor.readOnly, title: monitor.readOnly ? "Built-in process records cannot be removed" : "Remove process monitor", children: [_jsx(X, { "aria-hidden": "true" }), "Remove"] })] })] }))] }, monitor.id));
-                                    }) }))] }), _jsx("div", { className: "sidebar-spacer" })] }), actorChat ?? (showManagerWorkspace ? managerWorkspace : renderSessionMainBlock()), responseQuotePopover && (_jsx(ResponseQuotePopover, { quote: responseQuotePopover, onChange: setResponseQuotePopover, onAsk: () => askAboutResponseQuote(responseQuotePopover), onAskSideChat: sessionId ? () => { setSideChatAnnotation({ text: responseQuotePopover.text, source: responseQuotePopover.source, annotation: responseQuotePopover.annotation?.trim() }); setSessionTab({ sessionId, value: "side-chat" }); setResponseQuotePopover(null); window.getSelection()?.removeAllRanges(); } : undefined })), processCommandPrompt && _jsx(ProcessCommandDialog, { label: processCommandPrompt.label, parameters: processCommandPrompt.parameters, onRun: (values) => restartProcessMonitor(processCommandPrompt, values), onClose: () => setProcessCommandPrompt(null) }, processCommandPrompt.id), toastMessage && (_jsx("div", { className: "toast", role: "status", "aria-live": "polite", children: toastMessage })), processMonitorLog && (_jsx("div", { className: "modal-backdrop process-monitor-log-backdrop", role: "presentation", onMouseDown: () => setProcessMonitorLog(null), children: _jsxs("section", { className: "process-monitor-log-modal", role: "dialog", "aria-modal": "true", "aria-labelledby": "process-monitor-log-title", onMouseDown: (event) => event.stopPropagation(), onKeyDown: (event) => {
+                                    }) }))] }), _jsx("div", { className: "sidebar-spacer" })] }), actorChat ?? (showManagerWorkspace ? managerWorkspace : renderSessionMainBlock()), responseQuotePopover && (_jsx(ResponseQuotePopover, { quote: responseQuotePopover, onChange: setResponseQuotePopover, onAsk: () => askAboutResponseQuote(responseQuotePopover), onAskSideChat: sessionId ? () => { setSideChatAnnotations((current) => [...current, { text: responseQuotePopover.text, source: responseQuotePopover.source, annotation: responseQuotePopover.annotation?.trim() }]); setSessionTab({ sessionId, value: "side-chat" }); setResponseQuotePopover(null); window.getSelection()?.removeAllRanges(); } : undefined })), processCommandPrompt && _jsx(ProcessCommandDialog, { label: processCommandPrompt.label, parameters: processCommandPrompt.parameters, onRun: (values) => restartProcessMonitor(processCommandPrompt, values), onClose: () => setProcessCommandPrompt(null) }, processCommandPrompt.id), toastMessage && (_jsx("div", { className: "toast", role: "status", "aria-live": "polite", children: toastMessage })), processMonitorLog && (_jsx("div", { className: "modal-backdrop process-monitor-log-backdrop", role: "presentation", onMouseDown: () => setProcessMonitorLog(null), children: _jsxs("section", { className: "process-monitor-log-modal", role: "dialog", "aria-modal": "true", "aria-labelledby": "process-monitor-log-title", onMouseDown: (event) => event.stopPropagation(), onKeyDown: (event) => {
                             if (event.key === "Escape")
                                 setProcessMonitorLog(null);
                         }, children: [_jsxs("div", { className: "process-monitor-log-header", children: [_jsx(TerminalSquare, { "aria-hidden": "true" }), _jsxs("div", { children: [_jsx("strong", { id: "process-monitor-log-title", children: processMonitorLog.label }), _jsxs("small", { children: ["Process output", processMonitorLog.status === "ready" ? ` · ${formatBytes(processMonitorLog.size)}` : ""] })] }), _jsx("button", { className: "ghost-icon", type: "button", onClick: () => setProcessMonitorLog(null), title: "Close logs", "aria-label": "Close logs", autoFocus: true, children: _jsx(X, { "aria-hidden": "true" }) })] }), _jsx("div", { className: "process-monitor-log-content", "aria-live": "polite", children: processMonitorLog.status === "loading" ? (_jsxs("div", { className: "process-monitor-log-state", children: [_jsx(Loader2, { className: "spin", "aria-hidden": "true" }), " Loading logs\u2026"] })) : processMonitorLog.status === "error" ? (_jsx("div", { className: "process-monitor-log-state", "data-error": "true", children: processMonitorLog.error })) : processMonitorLog.content ? (_jsx("pre", { children: processMonitorLog.content })) : (_jsx("div", { className: "process-monitor-log-state", children: "No output captured yet." })) }), _jsxs("div", { className: "process-monitor-log-footer", children: [_jsxs("small", { children: [processMonitorLog.truncated ? "Showing the latest 256 KB" : "Complete captured output", processMonitorLog.updatedAt ? ` · Updated ${formatTimestamp(processMonitorLog.updatedAt)}` : ""] }), _jsxs("button", { className: "secondary", type: "button", onClick: () => void openProcessMonitorLog({ id: processMonitorLog.monitorId, label: processMonitorLog.label }), disabled: processMonitorLog.status === "loading", children: [_jsx(RotateCcw, { className: processMonitorLog.status === "loading" ? "spin" : undefined, "aria-hidden": "true" }), "Refresh"] })] })] }) })), isPendingWaitsOpen && (_jsx("div", { className: "modal-backdrop session-search-backdrop", role: "presentation", onMouseDown: () => setIsPendingWaitsOpen(false), children: _jsxs("section", { className: "session-search-modal pending-waits-modal", role: "dialog", "aria-modal": "true", "aria-labelledby": "pending-waits-title", onMouseDown: (event) => event.stopPropagation(), onKeyDown: (event) => {

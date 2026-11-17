@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
+import { CURRENT_CODEX_TIER_MODELS } from "../modelCatalog";
 import test from "node:test";
 import express from "express";
 import { SessionStore } from "./sessionStore";
@@ -254,9 +255,11 @@ test("manager has a persistent stop-and-continue action that advances the model 
     assert.equal((await send()).status, 200);
     assert.equal(posts.length, 2, "retry must not stop its own newly queued continuation");
     assert.equal(await store.getGlobalLoopMode(), false);
-    assert.equal(nextStrongerWorkspaceModel("gpt-6.1-terra"), "gpt-6.1-sol");
-    assert.equal(nextStrongerWorkspaceModel("gpt-6-sol"), "gpt-6-astra");
-    assert.equal(nextStrongerWorkspaceModel("gpt-6.1-sol"), "gpt-6-astra");
+    assert.equal(nextStrongerWorkspaceModel("gpt-6.1-terra"), CURRENT_CODEX_TIER_MODELS.sol);
+    assert.equal(nextStrongerWorkspaceModel("gpt-6-sol"), CURRENT_CODEX_TIER_MODELS.astra);
+    assert.equal(nextStrongerWorkspaceModel("gpt-6.1-sol"), CURRENT_CODEX_TIER_MODELS.astra);
+    assert.equal(nextStrongerWorkspaceModel(CURRENT_CODEX_TIER_MODELS.sol), CURRENT_CODEX_TIER_MODELS.astra);
+    assert.equal(nextStrongerWorkspaceModel(CURRENT_CODEX_TIER_MODELS.astra), null);
     assert.equal(nextStrongerWorkspaceModel("gpt-6-astra"), null);
   } finally { await new Promise<void>(done => server.close(() => done())); await store.close(); }
 });

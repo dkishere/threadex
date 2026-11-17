@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { actorPublishableConclusions, actorRoomForChat, actorRoundChatKey, emptyActorRoom, type ActorRoom, type ActorRound, type CreateDomainActor, type SubmitActorRequest } from "../domainActors";
-import { MODEL_CATALOG } from "../modelCatalog";
+import { CURRENT_CODEX_TIER_MODELS, MODEL_CATALOG } from "../modelCatalog";
 import { DomainActorStore, ActorMemoryConflict, type ActorPersistence } from "./domainActorStore";
 import { DomainActorService, acceptedRoleChange, rejectedMemoryField, type DomainActorDependencies, type ActorTaskStart } from "./domainActorService";
 import { createDecisionPolicy, type DecisionAudit } from "./decision/policy";
@@ -761,12 +761,12 @@ test("a matching continuation reuses task identity with the newly selected model
   await h.create("a");
   const first = await h.service.submit({ ...request, namedActorIds: ["a"] });
   await h.store.change("ws", room => { room.workItems[0].status = "completed"; });
-  h.deps.respond = async () => ({ text: "Continue UI", claim: true, preparedPrompt: "Restore the full composer", model: MODEL_CATALOG.astra.id, contextRoundIds: [first.id] });
+  h.deps.respond = async () => ({ text: "Continue UI", claim: true, preparedPrompt: "Restore the full composer", model: CURRENT_CODEX_TIER_MODELS.astra, contextRoundIds: [first.id] });
   const decide = h.deps.decide;
   h.deps.decide = async req => {
     const result = await decide(req);
     return result.ok && req.questions[0].id === "model" ? { ...result, answers: { ...result.answers,
-      model: { kind: "choice", choice: MODEL_CATALOG.astra.id, confidence: 0.99 },
+      model: { kind: "choice", choice: CURRENT_CODEX_TIER_MODELS.astra, confidence: 0.99 },
       workflow: { kind: "choice", choice: "substantial_managed", confidence: 0.99 } } } : result;
   };
   const input = { ...request, requestId: "continue", userPrompt: "Use Astra and restore the full composer", namedActorIds: ["a"] };
@@ -775,7 +775,7 @@ test("a matching continuation reuses task identity with the newly selected model
   assert.equal(updates.length, 1); assert.equal(updates[0].workItem.taskSessionId, h.starts[0].sessionId);
   assert.equal(updates[0].promptOrigin?.trigger, "task-update", "an idle routed continuation is a task-update, not a fast-track");
   assert.equal(updates[0].promptOrigin?.sourceActorId, "a");
-  assert.equal(updates[0].workItem.model, MODEL_CATALOG.astra.id); assert.equal(updates[0].idleOnly, false);
+  assert.equal(updates[0].workItem.model, CURRENT_CODEX_TIER_MODELS.astra); assert.equal(updates[0].idleOnly, false);
   assert.equal(updates[0].workflowGuidance, true, "a routed session reuse keeps its workflow guidance");
   assert.equal(updates[0].workItem.workflowDecisionSkipped, true);
   assert.match(updates[0].userPrompt, /Use Astra and restore the full composer/);
@@ -1242,7 +1242,7 @@ test("repicking stakeholders retains the first partial claimant in owner arbitra
 });
 
 test("owner-led honors explicit Astra XH and may delegate in-scope work while retaining integration", async () => {
-  const h = harness({ respond: async () => ({ ...partialReply, model: MODEL_CATALOG.astra.id }) });
+  const h = harness({ respond: async () => ({ ...partialReply, model: CURRENT_CODEX_TIER_MODELS.astra }) });
   await h.create("a"); await h.create("b");
   const decide = h.deps.decide;
   h.deps.decide = async req => {
@@ -1256,7 +1256,7 @@ test("owner-led honors explicit Astra XH and may delegate in-scope work while re
   };
   await h.service.submit({ ...request, userPrompt: "Continue migrating HMS into Hub, with astra XH managed" });
   const work = h.starts[0].workItem;
-  assert.equal(work.model, MODEL_CATALOG.astra.id);
+  assert.equal(work.model, CURRENT_CODEX_TIER_MODELS.astra);
   assert.equal(work.executionEffort, "xhigh");
   assert.equal(work.ownerLed, true);
   const result = await h.service.delegateParallel({ workspaceId: "ws", workItemId: work.id, sourceActorId: "a", sourceSessionId: work.taskSessionId,
@@ -1278,21 +1278,21 @@ test("forbidden explicit Astra never silently falls back to Sol", async () => {
 
 test("a user-named Astra from an earlier round still runs when the follow-up is sent with a Claude gear", async () => {
   const claudeModels: string[] = [MODEL_CATALOG.claudeHaiku.id, MODEL_CATALOG.claudeSonnet.id, MODEL_CATALOG.claudeOpus.id];
-  const h = harness(); await h.create("a", { model: MODEL_CATALOG.astra.id, allowedModels: [MODEL_CATALOG.astra.id, ...claudeModels] });
+  const h = harness(); await h.create("a", { model: CURRENT_CODEX_TIER_MODELS.astra, allowedModels: [CURRENT_CODEX_TIER_MODELS.astra, ...claudeModels] });
   const first = await h.service.submit({ ...request, namedActorIds: ["a"], userPrompt: "用astra 執下呢個ui",
-    responseProfile: { model: MODEL_CATALOG.astra.id, effort: "high" } });
-  assert.equal(h.starts[0].workItem.model, MODEL_CATALOG.astra.id);
+    responseProfile: { model: CURRENT_CODEX_TIER_MODELS.astra, effort: "high" } });
+  assert.equal(h.starts[0].workItem.model, CURRENT_CODEX_TIER_MODELS.astra);
   await h.store.change("ws", room => { room.workItems[0].status = "completed"; });
   h.deps.respond = async () => ({ text: "Fix the layout", claim: true, preparedPrompt: "Remove the wasted wrapping", contextRoundIds: [first.id] });
   const followUp = await h.service.submit({ ...request, requestId: "follow-up", namedActorIds: ["a"], userPrompt: "右邊無必要換行浪費好多空間",
     responseProfile: { model: MODEL_CATALOG.claudeOpus.id, effort: "high" } });
   assert.notEqual(followUp.status, "routing_failed", followUp.error ?? undefined);
   assert.equal(h.starts.length, 2);
-  assert.equal(h.starts[1].workItem.model, MODEL_CATALOG.astra.id, "the user's named model is used, not swapped for the gear's provider");
+  assert.equal(h.starts[1].workItem.model, CURRENT_CODEX_TIER_MODELS.astra, "the user's named model is used, not swapped for the gear's provider");
   const current = await h.service.submit({ ...request, requestId: "current", namedActorIds: ["a"], userPrompt: "用astra 再執一次",
     responseProfile: { model: MODEL_CATALOG.claudeOpus.id, effort: "high" } });
   assert.notEqual(current.status, "routing_failed", current.error ?? undefined);
-  assert.equal(h.starts.at(-1)!.workItem.model, MODEL_CATALOG.astra.id, "a current-message request crosses the gear's provider too");
+  assert.equal(h.starts.at(-1)!.workItem.model, CURRENT_CODEX_TIER_MODELS.astra, "a current-message request crosses the gear's provider too");
   await h.service.settled();
 });
 
@@ -1307,7 +1307,7 @@ test("an earlier-round model the actor does not allow lets Decision select inste
     responseProfile: { model: MODEL_CATALOG.claudeOpus.id, effort: "high" } });
   assert.notEqual(followUp.status, "routing_failed", followUp.error ?? undefined);
   assert.ok(claudeModels.includes(h.starts.at(-1)!.workItem.model!), h.starts.at(-1)!.workItem.model);
-  assert.match(followUp.replies[0].inheritedExecutionIgnored!, /gpt-6-astra/);
+  assert.ok(followUp.replies[0].inheritedExecutionIgnored?.includes(CURRENT_CODEX_TIER_MODELS.astra));
   await h.service.settled();
 });
 
@@ -1428,10 +1428,10 @@ test("owner-led model selection assesses all claims instead of trusting partial 
     assert.equal(state.stakeholderClaims.length, 2);
     assert.match(state.ownership, /Whole canonical request/);
     assert.equal(state.proposedModel, undefined);
-    return { ...result, answers: { ...result.answers, model: { kind: "choice", choice: MODEL_CATALOG.astra.id, confidence: 1 } } };
+    return { ...result, answers: { ...result.answers, model: { kind: "choice", choice: CURRENT_CODEX_TIER_MODELS.astra, confidence: 1 } } };
   };
   await h.service.submit({ ...request, userPrompt: "API, migration and UI" });
-  assert.equal(h.starts[0].workItem.model, MODEL_CATALOG.astra.id);
+  assert.equal(h.starts[0].workItem.model, CURRENT_CODEX_TIER_MODELS.astra);
   assert.equal(h.starts[0].workItem.title, undefined);
   await h.service.settled();
 });

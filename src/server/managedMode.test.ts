@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { MANAGED_MODE_PREFIX, actorRequiresManagedMode, managedModeTurnInstructions, managedModelSuggestions, resolveManagedModePrompt, resolveTurnManagedMode } from "../managedMode";
-import { MODEL_CATALOG as M } from "../modelCatalog";
+import { CURRENT_CODEX_TIER_MODELS, MODEL_CATALOG as M, modelLabel } from "../modelCatalog";
 
 test("actor Sol/Opus and Astra/Fable tiers require Managed mode; other tiers do not", () => {
-  for (const model of [M.sol.id, M.sol61.id, M.claudeOpus.id, M.astra.id, M.claudeFable.id, M.claudeFable51.id, "gpt-5.6-sol", "opus", "fable"]) {
+  for (const model of [CURRENT_CODEX_TIER_MODELS.sol, CURRENT_CODEX_TIER_MODELS.astra, M.sol.id, M.sol61.id, M.claudeOpus.id, M.astra.id, M.claudeFable.id, M.claudeFable51.id, "gpt-5.6-sol", "opus", "fable"]) {
     assert.equal(actorRequiresManagedMode(model), true, model);
   }
   for (const model of [M.luna.id, M.mini.id, M.terra61.id, M.claudeSonnet.id, M.claudeHaiku.id, M.gpt55.id, M.gpt54.id, "auto", "", undefined, "claude-unknown"]) {
@@ -34,6 +34,11 @@ test("Codex suggestions mirror Haiku/Sonnet/Opus tiers without exceeding the sup
   assert.deepEqual(ids(M.sol.id), [M.luna.id, M.terra61.id, M.sol61.id]);
   assert.deepEqual(ids(M.sol61.id), [M.luna.id, M.terra61.id, M.sol61.id]);
   assert.deepEqual(ids(M.astra.id), [M.luna.id, M.terra61.id, M.sol61.id, M.astra.id]);
+  assert.deepEqual(ids(CURRENT_CODEX_TIER_MODELS.sol), [CURRENT_CODEX_TIER_MODELS.luna, CURRENT_CODEX_TIER_MODELS.terra, CURRENT_CODEX_TIER_MODELS.sol]);
+  assert.deepEqual(ids(CURRENT_CODEX_TIER_MODELS.astra), Object.values(CURRENT_CODEX_TIER_MODELS));
+  const currentGuide = resolveManagedModePrompt("Implement the change.", CURRENT_CODEX_TIER_MODELS.astra, true);
+  assert.ok(currentGuide.includes(modelLabel(CURRENT_CODEX_TIER_MODELS.sol)));
+  assert.doesNotMatch(currentGuide, /gpt-6\.1-sol|gpt-6-astra|6\.1 Sol/);
   assert.deepEqual(ids("gpt-5.6-sol"), [M.luna.id, M.terra61.id, M.sol61.id]);
   assert.deepEqual(ids("gpt-5.6-terra"), [M.luna.id], "legacy Terra ids remain Luna aliases");
   assert.deepEqual(ids(M.mini.id), [M.mini.id]);
@@ -63,7 +68,7 @@ test("planned implementation uses worker-specific guidance instead of whole-task
   assert.doesNotMatch(sol, /Terra/);
   assert.match(sol, /security fixes whose rules have already been decided/);
   assert.match(astra, /exception for unresolved/);
-  assert.match(astra, /why Sol 6.1 cannot handle it/);
+  assert.match(astra, /why 6\.1 Sol cannot handle it/);
   assert.doesNotMatch(codex.map(choice => choice.guidance).join("\n"), /all security or safety work|Escalate to Astra for large scope/);
 
   const claude = managedModelSuggestions(M.claudeOpus.id);

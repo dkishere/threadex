@@ -221,6 +221,70 @@ test("same provider override sends without confirmation", async ({ page }) => {
   await expect(page.getByRole("alertdialog")).toHaveCount(0);
 });
 
+test("task gear edits persist 6.2 presets in localStorage across switches and reloads after server acknowledgment", async ({ page }) => {
+  await setup(page);
+  const savedRequests: Array<Record<string, any>> = [];
+  await page.route("**/api/workspace-model-preferences/**", async route => {
+    savedRequests.push(route.request().postDataJSON());
+    await route.fulfill({ status: 200, json: {} });
+  });
+  await open(page, beta);
+  await page.getByRole("button", { name: "Override session model settings" }).click();
+  await page.getByRole("button", { name: "Configure model gears" }).click();
+  await page.getByLabel("Gear 5 model", { exact: true }).selectOption("gpt-6.2-astra");
+  await page.getByLabel("Gear 6 model", { exact: true }).selectOption("gpt-6.2-sol");
+  await page.getByLabel("Gear 6 effort", { exact: true }).selectOption("ultra");
+  await page.getByRole("switch", { name: "Gear 6 fast mode", exact: true }).click();
+  await page.getByRole("button", { name: "Activate gear 6", exact: true }).click();
+  await expect.poll(() => savedRequests.at(-1)).toMatchObject({ activeGearIndex: 5,
+    gearProfiles: [expect.anything(), expect.anything(), expect.anything(), expect.anything(),
+      expect.objectContaining({ model: "gpt-6.2-astra" }), { model: "gpt-6.2-sol", effort: "ultra", fastMode: true }] });
+  await expect.poll(() => page.evaluate(() => {
+    const outbox = JSON.parse(localStorage.getItem("threadex.model-selector") ?? "null");
+    return outbox?.selectors?.default ?? null;
+  })).toBeNull();
+  // Refresh the manually configured task itself, not only a different task
+  // whose last-turn inheritance hides the saved presets.
+  await page.reload();
+  await expect(page.getByRole("button", { name: "Override session model settings" })).toHaveCount(0);
+  await expect(page.locator('input[name="main-composer-gear-active"]:checked')).toHaveAttribute("id", "main-composer-gear-6");
+  await page.getByRole("button", { name: "Configure model gears" }).click();
+  await expect(page.getByLabel("Gear 6 model", { exact: true })).toHaveValue("gpt-6.2-sol");
+  await expect(page.getByLabel("Gear 6 effort", { exact: true })).toHaveValue("ultra");
+  await expect(page.getByRole("switch", { name: "Gear 6 fast mode", exact: true })).toHaveAttribute("aria-checked", "true");
+  await page.keyboard.press("Escape");
+  await switchTo(page, alpha);
+  // Last-turn inheritance remains independent of the edited presets.
+  await expect(page.getByRole("button", { name: "Override session model settings" })).toContainText("Opus 5.5");
+  await page.reload();
+  await expect(page.getByRole("button", { name: "Override session model settings" })).toContainText("Opus 5.5");
+  await page.getByRole("button", { name: "Override session model settings" }).click();
+  await expect(page.locator('input[name="main-composer-gear-active"]:checked')).toHaveAttribute("id", "main-composer-gear-6");
+  await page.getByRole("button", { name: "Configure model gears" }).click();
+  await expect(page.getByLabel("Gear 5 model", { exact: true })).toHaveValue("gpt-6.2-astra");
+  await expect(page.getByLabel("Gear 6 model", { exact: true })).toHaveValue("gpt-6.2-sol");
+  await expect(page.getByLabel("Gear 6 effort", { exact: true })).toHaveValue("ultra");
+  await expect(page.getByRole("switch", { name: "Gear 6 fast mode", exact: true })).toHaveAttribute("aria-checked", "true");
+});
+
+test("manual 6.2 selection survives group chat task preview bootstrap and refresh", async ({ page }) => {
+  await setup(page);
+  await page.goto(`/?workspaceId=default&sessionId=${beta.id}#view=workspace-chat&chat=unassigned`);
+  await page.getByRole("button", { name: "Override session model settings" }).click();
+  await page.locator('button[aria-controls="main-composer-gear-menu"]').click();
+  const menu = page.locator("#main-composer-gear-menu");
+  await menu.getByLabel("Gear 6 model", { exact: true }).selectOption("gpt-6.2-sol");
+  await menu.getByRole("button", { name: "Activate gear 6", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem("threadex.session-gear-override") ?? "null")))
+    .toEqual({ sessionId: beta.id, activeGearIndex: 5 });
+  await page.reload();
+  await expect(page.locator('input[name="main-composer-gear-active"]:checked')).toHaveAttribute("aria-label", /6\.2 Sol/);
+  await expect(page.getByRole("button", { name: "Override session model settings" })).toHaveCount(0);
+  // A second refresh also exercises initialization from an already-restored override.
+  await page.reload();
+  await expect(page.locator('input[name="main-composer-gear-active"]:checked')).toHaveAttribute("aria-label", /6\.2 Sol/);
+});
+
 test("Claude to Auto asks for confirmation and Escape restores inherited settings", async ({ page }) => {
   const { sends } = await setup(page);
   await open(page);

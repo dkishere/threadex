@@ -306,7 +306,7 @@ export function applyTodoSnapshotForSession(ctx, targetSessionId, todo) {
 }
 
 export async function handleDurableEvent(ctx, event) {
-    const { activeTurnIdRef, applyDeveloperInstructionsToTurn, approvalEventToLiveItem, eventStore, finalizeTerminalAssistantMessage, loadWorkspaceSnapshot, markTurnFinished, readRecord, readStringField, reconnectRunner, reconnectingTurnIdsRef, refreshSelectedSessionSnapshot, removePendingApprovalItem, scheduleLoadSessions, sessionIdRef, setActiveTurnId, setMessages, setPendingApprovalItems, setPendingApprovalSessionIds, setSessionExecutionStatuses, setSessionTodo, streamTargetsRef, upsertPendingApprovalItem, viewKeyRef } = ctx;
+    const { activeTurnIdRef, applyDeveloperInstructionsToTurn, applyLiveItemToMessage, approvalEventToLiveItem, eventStore, finalizeTerminalAssistantMessage, loadWorkspaceSnapshot, markTurnFinished, readRecord, readStringField, reconnectRunner, reconnectingTurnIdsRef, refreshSelectedSessionSnapshot, removePendingApprovalItem, scheduleLoadSessions, sessionIdRef, setActiveTurnId, setMessages, setPendingApprovalItems, setPendingApprovalSessionIds, setSessionExecutionStatuses, setSessionTodo, streamTargetsRef, upsertPendingApprovalItem, viewKeyRef } = ctx;
         if (event.type === "workspace.created" || event.type === "workspace.switched") {
             await loadWorkspaceSnapshot({ preserveSelectedSession: true });
             return;
@@ -318,14 +318,27 @@ export async function handleDurableEvent(ctx, event) {
                 setPendingApprovalItems((current) => upsertPendingApprovalItem(current, item));
                 setPendingApprovalSessionIds((current) => current.includes(approval.sessionId) ? current : [...current, approval.sessionId]);
                 // A runner that re-registers after a server restart makes the request answerable again.
-                const reviveItem = (entry) => entry?.itemType === "approval" && entry.approvalId === approval.approvalId && entry.status === "expired"
+                const isThisApproval = (entry) => entry?.itemType === "approval" && entry.approvalId === approval.approvalId;
+                const reviveItem = (entry) => isThisApproval(entry) && entry.status === "expired"
                     ? { ...entry, eventType: "item.started", status: "pending", error: undefined }
                     : entry;
-                setMessages((current) => sessionIdRef.current !== approval.sessionId ? current : current.map((message) => ({
-                    ...message,
-                    liveItems: message.liveItems?.map(reviveItem),
-                    segments: message.segments?.map((segment) => segment.type === "live" ? { ...segment, item: reviveItem(segment.item) } : segment)
-                })));
+                setMessages((current) => {
+                    if (sessionIdRef.current !== approval.sessionId)
+                        return current;
+                    const cardAlreadyShown = current.some((message) => message.liveItems?.some(isThisApproval)
+                        || message.segments?.some((segment) => segment.type === "live" && isThisApproval(segment.item)));
+                    // Requests published outside the turn's runner stream (intent approvals, or a
+                    // disconnected stream) reach the bell through this event only; show the card too.
+                    const ownerTurnId = approval.turnId ?? event.turnId;
+                    const ownerTurnMessageIndex = cardAlreadyShown || !ownerTurnId || !applyLiveItemToMessage
+                        ? -1
+                        : current.findLastIndex((message) => message.role === "assistant" && message.turnId === ownerTurnId);
+                    return current.map((message, index) => index === ownerTurnMessageIndex ? applyLiveItemToMessage(message, item) : ({
+                        ...message,
+                        liveItems: message.liveItems?.map(reviveItem),
+                        segments: message.segments?.map((segment) => segment.type === "live" ? { ...segment, item: reviveItem(segment.item) } : segment)
+                    }));
+                });
             }
             return;
         }

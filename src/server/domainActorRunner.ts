@@ -1,4 +1,4 @@
-import { DEFAULT_MODEL, MODEL_CATALOG, MODEL_OPTIONS, isClaudeModel, normalizeModelEffort } from "../modelCatalog";
+import { CURRENT_CLAUDE_TIER_MODELS, CURRENT_CODEX_TIER_MODELS, DEFAULT_MODEL, MODEL_CATALOG, MODEL_OPTIONS, isClaudeModel, normalizeModelEffort } from "../modelCatalog";
 import { createHash } from "node:crypto";
 import type { ActorMemoryContent } from "../domainActors";
 import { actorProjectIds, isActorDirectChatRound, UNASSIGNED_ACTOR_PROJECT } from "../domainActors";
@@ -90,7 +90,7 @@ const MEMORY_DIGEST_TURN_FILES = 50;
 
 /** The Terra-tier model of a digest: Sonnet for a Claude-model actor, otherwise 6.1 Terra. */
 export function actorMemoryDigestModel(actorModel: string) {
-  return isClaudeModel(actorModel) ? MODEL_CATALOG.claudeSonnet.id : MODEL_CATALOG.terra61.id;
+  return isClaudeModel(actorModel) ? CURRENT_CLAUDE_TIER_MODELS.sonnet : CURRENT_CODEX_TIER_MODELS.terra;
 }
 
 /** Collective memory digest guidance; shared by the digest and the offline memory eval. */
@@ -264,7 +264,7 @@ export function actorModelHooks(store: SessionStore,summarizer: SessionSummarize
       return resolveActorTaskBinding(workspace, listCodexProjects(workspace.codexHome), bindingInput, undefined, defaults);
     },
     async reviewTask(input) {
-      const model = input.workItem.model.startsWith("claude-") ? MODEL_CATALOG.claudeHaiku.id : MODEL_CATALOG.luna.id;
+      const model = input.workItem.model.startsWith("claude-") ? CURRENT_CLAUDE_TIER_MODELS.haiku : CURRENT_CODEX_TIER_MODELS.luna;
       const [approvals, steers] = await Promise.all([
         store.listSessionApprovalLiveItems(input.workItem.taskSessionId),
         store.listSessionSteerMessages(input.workItem.taskSessionId)
@@ -515,7 +515,7 @@ export function actorModelHooks(store: SessionStore,summarizer: SessionSummarize
         ...(typeof value.executorActorId === "string" ? { executorActorId: value.executorActorId } : {}) };
     },
     async maintain({ actor, event, baseVersion, context, runningSessions }) {
-      const model = actor.model.startsWith("claude-") ? MODEL_CATALOG.claudeHaiku.id : MODEL_CATALOG.luna.id;
+      const model = actor.model.startsWith("claude-") ? CURRENT_CLAUDE_TIER_MODELS.haiku : CURRENT_CODEX_TIER_MODELS.luna;
       const window = await contextWindow(actor.workspaceId, model);
       const prompt = actorMemoryMaintenancePrompt({ memory: actor.memory, event, baseVersion, context, runningSessions });
       if (Buffer.byteLength(prompt) > actorInputBudget(window)) throw new Error("Full memory maintenance exceeds context admission budget; previous memory is retained.");

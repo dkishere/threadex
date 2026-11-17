@@ -10,7 +10,7 @@ import { actorMemoryDigestPrompt, actorMemoryMaintenancePrompt, actorModelHooks,
 import type { SessionStore } from "./sessionStore";
 import type { SessionSummarizer } from "./sessionSummarizer";
 import { actorInputBudget, actorFollowupTurnId } from "./domainActorContext";
-import { MODEL_CATALOG } from "../modelCatalog";
+import { CURRENT_CLAUDE_TIER_MODELS, CURRENT_CODEX_TIER_MODELS, MODEL_CATALOG } from "../modelCatalog";
 import { ACTOR_MODEL_TIER_GUIDANCE, ACTOR_WORKLOAD_ASSESSMENT } from "./domainActorModelSelection";
 import { emptyActorRoom, type ActorWorkItem } from "../domainActors";
 import { openActorBlocker, requestActorBlockerUserDecision, actorBlockerUserDecisionPrompt } from "../actorBlockers";
@@ -483,7 +483,7 @@ test("partial planning uses the existing middle tier in the prompt's provider gr
   for (const initiating of [MODEL_CATALOG.luna.id, MODEL_CATALOG.claudeOpus.id]) {
     await hooks.planClaims!({ round: { ...allocationRound, responseProfile: { model: initiating, effort: "high" } }, messages: ["API and UI"] } as unknown as Parameters<NonNullable<typeof hooks.planClaims>>[0]);
   }
-  assert.deepEqual(calls.map(c => c.model), [MODEL_CATALOG.sol61.id, MODEL_CATALOG.claudeSonnet.id]);
+  assert.deepEqual(calls.map(c => c.model), [CURRENT_CODEX_TIER_MODELS.sol, CURRENT_CLAUDE_TIER_MODELS.sonnet]);
   assert.ok(calls.every(c => c.effort === "high"));
 });
 

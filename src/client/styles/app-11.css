@@ -697,6 +697,15 @@
   line-height: 1.45;
 }
 
+.side-chat-question .response-annotation-list {
+  justify-items: start;
+  text-align: left;
+}
+
+.side-chat-question .response-annotation-list:last-child {
+  margin-bottom: 0;
+}
+
 .side-chat-question .markdown-content > :first-child,
 .side-chat-answer .turn-conclusion > :first-child {
   margin-top: 0;

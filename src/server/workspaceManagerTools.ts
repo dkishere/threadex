@@ -1,7 +1,7 @@
-import { MODEL_CATALOG, WORKSPACE_MANAGER_MODEL_ORDER } from "../modelCatalog";
+import { CURRENT_CODEX_TIER_MODELS, WORKSPACE_MANAGER_SUPPORTED_MODELS } from "../modelCatalog";
 
 const text = { type: "string", minLength: 1 };
-const model = { type: "string", enum: [...WORKSPACE_MANAGER_MODEL_ORDER, MODEL_CATALOG.sol.id], description: "Explicit worker model chosen by the persistent workload policy. Use gpt-6.1-terra for the Terra tier and gpt-6.1-sol for the Sol tier; gpt-6-sol is accepted only for an existing requestId retry. Luna is for tightly scoped mechanical work; Astra for 3D, security or large reviews/plans." };
+const model = { type: "string", enum: WORKSPACE_MANAGER_SUPPORTED_MODELS, description: `Explicit worker model chosen by the persistent workload policy. Use ${CURRENT_CODEX_TIER_MODELS.terra} for the Terra tier and ${CURRENT_CODEX_TIER_MODELS.sol} for the Sol tier; legacy Sol and Astra IDs remain accepted for stored selections and retries. Luna is for tightly scoped mechanical work; Astra for 3D, security or large reviews/plans.` };
 const session = { ...text, description: "An exact session ID from this workspace's status or search results." };
 const attachmentSourceTurnId = { ...text, description: "Exact turn ID holding the original uploaded files in this workspace. Omit for files on the current manager turn. The server copies saved files into the destination turn; a filename, path or summary in the brief does not attach them." };
 const requestId = { ...text, maxLength: 100, description: "A unique ID for this action. Reuse it only when retrying the same action." };

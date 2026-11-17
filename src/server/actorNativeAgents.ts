@@ -1,5 +1,5 @@
 import type { ActorRoom, ActorRunningSession, ActorWorkItem, DomainActor } from "../domainActors";
-import { MODEL_CATALOG, modelProvider, normalizeModelEffort, normalizeModelId } from "../modelCatalog";
+import { CURRENT_CLAUDE_TIER_MODELS, modelProvider, normalizeModelEffort, normalizeModelId } from "../modelCatalog";
 import { actorExecutionMessage, boundedActorContext } from "./domainActorContext";
 
 /** A partial-claim split runs in its integration owner's session: the other
@@ -18,11 +18,10 @@ export function actorNativeProvider(model: string): ActorNativeProvider {
   return modelProvider(model);
 }
 
-const CLAUDE_AGENT_MODELS = ["sonnet", "opus", "haiku", "fable"];
 /** The Claude Agent tool's model alias that runs exactly this model; undefined when none does (for example an older Fable). */
 export function actorClaudeAgentModel(model: string) {
-  const aliases: readonly string[] = Object.values(MODEL_CATALOG).find(entry => entry.id === model)?.aliases ?? [];
-  return aliases.find(alias => CLAUDE_AGENT_MODELS.includes(alias));
+  return (Object.keys(CURRENT_CLAUDE_TIER_MODELS) as Array<keyof typeof CURRENT_CLAUDE_TIER_MODELS>)
+    .find(alias => CURRENT_CLAUDE_TIER_MODELS[alias] === model);
 }
 
 /** The work item a task session executes. Native children share their host's

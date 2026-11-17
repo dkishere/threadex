@@ -1,20 +1,31 @@
-import { DEFAULT_MODEL, MODEL_CATALOG, modelProvider, modelWorkTier, normalizeModelEffort, normalizeModelId } from "../modelCatalog";
+import { CODEX_ROUTING_TIERS, CURRENT_CLAUDE_TIER_MODELS, CURRENT_CODEX_TIER_MODELS, DEFAULT_MODEL, MODEL_CATALOG, codexTierModels, modelProvider, modelWorkTier, normalizeModelEffort, normalizeModelId } from "../modelCatalog";
 import type { ActorRound, ActorWorkItem } from "../domainActors";
 import type { DecisionQuestion, DecisionResult } from "./decision/types";
 
+const actorModelNames: Record<string, string> = {
+  ...CURRENT_CODEX_TIER_MODELS,
+  opus: CURRENT_CLAUDE_TIER_MODELS.opus,
+  sonnet: CURRENT_CLAUDE_TIER_MODELS.sonnet,
+  haiku: CURRENT_CLAUDE_TIER_MODELS.haiku
+};
+const codexExecutionTiers = [
+  [...codexTierModels("luna"), MODEL_CATALOG.mini.id],
+  codexTierModels("terra"),
+  [...codexTierModels("sol"), MODEL_CATALOG.gpt55.id, MODEL_CATALOG.gpt54.id],
+  codexTierModels("astra")
+];
+const codexModelIdPattern = String.raw`gpt-\d+(?:\.\d+)?-(?:${CODEX_ROUTING_TIERS.join("|")})`;
+const actorExecutionDirective = new RegExp(String.raw`(?:\b(?:with|use|using)\s+|(?<![不唔別])用\s*)(${codexModelIdPattern}|${Object.keys(actorModelNames).join("|")})\b(?:\s+(xh|xhigh|high|medium|low|max|ultra)\b)?`, "gi");
+
 /** Recognize affirmative execution directives in canonical user messages only. */
 export function actorRequestedExecution(messages: string[]): { model: string; effort?: string } | undefined {
-  const aliases: Record<string, string> = { astra: MODEL_CATALOG.astra.id, sol: MODEL_CATALOG.sol61.id,
-    luna: MODEL_CATALOG.luna.id, terra: MODEL_CATALOG.terra61.id, opus: MODEL_CATALOG.claudeOpus.id,
-    sonnet: MODEL_CATALOG.claudeSonnet.id, haiku: MODEL_CATALOG.claudeHaiku.id };
   let requested: { model: string; effort?: string } | undefined;
   for (const message of messages) {
     const text = message.replace(/```[\s\S]*?```/g, "").replace(/^\s*>.*$/gm, "");
-    const pattern = /(?:\b(?:with|use|using)\s+|(?<![不唔別])用\s*)(gpt-6(?:\.1)?-(?:astra|sol|luna|terra)|astra|sol|luna|terra|opus|sonnet|haiku)\b(?:\s+(xh|xhigh|high|medium|low|max|ultra)\b)?/gi;
-    for (const match of text.matchAll(pattern)) {
+    for (const match of text.matchAll(actorExecutionDirective)) {
       if (/(?:do not|don't|never|唔好|不要|別)\s*$/i.test(text.slice(0, match.index))) continue;
       const name = match[1].toLowerCase();
-      requested = { model: aliases[name] ?? normalizeModelId(name),
+      requested = { model: actorModelNames[name] ?? normalizeModelId(name),
         ...(match[2] ? { effort: match[2].toLowerCase() === "xh" ? "xhigh" : match[2].toLowerCase() } : {}) };
     }
   }
@@ -35,8 +46,8 @@ export function actorInitiatingModel(round: Pick<ActorRound, "responseProfile" |
  * API requests without a gear use the application default, never actor identity. */
 export function actorExecutionModels(allowed: string[], initiatingModel: string = DEFAULT_MODEL): string[] {
   const tiers = modelProvider(initiatingModel) === "claude"
-    ? [[MODEL_CATALOG.claudeHaiku.id], [MODEL_CATALOG.claudeSonnet.id], [MODEL_CATALOG.claudeOpus.id]]
-    : [[MODEL_CATALOG.luna.id, MODEL_CATALOG.mini.id], [MODEL_CATALOG.terra61.id], [MODEL_CATALOG.sol61.id, MODEL_CATALOG.sol.id, MODEL_CATALOG.gpt55.id, MODEL_CATALOG.gpt54.id], [MODEL_CATALOG.astra.id]];
+    ? [[CURRENT_CLAUDE_TIER_MODELS.haiku], [CURRENT_CLAUDE_TIER_MODELS.sonnet], [CURRENT_CLAUDE_TIER_MODELS.opus]]
+    : codexExecutionTiers;
   return tiers.flatMap(models => {
     const model = models.find(model => allowed.includes(model));
     return model ? [model] : [];
@@ -139,13 +150,13 @@ export function actorChosenModel(choice: string | undefined, allowed: string[]):
 export function actorModelOptions(models: string[], effort: string) {
   return Object.fromEntries(models.map(model => {
     const id = normalizeModelId(model);
-    const lightweight = [MODEL_CATALOG.luna.id, MODEL_CATALOG.mini.id, MODEL_CATALOG.claudeHaiku.id].some(value => value === id);
-    const belowPromptFloor = lightweight || id === MODEL_CATALOG.claudeSonnet.id || id === MODEL_CATALOG.terra61.id;
+    const lightweight = codexExecutionTiers[0].includes(id) || id === CURRENT_CLAUDE_TIER_MODELS.haiku;
+    const belowPromptFloor = lightweight || id === CURRENT_CLAUDE_TIER_MODELS.sonnet || codexExecutionTiers[1].includes(id);
     const configured = normalizeModelEffort(model, effort), raised = actorTaskExecutionEffort(model, effort);
     return [model, `${model}, actual execution effort ${raised === configured ? configured : `${raised} (${configured} for mechanical work)`}. ${lightweight
       ? "Eligible only for small, clear, self-contained, low-risk tasks; exclude substantial or interacting multi-part work."
       : "Assess capability and headroom against the full assigned workload before considering cost."}${belowPromptFloor
-      ? " Not eligible for any prompt work, however small." : ""}${id === MODEL_CATALOG.astra.id
+      ? " Not eligible for any prompt work, however small." : ""}${codexExecutionTiers[3].includes(id)
       ? " Exception tier: only when the assigned work itself needs difficult architecture, security analysis, a large review or plan, demanding correctness reasoning, or follows demonstrated lower-tier failures." : ""}`];
   }));
 }

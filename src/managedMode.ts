@@ -1,4 +1,4 @@
-import { MODEL_CATALOG, isClaudeModel, modelWorkTier, normalizeModelId, type ModelWorkTier } from "./modelCatalog";
+import { CODEX_ROUTING_TIERS, CODEX_TIER_MODEL_LINEUPS, CURRENT_CLAUDE_TIER_MODELS, MODEL_CATALOG, isClaudeModel, modelLabel, modelWorkTier, normalizeModelId, type ModelWorkTier } from "./modelCatalog";
 
 /** Actor turns in these workload tiers always run in Managed mode. */
 export const ACTOR_MANAGED_MODE_TIERS: readonly ModelWorkTier[] = ["sol", "astra"];
@@ -18,13 +18,11 @@ export function resolveTurnManagedMode(input: { requested: boolean; domainActor:
 
 // Auto classifies the whole user request. Route workers by their assigned work
 // after supervisor planning, throughout execution and verification.
-const MANAGED_CODEX_MODEL_GUIDANCE = {
-  [MODEL_CATALOG.luna.id]: "Luna: mechanical work with explicit targets, methods and outcomes; routine commands, known checks and specified lookups.",
-  [MODEL_CATALOG.terra61.id]: "Terra 6.1: Terra-class routine small development, lookups and ordinary debugging.",
-  [MODEL_CATALOG.sol61.id]: "Sol 6.1: default implementation worker for substantive implementation, regression tests, specified migrations, security fixes whose rules have already been decided, bounded analysis/review evidence, log/root-cause investigation, large-data reasoning, performance and prompt work.",
-  [MODEL_CATALOG.astra.id]: "Astra: exception for unresolved architecture/security analysis, difficult reasoning or demonstrated failures within the assignment. Explain why Sol 6.1 cannot handle it; do not default to high effort."
-} as const;
-const MANAGED_CODEX_MODEL_ORDER = [MODEL_CATALOG.luna.id, MODEL_CATALOG.terra61.id, MODEL_CATALOG.sol61.id, MODEL_CATALOG.astra.id] as const;
+const managedCodexGuidance = {
+  luna: "mechanical work with explicit targets, methods and outcomes; routine commands, known checks and specified lookups.",
+  terra: "Terra-class routine small development, lookups and ordinary debugging.",
+  sol: "default implementation worker for substantive implementation, regression tests, specified migrations, security fixes whose rules have already been decided, bounded analysis/review evidence, log/root-cause investigation, large-data reasoning, performance and prompt work."
+};
 
 /** Runner-only instruction. Never use message text to detect whether the mode is enabled. */
 export const MANAGED_MODE_PREFIX = "[Managed mode]\nThe supervisor decides whether to execute directly or delegate; no sub-agent is required for every task. Split substantial or complex work when domain boundaries are clear; retain integration and verification. Favor direct execution for small work, unclear boundaries or tightly coupled edits. Keep task-level decisions, planning and result review with the supervisor. Where native model selection is supported, choose suitable models no stronger than your own current model.";
@@ -52,24 +50,32 @@ export function managedModelSuggestions(model: string): { model: string; guidanc
   const current = normalizeModelId(model);
   if (isClaudeModel(current)) {
     const choices = [
-      { tier: 0, model: MODEL_CATALOG.claudeHaiku.id, guidance: "Haiku: Luna-class mechanical work with explicit targets, methods and outcomes; routine commands and known checks." },
-      { tier: 1, model: MODEL_CATALOG.claudeSonnet.id, guidance: "Sonnet: Terra-class routine small development, lookups and ordinary debugging." },
-      { tier: 2, model: MODEL_CATALOG.claudeOpus.id, guidance: "Opus: normal implementation worker for Sol-class substantive implementation, bounded analysis/review evidence, log/root-cause investigation, large-data reasoning, performance and prompt work." },
-      { tier: 2, model: MODEL_CATALOG.claudeFable.id, guidance: "Fable: same routing tier and Sol-class workload as Opus; normal implementation and deeper analysis, not exception-only escalation." }
+      { tier: 0, model: CURRENT_CLAUDE_TIER_MODELS.haiku, guidance: "Haiku: Luna-class mechanical work with explicit targets, methods and outcomes; routine commands and known checks." },
+      { tier: 1, model: CURRENT_CLAUDE_TIER_MODELS.sonnet, guidance: "Sonnet: Terra-class routine small development, lookups and ordinary debugging." },
+      { tier: 2, model: CURRENT_CLAUDE_TIER_MODELS.opus, guidance: "Opus: normal implementation worker for Sol-class substantive implementation, bounded analysis/review evidence, log/root-cause investigation, large-data reasoning, performance and prompt work." },
+      { tier: 2, model: CURRENT_CLAUDE_TIER_MODELS.fable, guidance: "Fable: same routing tier and Sol-class workload as Opus; normal implementation and deeper analysis, not exception-only escalation." }
     ];
     // Product routing policy, not a benchmark claim: no established reason to
     // rank Fable above Opus. Both share the normal implementation ceiling.
-    const ceilingModel = current === MODEL_CATALOG.claudeFable51.id ? MODEL_CATALOG.claudeFable.id : current;
+    const ceilingModel = current === MODEL_CATALOG.claudeFable51.id ? CURRENT_CLAUDE_TIER_MODELS.fable : current;
     const ceiling = choices.find(choice => choice.model === ceilingModel)?.tier;
     return ceiling === undefined
       ? [{ model: current, guidance: "Use this same model; no stronger-model ranking is established." }]
       : choices.filter(choice => choice.tier <= ceiling).map(({ model, guidance }) => ({ model, guidance }));
   }
-  // Mirrors Haiku/Sonnet/Opus. 6 Sol shares 6.1 Sol's role; legacy models have
-  // no declared cross-generation rank, so use only themselves.
-  const ceiling = MANAGED_CODEX_MODEL_ORDER.findIndex(id => id === (current === MODEL_CATALOG.sol.id ? MODEL_CATALOG.sol61.id : current));
-  if (ceiling < 0) return current === "auto" || !current ? [] : [{ model: current, guidance: "Use this same model with an appropriate effort; no stronger-model ranking is established." }];
-  return MANAGED_CODEX_MODEL_ORDER.slice(0, ceiling + 1).map(id => ({ model: id, guidance: MANAGED_CODEX_MODEL_GUIDANCE[id] }));
+  // Keep legacy supervisors on their existing generation's recommendations.
+  // Unknown models have no declared rank and can recommend only themselves.
+  const supervisor = current === MODEL_CATALOG.sol.id ? MODEL_CATALOG.sol61.id : current;
+  const lineup = CODEX_TIER_MODEL_LINEUPS.find(candidate => CODEX_ROUTING_TIERS.some(tier => candidate[tier] === supervisor));
+  if (!lineup) return current === "auto" || !current ? [] : [{ model: current, guidance: "Use this same model with an appropriate effort; no stronger-model ranking is established." }];
+  const ceiling = CODEX_ROUTING_TIERS.findIndex(tier => lineup[tier] === supervisor);
+  return CODEX_ROUTING_TIERS.slice(0, ceiling + 1).map(tier => {
+    const model = lineup[tier];
+    const guidance = tier === "astra"
+      ? `exception for unresolved architecture/security analysis, difficult reasoning or demonstrated failures within the assignment. Explain why ${modelLabel(lineup.sol)} cannot handle it; do not default to high effort.`
+      : managedCodexGuidance[tier];
+    return { model, guidance: `${modelLabel(model)}: ${guidance}` };
+  });
 }
 
 /** Expand only at execution, after Auto routing and any queued model change. */

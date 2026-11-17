@@ -5,17 +5,19 @@ export const MODEL_CATALOG = {
   luna: { id: "gpt-6-luna", label: "6 Luna", ultra: true, autoLowEffort: false, workTier: null, aliases: ["gpt-5.6-luna", "gpt-5.6 Luna", "gpt-5.6-terra", "gpt-5.6 Terra"] },
   sol: { id: "gpt-6-sol", label: "6 Sol", ultra: true, autoLowEffort: false, workTier: "sol", aliases: ["gpt-5.6-sol", "gpt-5.6 Sol"] },
   sol61: { id: "gpt-6.1-sol", label: "6.1 Sol", ultra: true, autoLowEffort: false, workTier: "sol", aliases: [] },
+  sol62: { id: "gpt-6.2-sol", label: "6.2 Sol", ultra: true, autoLowEffort: false, workTier: "sol", aliases: [] },
   // Sonnet-class Terra workload; legacy gpt-5.6-terra ids remain Luna aliases.
   terra61: { id: "gpt-6.1-terra", label: "6.1 Terra", ultra: true, autoLowEffort: false, workTier: null, aliases: [] },
   astra: { id: "gpt-6-astra", label: "6 Astra", ultra: true, autoLowEffort: true, workTier: "astra", aliases: [] },
+  astra62: { id: "gpt-6.2-astra", label: "6.2 Astra", ultra: true, autoLowEffort: true, workTier: "astra", aliases: [] },
   gpt55: { id: "gpt-5.5", label: "5.5", ultra: false, autoLowEffort: false, workTier: null, aliases: [] },
   gpt54: { id: "gpt-5.4", label: "5.4", ultra: false, autoLowEffort: false, workTier: null, aliases: [] },
   mini: { id: "gpt-5.4-mini", label: "5.4-mini", ultra: false, autoLowEffort: false, workTier: null, aliases: [] },
   // Claude models run through the Claude Agent SDK instead of Codex (see server/claudeRunner.ts).
-  claudeOpus: { id: "claude-opus-5-5", label: "Opus 5.5", ultra: false, autoLowEffort: false, workTier: "sol", aliases: ["opus"] },
-  claudeSonnet: { id: "claude-sonnet-5-5", label: "Sonnet 5.5", ultra: false, autoLowEffort: false, workTier: null, aliases: ["sonnet"] },
-  claudeHaiku: { id: "claude-haiku-5-5", label: "Haiku 5.5", ultra: false, autoLowEffort: false, workTier: null, aliases: ["haiku"] },
-  claudeFable: { id: "claude-fable-5-2", label: "Fable 5.2", ultra: false, autoLowEffort: false, workTier: "astra", aliases: ["fable"] },
+  claudeOpus: { id: "claude-opus-5-5", label: "Opus 5.5", ultra: false, autoLowEffort: false, workTier: "sol", aliases: [] },
+  claudeSonnet: { id: "claude-sonnet-5-5", label: "Sonnet 5.5", ultra: false, autoLowEffort: false, workTier: null, aliases: [] },
+  claudeHaiku: { id: "claude-haiku-5-5", label: "Haiku 5.5", ultra: false, autoLowEffort: false, workTier: null, aliases: [] },
+  claudeFable: { id: "claude-fable-5-2", label: "Fable 5.2", ultra: false, autoLowEffort: false, workTier: "astra", aliases: [] },
   // Superseded by Fable 5.2 but kept so stored selections, actor allowedModels and history keep their label and tier.
   claudeFable51: { id: "claude-fable-5-1", label: "Fable 5.1", ultra: false, autoLowEffort: false, workTier: "astra", aliases: [] }
 } as const;
@@ -39,12 +41,47 @@ export function isClaudeModel(value: string | null | undefined): boolean {
 }
 
 export const AUTO_MODEL_ORDER = [MODEL_CATALOG.luna.id, MODEL_CATALOG.sol.id, MODEL_CATALOG.astra.id] as const;
-/** Manager assignments use the 6.1 Terra/Sol models without changing Auto routing defaults. */
-export const WORKSPACE_MANAGER_MODEL_ORDER = [MODEL_CATALOG.luna.id, MODEL_CATALOG.terra61.id, MODEL_CATALOG.sol61.id, MODEL_CATALOG.astra.id] as const;
+
+const LEGACY_CODEX_TIER_MODELS = {
+  luna: MODEL_CATALOG.luna.id,
+  terra: MODEL_CATALOG.terra61.id,
+  sol: MODEL_CATALOG.sol61.id,
+  astra: MODEL_CATALOG.astra.id
+} as const;
+export const CODEX_TIER_MODEL_LINEUPS = [
+  // Put the next recommendation here. Keep older lineups for their Managed supervisors.
+  { ...LEGACY_CODEX_TIER_MODELS, sol: MODEL_CATALOG.sol62.id, astra: MODEL_CATALOG.astra62.id },
+  LEGACY_CODEX_TIER_MODELS
+] as const;
+export const CURRENT_CODEX_TIER_MODELS = CODEX_TIER_MODEL_LINEUPS[0];
+/** Current Claude recommendations and the targets of the unversioned family names. */
+export const CURRENT_CLAUDE_TIER_MODELS = {
+  haiku: MODEL_CATALOG.claudeHaiku.id,
+  sonnet: MODEL_CATALOG.claudeSonnet.id,
+  opus: MODEL_CATALOG.claudeOpus.id,
+  fable: MODEL_CATALOG.claudeFable.id
+} as const;
+export type CodexRoutingTier = keyof typeof CURRENT_CODEX_TIER_MODELS;
+export const CODEX_ROUTING_TIERS = ["luna", "terra", "sol", "astra"] as const;
+
+/** Models within a tier, from the current recommendation to older choices. */
+export function codexTierModels(tier: CodexRoutingTier): string[] {
+  const models: string[] = CODEX_TIER_MODEL_LINEUPS.map(lineup => lineup[tier]);
+  if (tier === "sol") models.push(MODEL_CATALOG.sol.id);
+  return [...new Set(models)];
+}
+
+export const WORKSPACE_MANAGER_MODEL_ORDER = CODEX_ROUTING_TIERS.map(tier => CURRENT_CODEX_TIER_MODELS[tier]);
+export const WORKSPACE_MANAGER_SUPPORTED_MODELS = [...new Set([
+  ...WORKSPACE_MANAGER_MODEL_ORDER, ...CODEX_ROUTING_TIERS.flatMap(codexTierModels)
+])];
 export const MODEL_OPTIONS: readonly string[] = [...[...AUTO_MODEL_ORDER].reverse(), ...Object.values(MODEL_CATALOG).filter(model => !(AUTO_MODEL_ORDER as readonly string[]).includes(model.id)).map(model => model.id)];
 export const DEFAULT_MODEL = MODEL_CATALOG.luna.id;
 export const REVIEW_MODEL = MODEL_CATALOG.sol.id;
 export function normalizeModelId(value: string): string {
+  if (Object.hasOwn(CURRENT_CLAUDE_TIER_MODELS, value)) {
+    return CURRENT_CLAUDE_TIER_MODELS[value as keyof typeof CURRENT_CLAUDE_TIER_MODELS];
+  }
   return Object.values(MODEL_CATALOG).find(model => model.id === value || (model.aliases as readonly string[]).includes(value))?.id ?? value;
 }
 export function modelLabel(value: string): string {

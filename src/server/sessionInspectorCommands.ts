@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { INTENT_APPROVAL_TOOL, intentRequest } from "../intentApproval";
-import { AUTO_MODEL_ORDER, isClaudeModel } from "../modelCatalog";
+import { AUTO_MODEL_ORDER, CURRENT_CLAUDE_TIER_MODELS, CURRENT_CODEX_TIER_MODELS, isClaudeModel } from "../modelCatalog";
 import type { CollaborationView } from "../collaboration";
 import { WORKSPACE_MANAGER_TOOLS, WORKSPACE_MANAGER_ACTIONS } from "./workspaceManagerTools";
 import { ACTOR_REGISTRY_TOOLS, DOMAIN_ACTOR_TOOLS } from "./domainActorTools";
@@ -776,7 +776,7 @@ const concurrentMainTools: ToolSpec[] = [{
   inputSchema: { type: "object", required: ["requestId", "task"], additionalProperties: false,
     properties: { requestId: { type: "string", minLength: 1, maxLength: 100 },
       task: { type: "string", minLength: 1, maxLength: 100000, description: "Complete brief: objective, files the worker owns, constraints, and expected result." },
-      model: { type: "string", description: "Always set it by the work's strongest requirement (Codex | Claude): mechanical with explicit method → gpt-6-luna | claude-haiku-5-5; routine small development or debugging → gpt-6.1-terra | claude-sonnet-5-5; default implementation, UI, reviews, investigation → gpt-6.1-sol | claude-opus-5-5 or claude-fable-5-2; exception tier after an observed failure or unresolved architecture/security → gpt-6-astra | claude-fable-5-2. Never use superseded gpt-6-sol, gpt-5.5, gpt-5.4 or gpt-5.4-mini. Omitted means this session's model." },
+      model: { type: "string", description: `Always set it by the work's strongest requirement (Codex | Claude): mechanical with explicit method → ${CURRENT_CODEX_TIER_MODELS.luna} | ${CURRENT_CLAUDE_TIER_MODELS.haiku}; routine small development or debugging → ${CURRENT_CODEX_TIER_MODELS.terra} | ${CURRENT_CLAUDE_TIER_MODELS.sonnet}; default implementation, UI, reviews, investigation → ${CURRENT_CODEX_TIER_MODELS.sol} | ${CURRENT_CLAUDE_TIER_MODELS.opus} or ${CURRENT_CLAUDE_TIER_MODELS.fable}; exception tier after an observed failure or unresolved architecture/security → ${CURRENT_CODEX_TIER_MODELS.astra} | ${CURRENT_CLAUDE_TIER_MODELS.fable}. Never use superseded gpt-6-sol, gpt-5.5, gpt-5.4 or gpt-5.4-mini. Omitted means this session's model.` },
       modelReasoningEffort: { type: "string", enum: ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"], description: "low for mechanical work, medium for settled implementation, higher only for a concrete reasoning difficulty." } } }
 }, {
   name: "concurrent_wait", description: "Block inside this turn until your Concurrent workers settle, then return their conclusions and change lists in this tool result. Results returned here are not delivered again as messages. mode=all (default) waits for every awaited worker; mode=any returns at the first new result. On timedOut, call again to keep waiting or continue other work; a result already being steered to you arrives as a message instead. Set the shell command timeout above timeoutSeconds.",

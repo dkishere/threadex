@@ -1599,6 +1599,54 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.doesNotMatch(turn.settings.developer_instructions, /x{100}/);
 });
 
+test("6.2 model IDs reach Codex thread start/resume and turn start unchanged", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "prompt-runner-model-62-"));
+  const fakeCodexPath = resolve(root, "fake-codex.mjs");
+  const jobPath = resolve(root, "job.json");
+  const capturedRequestsPath = resolve(root, "requests.ndjson");
+  writeFileSync(fakeCodexPath, `#!/usr/bin/env node
+import { createInterface } from "node:readline";
+import { appendFileSync } from "node:fs";
+const send = value => process.stdout.write(JSON.stringify(value) + "\\n");
+createInterface({ input: process.stdin }).on("line", line => {
+  const request = JSON.parse(line);
+  appendFileSync(process.env.CAPTURED_REQUESTS_PATH, JSON.stringify(request) + "\\n");
+  if (request.method === "initialize" || request.method === "thread/goal/clear") send({ id: request.id, result: {} });
+  if (request.method === "thread/start" || request.method === "thread/resume") send({ id: request.id, result: { thread: { id: "thread-62" } } });
+  if (request.method === "turn/start") {
+    send({ id: request.id, result: { turn: { id: "turn-62" } } });
+    send({ method: "item/completed", params: { item: { id: "answer", type: "agentMessage", text: "done" } } });
+    send({ method: "turn/completed", params: { turn: { id: "turn-62", status: "completed" } } });
+  }
+});
+`, "utf8");
+  chmodSync(fakeCodexPath, 0o755);
+  try {
+    for (const model of ["gpt-6.2-sol", "gpt-6.2-astra"]) {
+      for (const resume of [false, true]) {
+        writeFileSync(capturedRequestsPath, "");
+        writeFileSync(jobPath, JSON.stringify({ sessionId: "session-62", turnId: "turn-62", model,
+          ...(resume ? { threadId: "thread-62" } : {}), modelReasoningEffort: "ultra", message: "Check model forwarding",
+          logPath: resolve(root, "runner.ndjson"), codexHome: resolve(root, "codex-home"), cwd: projectRoot }));
+        const child = spawn(process.execPath, ["--import", "tsx", runnerPath, jobPath], {
+          cwd: projectRoot, env: { ...process.env, CODEX_PATH: fakeCodexPath, CAPTURED_REQUESTS_PATH: capturedRequestsPath,
+            SESSION_INSPECTOR_MCP_MODE: "off" }, stdio: ["ignore", "pipe", "pipe"]
+        });
+        let stderr = "";
+        child.stderr.setEncoding("utf8");
+        child.stderr.on("data", chunk => { stderr += chunk; });
+        const exitCode = await new Promise<number | null>(resolveExit => child.once("exit", resolveExit));
+        assert.equal(exitCode, 0, stderr);
+        const requests = readFileSync(capturedRequestsPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
+        assert.equal(requests.find(request => request.method === (resume ? "thread/resume" : "thread/start")).params.model, model);
+        const turn = requests.find(request => request.method === "turn/start").params;
+        assert.equal(turn.model, model);
+        assert.equal(turn.effort, "ultra");
+      }
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("auto model continues the same request in a stronger second phase", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "prompt-runner-auto-model-"));
   const fakeCodexPath = resolve(root, "fake-codex.mjs");

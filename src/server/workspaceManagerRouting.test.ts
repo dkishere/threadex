@@ -4,10 +4,24 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test, { type TestContext } from "node:test";
 import express from "express";
+import { CURRENT_CODEX_TIER_MODELS } from "../modelCatalog";
 import { SessionStore } from "./sessionStore";
 import { WorkspaceManagerService, WORKSPACE_MANAGER_INSTRUCTIONS } from "./workspaceManager";
 import { WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS } from "./workspaceManagerRouting";
 import { WORKSPACE_MANAGER_TOOLS } from "./workspaceManagerTools";
+
+test("manager model guide recommends the current tiers while the tool schema retains legacy IDs", () => {
+  assert.ok(WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS.includes(`${CURRENT_CODEX_TIER_MODELS.sol} or higher`));
+  assert.ok(WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS.includes(`${CURRENT_CODEX_TIER_MODELS.astra}: 3D`));
+  assert.doesNotMatch(WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS, /gpt-6\.1-sol|gpt-6-astra/);
+  for (const name of ["workspace_create_task", "workspace_prompt_task", "workspace_fork_task"]) {
+    const tool = WORKSPACE_MANAGER_TOOLS.find(tool => tool.name === name)!;
+    const models = (tool.inputSchema.properties.model as { enum: readonly string[] }).enum;
+    for (const model of [CURRENT_CODEX_TIER_MODELS.sol, CURRENT_CODEX_TIER_MODELS.astra, "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol"]) {
+      assert.ok(models.includes(model), `${name}: ${model}`);
+    }
+  }
+});
 
 test("manager policy preserves routing order, ownership and minimal handoffs without historical examples", () => {
   assert.ok(WORKSPACE_MANAGER_INSTRUCTIONS.includes(WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS));
@@ -36,7 +50,10 @@ test("manager policy preserves routing order, ownership and minimal handoffs wit
   assert.match(tool("workspace_create_task").description, /Only when no suitable context-known or searched thread exists/);
   assert.ok(tool("workspace_create_task").inputSchema.properties.parentSessionId);
   assert.ok(tool("workspace_inspect_task").inputSchema.properties.turnId);
-  assert.ok((tool("workspace_create_task").inputSchema.properties.model as { enum: string[] }).enum.includes("gpt-6.1-sol"));
+  assert.ok((tool("workspace_create_task").inputSchema.properties.model as { enum: string[] }).enum.includes(CURRENT_CODEX_TIER_MODELS.sol));
+  for (const model of [CURRENT_CODEX_TIER_MODELS.astra, "gpt-6.1-sol", "gpt-6-astra"]) {
+    assert.ok((tool("workspace_create_task").inputSchema.properties.model as { enum: string[] }).enum.includes(model));
+  }
   assert.ok((tool("workspace_create_task").inputSchema.properties.model as { enum: string[] }).enum.includes("gpt-6.1-terra"));
 });
 
@@ -48,9 +65,9 @@ test("compact manager policy retains continuation gates and workload/escalation 
   assert.match(policy, /Do not independently audit, invent requirements or request optional improvements/);
   assert.match(policy, /Never restart user-stopped work without authorization/);
   assert.match(policy, /gpt-6-luna: only tightly scoped mechanical work/);
-  assert.match(policy, /gpt-6\.1-sol or higher/);
+  assert.ok(policy.includes(`${CURRENT_CODEX_TIER_MODELS.sol} or higher`));
   assert.match(policy, /gpt-6\.1-terra \(the user's Terra workload category\): routine small development\/search and ordinary debugging; never prompt work/);
-  assert.match(policy, /gpt-6-astra: 3D, security, large reviews/);
+  assert.ok(policy.includes(`${CURRENT_CODEX_TIER_MODELS.astra}: 3D, security, large reviews`));
   assert.match(policy, /next stronger supported model/);
   assert.match(policy, /never use workspace_continue_stronger to bypass rate limits/);
   assert.match(policy, /begin the final response with \[workspace-note\]/);

@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { MODEL_CATALOG as M, MODEL_OPTIONS } from "../modelCatalog";
+import { CURRENT_CODEX_TIER_MODELS, MODEL_CATALOG as M, MODEL_OPTIONS } from "../modelCatalog";
 import { ACTOR_MODEL_SELECTION_INSTRUCTIONS, ACTOR_MODEL_TIER_GUIDANCE, ACTOR_WORKFLOW_QUESTION, ACTOR_WORKLOAD_ASSESSMENT, PROMPT_WORK_MODEL_FLOOR, actorChosenModel, actorWorkflowAssessment, actorWorkflowExecutionGuidance, actorExecutionModels, actorModelOptions, actorRequestedExecution, actorTaskExecutionEffort, actorWorkloadKind } from "./domainActorModelSelection";
 import type { DecisionResult } from "./decision/types";
 
 test("explicit canonical model and effort directives beat routing defaults", () => {
-  assert.deepEqual(actorRequestedExecution(["continue merging HMS into hub on a new branch, with astra XH managed"]), { model: M.astra.id, effort: "xhigh" });
-  assert.deepEqual(actorRequestedExecution(["用 astra xh", "use sol high"]), { model: M.sol61.id, effort: "high" });
+  assert.deepEqual(actorRequestedExecution(["continue merging HMS into hub on a new branch, with astra XH managed"]), { model: CURRENT_CODEX_TIER_MODELS.astra, effort: "xhigh" });
+  assert.deepEqual(actorRequestedExecution(["用 astra xh", "use sol high"]), { model: CURRENT_CODEX_TIER_MODELS.sol, effort: "high" });
+  for (const model of [M.sol.id, M.sol61.id, CURRENT_CODEX_TIER_MODELS.sol, M.astra.id, CURRENT_CODEX_TIER_MODELS.astra]) {
+    assert.deepEqual(actorRequestedExecution([`use ${model} high`]), { model, effort: "high" });
+  }
   for (const text of ["don't use astra xh", "唔用 astra xh", "> use astra xh", "```\nuse astra xh\n```", "Compare Astra and Sol"]) {
     assert.equal(actorRequestedExecution([text]), undefined, text);
   }
@@ -14,7 +17,7 @@ test("explicit canonical model and effort directives beat routing defaults", () 
 
 test("prompt provider offers one concrete model per workload tier independent of actor defaults", () => {
   assert.deepEqual(actorExecutionModels([...MODEL_OPTIONS], M.claudeSonnet.id), [M.claudeHaiku.id, M.claudeSonnet.id, M.claudeOpus.id]);
-  assert.deepEqual(actorExecutionModels([...MODEL_OPTIONS], M.luna.id), [M.luna.id, M.terra61.id, M.sol61.id, M.astra.id], "6.1 Terra pairs with Sonnet");
+  assert.deepEqual(actorExecutionModels([...MODEL_OPTIONS], M.luna.id), Object.values(CURRENT_CODEX_TIER_MODELS), "the current lineup is preferred when every model is allowed");
   assert.deepEqual(actorExecutionModels([M.luna.id, M.sol61.id, M.astra.id], M.luna.id), [M.luna.id, M.sol61.id, M.astra.id], "actors without Terra permission keep the Sol tier");
   assert.deepEqual(actorExecutionModels([M.sol.id, M.claudeOpus.id], M.astra.id), [M.sol.id]);
   assert.deepEqual(actorExecutionModels([M.luna.id], M.claudeHaiku.id), [], "permissions cannot cause a provider fallback");
@@ -47,6 +50,9 @@ test("tier guidance sends mechanical work low, keeps Astra for genuine difficult
   const options = actorModelOptions([M.sol61.id, M.astra.id], "medium");
   assert.match(options[M.astra.id], /Exception tier/);
   assert.doesNotMatch(options[M.sol61.id], /Exception tier/);
+  const currentOptions = actorModelOptions([CURRENT_CODEX_TIER_MODELS.sol, CURRENT_CODEX_TIER_MODELS.astra], "medium");
+  assert.match(currentOptions[CURRENT_CODEX_TIER_MODELS.astra], /Exception tier/);
+  assert.doesNotMatch(currentOptions[CURRENT_CODEX_TIER_MODELS.sol], /Exception tier|Not eligible for any prompt work/);
   assert.equal(actorChosenModel(M.luna.id, [M.luna.id, M.astra.id]), M.luna.id);
   assert.equal(actorChosenModel(M.astra.id, [M.luna.id]), undefined, "a choice outside the allowed options falls back to Decision");
   assert.equal(actorChosenModel(undefined, [M.luna.id]), undefined);
@@ -59,7 +65,7 @@ test("lighter models run at raised effort unless the work is mechanical; Sol/Ast
     assert.equal(actorTaskExecutionEffort(model, "medium", { workloadKind: "mechanical" }), "medium", model);
   }
   assert.equal(actorTaskExecutionEffort(M.luna.id, "xhigh"), "xhigh", "the floor never lowers a higher actor effort");
-  for (const model of [M.sol61.id, M.astra.id, M.claudeOpus.id, M.claudeFable.id, M.claudeFable51.id]) assert.equal(actorTaskExecutionEffort(model, "medium"), "medium", model);
+  for (const model of [CURRENT_CODEX_TIER_MODELS.sol, CURRENT_CODEX_TIER_MODELS.astra, M.sol61.id, M.astra.id, M.claudeOpus.id, M.claudeFable.id, M.claudeFable51.id]) assert.equal(actorTaskExecutionEffort(model, "medium"), "medium", model);
   assert.equal(actorTaskExecutionEffort(M.luna.id, "medium", { requestedEffort: "low" }), "low", "an explicit user effort is final");
   assert.equal(actorTaskExecutionEffort(M.claudeOpus.id, "medium", { requestedEffort: "xhigh" }), "xhigh");
   const options = actorModelOptions([M.luna.id, M.sol61.id], "medium");

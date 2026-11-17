@@ -7,7 +7,7 @@ import { isSilentManagerResponse, WORKSPACE_MANAGER_MODEL, WORKSPACE_MANAGER_EFF
 import { WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS } from "./workspaceManagerRouting";
 import { MANAGER_REPLY_LANGUAGE_INSTRUCTIONS } from "./replyLanguage";
 import { inspectorInstructions } from "./sessionInspectorCommand";
-import { MODEL_CATALOG, normalizeModelId, WORKSPACE_MANAGER_MODEL_ORDER } from "../modelCatalog";
+import { CODEX_ROUTING_TIERS, codexTierModels, normalizeModelId, WORKSPACE_MANAGER_MODEL_ORDER, WORKSPACE_MANAGER_SUPPORTED_MODELS } from "../modelCatalog";
 import type { UploadedAttachment, SavedAttachment } from "./attachmentUploads";
 
 export const WORKSPACE_MANAGER_INSTRUCTIONS = [
@@ -35,8 +35,7 @@ export const MANAGER_CONCURRENT_INSTRUCTIONS = [
 
 export function nextStrongerWorkspaceModel(current: string): string | null {
   const normalized = normalizeModelId(current);
-  const index = WORKSPACE_MANAGER_MODEL_ORDER.findIndex(model => model === normalized ||
-    (normalized === MODEL_CATALOG.sol.id && model === MODEL_CATALOG.sol61.id));
+  const index = CODEX_ROUTING_TIERS.findIndex(tier => codexTierModels(tier).includes(normalized));
   return index < 0 || index === WORKSPACE_MANAGER_MODEL_ORDER.length - 1 ? null : WORKSPACE_MANAGER_MODEL_ORDER[index + 1];
 }
 
@@ -834,8 +833,8 @@ export class WorkspaceManagerService {
 
 function taskAssignmentModel(value: unknown): string | undefined {
   if (value === undefined) return undefined;
-  if (typeof value !== "string" || ![...WORKSPACE_MANAGER_MODEL_ORDER, MODEL_CATALOG.sol.id].some(model => model === value)) {
-    throw new Error(`model must be one of ${[...WORKSPACE_MANAGER_MODEL_ORDER, MODEL_CATALOG.sol.id].join(", ")}.`);
+  if (typeof value !== "string" || !WORKSPACE_MANAGER_SUPPORTED_MODELS.some(model => model === value)) {
+    throw new Error(`model must be one of ${WORKSPACE_MANAGER_SUPPORTED_MODELS.join(", ")}.`);
   }
   return value;
 }

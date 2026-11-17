@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import test from "node:test";
+import { CURRENT_CLAUDE_TIER_MODELS, CURRENT_CODEX_TIER_MODELS } from "../modelCatalog";
 import { IntentApprovals } from "./intentApprovals";
 
 const cliPath = resolve(import.meta.dirname, "../../scripts/session-inspector.mjs");
@@ -1251,6 +1252,12 @@ test("an ordinary session can become Concurrent main and wait for its workers in
   try {
     const help = JSON.parse((await runCli(["help"], env)).stdout).commands.map((tool: { name: string }) => tool.name);
     for (const name of ["concurrent_spawn", "concurrent_wait", "concurrent_stop", "concurrent_status", "concurrent_send"]) assert.ok(help.includes(name), name);
+    const spawnHelp = await runCli(["help", "concurrent_spawn"], env);
+    assert.equal(spawnHelp.code, 0, spawnHelp.stderr);
+    const modelGuide = JSON.parse(spawnHelp.stdout).inputSchema.properties.model.description;
+    for (const model of [...Object.values(CURRENT_CODEX_TIER_MODELS), ...Object.values(CURRENT_CLAUDE_TIER_MODELS)]) {
+      assert.ok(modelGuide.includes(model), model);
+    }
     const spawned = await runCli(["concurrent_spawn", JSON.stringify({ requestId: "review-1", task: "Review the parser", model: "claude-opus-5-5" })], env);
     assert.equal(spawned.code, 0, spawned.stderr);
     assert.equal(JSON.parse(spawned.stdout).localId, "c1");

@@ -1,15 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AUTO_MODEL_ORDER, MODEL_OPTIONS, defaultGearProfiles, isClaudeModel, modelProvider, normalizeModelId, supportsUltraEffort } from "./modelCatalog";
+import { AUTO_MODEL_ORDER, CURRENT_CLAUDE_TIER_MODELS, MODEL_OPTIONS, defaultGearProfiles, isClaudeModel, modelProvider, normalizeModelId, supportsUltraEffort } from "./modelCatalog";
 import { AUTO_MODEL_CHOICES } from "./autoModelCatalog";
 import { MODEL_OPTIONS as composerModels } from "./client/appConstants";
 import { modelOptionLabel, normalizeStoredModel } from "./client/sessionHelpers04";
-import { modelEfforts, modelLabel, modelWorkTier, normalizeModelEffort } from "./modelCatalog";
+import { modelEfforts, modelLabel, modelWorkTier, normalizeModelEffort, supportsAutoLowEffort } from "./modelCatalog";
 import { roundtableEfforts, parseRoundtableActors, newRoundtableActor } from "./roundtable";
 import { normalizeEffortForModel } from "./client/sessionHelpers04";
 import { updateGearProfile } from "./client/sessionActions05";
 
 test("Claude gears and actors share provider effort choices and model-switch normalization", () => {
+  for (const [family, model] of Object.entries(CURRENT_CLAUDE_TIER_MODELS)) {
+    assert.equal(normalizeModelId(family), model);
+    assert.ok(composerModels.includes(model));
+    assert.equal(modelProvider(family), "claude");
+  }
   for (const model of ["opus", "sonnet", "haiku", "fable", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-2", "claude-fable-5-1"]) {
     assert.deepEqual(modelEfforts(model), ["low", "medium", "high", "xhigh", "max"]);
     assert.equal(roundtableEfforts(model), modelEfforts(model));
@@ -37,12 +42,10 @@ test("Fable 5.2 is selectable, survives stored preferences and routes to Claude"
   const model = "claude-fable-5-2";
   assert.ok(composerModels.includes(model));
   assert.equal(modelOptionLabel({}, model), "Fable 5.2");
-  for (const value of [model, "fable"]) {
-    assert.equal(normalizeModelId(value), model);
-    assert.equal(normalizeStoredModel({ AUTO_MODEL_VALUE: "auto", MODEL_OPTIONS }, value), model);
-    assert.equal(modelProvider(value), "claude");
-    assert.equal(isClaudeModel(value), true);
-  }
+  assert.equal(normalizeModelId(model), model);
+  assert.equal(normalizeStoredModel({ AUTO_MODEL_VALUE: "auto", MODEL_OPTIONS }, model), model);
+  assert.equal(modelProvider(model), "claude");
+  assert.equal(isClaudeModel(model), true);
   assert.ok(!(AUTO_MODEL_ORDER as readonly string[]).includes(model));
   assert.equal(supportsUltraEffort(model), false);
   assert.equal(modelWorkTier(model), "astra");
@@ -80,6 +83,27 @@ test("composer, persisted gears and Auto share the catalog", () => {
   assert.equal(modelLabel("gpt-6.1-terra"), "6.1 Terra");
   assert.equal(modelWorkTier("gpt-6.1-terra"), null, "Sonnet-class Terra is outside the Sol/Opus tier");
   assert.equal(modelWorkTier("gpt-6.1-sol"), "sol");
+});
+
+test("6.2 models are selectable and preserve tier/effort metadata without migrating older selections", () => {
+  for (const [current, previous, tier, label] of [
+    ["gpt-6.2-sol", "gpt-6.1-sol", "sol", "6.2 Sol"],
+    ["gpt-6.2-astra", "gpt-6-astra", "astra", "6.2 Astra"]
+  ]) {
+    assert.ok(composerModels.includes(current));
+    assert.equal(modelLabel(current), label);
+    assert.equal(modelProvider(current), "codex");
+    assert.equal(modelWorkTier(current), tier);
+    assert.deepEqual(modelEfforts(current), modelEfforts(previous));
+    assert.equal(supportsAutoLowEffort(current), supportsAutoLowEffort(previous));
+    for (const model of [current, previous]) {
+      assert.equal(normalizeModelId(model), model);
+      assert.equal(normalizeStoredModel({ AUTO_MODEL_VALUE: "auto", MODEL_OPTIONS }, model), model);
+    }
+  }
+  assert.equal(modelLabel("gpt-6.1-sol"), "6.1 Sol");
+  assert.equal(modelLabel("gpt-6-astra"), "6 Astra");
+  assert.deepEqual(AUTO_MODEL_ORDER, ["gpt-6-luna", "gpt-6-sol", "gpt-6-astra"]);
 });
 
 test("crossesModelGroup flags only Claude Code <-> Codex switches", async () => {
