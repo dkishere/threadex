@@ -58,14 +58,14 @@ export function resolveActorTaskBinding(workspace: { id: string; cwd: string }, 
   }));
   const matches = [...pathMatches, ...named, ...repositories];
   const unique = [...new Map(matches.map(entry => [JSON.stringify([entry.project.id, entry.cwd]), entry])).values()];
-  if (unique.length === 1) return binding(unique[0], "message");
   // Membership is a default only for an individual actor; never choose an
   // arbitrary project from a worker that belongs to several project chats.
   const defaults = [...new Set(defaultProjectIds)];
-  if (unique.length > 1) {
-    // Several referenced roots are ordinary message content for an actor that
-    // knows its own project; its references only choose among that project's roots.
-    const actorProjects = defaults.filter(id => entries.some(entry => entry.project.id === id));
+  // Referenced roots are ordinary message content for an actor that knows its
+  // own project: they only choose among that project's roots, never replace it.
+  const actorProjects = defaults.filter(id => entries.some(entry => entry.project.id === id));
+  if (unique.length === 1 && (!actorProjects.length || actorProjects.includes(unique[0].project.id))) return binding(unique[0], "message");
+  if (unique.length) {
     const referenced = unique.filter(entry => actorProjects.includes(entry.project.id));
     if (referenced.length === 1) return binding(referenced[0], "message");
     const referencedProjects = [...new Set(referenced.map(entry => entry.project.id))];

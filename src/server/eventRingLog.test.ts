@@ -34,7 +34,7 @@ test("appends events without rewriting the complete ring for every record", asyn
 
     const diskLineCount = readFileSync(target.path, "utf8").trim().split("\n").length;
     assert.ok(diskLineCount >= 128);
-    assert.ok(diskLineCount < 160);
+    assert.ok(diskLineCount <= 256, "stale lines are compacted once they reach the retained capacity");
     assert.equal(log.entries.length, 128);
     assert.equal(log.entries[0]?.eventId, "event-372");
     assert.equal(log.latestPosition, 500);
@@ -112,7 +112,7 @@ test("keeps only the latest replay state for progressive runner items", async ()
     assert.equal(log.entries.length, 1);
     assert.equal((log.entries[0]?.payload as { aggregatedOutput?: string }).aggregatedOutput, "output-299");
     assert.equal(loadEventRing(target.path, 128).length, 1);
-    assert.ok(statSync(target.path).size < 10_000);
+    assert.ok(readFileSync(target.path, "utf8").trim().split("\n").length <= 128, "superseded updates are compacted at the ring capacity");
   } finally {
     target.cleanup();
   }

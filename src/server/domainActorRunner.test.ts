@@ -154,9 +154,12 @@ test("individual actor defaults use workspace registry and root membership for a
   const explicit = await hooks.resolveTaskBinding!({ workspaceId: "threadex", requestId: "explicit", userPrompt: "fix this",
     namedActorIds: [threadexActors[0].id], newSessionProjectId: bdd });
   assert.equal(explicit.projectId, bdd); assert.equal(explicit.source, "explicit");
-  const message = await hooks.resolveTaskBinding!({ workspaceId: "threadex", requestId: "message", userPrompt: "fix bdd",
+  const outsideActorProject = await hooks.resolveTaskBinding!({ workspaceId: "threadex", requestId: "message", userPrompt: "fix bdd",
     namedActorIds: [threadexActors[0].id] });
-  assert.equal(message.projectId, bdd); assert.equal(message.source, "message");
+  assert.equal(outsideActorProject.projectId, threadex); assert.equal(outsideActorProject.source, "actor");
+  const withinActorProject = await hooks.resolveTaskBinding!({ workspaceId: "threadex", requestId: "bdd-message", userPrompt: "fix bdd",
+    namedActorIds: ["actor_9a12e776-2564-4a32-8850-a7e444cda89c"] });
+  assert.equal(withinActorProject.projectId, bdd); assert.equal(withinActorProject.source, "message");
   const crossWorkspace = await hooks.resolveTaskBinding!({ workspaceId: "default", requestId: "cross", userPrompt: "fix bdd in /Volumes/dev/tools/session-manager",
     namedActorIds: [actors.default[0].id!], crossWorkspaceOrigin: {} as never });
   assert.equal(crossWorkspace.projectId, dev, "the source workspace's quoted paths and names never pick the target project");
@@ -568,7 +571,10 @@ test("stakeholder prompt includes intact prior room conversation across roots an
     { id: "future", userPrompt: "Future request", status: "no_claims", replies: [{ actorId: "self", status: "opinion", text: "Future secret" }] }
   ] };
   const hooks = actorModelHooks({ getDomainActorRoom: async () => room } as unknown as SessionStore,
-    { runBackgroundJsonTask: async (_workspace: string, _purpose: string, input: string) => { prompt = input; return JSON.stringify({ text: "Taking this", claim: true, preparedPrompt: "Implement the agreed endpoint without changing its contract." }); } } as unknown as SessionSummarizer, "http://localhost");
+    { runBackgroundJsonTask: async (_workspace: string, purpose: string, input: string) => {
+      if (purpose === "actor_claim_scope_review") return JSON.stringify({ disposition: "keep", requiredRoundIds: [], scope: "" });
+      prompt = input; return JSON.stringify({ text: "Taking this", claim: true, preparedPrompt: "Implement the agreed endpoint without changing its contract." });
+    } } as unknown as SessionSummarizer, "http://localhost");
   await hooks.respond({ actor: { id: "self", workspaceId: "workspace", model: "gpt-6-luna", allowedModels: ["gpt-6-luna"], memory },
     round: room.rounds[1], treeActors: [], runningSessions: [], signal: new AbortController().signal } as unknown as Parameters<typeof hooks.respond>[0]);
   const context = JSON.parse(prompt.slice(prompt.indexOf('{"userPrompt"')));
@@ -925,6 +931,17 @@ test("null optional stakeholder fields are treated as omitted", async () => {
   assert.deepEqual(result, { text: "好，我做。", claim: true, claimKind: "full", preparedPrompt: "加 sub-actor 支援並驗證。" });
 });
 
+test("a claim keeps a supported proposed effort and drops an unusable one without failing the reply", async () => {
+  for (const [effort, expected] of [["xhigh", "xhigh"], ["extreme", undefined], [null, undefined]] as const) {
+    const hooks = actorModelHooks({} as SessionStore, { runBackgroundJsonTask: async () => JSON.stringify({ text: "好，我做。", claim: true,
+      preparedPrompt: "查根因。", effort }) } as unknown as SessionSummarizer, "http://localhost");
+    const result = await hooks.respond({ actor: { id: "actor", workspaceId: "workspace", model: "gpt-6-luna", allowedModels: ["gpt-6-luna"], memory },
+      round: { userPrompt: "查下" }, runningSessions: [], signal: new AbortController().signal } as unknown as Parameters<typeof hooks.respond>[0]);
+    assert.equal(result.effort, expected, String(effort));
+    assert.equal(result.claim, true);
+  }
+});
+
 test("claimed context rounds are limited to history the actor was shown", async () => {
   let value: object = {};
   const room = { rounds: [
@@ -933,7 +950,8 @@ test("claimed context rounds are limited to history the actor was shown", async 
     { id: "current", userPrompt: "做", status: "responding", replies: [] }
   ] };
   const hooks = actorModelHooks({ getDomainActorRoom: async () => room } as unknown as SessionStore,
-    { runBackgroundJsonTask: async () => JSON.stringify(value) } as unknown as SessionSummarizer, "http://localhost");
+    { runBackgroundJsonTask: async (_workspace: string, purpose: string) => JSON.stringify(purpose === "actor_claim_scope_review"
+      ? { disposition: "keep", requiredRoundIds: ["seen"], scope: "" } : value) } as unknown as SessionSummarizer, "http://localhost");
   const input = { actor: { id: "actor", workspaceId: "workspace", model: "gpt-6-luna", allowedModels: ["gpt-6-luna"], memory },
     round: room.rounds[2], runningSessions: [], signal: new AbortController().signal } as unknown as Parameters<typeof hooks.respond>[0];
   value = { text: "好，我做。", claim: true, preparedPrompt: "改用完整 composer。", contextRoundIds: ["seen", "unseen", "current", "seen"] };
@@ -1035,7 +1053,7 @@ test("contextRead evidence still fits when memory fills the input budget and ove
   const dir = mkdtempSync(join(tmpdir(), "actor-read-"));
   const big = { rolePrompt: "角".repeat(4000), roleSummary: "摘".repeat(4000), longTerm: "知".repeat(4000), rolling: "近".repeat(4000) };
   // A tight observed window leaves only a few KB beyond the stakeholder instructions.
-  const window = 40_000;
+  const window = 40_500;
   for (const [name, body, expectFull] of [["small", JSON.stringify({ kind: "browser-bridge-context", tabId: 1, text: "我嘗試讀取" }), true],
     ["large", JSON.stringify({ kind: "browser-bridge-context", tabId: 1, text: "我".repeat(8000) }), false]] as const) {
     const path = join(dir, `${name}.json`); writeFileSync(path, body);

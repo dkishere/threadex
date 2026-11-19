@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ExternalLink, Loader2, MessageCircle, RotateCcw, Users } from "lucide-react";
 import { actorRoundtablesPath, type ActorRoundtable, type ActorRoundtableView } from "../actorRoundtables";
 import type { RoundtableActor } from "../roundtable";
-import { defaultRoundtableActors, roundtableLibraryEndpoint, syncRoundtableDraftAvatars, type RoundtableLibrary, type RoundtablePreset } from "../roundtablePresets";
+import { defaultRoundtableActors, roundtableLibraryEndpoint, syncRoundtableDraftWithPresets, type RoundtableLibrary, type RoundtablePreset } from "../roundtablePresets";
 import { apiJson } from "./apiClient";
 import { ActorMultiSelect } from "./ActorMultiSelect";
 import { RoundtableLibraryPopup } from "./Roundtable";
@@ -32,7 +32,7 @@ export function useActorRoundtableDraft(workspaceId: string, gears: { model: str
   const [error, setError] = useState("");
   const loading = useRef(false);
   const stored = state.workspaceId === workspaceId ? state.actors : readActors(workspaceId);
-  const actors = syncRoundtableDraftAvatars(stored, presets);
+  const actors = syncRoundtableDraftWithPresets(stored, presets);
   const loadPresets = useCallback(async () => {
     const library = await apiJson<RoundtableLibrary>(roundtableLibraryEndpoint, { fresh: true });
     setPresets(library.actors); setError(""); return library.actors;

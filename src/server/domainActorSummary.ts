@@ -55,6 +55,12 @@ export function actorSummary(room: ActorRoom, running: ActorRunningSession[], ta
     return taskSessionTitle ? { ...structuredClone(blocker), taskSessionTitle } : structuredClone(blocker);
   });
   const liveWorkItemIds = new Set(running.map(session => session.workItemId));
+  const runningSessionIdsByActor = new Map<string, Set<string>>();
+  for (const { actorId, sessionId } of running) {
+    const sessionIds = runningSessionIdsByActor.get(actorId) ?? new Set<string>();
+    sessionIds.add(sessionId);
+    runningSessionIdsByActor.set(actorId, sessionIds);
+  }
   return { workspaceId: room.workspaceId, revision: room.revision, blockers, ...(projects ? { groups: actorGroupsWithActivity(room, actorProjectGroups(room.actors, projects)) } : {}), actors: room.actors.map(actor => {
     const members = new Set(actor.parentActorId === null
       ? [actor.id, ...room.actors.filter(candidate => candidate.parentActorId === actor.id).map(candidate => candidate.id)]
@@ -72,8 +78,12 @@ export function actorSummary(room: ActorRoom, running: ActorRunningSession[], ta
       if (actorWorkNeedsUser(room, item, liveWorkItemIds)) counts.attention++;
       else if (OPEN_STATUSES.has(item.status)) counts.open++;
     }
+    const runningSessions = Array.from(runningSessionIdsByActor.get(actor.id) ?? [], sessionId => ({
+      sessionId, title: taskSessionTitles.get(sessionId)?.trim() || `Untitled task (${sessionId})`
+    }));
     return { type: "worker" as const, id: actor.id, name: actor.name, rootActorId: actor.rootActorId, parentActorId: actor.parentActorId, model: actor.model,
-      ...(actor.avatar !== undefined ? { avatar: actor.avatar } : {}), ...(actor.projectIds?.length ? { projectIds: [...actor.projectIds] } : {}), counts, running: new Set(running.filter(session => session.actorId === actor.id).map(session => session.sessionId)).size,
+      ...(actor.avatar !== undefined ? { avatar: actor.avatar } : {}), ...(actor.projectIds?.length ? { projectIds: [...actor.projectIds] } : {}), counts,
+      running: runningSessions.length, runningSessions,
       unreadConclusions: actorDialogConclusions(room, actor.id).filter(conclusion => !conclusion.acknowledgedAt).length };
   }) };
 }

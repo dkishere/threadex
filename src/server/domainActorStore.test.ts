@@ -56,7 +56,9 @@ test("actor room CAS, baseline and memory event dedupe survive database reopen a
     await first.recordTokenUsage([{ id: "orphan", usageType: "agent", source: "test", inputTokens: 999, totalTokens: 999 },
       { id: "foreign", usageType: "agent", source: "test", workspaceId: "foreign", inputTokens: 555, totalTokens: 555 }]);
     await actors.captureCostBaseline("default");
-    await actors.create("default", { id: "root", name: "Root", model: MODEL_CATALOG.luna.id, memory });
+    const newRoot = await actors.create("default", { id: "root", name: "Root", model: MODEL_CATALOG.luna.id, memory });
+    assert.equal(newRoot.allowedModelTiers, null);
+    assert.equal(newRoot.allowedModels, undefined);
     const results = await Promise.allSettled([first, second].map((store, index) => new DomainActorStore(store).updateMemory({
       workspaceId: "default", actorId: "root", sourceEventId: `source-${index}`, baseVersion: 0, memory: { ...memory, rolling: `Update ${index}` } })));
     assert.equal(results.filter(result => result.status === "fulfilled").length, 1);
@@ -89,7 +91,8 @@ test("actor room CAS, baseline and memory event dedupe survive database reopen a
     });
     assert.deepEqual((await actors.runningSessions("default")).map(item => [item.actorId, item.sessionId]).sort(),
       [["root", "root-session"], ["sub", "queued-session"], ["sub", "sub-session"]]);
-    await actors.update("default", "root", { name: "Configured worker", model: MODEL_CATALOG.sol.id, effort: "max", allowedModels: [MODEL_CATALOG.sol.id], avatar: "data:image/png;base64,YQ==" });
+    await assert.rejects(actors.update("default", "root", { allowedModelTiers: ["claude-sonnet"] }), /Invalid actor model permissions/);
+    await actors.update("default", "root", { name: "Configured worker", model: MODEL_CATALOG.sol.id, effort: "max", allowedModelTiers: ["codex-sol"], avatar: "data:image/png;base64,YQ==" });
   } finally { await Promise.all([first.close(), second.close()]); }
   const reopened = new SessionStore(id);
   try {
@@ -99,7 +102,7 @@ test("actor room CAS, baseline and memory event dedupe survive database reopen a
     assert.equal(room.actors[0].name, "Configured worker");
     assert.equal(room.actors[0].model, MODEL_CATALOG.sol.id);
     assert.equal(room.actors[0].effort, "max");
-    assert.deepEqual(room.actors[0].allowedModels, [MODEL_CATALOG.sol.id]);
+    assert.deepEqual(room.actors[0].allowedModelTiers, ["codex-sol"]);
     assert.equal(room.actors[0].avatar, "data:image/png;base64,YQ==");
     assert.equal(room.actors[0].memory.version, 1); assert.equal(room.memoryErrors.length, 8);
     const luna = room.costBaseline?.usage.find(row => row.model === MODEL_CATALOG.luna.id);

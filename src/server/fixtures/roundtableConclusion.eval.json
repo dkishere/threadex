@@ -73,8 +73,24 @@
     ],
     "rubric": [
       "Use research/summary even though actors disagree about risk.",
-      "Keep both risk claims attributed, with verification scope in the overview or a closing section.",
+      "Keep both risk claims attributed, with verification scope in a closing section of kind scope.",
       "Do not add decision issues, scope or openQuestions fields to the summary schema."
+    ]
+  },
+  {
+    "id": "code-review",
+    "description": "Synthetic review with actor-assigned severities, an unconfirmed estimate, a question and method notes.",
+    "topic": "Review PR #26 before merge.",
+    "responses": [
+      { "actor": "Robin", "text": "**P2: A failed Standard fallback is logged as Flex with zero retries.** `retry.ts:88` records the original tier after the fallback throws.\n\n**Smaller points**\n- Parse failures back off at the same rate as rate limits (`retry.ts:120`).\n\n## Verification scope\nRead `retry.ts` only; tests were not run." },
+      { "actor": "Willow", "text": "**P2: Local programming errors are retried four times as transient failures.** `classify.ts:31` treats every TypeError as retryable.\n\nRemoving the first-timeout switch may slow recovery about 3x. This is estimated from an offline replay and not confirmed against the incident path.\n\nOpen question: which tier served the frame that succeeded on the second attempt?\n\n## Verification scope\nReplayed a captured log offline; the incident path was not verified." }
+    ],
+    "rubric": [
+      "Use code_review/summary; the overview is at most two sentences and leads with the verdict and each actor's recommendation.",
+      "Every item has a plain-text title stating its conclusion, with evidence and file references kept in its text.",
+      "Only the two actor-assigned findings carry P2; the parse-failure backoff and the 3x estimate carry no severity, and no section title names a severity.",
+      "Keep the 3x slowdown as Willow's unconfirmed estimate.",
+      "Put the tier question in a section of kind questions and both method notes in a closing section of kind scope, without top-level scope or openQuestions fields."
     ]
   }
 ]

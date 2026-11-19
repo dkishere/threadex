@@ -184,7 +184,7 @@ test("moves cannot widen project or model permissions unless the request sets th
   await reorganize(h, [moveToChisato, { op: "update", actorId: "chisato", changes: { projectIds: ["threadex", "other"] } }]);
   assert.equal(h.read().actors.find(actor => actor.id === "hatsune")!.rootActorId, "chisato");
 
-  h.seed(room => { room.actors.find(actor => actor.id === "anya")!.allowedModels = [luna]; room.actors.find(actor => actor.id === "anya")!.model = luna; });
+  h.seed(room => { room.actors.find(actor => actor.id === "anya")!.allowedModelTiers = ["codex-luna"]; room.actors.find(actor => actor.id === "anya")!.model = luna; });
   assert.ok(MODEL_OPTIONS.length > 1);
   await assert.rejects(h.service.reorganizeActors("ws", { requestId: "models", reason: "Move", operations: [
     { op: "move", actorId: "hatsune", parentActorId: "anya", expectedParentActorId: "chisato" },

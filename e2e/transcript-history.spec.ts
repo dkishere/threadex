@@ -7,6 +7,20 @@ const sessionUrl = `/?workspaceId=${workspaceId}&sessionId=${session.id}`;
 // Each timeline prompt also has a hidden copy, so match the rendered one.
 const prompt = (messages: Locator, index: number) => messages.getByText(`History prompt ${index}`, { exact: true }).filter({ visible: true });
 
+for (const view of [{ name: "standalone", hash: "" }, { name: "embedded", hash: "#view=workspace-chat" }]) {
+  test(`step-prefixed replies keep their turns visible in the ${view.name} transcript`, async ({ page }) => {
+    await page.goto(`${sessionUrl}${view.hash}`);
+    const sessionPane = page.locator(view.hash ? ".session-main-block" : ".chat:not(.session-main-block)");
+    const messages = sessionPane.locator(".messages-pane > .messages");
+    const { turnCount } = transcriptHistoryScenario;
+
+    for (const turnNumber of [turnCount - 1, turnCount]) {
+      await expect(prompt(messages, turnNumber)).toBeVisible();
+      await expect(messages.getByText(`Step ${turnNumber}: History response ${turnNumber}`, { exact: false })).toBeVisible();
+    }
+  });
+}
+
 for (const viewport of [{ width: 1280, height: 900 }, { width: 400, height: 844 }]) {
   test(`load earlier prepends turns without moving the reader at ${viewport.width}px`, async ({ page }) => {
     await page.setViewportSize(viewport);

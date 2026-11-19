@@ -384,9 +384,10 @@ existing actor, then `actor_create_root` with name, model and initial memory.
 To copy memory from existing actors at the user's request, read it with
 `actor_read_memory` (actorId, plus workspaceId for another workspace) and put
 the selected text in the new actor's initial memory. The server fixes the new
-root's parent to null. An actor caller's allowed models are inherited; a task
-without an actor binding gives the new root only its chosen model, which the
-user can widen in Settings. Creation does not start work or authorize
+root's parent to null. An actor caller's allowed model tiers are inherited.
+New roots created without an actor binding allow all tiers by default. Use
+`allowedModelTiers` to restrict a worker in Settings or a registry reorganization.
+Each tier follows its provider’s platform model guide. Creation does not start work or authorize
 delegation. Verify with `actor_list`; after an uncertain result, list before
 retrying to avoid duplicates. Do not request user login credentials.
 

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { actorPublishableConclusions, actorRoomForChat, actorRoundChatKey, emptyActorRoom, type ActorRoom, type ActorRound, type CreateDomainActor, type SubmitActorRequest } from "../domainActors";
-import { CURRENT_CODEX_TIER_MODELS, MODEL_CATALOG } from "../modelCatalog";
+import { actorAllowedModels, CURRENT_CODEX_TIER_MODELS, MODEL_CATALOG } from "../modelCatalog";
 import { DomainActorStore, ActorMemoryConflict, type ActorPersistence } from "./domainActorStore";
 import { DomainActorService, acceptedRoleChange, rejectedMemoryField, type DomainActorDependencies, type ActorTaskStart } from "./domainActorService";
 import { createDecisionPolicy, type DecisionAudit } from "./decision/policy";
@@ -16,7 +16,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { saveActorAttachments } from "./domainActorAttachments";
 import { actorModelHooks } from "./domainActorRunner";
-import { actorFollowupTurnId } from "./domainActorContext";
+import { actorRoundtableMessage } from "./actorRoundtables";
+import { actorExecutionMessage, actorFollowupTurnId } from "./domainActorContext";
 import { actorNativeAgentName, actorNativeSignals, actorSplitHostContext } from "./actorNativeAgents";
 import { actorSummary } from "./domainActorSummary";
 import { resolveActorTaskBinding } from "./domainActorProject";
@@ -85,6 +86,91 @@ function harness(overrides: Partial<DomainActorDependencies> = {}) {
   return { service, store, rooms, starts, decisions, deps, create, captures: () => captures };
 }
 const request = { workspaceId: "ws", requestId: "request", userPrompt: "Implement this" };
+test("a Composer mention resolves a fix in its review session without importing actor-chat instructions", async () => {
+  const priorActorRequest = "Change the actor registry settings";
+  const composerMessage = "@Nobara fix";
+  const targetSessionId = "review-session";
+  const reviewFinding = "Fix failure evidence on PR #26";
+  const h = harness({ listProjects: async () => [{ id: "review-project", name: "Review" }] });
+  await h.create("nobara");
+  await h.service.updateActor("ws", "nobara", { projectIds: ["review-project"] });
+  const priorActorRound = await h.service.submit({ ...request, userPrompt: priorActorRequest, namedActorIds: ["nobara"] });
+  await h.service.settled();
+  const hooks = actorModelHooks({
+    getDomainActorRoom: (workspaceId: string) => h.service.getRoom(workspaceId),
+    inspectSession: async (input: unknown) => {
+      assert.deepEqual(input, { sessionId: targetSessionId, workspaceId: "ws", status: "done", order: "desc", turnLimit: 4, maxTextChars: 2000 });
+      return { session: { id: targetSessionId, workspaceId: "ws" }, turns: [
+        { created: "2026-10-20T00:00:00Z", userInput: priorActorRequest, agentResponse: "Registry preview", requestMetadata: { promptOrigin: { kind: "inter-actor" } } },
+        { created: "2026-10-19T00:00:00Z", userInput: "anything to fix?", agentResponse: reviewFinding },
+        { created: "2999-10-19T00:00:00Z", userInput: "Future request", agentResponse: "Future reply" },
+        { created: "2026-10-18T00:00:00Z", userInput: actorRoundtableMessage("Review PR #26", priorActorRequest),
+          agentResponse: "Review summary", requestMetadata: { roundtable: true } }
+      ] };
+    }
+  } as unknown as SessionStore, {
+    runBackgroundJsonTask: async (_workspace: string, _task: string, prompt: string) => {
+      const context = JSON.parse(prompt.slice(prompt.indexOf('\n\n{"userPrompt"') + 2));
+      assert.deepEqual(context.composerSessionExcerpt, [
+        { userMessage: "Review PR #26", assistantReply: "Review summary" },
+        { userMessage: "anything to fix?", assistantReply: reviewFinding }
+      ]);
+      assert.ok(!prompt.includes(priorActorRequest));
+      assert.ok(!prompt.includes("Future request"));
+      return JSON.stringify({ intent: "work", inRole: true, claim: true, claimKind: "full",
+        text: reviewFinding, preparedPrompt: reviewFinding, contextRoundIds: [priorActorRound.id] });
+    }
+  } as unknown as SessionSummarizer, "http://localhost");
+  h.deps.respond = hooks.respond;
+  const mentionRound = await h.service.submit({ ...request, requestId: "composer-mention", userPrompt: composerMessage, namedActorIds: ["nobara"],
+    sessionTarget: { sessionId: targetSessionId, projectId: "review-project", model: MODEL_CATALOG.luna.id } });
+  await h.service.settled();
+  const start = h.starts.at(-1)!;
+  assert.equal(start.workItem.roundId, mentionRound.id);
+  assert.equal(start.sessionId, targetSessionId);
+  assert.equal(start.executor.id, "nobara");
+  assert.equal(start.workItem.sessionScope, "turn");
+  assert.deepEqual(start.workItem.canonicalUserMessages, [composerMessage]);
+  assert.equal(start.workItem.preparedPrompt, reviewFinding);
+  assert.equal(actorExecutionMessage(start.userPrompt, start.workItem),
+    `Original user request (canonical authorization):\n${composerMessage}\n\nActor-prepared execution brief:\n${reviewFinding}`);
+});
+
+test("a missing-task report dispatches only creation repair even when peers also claim the missing task's contents", async () => {
+  const h = harness({ respond: async () => ({ text: "Noted", claim: false }) });
+  await h.create("routing");
+  await h.create("model-effort");
+  const effortRequest = "我覺得actor 開task 普遍reasoning effort 俾太低";
+  const prior = await h.service.submit({ ...request, userPrompt: effortRequest });
+  const repair = "核對畫面連結同派工記錄，修正冇建立 task 嘅原因。";
+  const staleWork = "Raise reasoning effort to xhigh";
+  const hooks = actorModelHooks({ getDomainActorRoom: () => h.service.getRoom("ws") } as unknown as SessionStore, {
+    runBackgroundJsonTask: async (_workspace: string, purpose: string, prompt: string, options: { lane: string }) => {
+      const routing = options.lane.endsWith(":routing");
+      if (purpose === "actor_claim_scope_review") {
+        const evidence = JSON.parse(prompt.slice(prompt.lastIndexOf("\n\n") + 2));
+        assert.equal(evidence.currentRequest, "無建立task");
+        assert.equal(evidence.selectedHistory[0].userPrompt, effortRequest);
+        return JSON.stringify({ disposition: routing ? "narrow" : "unrelated", requiredRoundIds: [],
+          scope: routing ? repair : "呢個係開 task 嘅問題。" });
+      }
+      return JSON.stringify({ intent: "work", inRole: true, claim: true, claimKind: "full", text: staleWork,
+        preparedPrompt: routing ? repair + staleWork : staleWork, title: staleWork, contextRoundIds: [prior.id] });
+    }
+  } as unknown as SessionSummarizer, "http://localhost");
+  h.deps.respond = hooks.respond;
+  const report = await h.service.submit({ ...request, requestId: "missing-task", userPrompt: "無建立task" });
+  await h.service.settled();
+  assert.equal(report.ownerActorId, "routing");
+  assert.equal(report.replies.find(reply => reply.actorId === "model-effort")?.status, "opinion");
+  assert.equal(h.starts.length, 1);
+  const [start] = h.starts;
+  assert.equal(start.workItem.preparedPrompt, repair);
+  assert.deepEqual(start.workItem.canonicalUserMessages, ["無建立task"]);
+  assert.deepEqual(start.advisories.map(advice => advice.text), [repair]);
+  assert.ok(!JSON.stringify(start.workItem).includes(staleWork));
+});
+
 test("deleting workers archives their full identity, reserves IDs and preserves task and discussion history", async () => {
   const h = harness(); await h.create("a"); await h.create("child", { parentActorId: "a" });
   await assert.rejects(h.service.deleteActor("ws", "a"), /sub-workers first/);
@@ -405,8 +491,8 @@ test("group fast track queues same-context work before picking and keeps only th
   const note = updates[0].sourceNote ?? "";
   assert.match(note, new RegExp(`^\\[Threadex Actors room message\\] Source: Actors group chat \\(workspace ws; round ${round.id}\\)\\. Sender: the user\\.`));
   assert.match(note, /Recent Actors group chat messages before it/);
-  assert.match(note, /- User: Composer edit 3/); assert.match(note, /- User: Composer edit 2/);
-  assert.doesNotMatch(note, /Composer edit 1|PRIVATE SECRET|Also remove the adjacent/, "only the two latest earlier group rounds, never private rounds or the message itself");
+  assert.match(note, /- User: Composer edit 3/);
+  assert.doesNotMatch(note, /Composer edit [12]|PRIVATE SECRET|Also remove the adjacent/, "only the matched task, even when another recent task used similar wording");
   assert.equal((await h.service.getRoom("ws")).rounds.find(item => item.id === round.id)!.continuation!.sourceNote, note, "the note is frozen for retries");
   await Promise.all([h.service.submit(input), h.service.submit(input)]);
   assert.equal(fastCalls, 1); assert.equal(updates.length, 1); assert.equal(h.starts.length, 5);
@@ -554,6 +640,21 @@ test("legacy individual retries retain their saved task selection and binding", 
   assert.deepEqual(retried.taskSelection, original.taskSelection); assert.equal(h.starts.length, 1);
 });
 
+test("fast track never continues a task whose session was archived", async () => {
+  const h = harness(); await h.create("a"); await h.service.submit(request);
+  await h.store.change("ws", room => { room.workItems[0].status = "completed"; room.archivedSessionIds = [room.workItems[0].taskSessionId]; });
+  h.deps.updateTask = async () => { assert.fail("an archived task session must not be continued"); };
+  const decide = h.deps.decide;
+  let fastCalls = 0;
+  h.deps.decide = async req => {
+    if (req.questions[0].id === "fastTrack") fastCalls++;
+    return decide(req);
+  };
+  const round = await h.service.submit({ ...request, requestId: "after-archive", userPrompt: "Continue the same edit" });
+  assert.equal(fastCalls, 0);
+  assert.notEqual(round.status, "routing_failed", round.error ?? undefined);
+});
+
 test("fast track never continues a task from another project's chat", async () => {
   const h = harness({ listProjects: async () => [{ id: "p1", name: "One" }, { id: "p2", name: "Two" }] });
   await h.create("a"); await h.service.updateActor("ws", "a", { projectIds: ["p1", "p2"] });
@@ -631,6 +732,18 @@ test("picking after a declined fast track sees the direct previous request and r
   }
 });
 
+test("a correction after an unclaimed group request gives picking that request as context without fast track", async () => {
+  const h = harness({ respond: async () => ({ text: "Not mine", claim: false }) });
+  await h.create("a"); await h.create("b");
+  const unclaimed = await h.service.submit({ ...request, userPrompt: "implement the role CD config update in ABC patch" });
+  assert.equal(unclaimed.status, "no_claims");
+  h.deps.updateTask = async () => { assert.fail("an unclaimed request has no task to queue onto"); };
+  await h.service.submit({ ...request, requestId: "correction", userPrompt: "no, it's a CD task" });
+  assert.equal(h.decisions.filter(req => req.questions[0].id === "fastTrack").length, 0);
+  const pick = h.decisions.filter(req => req.purpose === "sh_pick").at(-1)!;
+  assert.deepEqual(JSON.parse(pick.state).recentRequests, [{ userPrompt: "implement the role CD config update in ABC patch", claimantIds: [] }]);
+});
+
 test("normal session selection admits similar follow-ups without explicit context selection", async () => {
   const deliveries: string[] = [];
   const h = harness({ updateTask: async input => { deliveries.push(input.workItem.id); } }); await h.create("a");
@@ -652,9 +765,9 @@ test("uncertain fast-track delivery retries the same reference without new work 
   };
   const input = { ...request, requestId: "lost-fast-receipt", userPrompt: "Continue the same Composer change" };
   assert.match((await h.service.submit(input)).error!, /Receipt lost/);
-  await h.store.change("ws", room => { room.actors[0].allowedModels = [MODEL_CATALOG.astra.id]; });
+  await h.store.change("ws", room => { room.actors[0].allowedModelTiers = ["codex-astra"]; });
   assert.match((await h.service.submit(input)).error!, /permissions changed/); assert.equal(calls, 1);
-  await h.store.change("ws", room => { room.actors[0].allowedModels.push(MODEL_CATALOG.luna.id); });
+  await h.store.change("ws", room => { room.actors[0].allowedModelTiers = ["codex-astra", "codex-luna"]; });
   const round = await h.service.submit(input);
   assert.equal(round.workItemId, first.workItemId); assert.equal(round.status, "assigned"); assert.equal(calls, 2); assert.equal(h.starts.length, 1);
 });
@@ -875,6 +988,21 @@ test("continuation candidates exclude foreign executors and invisible private co
   assert.equal(h.starts.length, 3); assert.equal(h.decisions.filter(req => req.questions[0].id === "session").length, 0);
 });
 
+test("an archived task session is never a continuation candidate, so a valid claim starts a new task", async () => {
+  const h = harness({ updateTask: async () => { assert.fail("an archived task session must not be continued"); } }); await h.create("a");
+  const first = await h.service.submit({ ...request, namedActorIds: ["a"] });
+  await h.store.change("ws", room => { room.workItems[0].status = "completed"; room.archivedSessionIds = [room.workItems[0].taskSessionId]; });
+  h.deps.respond = async () => ({ text: "Continue", claim: true, preparedPrompt: "Continue existing work", contextRoundIds: [first.id] });
+  const round = await h.service.submit({ ...request, requestId: "after-archive", namedActorIds: ["a"] });
+  assert.notEqual(round.status, "routing_failed", round.error ?? undefined);
+  assert.equal(round.continuation?.workItem, undefined);
+  assert.equal(h.decisions.filter(req => req.questions[0].id === "session").length, 0);
+  const room = await h.service.getRoom("ws");
+  assert.equal(h.starts.length, 2); assert.equal(room.workItems.length, 2);
+  assert.notEqual(room.workItems[1].taskSessionId, room.workItems[0].taskSessionId);
+  await h.service.settled();
+});
+
 test("continuation permission changes and uncertain receipts never fall back to duplicate work", async () => {
   let calls = 0;
   const h = harness({ updateTask: async () => { if (++calls === 1) throw new Error("Receipt lost"); } }); await h.create("a");
@@ -883,10 +1011,10 @@ test("continuation permission changes and uncertain receipts never fall back to 
   h.deps.respond = async () => ({ text: "Continue", claim: true, preparedPrompt: "Continue", contextRoundIds: [first.id] });
   const input = { ...request, requestId: "uncertain-continuation", namedActorIds: ["a"] };
   assert.equal((await h.service.submit(input)).status, "routing_failed");
-  await h.store.change("ws", room => { room.actors[0].allowedModels = [MODEL_CATALOG.astra.id]; });
+  await h.store.change("ws", room => { room.actors[0].allowedModelTiers = ["codex-astra"]; });
   assert.match((await h.service.submit(input)).error!, /permissions changed/);
   assert.equal(calls, 1); assert.equal(h.starts.length, 1);
-  await h.store.change("ws", room => { room.actors[0].allowedModels.push(MODEL_CATALOG.luna.id); });
+  await h.store.change("ws", room => { room.actors[0].allowedModelTiers = ["codex-astra", "codex-luna"]; });
   assert.equal((await h.service.submit(input)).status, "assigned");
   assert.equal(calls, 2); assert.equal(h.starts.length, 1);
 });
@@ -1474,15 +1602,15 @@ test("an incompatible default requires model selection instead of allowed[0]", a
   h.deps.decide = async req => {
     assert.deepEqual(req.questions.map(q => q.id), ["model", "workload_kind"]);
     const result = await decide(req);
-    return result.ok ? { ...result, answers: { model: { kind: "choice", choice: MODEL_CATALOG.astra.id, confidence: 1 } } } : result;
+    return result.ok ? { ...result, answers: { model: { kind: "choice", choice: CURRENT_CODEX_TIER_MODELS.astra, confidence: 1 } } } : result;
   };
   await h.service.submit({ ...request, namedActorIds: ["a"], responseProfile: { model: MODEL_CATALOG.luna.id, effort: "low" } });
-  assert.equal(h.starts[0].workItem.model, MODEL_CATALOG.astra.id);
+  assert.equal(h.starts[0].workItem.model, CURRENT_CODEX_TIER_MODELS.astra);
   await h.service.settled();
 });
 
 test("task effort follows the selected tier and Decision's workload kind without changing the actor's setting", async () => {
-  const cases: Array<[string, string, string]> = [[MODEL_CATALOG.luna.id, "reasoning", "high"], [MODEL_CATALOG.luna.id, "mechanical", "medium"], [MODEL_CATALOG.sol61.id, "reasoning", "medium"]];
+  const cases: Array<[string, string, string]> = [[MODEL_CATALOG.luna.id, "reasoning", "xhigh"], [MODEL_CATALOG.luna.id, "mechanical", "medium"], [CURRENT_CODEX_TIER_MODELS.sol, "reasoning", "medium"]];
   for (const [model, workloadKind, expected] of cases) {
     const h = harness();
     await h.create("a", { model: MODEL_CATALOG.claudeOpus.id, effort: "medium", allowedModels: [MODEL_CATALOG.claudeOpus.id, MODEL_CATALOG.luna.id, MODEL_CATALOG.sol61.id] });
@@ -1497,6 +1625,18 @@ test("task effort follows the selected tier and Decision's workload kind without
     assert.equal(h.starts[0].workItem.model, model);
     assert.equal(h.starts[0].workItem.executionEffort, expected, `${model} ${workloadKind}`);
     assert.equal((await h.service.listActors("ws"))[0].effort, "medium");
+    await h.service.settled();
+  }
+});
+
+test("a claiming actor's proposed effort raises the task effort above the floor but never lowers it", async () => {
+  for (const [proposed, expected] of [["xhigh", "xhigh"], ["low", "medium"], [undefined, "medium"]] as const) {
+    const h = harness({ respond: async () => ({ text: "Do it", claim: true, preparedPrompt: "Investigate", model: MODEL_CATALOG.sol61.id, ...(proposed ? { effort: proposed } : {}) }) });
+    await h.create("a", { model: MODEL_CATALOG.sol61.id, effort: "medium", allowedModels: [MODEL_CATALOG.sol61.id] });
+    const round = await h.service.submit({ ...request, namedActorIds: ["a"] });
+    assert.equal(round.replies[0].proposedEffort, proposed, String(proposed));
+    assert.equal(h.starts[0].workItem.executionEffort, expected, String(proposed));
+    assert.equal((await h.service.listActors("ws"))[0].effort, "medium", "the actor's saved effort is unchanged");
     await h.service.settled();
   }
 });
@@ -2645,6 +2785,22 @@ test("when no claimant may read every private context, the owner runs without th
   await h.service.settled();
 });
 
+test("a private round used only as a reference protects peer scopes, briefs and dispatch advice", async () => {
+  const h = harness({ respond: async () => ({ text: "Advice", claim: false }) });
+  await h.create("a"); await h.create("b");
+  const privateRound = await h.service.submit({ ...request, requestId: "private-detail", userPrompt: "Secret task detail", namedActorIds: ["b"] });
+  h.deps.respond = async ({ actor }) => ({ ...partialReply, text: actor.id === "a" ? "Repair delivery" : "Secret reference in advice",
+    claimScope: actor.id === "a" ? "Repair delivery" : "Secret reference in scope",
+    preparedPrompt: actor.id === "a" ? "Repair delivery" : "Secret reference in brief",
+    ...(actor.id === "b" ? { briefContextRoundIds: [privateRound.id] } : {}) });
+  const round = await h.service.submit({ ...request, requestId: "delivery", userPrompt: "Repair delivery" });
+  const [start] = h.starts;
+  assert.equal(round.ownerActorId, "a");
+  assert.deepEqual(start.workItem.canonicalUserMessages, ["Repair delivery"]);
+  assert.doesNotMatch(JSON.stringify([start.workItem.preparedPrompt, start.advisories]), /Secret/);
+  await h.service.settled();
+});
+
 test("partial splitting shares selected group requirements omitted by another claimant's peer-history cap", async () => {
   const h = harness({ respond: async () => ({ text: "Advice", claim: false }) });
   await h.create("a"); await h.create("b"); await h.create("c");
@@ -2784,8 +2940,8 @@ test("a response gear does not change actor task permissions or execution model 
   const round = await h.service.submit({ ...request, namedActorIds: ["actor"], responseProfile: { model: MODEL_CATALOG.sol.id, effort: "high" } });
   assert.equal(round.status, "awaiting_pickup");
   assert.equal(h.starts[0].workItem.model, MODEL_CATALOG.luna.id);
-  assert.equal(h.starts[0].workItem.executionEffort, "high", "a lighter model is raised to the light-tier floor, not to the response gear");
-  assert.deepEqual((await h.service.listActors("ws"))[0].allowedModels, [MODEL_CATALOG.luna.id]);
+  assert.equal(h.starts[0].workItem.executionEffort, "xhigh", "a lighter model is raised to the light-tier floor, not to the response gear");
+  assert.deepEqual((await h.service.listActors("ws"))[0].allowedModelTiers, ["codex-luna"]);
   await h.service.settled();
 });
 
@@ -2994,7 +3150,7 @@ test("a Claude host starts a hosted handoff in place with the Agent tool, and th
   const { h, parent, input } = await handoffSetup(true, { updateTask: async update => { updates.push(update); } });
   await h.store.change("ws", room => {
     room.workItems[0].model = MODEL_CATALOG.claudeOpus.id;
-    for (const actor of room.actors) actor.allowedModels = [MODEL_CATALOG.claudeOpus.id];
+    for (const actor of room.actors) actor.allowedModelTiers = ["claude-opus"];
   });
   const { mode: _mode, ...hosted } = input;
   const result = await h.service.delegateParallel({ ...hosted, sourceTurnId: parent.taskTurnId });
@@ -3445,7 +3601,7 @@ test("memory CAS deduplicates source events and cannot mutate system permissions
   const update = { workspaceId: "ws", actorId: "a", sourceEventId: "event", baseVersion: 0,
     memory: { ...memory, rolling: "Updated", allowedModels: ["forged"] } };
   const written = await h.store.updateMemory(update);
-  assert.equal(written.memory.version, 1); assert.deepEqual(written.allowedModels, original.allowedModels);
+  assert.equal(written.memory.version, 1); assert.deepEqual(written.allowedModelTiers, original.allowedModelTiers);
   assert.equal((await h.store.updateMemory(update)).memory.version, 1);
   const results = await Promise.allSettled(["one", "two"].map(sourceEventId => h.store.updateMemory({ ...update, sourceEventId, baseVersion: 1 })));
   assert.equal(results.filter(result => result.status === "fulfilled").length, 1);
@@ -3923,7 +4079,7 @@ test("a failed winning claim model Decision dispatches the winner with a permitt
   const winner = round.replies.find(reply => reply.actorId === "a")!;
   assert.equal(winner.modelFallback, "decision_failed");
   const actor = (await h.service.getRoom("ws")).actors.find(actor => actor.id === "a")!;
-  assert.ok(actor.allowedModels.includes(winner.model!));
+  assert.ok(actorAllowedModels(actor).includes(winner.model!));
   assert.equal(h.starts.length, 1); assert.equal(h.starts[0].workItem.model, winner.model);
   assert.ok(h.decisions.some(req => req.purpose === "claim_tiebreak"));
   await new DomainActorService(h.store, h.deps).submit({ ...request, namedActorIds: ["a", "b"] });
@@ -3966,11 +4122,34 @@ test("claim model choices use owner/executor permission intersection and an empt
   await h.create("root", { allowedModels: [MODEL_CATALOG.luna.id, MODEL_CATALOG.sol61.id] });
   await h.create("sub", { parentActorId: "root", model: MODEL_CATALOG.sol61.id, allowedModels: [MODEL_CATALOG.sol61.id, MODEL_CATALOG.claudeHaiku.id] });
   const round = await h.service.submit({ ...request, namedActorIds: ["root"] });
-  assert.equal(round.replies[0].model, MODEL_CATALOG.sol61.id);
+  assert.equal(round.replies[0].model, CURRENT_CODEX_TIER_MODELS.sol);
   assert.deepEqual(h.decisions.map(req => req.questions.map(q => q.id)), [["model", "workload_kind"]]);
   await h.service.updateActor("ws", "root", { allowedModels: [MODEL_CATALOG.luna.id] });
   const empty = await h.service.submit({ ...request, requestId: "empty-intersection", namedActorIds: ["root"] });
   assert.equal(empty.status, "routing_failed"); assert.equal(empty.replies[0].text, "Sub should execute"); assert.equal(h.starts.length, 1);
+  await h.service.settled();
+});
+
+test("legacy Sol permission follows the current tier, while an explicit old version still works", async () => {
+  const h = harness();
+  const actor = await h.create("a");
+  assert.equal(actor.allowedModelTiers, null, "new root workers default to all tiers");
+  await h.store.change("ws", room => {
+    const existing = room.actors[0];
+    delete existing.allowedModelTiers;
+    existing.allowedModels = [MODEL_CATALOG.sol61.id];
+    existing.model = MODEL_CATALOG.sol61.id;
+  });
+  for (const [index, [requested, expected]] of [
+    ["Sol", CURRENT_CODEX_TIER_MODELS.sol],
+    [MODEL_CATALOG.sol61.id, MODEL_CATALOG.sol61.id]
+  ].entries()) {
+    await h.service.submit({ ...request, requestId: `version-${index}`, userPrompt: `Implement this using ${requested}`, namedActorIds: ["a"] });
+    assert.equal(h.starts.at(-1)?.workItem.model, expected);
+  }
+  await h.service.submit({ ...request, requestId: "other-tier", userPrompt: "Implement using Astra", namedActorIds: ["a"] });
+  assert.equal(h.starts.length, 2);
+  assert.equal((await h.service.listActors("ws"))[0].model, MODEL_CATALOG.sol61.id);
   await h.service.settled();
 });
 
@@ -4111,8 +4290,16 @@ test("a cross-workspace handoff runs as the target workspace's own individual ro
   await h.service.createActor("other", { id: "dev", name: "貓貓 · dev-env", model: MODEL_CATALOG.luna.id, memory });
   await h.service.submit({ ...request, namedActorIds: ["a"], approvalPolicy: "never" });
   const source = (await h.service.getRoom("ws")).workItems[0];
+  const unrelatedUserMessage = "Change the rules for opening tasks in single-actor chat";
+  const authorization = "請叫貓貓補 dev-env 嘅 bucket";
+  const correction = "係，用 local-staging";
+  const generatedEnvelope = "Execution brief containing the old actor chat request";
+  await h.store.change("ws", room => {
+    room.workItems[0].canonicalUserMessages = [unrelatedUserMessage, generatedEnvelope, request.userPrompt];
+  });
   const input = { workspaceId: "ws", workspaceName: "Threadex", workItemId: source.id, sourceActorId: "a", sourceSessionId: source.taskSessionId, sourceTurnId: "turn-2",
-    userMessages: [request.userPrompt, "請叫貓貓補 dev-env 嘅 bucket", "係"], requestId: "xws-1", targetWorkspaceId: "other", targetActorId: "dev", task: "Create bucket local-staging" };
+    userMessages: [unrelatedUserMessage, authorization, correction].map(text => ({ text })),
+    requestId: "xws-1", targetWorkspaceId: "other", targetWorkspaceName: "Default", targetActorId: "dev", task: "Create bucket local-staging" };
   const record = async () => (await h.service.getRoom("ws")).workItems[0].crossWorkspaceHandoffs?.find(item => item.requestId === input.requestId);
   const settle = async () => { for (let i = 0; i < 200 && (await record())?.status === "pending"; i++) await new Promise(resolve => setTimeout(resolve, 5)); };
 
@@ -4125,7 +4312,38 @@ test("a cross-workspace handoff runs as the target workspace's own individual ro
   const decide = h.deps.decide;
   h.deps.decide = async request => {
     const result = await decide(request);
-    if (result.ok && result.answers.authorization) result.answers.authorization = { kind: "choice", choice: "allow", confidence: 1 };
+    if (result.ok && result.answers.authorization) {
+      result.answers.authorization = { kind: "choice", choice: "allow", confidence: 1 };
+      if (request.audit.workItemId?.endsWith(":xws-2")) {
+        assert.deepEqual(JSON.parse(request.state).userMessages, input.userMessages, "the service does not add the canonical snapshot");
+        result.answers.evidence_1 = { kind: "choice", choice: "forward", confidence: 1 };
+        result.answers.evidence_2 = { kind: "choice", choice: "forward", confidence: 1 };
+      }
+      if (request.audit.workItemId?.endsWith(":uncertain-correction")) {
+        result.answers.evidence_1 = { kind: "choice", choice: "forward", confidence: 1 };
+        result.answers.evidence_2 = { kind: "choice", choice: "forward", confidence: 0.1 };
+      }
+      if (request.audit.workItemId?.endsWith(":uncertain-omission")) {
+        result.answers.evidence_1 = { kind: "choice", choice: "forward", confidence: 1 };
+        result.answers.evidence_2 = { kind: "choice", choice: "omit", confidence: 0.1 };
+      }
+      if (request.audit.workItemId?.includes(":long-history:")) {
+        assert.ok(request.questions.length <= 400);
+        assert.equal(JSON.parse(request.state).userMessages.at(-1).text, correction);
+        for (const [index, value] of [[0, authorization], [399, correction]] as const) {
+          const id = `evidence_${index}`;
+          if (Object.hasOwn(result.answers, id)) {
+            assert.equal(JSON.parse(request.state).userMessages[index].text, value);
+            result.answers[id] = { kind: "choice", choice: "forward", confidence: 1 };
+          }
+        }
+      }
+      if (request.audit.workItemId?.endsWith(":later-refusal")) {
+        const messages = JSON.parse(request.state).userMessages;
+        assert.deepEqual(messages.at(-1), { text: "唔好建立 bucket", question: "Create the bucket?" });
+        result.answers.authorization = { kind: "choice", choice: "deny", confidence: 1 };
+      }
+    }
     return result;
   };
   const allowed = { ...input, requestId: "xws-2" };
@@ -4135,9 +4353,10 @@ test("a cross-workspace handoff runs as the target workspace's own individual ro
   const target = await h.service.getRoom("other");
   assert.equal(target.rounds.length, 1);
   const round = target.rounds[0];
-  assert.equal(round.userPrompt, input.userMessages.join("\n\n"), "the user's own words, oldest first, stay the canonical request");  assert.deepEqual(round.namedActorIds, ["dev"]);
+  assert.equal(round.userPrompt, [authorization, correction].join("\n\n"), "only scoped user evidence is carried verbatim, oldest first");
+  assert.deepEqual(round.namedActorIds, ["dev"]);
   assert.deepEqual(round.crossWorkspaceOrigin, { sourceWorkspaceId: "ws", sourceWorkspaceName: "Threadex", sourceSessionId: source.taskSessionId, sourceTurnId: "turn-2",
-    sourceActorId: "a", sourceActorName: "a", sourceRequestId: "xws-2", task: input.task });
+    sourceActorId: "a", sourceActorName: "a", sourceRequestId: "xws-2", task: input.task, userMessages: [authorization, correction] });
   assert.equal(round.approvalPolicy, undefined, "the source session's approval policy is never inherited");
   const start = h.starts.find(start => start.workspaceId === "other")!;
   assert.equal(start.executor.id, "dev");
@@ -4146,10 +4365,27 @@ test("a cross-workspace handoff runs as the target workspace's own individual ro
   assert.equal(h.starts.find(start => start.workspaceId === "ws")!.approvalPolicy, "never");
   const saved = (await record())!;
   assert.equal(saved.status, "submitted"); assert.equal(saved.targetRoundId, round.id);
+  assert.deepEqual(saved.forwardedUserMessages, [authorization, correction]);
+  assert.equal(saved.authorizationEvidenceDigest, undefined, "the pending Decision fingerprint is cleared after settlement");
   assert.equal(saved.sourceActorId, "a"); assert.equal(saved.targetActorId, "dev"); assert.equal(saved.targetActorName, "貓貓 · dev-env"); assert.equal(saved.targetWorkspaceId, "other");
 
   const retried = await h.service.handoffAcrossWorkspaces(allowed);
   assert.equal(retried.targetRoundId, round.id); assert.equal((await h.service.getRoom("other")).rounds.length, 1, "a retry never creates a second round");
+  await assert.rejects(h.service.handoffAcrossWorkspaces({ ...allowed, requestId: "no-evidence" }), /did not identify user instructions naming the destination/);
+  assert.equal((await h.service.getRoom("other")).rounds.length, 1, "an allow vote without forwarding evidence creates no target round");
+  await assert.rejects(h.service.handoffAcrossWorkspaces({ ...allowed, requestId: "uncertain-correction" }), /uncertain which user instructions/);
+  await assert.rejects(h.service.handoffAcrossWorkspaces({ ...allowed, requestId: "uncertain-omission" }), /uncertain which user instructions/);
+  await assert.rejects(h.service.handoffAcrossWorkspaces({ ...allowed, requestId: "later-refusal", userMessages: [
+    ...allowed.userMessages, { text: "唔好建立 bucket", question: "Create the bucket?" }
+  ] }), /Decision chose deny/);
+  assert.equal((await h.service.getRoom("other")).rounds.length, 1, "an uncertain correction or later refusal creates no target round");
+  input.requestId = "long-history";
+  await h.service.handoffAcrossWorkspaces({ ...allowed, requestId: input.requestId, userMessages: [
+    { text: authorization }, ...Array.from({ length: 398 }, () => ({ text: unrelatedUserMessage })), { text: correction }
+  ] });
+  await settle();
+  assert.deepEqual((await record())?.forwardedUserMessages, [authorization, correction]);
+  assert.equal(h.decisions.filter(item => item.audit.workItemId?.includes(":long-history:")).length, 2);
   await assert.rejects(h.service.handoffAcrossWorkspaces({ ...allowed, task: "Something else" }), /reused/);
   await assert.rejects(h.service.handoffAcrossWorkspaces({ ...allowed, requestId: "same-ws", targetWorkspaceId: "ws", targetActorId: "a" }), /Choose one actor/);
   await assert.rejects(h.service.handoffAcrossWorkspaces({ ...allowed, requestId: "forged", sourceActorId: "dev" }), /bound work item/);

@@ -1,6 +1,7 @@
 import { STATE_DATA_INSTRUCTION, type BackendId, type Decision, type DecisionAnswer, type DecisionAttempt, type DecisionBackend, type DecisionRequest, type DecisionResult, type DecisionUsage, type PurposePolicy } from "./types";
 
 export const DEFAULT_POLICY: PurposePolicy = { order: ["jev"], threshold: { jev: 0.5, openai: 0.5, llm: 0.7 } };
+export const MAX_DECISION_QUESTIONS = 400;
 export function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
@@ -38,7 +39,7 @@ export function validatedAnswers(req: DecisionRequest, raw: unknown): Record<str
 export function validRequest(req: DecisionRequest): boolean {
   return typeof req.state === "string" && Boolean(req.purpose && req.audit.workspaceId)
     && (req.timeoutMs === undefined || (Number.isFinite(req.timeoutMs) && req.timeoutMs > 0 && req.timeoutMs <= 120_000))
-    && req.questions.length > 0 && req.questions.length <= 400
+    && req.questions.length > 0 && req.questions.length <= MAX_DECISION_QUESTIONS
     && new Set(req.questions.map(q => q.id)).size === req.questions.length
     && req.questions.every(q => q.id.length > 0 && q.instructions.length > 0 && (q.kind === "predicate"
       || q.kind === "choice" && Object.keys(q.options).length > 0 && Object.entries(q.options).every(([id, criterion]) => id.length > 0 && typeof criterion === "string")

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { MODEL_OPTIONS, modelEfforts, normalizeModelId } from "../modelCatalog";
+import { ACTOR_MODEL_TIERS, MODEL_OPTIONS, actorAllowedModels, actorAllowedModelTiers, modelEfforts, normalizeModelId, type ActorModelPermissions } from "../modelCatalog";
 import type { ActorMemoryContent, ActorRoom, CreateDomainActor, DomainActor, UpdateDomainActor } from "../domainActors";
 import type { SessionStore } from "./sessionStore";
 import { captureActorConclusions, newActorConclusions } from "../actorConclusions";
@@ -63,11 +63,31 @@ export function validateActorMemory(memory: ActorMemoryContent) {
 }
 function validateActor(actor: DomainActor) {
   if (!actor.name.trim() || actor.name.length > 80) throw new Error("Actor name must contain 1–80 characters.");
-  if (!actor.allowedModels.length || actor.allowedModels.some(model => !MODEL_OPTIONS.includes(model))
-    || !actor.allowedModels.includes(actor.model) || !modelEfforts(actor.model).includes(actor.effort as never)) throw new Error("Invalid actor model permissions or effort.");
+  const allowed = actorAllowedModels(actor);
+  if (!allowed.includes(actor.model) || !modelEfforts(actor.model).includes(actor.effort as never)) throw new Error("Invalid actor model permissions or effort.");
   validateActorMemory(actor.memory);
 }
 export function validateActorRegistryEntry(actor: DomainActor) { validateActor(actor); }
+
+function validatedActorModelTiers(input: ActorModelPermissions) {
+  if (input.allowedModelTiers !== undefined && input.allowedModels !== undefined) throw new Error("Choose allowedModelTiers or legacy allowedModels.");
+  if (input.allowedModelTiers !== undefined && input.allowedModelTiers !== null
+    && (!Array.isArray(input.allowedModelTiers) || !input.allowedModelTiers.length || input.allowedModelTiers.some(tier => !ACTOR_MODEL_TIERS.includes(tier))))
+    throw new Error("Invalid allowed model tiers.");
+  if (input.allowedModels !== undefined && (!Array.isArray(input.allowedModels)
+    || input.allowedModels.some(model => typeof model !== "string" || !MODEL_OPTIONS.includes(normalizeModelId(model)))))
+    throw new Error("Invalid actor model permissions or effort.");
+  const tiers = actorAllowedModelTiers(input);
+  return tiers === null ? null : [...new Set(tiers)];
+}
+
+export function assertChildModelTiers(actor: DomainActor, parent: DomainActor) {
+  const parentTiers = actorAllowedModelTiers(parent);
+  const childTiers = actorAllowedModelTiers(actor);
+  if (parentTiers !== null && (childTiers === null || childTiers.some(tier => !parentTiers.includes(tier)))) {
+    throw new ActorHierarchyConflict("The root actor does not allow all of this actor's models.");
+  }
+}
 type RunningActorSessions = Awaited<ReturnType<ActorPersistence["getDomainActorRunningSessions"]>>;
 type ActorWork = ActorRoom["workItems"][number];
 
@@ -164,9 +184,11 @@ export function newDomainActor(room: ActorRoom, workspaceId: string, input: Crea
   if (room.deletedActors?.some(actor => actor.id === id) || room.actors.some(actor => actor.id === id || actor.name.toLowerCase() === input.name.trim().toLowerCase())) throw new Error("Actor ID or name already exists.");
   const parent = input.parentActorId ? actorById(room, input.parentActorId) : null;
   if (parent?.parentActorId) throw new Error("Actors support only one sub-actor level.");
+  const allowedModelTiers = input.allowedModelTiers === undefined && input.allowedModels === undefined && parent
+    ? validatedActorModelTiers({ allowedModelTiers: actorAllowedModelTiers(parent) }) : validatedActorModelTiers(input);
   return { type: "worker", id, workspaceId, rootActorId: parent?.id ?? id, parentActorId: parent?.id ?? null,
     name: input.name.trim(), model: normalizeModelId(input.model), effort: input.effort ?? "medium", ...(avatar === undefined ? {} : { avatar }),
-    allowedModels: [...new Set((input.allowedModels ?? MODEL_OPTIONS).map(normalizeModelId))],
+    allowedModelTiers,
     memory: { ...input.memory, version: 0, sourceEventIds: [] }, created: now, updated: now };
 }
 
@@ -175,7 +197,10 @@ export function applyActorUpdate(actor: DomainActor, input: Omit<UpdateDomainAct
   if (input.name !== undefined) actor.name = input.name.trim();
   if (input.model !== undefined) actor.model = normalizeModelId(input.model);
   if (input.effort !== undefined) actor.effort = input.effort;
-  if (input.allowedModels !== undefined) actor.allowedModels = [...new Set(input.allowedModels.map(normalizeModelId))];
+  if (input.allowedModelTiers !== undefined || input.allowedModels !== undefined) {
+    actor.allowedModelTiers = validatedActorModelTiers(input);
+    delete actor.allowedModels;
+  }
   if (input.projectIds !== undefined) {
     if (actor.parentActorId) throw new Error("Sub-actors belong to their root actor's projects.");
     const projectIds = [...new Set(input.projectIds.map(value => value.trim()))];
@@ -284,8 +309,7 @@ export class DomainActorStore {
         const destinationProjects = new Set(actorProjectIds(room.actors, parent.id));
         if (projects.length !== destinationProjects.size || projects.some(project => !destinationProjects.has(project)))
           conflict("Actor trees must have the same projects before moving an actor.");
-        if (actor.allowedModels.some(model => !parent.allowedModels.includes(model)))
-          conflict("The destination root does not allow all of this actor's models.");
+        assertChildModelTiers(actor, parent);
       }
       // Both whole trees are affected: moving a child also changes its former root's authority.
       const affected = actorTreeMembers(room, [actor.rootActorId, ...(parent ? [parent.rootActorId] : [])]);

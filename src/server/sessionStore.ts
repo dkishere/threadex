@@ -1,6 +1,8 @@
 import { DEFAULT_MODEL, defaultGearProfiles, type ModelProvider } from "../modelCatalog";
 import { isDeepStrictEqual } from "node:util";
 import { cloneJsonDocument } from "./jsonDocument";
+import { ACTOR_ROOM_STORAGE_SCHEMA, actorRoomCore, LegacyActorRoomError, loadActorRoom, migrateLegacyActorRoom, planActorRoomWrite, writeActorRoom,
+  type ActorRoomCache } from "./actorRoomStorage";
 import type { LightweightTodo } from "../lightweightTodo";
 import { normalizeSubagentActivity, SUBAGENT_ACTIVITY_RETAINED_PER_AGENT, type SubagentActivityPayload } from "../eventProtocol";
 import type { DecisionAudit } from "./decision/policy";
@@ -1633,7 +1635,7 @@ export class SessionStore {
   private connectionPromise: Promise<SessionDbConnection>;
   private queue = Promise.resolve();
   private readonly pendingReads = new Set<Promise<unknown>>();
-  private readonly actorRoomCache = new Map<string, { version: string; room: ActorRoom }>();
+  private readonly actorRoomCache = new Map<string, ActorRoomCache>();
   private readonly actorRoomReads = new Map<string, Promise<ActorRoom>>();
   private connection: SessionDbConnection | null = null;
   private duckDbUiStarted = false;
@@ -1690,7 +1692,7 @@ export class SessionStore {
     if (!pending) {
       // A cold cache must not fan out several concurrent detoasts/JSON encodes
       // of the same large document in PostgreSQL after an API restart.
-      pending = this.read(async connection => (await this.readActorRoom(connection, workspaceId)) ?? emptyActorRoom(workspaceId));
+      pending = this.read(connection => this.readActorRoom(connection, workspaceId));
       this.actorRoomReads.set(workspaceId, pending);
     }
     try {
@@ -1700,19 +1702,20 @@ export class SessionStore {
     }
   }
 
-  /** The room is one multi-MB document polled several times a second. xmin changes with every committed
-   * row version, from any process, so it validates the cached copy without detoasting the document. */
-  private async readActorRoom(connection: SessionDbConnection, workspaceId: string): Promise<ActorRoom | null> {
-    const versionRows = await (await connection.run("SELECT xmin::text AS version FROM actor_room WHERE workspace_id = $workspaceId", { workspaceId })).getRowObjectsJS();
-    if (!versionRows[0]) return null;
-    const cached = this.actorRoomCache.get(workspaceId);
-    if (cached?.version === String(versionRows[0].version)) return cached.room;
-    const rows = await (await connection.run("SELECT xmin::text AS version, state FROM actor_room WHERE workspace_id = $workspaceId", { workspaceId })).getRowObjectsJS();
-    if (!rows[0]) return null;
-    const room = (typeof rows[0].state === "string" ? JSON.parse(rows[0].state) : rows[0].state) as ActorRoom;
-    this.actorRoomCache.set(workspaceId, { version: String(rows[0].version), room });
-    // Public readers and writers clone before normalising or mutating this cached copy.
-    return room;
+  /** The room is polled several times a second. The core row's xmin changes with every committed room write,
+   * from any process, so it validates the cached copy; a changed room reloads only its changed round rows.
+   * Readers and writers clone before normalising or mutating this cached copy (shared snapshots are frozen). */
+  private async readActorRoom(connection: SessionDbConnection, workspaceId: string): Promise<ActorRoom> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const load = await loadActorRoom((sql, params) => connection.run(sql, params), workspaceId, this.actorRoomCache.get(workspaceId));
+      if (load.kind === "missing") return emptyActorRoom(workspaceId);
+      if (load.kind === "room") {
+        this.actorRoomCache.set(workspaceId, load.cache);
+        return load.cache.room;
+      }
+      await this.transaction(writer => migrateLegacyActorRoom((sql, params) => writer.run(sql, params), workspaceId));
+    }
+    throw new Error("Actor room storage migration did not complete; retry.");
   }
 
   /** Store only a SHA256 verifier. The opaque bearer stays in the runner environment.
@@ -1821,39 +1824,58 @@ export class SessionStore {
       return [...sessions.values()];
   }
 
-  /** One atomic workspace document keeps identities, reservations and events together. */
+  /** One atomic workspace room keeps identities, reservations and events together. The core row, round rows
+   * and snapshots change in one transaction; the core revision stays the CAS token. See actorRoomStorage. */
   async changeDomainActorRoom<T>(workspaceId: string, change: (room: ActorRoom, runningSessions?: import("../domainActors").ActorRunningSession[]) => T,
     options?: { actorLifecycleLock: true }): Promise<T> {
+    for (let migration = 0; ; migration++) {
+      try {
+        return await this.changeActorRoomRows(workspaceId, change, options);
+      } catch (error) {
+        if (!(error instanceof LegacyActorRoomError) || migration >= 2) throw error;
+        await this.transaction(writer => migrateLegacyActorRoom((sql, params) => writer.run(sql, params), workspaceId));
+      }
+    }
+  }
+
+  private async changeActorRoomRows<T>(workspaceId: string, change: (room: ActorRoom, runningSessions?: import("../domainActors").ActorRunningSession[]) => T,
+    options?: { actorLifecycleLock: true }): Promise<T> {
+    let committed: ActorRoomCache | null = null;
     const mutate = async (connection: SessionDbConnection) => {
-      await connection.run(`INSERT INTO actor_room (workspace_id, state) VALUES ($workspaceId, $state::JSONB)
-        ON CONFLICT (workspace_id) DO NOTHING`, { workspaceId, state: JSON.stringify(emptyActorRoom(workspaceId)) });
-      if (options?.actorLifecycleLock) await connection.run("SELECT workspace_id FROM actor_room WHERE workspace_id = $workspaceId FOR UPDATE", { workspaceId });
+      const run: SessionDbConnection["run"] = (sql, params) => connection.run(sql, params);
+      await run(`INSERT INTO actor_room (workspace_id, state) VALUES ($workspaceId, $state::JSONB)
+        ON CONFLICT (workspace_id) DO NOTHING`, { workspaceId, state: JSON.stringify(actorRoomCore(emptyActorRoom(workspaceId))) });
+      if (options?.actorLifecycleLock) await run("SELECT workspace_id FROM actor_room WHERE workspace_id = $workspaceId FOR UPDATE", { workspaceId });
       const runningSessions = options?.actorLifecycleLock ? await this.actorRunningSessionsWithConnection(connection, workspaceId, true) : undefined;
+      let known = this.actorRoomCache.get(workspaceId);
       for (let attempt = 0; attempt < 32; attempt++) {
-        const room = cloneJsonDocument((await this.readActorRoom(connection, workspaceId))!);
-        // Every writer bumps revision, so it is the CAS token; comparing the whole multi-MB document cost seconds per write.
+        const load = await loadActorRoom(run, workspaceId, known);
+        if (load.kind === "legacy") throw new LegacyActorRoomError();
+        if (load.kind === "missing") throw new Error("Actor room disappeared during an update; retry.");
+        known = load.cache;
+        const room = cloneJsonDocument(load.cache.room);
+        // Every writer bumps revision, so it is the CAS token.
         const previousRevision = Number(room.revision) || 0;
-        const before = cloneJsonDocument(room);
         const result = change(room, runningSessions);
         room.revision = previousRevision;
-        // A no-op change must not rewrite (and re-TOAST) the whole document.
-        const normalized = cloneJsonDocument(room);
-        if (isDeepStrictEqual(normalized, before)) return result;
+        const next = cloneJsonDocument(room);
+        // A no-op change must not rewrite any row.
+        const plan = planActorRoomWrite(load.cache, next);
+        if (!plan.changed) return result;
         room.revision = previousRevision + 1;
-        normalized.revision = room.revision;
-        const state = JSON.stringify(normalized);
-        const updated = await connection.run(`UPDATE actor_room SET state = $state::JSONB
-          WHERE workspace_id = $workspaceId AND COALESCE((state->>'revision')::BIGINT, 0) = $previousRevision
-          RETURNING xmin::text AS version`, { workspaceId, state, previousRevision });
-        if (updated.rowCount === 1) {
-          const [row] = await updated.getRowObjectsJS();
-          this.actorRoomCache.set(workspaceId, { version: String(row.version), room: normalized });
+        next.revision = room.revision;
+        const written = await writeActorRoom(run, workspaceId, load.cache, next, plan, previousRevision);
+        if (written) {
+          committed = written;
           return result;
         }
       }
       throw new Error("Actor room changed concurrently; retry with the same request ID.");
     };
-    return options?.actorLifecycleLock ? this.actorLifecycleTransaction(null, mutate) : this.write(mutate);
+    const result = options?.actorLifecycleLock ? await this.actorLifecycleTransaction(null, mutate) : await this.transaction(mutate);
+    // Only a committed write may seed the cache: its snapshot pool marks rows as present.
+    if (committed) this.actorRoomCache.set(workspaceId, committed);
+    return result;
   }
 
   /** Admission and deletion lock the same document on a pinned PostgreSQL client. */
@@ -9294,6 +9316,7 @@ export class SessionStore {
     await connection.run(`CREATE TABLE IF NOT EXISTS actor_room (
       workspace_id VARCHAR PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE, state JSONB NOT NULL
     )`);
+    for (const sql of ACTOR_ROOM_STORAGE_SCHEMA) await connection.run(sql);
     await connection.run(`CREATE TABLE IF NOT EXISTS workspace_manager (
       workspace_id VARCHAR PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
       session_id VARCHAR NOT NULL UNIQUE REFERENCES sessions(id) ON DELETE CASCADE,
@@ -12089,7 +12112,7 @@ export class SessionStore {
               OR (status = 'todo' AND pending_reason = 'stopped')
               OR agent_response LIKE 'Codex error: thread % already has an active writer%'
             )
-          RETURNING account_id
+          RETURNING account_id, agent_response, runner_exit_code, request_metadata
         `,
         {
           turnId: managerTurn.id,
@@ -12107,6 +12130,18 @@ export class SessionStore {
 
       usedManagerTurnIds.add(managerTurn.id);
       reconciled += 1;
+      // A round table host that finished while the API was unreachable is
+      // completed here instead of by the runner callback, so settle its round too.
+      if (parseJsonRecord(rows[0]?.request_metadata)?.roundtable === true) {
+        await this.settleRoundtableHostWithConnection(connection, {
+          id: managerTurn.id,
+          agentResponse: stringValue(rows[0]?.agent_response),
+          tokenIn: localTurn.tokenIn,
+          tokenOut: localTurn.tokenOut,
+          status: "done",
+          runnerExitCode: nullableNumber(rows[0]?.runner_exit_code)
+        });
+      }
       await connection.run(
         `
           INSERT INTO token_usage (

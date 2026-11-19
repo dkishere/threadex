@@ -3,7 +3,7 @@ import { actorInProjectChat, type ActorRoom, type ActorRound, type ActorTaskBind
 import { actorSessionWork, SESSION_MENTION_HOST_ALLOCATION } from "./actorNativeAgents";
 import type { CodexProject } from "./codexProjects";
 import { actorExecutionModels } from "./domainActorModelSelection";
-import { MODEL_OPTIONS, normalizeModelEffort, normalizeModelId } from "../modelCatalog";
+import { actorAllowedModels, MODEL_OPTIONS, normalizeModelEffort, normalizeModelId } from "../modelCatalog";
 
 /** Composer @mentions of workers in an ordinary session. See docs/session-actor-mentions.md. */
 export const SESSION_MENTION_LIMIT = 8;
@@ -60,7 +60,7 @@ export function sessionMentionComposerModel(body: unknown, saved: { model: strin
 }
 
 /** An actor may execute here only with a model in the session's provider group. */
-const permitted = (actor: DomainActor, model: string) => actorExecutionModels(actor.allowedModels ?? [], model).length > 0;
+const permitted = (actor: DomainActor, model: string) => actorExecutionModels(actorAllowedModels(actor), model).length > 0;
 
 export function sessionMentionCandidates(scope: SessionMentionScope): SessionMentionCandidate[] {
   return scope.room.actors.filter(actor => actor.id !== scope.host?.actorId && actorInProjectChat(scope.room.actors, actor.id, scope.project.id) && permitted(actor, scope.model))

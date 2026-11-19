@@ -28,10 +28,15 @@ type RoundtableNote = { actors: string[]; text: string };
 export type RoundtableSynthesis = { template?: "decision"; taskType?: "decision";
   issues: { topic: string; positions: { view: string; actors: string[]; details?: { actors: string[]; detail: string }[] }[] }[];
   openQuestions?: RoundtableNote[]; scope?: RoundtableNote[] };
+/** An item's title states its conclusion; its text holds the evidence. Legacy items have text only. */
+export type RoundtableSummaryItem = { title?: string; text: string; actors: string[] };
+/** Questions and verification scope render apart from findings and are not counted as points. */
+export type RoundtableSummarySectionKind = "questions" | "scope";
 export type RoundtableSummary = {
   template: "summary"; taskType: "code_review" | "research" | "summary";
-  overview: string; sections: { title: string; items: { text: string; actors: string[] }[] }[];
+  overview: string; sections: { title: string; kind?: RoundtableSummarySectionKind; items: RoundtableSummaryItem[] }[];
 };
+const SUMMARY_SECTION_KINDS: readonly unknown[] = ["questions", "scope"] satisfies RoundtableSummarySectionKind[];
 export type RoundtableConclusion = RoundtableSynthesis | RoundtableSummary;
 export const ROUNDTABLE_TASK_LABELS = { decision: "Decision", code_review: "Code review", research: "Research", summary: "Summary" };
 export type RoundtableIssueKind = "consensus" | "disagreement" | "partial";
@@ -153,13 +158,17 @@ export function parseRoundtableConclusion(text: string, actorNames: string[]): R
   const sections: RoundtableSummary["sections"] = [];
   for (const section of raw.sections) {
     if (typeof section?.title !== "string" || !section.title.trim() || !Array.isArray(section.items) || !section.items.length) return null;
-    const items: RoundtableSummary["sections"][number]["items"] = [];
+    const items: RoundtableSummaryItem[] = [];
     for (const item of section.items) {
       if (typeof item?.text !== "string" || !item.text.trim() || !Array.isArray(item.actors) || !item.actors.length
         || item.actors.some((name: unknown) => typeof name !== "string" || !known.has(name))) return null;
-      items.push({ text: item.text.trim(), actors: [...new Set<string>(item.actors)] });
+      // Titles and kinds only shape the display, so an unusable value falls
+      // back to the legacy layout instead of discarding the whole conclusion.
+      const title = typeof item.title === "string" && item.title.trim() ? item.title.trim() : undefined;
+      items.push({ ...(title ? { title } : {}), text: item.text.trim(), actors: [...new Set<string>(item.actors)] });
     }
-    sections.push({ title: section.title.trim(), items });
+    const kind = SUMMARY_SECTION_KINDS.includes(section.kind) ? section.kind as RoundtableSummarySectionKind : undefined;
+    sections.push({ title: section.title.trim(), ...(kind ? { kind } : {}), items });
   }
   return { template: "summary", taskType: raw.taskType, overview: raw.overview.trim(), sections };
 }
@@ -167,7 +176,7 @@ export function parseRoundtableConclusion(text: string, actorNames: string[]): R
 /** Readable form kept in the host turn for history, search, copy and the next round's context. */
 export function roundtableSynthesisMarkdown(synthesis: RoundtableConclusion, actorCount: number) {
   if (synthesis.template === "summary") return [synthesis.overview, ...synthesis.sections.map(section =>
-    `**${section.title}**\n\n${section.items.map(item => `- ${item.text.replace(/\n/g, "\n  ")} — ${item.actors.join(", ")}`).join("\n")}`
+    `**${section.title}**\n\n${section.items.map(item => `- ${(item.title ? `**${item.title}**\n${item.text}` : item.text).replace(/\n/g, "\n  ")} — ${item.actors.join(", ")}`).join("\n")}`
   )].join("\n\n");
   const sections: [RoundtableIssueKind, string][] = [["consensus", "Consensus"], ["disagreement", "Disagreements"], ["partial", "Other points"]];
   const groups = sections.flatMap(([kind, title]) => {

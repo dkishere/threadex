@@ -41,6 +41,25 @@ function repository(cwd: string) {
 
 const enrolledWorktrees = new Set<string>();
 
+// Every file-changing runner item resolves its directories; two synchronous git spawns each
+// stalled the API event loop during edit-heavy turns. A short TTL still notices git init/removal.
+const REPOSITORY_CACHE_TTL_MS = 60_000;
+const repositoryCache = new Map<string, { repo: ReturnType<typeof repository> | null; expiresAt: number }>();
+
+function cachedRepository(directory: string) {
+  const cached = repositoryCache.get(directory);
+  if (cached && cached.expiresAt > Date.now()) return cached.repo;
+  let repo: ReturnType<typeof repository> | null;
+  try { repo = repository(directory); }
+  catch (error) {
+    if (!/not a git repository/.test(String((error as { stderr?: unknown }).stderr ?? ""))) throw error;
+    repo = null;
+  }
+  if (repositoryCache.size > 1024) repositoryCache.clear();
+  repositoryCache.set(directory, { repo, expiresAt: Date.now() + REPOSITORY_CACHE_TTL_MS });
+  return repo;
+}
+
 export function recordGitProvenance(cwd: string, sessionId: string, turnId: string, paths: string[], eventId?: string, workspaceId = "default", turnNumber?: number) {
   const groups = new Map<string, { repo: ReturnType<typeof repository>; files: Set<string> }>();
   const directories = new Map<string, ReturnType<typeof repository> | null>();
@@ -51,13 +70,7 @@ export function recordGitProvenance(cwd: string, sessionId: string, turnId: stri
     // file itself: an edited symlink belongs to the repo containing the link.
     let directory = dirname(absolute);
     while (!existsSync(directory) && dirname(directory) !== directory) directory = dirname(directory);
-    if (!directories.has(directory)) {
-      try { directories.set(directory, repository(directory)); }
-      catch (error) {
-        if (!/not a git repository/.test(String((error as { stderr?: unknown }).stderr ?? ""))) throw error;
-        directories.set(directory, null);
-      }
-    }
+    if (!directories.has(directory)) directories.set(directory, cachedRepository(directory));
     const repo = directories.get(directory);
     if (!repo) continue;
     const canonicalPath = resolve(realpathSync(directory), relative(directory, absolute));

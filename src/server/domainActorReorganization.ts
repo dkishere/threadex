@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
+import type { ActorModelTier } from "../modelCatalog";
 import { isDeepStrictEqual } from "node:util";
 import { actorProjectIds, type ActorMemoryContent, type ActorReorganization, type ActorReorganizationInitiator,
   type ActorReorganizationOperation, type ActorReorganizationRequest, type ActorRoom, type DomainActor } from "../domainActors";
-import { ActorHierarchyConflict, ActorMemoryConflict, actorById, actorTreeMembers, applyActorUpdate, archiveActor, assertActorTreesSettled,
+import { ActorHierarchyConflict, ActorMemoryConflict, actorById, actorTreeMembers, applyActorUpdate, archiveActor, assertActorTreesSettled, assertChildModelTiers,
   newDomainActor, validateActorMemory, validateActorRegistryEntry, type ActorPersistence } from "./domainActorStore";
 
 const MAX_REORGANIZATION_OPERATIONS = 100;
@@ -27,11 +28,11 @@ export function parseActorReorganizationRequest(body: unknown): ActorReorganizat
 }
 
 function parseProfile(value: Record<string, unknown>) {
-  const { name, model, effort, allowedModels, projectIds } = value;
+  const { name, model, effort, allowedModelTiers, allowedModels, projectIds } = value;
   if (name !== undefined && typeof name !== "string" || model !== undefined && typeof model !== "string" || effort !== undefined && typeof effort !== "string"
-    || !optionalStrings(allowedModels) || !optionalStrings(projectIds)) throw new Error("Invalid actor profile fields.");
-  return Object.fromEntries(Object.entries({ name, model, effort, allowedModels, projectIds }).filter(([, field]) => field !== undefined)) as {
-    name?: string; model?: string; effort?: string; allowedModels?: string[]; projectIds?: string[] };
+    || (allowedModelTiers !== null && !optionalStrings(allowedModelTiers)) || !optionalStrings(allowedModels) || !optionalStrings(projectIds)) throw new Error("Invalid actor profile fields.");
+  return Object.fromEntries(Object.entries({ name, model, effort, allowedModelTiers, allowedModels, projectIds }).filter(([, field]) => field !== undefined)) as {
+    name?: string; model?: string; effort?: string; allowedModelTiers?: ActorModelTier[] | null; allowedModels?: string[]; projectIds?: string[] };
 }
 
 function parseOperation(value: unknown, index: number): ActorReorganizationOperation {
@@ -168,7 +169,7 @@ export function applyActorReorganization(room: ActorRoom, runningSessions: Runni
   return record;
 }
 
-const PROFILE_FIELDS = ["name", "parentActorId", "rootActorId", "projectIds", "model", "effort", "allowedModels"] as const;
+const PROFILE_FIELDS = ["name", "parentActorId", "rootActorId", "projectIds", "model", "effort", "allowedModelTiers", "allowedModels"] as const;
 /** Compact change summary for model context: profile fields that changed, and memory by version and field name. */
 export function actorReorganizationDelta(before: DomainActor | null, after: DomainActor | null) {
   if (!before || !after) {
@@ -198,7 +199,7 @@ function validateFinalRegistry(room: ActorRoom, initial: DomainActor[], touched:
     if (actor.rootActorId !== parent!.id) conflict(`${actor.name} must belong to its parent's tree.`);
     if (!checked.has(actor.id)) continue;
     if (actor.projectIds?.length) conflict(`Sub-actor ${actor.name} belongs to its root's projects.`);
-    if (actor.allowedModels.some(model => !parent!.allowedModels.includes(model))) conflict(`${parent!.name} does not allow all of ${actor.name}'s models.`);
+    assertChildModelTiers(actor, parent!);
   }
   const names = new Map<string, string>();
   for (const actor of room.actors) {

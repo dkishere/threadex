@@ -181,7 +181,7 @@ test("Claude in-place children use the Agent model alias that runs exactly their
 test("a Codex host passes each child brief verbatim and issues no unusable credentials", async () => {
   const room = splitRoom("gpt-6-luna");
   room.workItems[1].model = "gpt-6-sol";
-  for (const actor of room.actors) actor.allowedModels.push("gpt-6-luna", "gpt-6-sol");
+  for (const actor of room.actors) actor.allowedModels = [...actor.allowedModels ?? [], "gpt-6-luna", "gpt-6-sol"];
   room.workItems[0].nativeAgent!.provider = "codex";
   const context = await actorSplitHostContext({ room, host: room.workItems[1], hostActor: actor("api"), turnId: "t-host", runningSessions: [],
     contextWindow: async () => null, issue: async () => { throw new Error("Codex children have no credential channel"); } });

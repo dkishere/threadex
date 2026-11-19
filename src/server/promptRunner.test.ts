@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -20,6 +20,72 @@ import {
 
 const projectRoot = resolve(import.meta.dirname, "../..");
 const runnerPath = resolve(import.meta.dirname, "promptRunner.ts");
+
+test("native Codex delivers Threadex turn and steer instructions to the model", async (t) => {
+  const executable = process.env.CODEX_PATH || "codex";
+  if (spawnSync(executable, ["--version"]).error?.message.includes("ENOENT")) {
+    t.skip("Codex CLI is unavailable");
+    return;
+  }
+  const root = mkdtempSync(resolve(tmpdir(), "threadex-native-context-"));
+  const jobPath = resolve(root, "job.json");
+  const controlPath = resolve(root, "control.ndjson");
+  const controlResultDir = resolve(root, "acks");
+  mkdirSync(controlResultDir);
+  const logPath = resolve(root, "runner.ndjson");
+  const modelInputs: string[] = [];
+  let releaseFirstRequest!: () => void;
+  const steerAccepted = new Promise<void>(resolve => { releaseFirstRequest = resolve; });
+  const server = createServer(async (request, response) => {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    modelInputs.push(JSON.stringify(JSON.parse(body).input));
+    if (modelInputs.length === 1) await steerAccepted;
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end('data: {"type":"response.created","response":{"id":"resp_local"}}\n\n' +
+      'data: {"type":"response.completed","response":{"id":"resp_local","status":"completed","output":[]}}\n\n');
+  });
+  await new Promise<void>(ready => server.listen(0, "127.0.0.1", ready));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  writeFileSync(resolve(root, "config.toml"), [
+    'model_provider = "localtest"', '[model_providers.localtest]', 'name = "Local test"',
+    `base_url = "http://127.0.0.1:${address.port}/v1"`, 'wire_api = "responses"'
+  ].join("\n"));
+  writeFileSync(jobPath, JSON.stringify({
+    sessionId: "session-native", turnId: "turn-native", cwd: root, codexHome: root,
+    model: "gpt-6.2-astra", message: "start-user-marker", developerInstructions: "start-application-marker",
+    logPath, controlPath, controlResultDir
+  }));
+  const child = spawn(process.execPath, ["--import", "tsx", runnerPath, jobPath], {
+    cwd: projectRoot, stdio: "ignore",
+    env: { PATH: process.env.PATH, HOME: root, CODEX_HOME: root, CODEX_PATH: executable, CODEX_SANDBOX_MODE: "read-only" }
+  });
+  const exited = new Promise<number | null>(done => child.once("exit", done));
+  t.after(async () => {
+    releaseFirstRequest();
+    if (child.exitCode === null) child.kill();
+    await exited;
+    server.closeAllConnections();
+    await new Promise<void>(done => server.close(() => done()));
+    rmSync(root, { recursive: true, force: true });
+  });
+  await waitFor(() => modelInputs.length > 0, 15_000);
+  assert.match(modelInputs[0], /start-user-marker/);
+  assert.match(modelInputs[0], /start-application-marker/);
+  appendFileSync(controlPath, JSON.stringify({
+    id: "native-steer", source: "user", message: "steer-user-marker", developerInstructions: "steer-application-marker"
+  }) + "\n");
+  const acknowledgement = resolve(controlResultDir, "native-steer.json");
+  await waitFor(() => existsSync(acknowledgement));
+  assert.equal(JSON.parse(readFileSync(acknowledgement, "utf8")).ok, true);
+  releaseFirstRequest();
+  await waitFor(() => modelInputs.length >= 2, 10_000);
+  assert.match(modelInputs[1], /steer-user-marker/);
+  assert.match(modelInputs[1], /steer-application-marker/);
+  await waitFor(() => child.exitCode !== null, 10_000);
+  assert.equal(await exited, 0);
+});
 
 test("prompt runner serializes burst callbacks so terminal updates are not stranded", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "prompt-runner-callback-burst-"));
@@ -147,7 +213,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.equal(exitCode, 0, stderr);
   assert.equal(JSON.parse(readFileSync(turnParamsPath, "utf8")).serviceTierForTurn, "fast");
   assert.match(JSON.parse(readFileSync(turnParamsPath, "utf8")).input[0].text, /\[Managed mode\]/);
-  assert.match(JSON.parse(readFileSync(turnParamsPath, "utf8")).settings.developer_instructions, /Current Threadex Managed mode: ON/);
+  assert.match(JSON.parse(readFileSync(turnParamsPath, "utf8")).additionalContext.threadexTurn.value, /Current Threadex Managed mode: ON/);
   assert.equal(JSON.parse(readFileSync(jobPath, "utf8")).message, "test callback burst");
   const entries = readFileSync(logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
   assert.equal(entries.some((entry) => entry.event === "runner.callback_error"), false);
@@ -631,25 +697,25 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.match(turn.input[0].text, /Do not use `update_plan`/);
   assert.match(turn.input[0].text, /operational metadata/);
   assert.equal(JSON.parse(readFileSync(jobPath, "utf8")).message, "請建立 todo plan，todo language 要跟返用戶 prompt");
-  assert.match(turn.settings.developer_instructions, /original user's actual task request/);
-  assert.doesNotMatch(turn.settings.developer_instructions, /Managed mode/);
-  assert.doesNotMatch(turn.settings.developer_instructions, /compact status headline/);
-  assert.match(turn.settings.developer_instructions, /appended English force-plan suffix/);
-  assert.match(turn.settings.developer_instructions, /session-inspector todo_request_clarification/);
-  assert.match(turn.settings.developer_instructions, /todo_set_plan plans/);
-  assert.match(turn.settings.developer_instructions, /item title\/details/);
-  assert.match(turn.settings.developer_instructions, /activeStatus/);
-  assert.match(turn.settings.developer_instructions, /todo_add_message/);
-  assert.match(turn.settings.developer_instructions, /todo_add_comment status\/blocker\/note bodies/);
-  assert.match(turn.settings.developer_instructions, /nested split items/);
-  assert.match(turn.settings.developer_instructions, /todo_create_task/);
-  assert.match(turn.settings.developer_instructions, /TODO CLI PLAN COMPLETION AND MUTATION GATE/);
+  assert.match(turn.additionalContext.threadexTurn.value, /original user's actual task request/);
+  assert.doesNotMatch(turn.additionalContext.threadexTurn.value, /Managed mode/);
+  assert.doesNotMatch(turn.additionalContext.threadexTurn.value, /compact status headline/);
+  assert.match(turn.additionalContext.threadexTurn.value, /appended English force-plan suffix/);
+  assert.match(turn.additionalContext.threadexTurn.value, /session-inspector todo_request_clarification/);
+  assert.match(turn.additionalContext.threadexTurn.value, /todo_set_plan plans/);
+  assert.match(turn.additionalContext.threadexTurn.value, /item title\/details/);
+  assert.match(turn.additionalContext.threadexTurn.value, /activeStatus/);
+  assert.match(turn.additionalContext.threadexTurn.value, /todo_add_message/);
+  assert.match(turn.additionalContext.threadexTurn.value, /todo_add_comment status\/blocker\/note bodies/);
+  assert.match(turn.additionalContext.threadexTurn.value, /nested split items/);
+  assert.match(turn.additionalContext.threadexTurn.value, /todo_create_task/);
+  assert.match(turn.additionalContext.threadexTurn.value, /TODO CLI PLAN COMPLETION AND MUTATION GATE/);
   assert.equal(
-    turn.settings.developer_instructions.match(/\[TODO CLI PLAN COMPLETION AND MUTATION GATE/g)?.length,
+    turn.additionalContext.threadexTurn.value.match(/\[TODO CLI PLAN COMPLETION AND MUTATION GATE/g)?.length,
     1
   );
-  assert.match(turn.settings.developer_instructions, /MUST conduct exactly one focused grill-me round/);
-  assert.match(turn.settings.developer_instructions, /chronological, not a final-state check/);
+  assert.match(turn.additionalContext.threadexTurn.value, /MUST conduct exactly one focused grill-me round/);
+  assert.match(turn.additionalContext.threadexTurn.value, /chronological, not a final-state check/);
   assert.deepEqual(turn.sandboxPolicy, { type: "readOnly", networkAccess: false });
   assert.equal(turn.approvalPolicy, "on-request");
 });
@@ -727,8 +793,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     assert.match(thread.developerInstructions, /call recover_current_session/i);
     assert.match(thread.developerInstructions, /complete user prompts and final assistant responses/i);
     assert.doesNotMatch(thread.developerInstructions, /For Todo CLI planning|Use list_processes/);
-    assert.doesNotMatch(turn.settings?.developer_instructions ?? "", /recover_current_session|THREADEX_WORKTREE_REVIEW/);
-    const instructions = turn.settings.developer_instructions;
+    assert.doesNotMatch(turn.additionalContext?.threadexTurn?.value ?? "", /recover_current_session|THREADEX_WORKTREE_REVIEW/);
+    const instructions = turn.additionalContext.threadexTurn.value;
     if (managedMode) {
       assert.match(instructions, /Current Threadex Managed mode: ON/);
       assert.doesNotMatch(instructions, /Managed mode: OFF/);
@@ -855,10 +921,10 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.equal(thread.approvalPolicy, "on-request");
   const turn = JSON.parse(readFileSync(capturedTurnPath, "utf8"));
   assert.equal(turn.input[0].text, "跟進 Todo CLI plan");
-  assert.match(turn.settings.developer_instructions, /Todo CLI plan already exists/);
-  assert.match(turn.settings.developer_instructions, /Do not call todo_set_plan/);
-  assert.doesNotMatch(turn.settings.developer_instructions, /TODO CLI PLAN COMPLETION AND MUTATION GATE/);
-  assert.doesNotMatch(turn.settings.developer_instructions, /first task-related action MUST/);
+  assert.match(turn.additionalContext.threadexTurn.value, /Todo CLI plan already exists/);
+  assert.match(turn.additionalContext.threadexTurn.value, /Do not call todo_set_plan/);
+  assert.doesNotMatch(turn.additionalContext.threadexTurn.value, /TODO CLI PLAN COMPLETION AND MUTATION GATE/);
+  assert.doesNotMatch(turn.additionalContext.threadexTurn.value, /first task-related action MUST/);
 });
 
 test("prompt runner retries then rejects force-plan turns that omit the initial grill-me call", async () => {
@@ -1126,11 +1192,11 @@ syncBuiltinESMExports();
   assert.match(thread.developerInstructions, /Context Fork\/New task is explicit delegation/i);
   const turn = JSON.parse(readFileSync(capturedTurnPath, "utf8"));
   assert.equal(turn.input[0].text, `開 child task\n\n${CONTEXT_FORK_USER_SUFFIX}`);
-  assert.match(turn.settings.developer_instructions, /session-inspector create_task/);
-  assert.doesNotMatch(turn.settings.developer_instructions, /mcp__session_inspectorcreate_task/);
-  assert.doesNotMatch(turn.settings.developer_instructions, /Use get_session with sessionId or threadId/);
-  assert.doesNotMatch(turn.settings.developer_instructions, /For Todo CLI planning/);
-  assert.doesNotMatch(turn.settings.developer_instructions, /Use list_processes for a compact view/);
+  assert.match(turn.additionalContext.threadexTurn.value, /session-inspector create_task/);
+  assert.doesNotMatch(turn.additionalContext.threadexTurn.value, /mcp__session_inspectorcreate_task/);
+  assert.doesNotMatch(turn.additionalContext.threadexTurn.value, /Use get_session with sessionId or threadId/);
+  assert.doesNotMatch(turn.additionalContext.threadexTurn.value, /For Todo CLI planning/);
+  assert.doesNotMatch(turn.additionalContext.threadexTurn.value, /Use list_processes for a compact view/);
   assert.equal(turn.sandboxPolicy.type, thread.sandbox === "workspace-write" ? "workspaceWrite" : thread.sandbox === "danger-full-access" ? "dangerFullAccess" : "readOnly");
   assert.equal(turn.approvalPolicy, thread.approvalPolicy);
 });
@@ -1478,7 +1544,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     assert.match(steer.input[0].text, /not a user instruction or permission grant/);
     assert.doesNotMatch(steer.input[0].text, /focus on the server path/);
   } else assert.deepEqual(steer.input, [{ type: "text", text: "focus on the server path", text_elements: [] }]);
-  assert.equal(steer.settings.developer_instructions, "Force plan steps for this steer.");
+  assert.equal(steer.additionalContext.threadexSteer.value, "Force plan steps for this steer.");
 
   const goal = JSON.parse(readFileSync(capturedGoalPath, "utf8"));
   assert.deepEqual(goal, { threadId: "thread-1", objective: "initial prompt", status: "active" });
@@ -1494,8 +1560,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.match(thread.developerInstructions, /another Threadex turn are expired/);
   const turn = JSON.parse(readFileSync(capturedTurnPath, "utf8"));
   assert.equal(turn.approvalPolicy, "on-request");
-  assert.match(turn.settings.developer_instructions, /\[STARTUP\]/);
-  assert.match(turn.settings.developer_instructions, /parent Threadex session local_parent-1/);
+  assert.match(turn.additionalContext.threadexTurn.value, /\[STARTUP\]/);
+  assert.match(turn.additionalContext.threadexTurn.value, /parent Threadex session local_parent-1/);
   assert.deepEqual(turn.input, [
     {
       type: "text",
@@ -1594,9 +1660,9 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.doesNotMatch(text, /\[SERVER-PROVIDED LONG GOAL OBJECTIVE\]/);
   assert.match(text, new RegExp(goalFilePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.doesNotMatch(text, /x{100}/);
-  assert.match(turn.settings.developer_instructions, /\[SERVER-PROVIDED LONG GOAL OBJECTIVE\]/);
-  assert.match(turn.settings.developer_instructions, new RegExp(goalFilePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  assert.doesNotMatch(turn.settings.developer_instructions, /x{100}/);
+  assert.match(turn.additionalContext.threadexTurn.value, /\[SERVER-PROVIDED LONG GOAL OBJECTIVE\]/);
+  assert.match(turn.additionalContext.threadexTurn.value, new RegExp(goalFilePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.doesNotMatch(turn.additionalContext.threadexTurn.value, /x{100}/);
 });
 
 test("6.2 model IDs reach Codex thread start/resume and turn start unchanged", async () => {
@@ -1737,15 +1803,15 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.equal(turns[0].model, "gpt-5.6-luna");
   assert.equal(turns[0].effort, "high");
   assert.equal(turns[0].input[0].text, "make the architecture decision");
-  assert.match(turns[0].settings.developer_instructions, /\[AUTO MODEL\]/);
-  assert.ok(turns[0].settings.developer_instructions.includes(`Available upgrades are ${AUTO_MODEL_ORDER.join(", ")}`));
-  assert.match(turns[0].settings.developer_instructions, /session-inspector upgrade_model/);
+  assert.match(turns[0].additionalContext.threadexTurn.value, /\[AUTO MODEL\]/);
+  assert.ok(turns[0].additionalContext.threadexTurn.value.includes(`Available upgrades are ${AUTO_MODEL_ORDER.join(", ")}`));
+  assert.match(turns[0].additionalContext.threadexTurn.value, /session-inspector upgrade_model/);
   assert.equal(turns[1].model, "gpt-5.6-sol");
   assert.equal(turns[1].effort, "xhigh");
   assert.equal(turns[1].input[0].text, "make the architecture decision");
-  assert.match(turns[1].settings.developer_instructions, /AUTO MODEL CONTINUATION/);
-  assert.match(turns[1].settings.developer_instructions, /Current setting: gpt-5\.6-sol \/ xhigh/);
-  assert.doesNotMatch(turns[1].settings.developer_instructions, /Available upgrades are/);
+  assert.match(turns[1].additionalContext.threadexTurn.value, /AUTO MODEL CONTINUATION/);
+  assert.match(turns[1].additionalContext.threadexTurn.value, /Current setting: gpt-5\.6-sol \/ xhigh/);
+  assert.doesNotMatch(turns[1].additionalContext.threadexTurn.value, /Available upgrades are/);
   assert.match(readFileSync(logPath, "utf8"), /auto_model\.phase_transition/);
 });
 
@@ -2701,11 +2767,11 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     assert.equal(thread.excludeTurns, true, `${variant} must resume without returning full history`);
   }
   const worktreeReviewGuidance = /THREADEX_WORKTREE_(?:REVIEW|REASON)|HOW TO SKIP|Threadex automatically installs Git pre-commit\/pre-push hooks/;
-  assert.doesNotMatch(turn.settings.developer_instructions, worktreeReviewGuidance);
+  assert.doesNotMatch(turn.additionalContext.threadexTurn.value, worktreeReviewGuidance);
   assert.doesNotMatch(thread.developerInstructions, worktreeReviewGuidance);
   // Global instructions travel with thread start/resume only, never as a per-turn copy.
   assert.match(thread.developerInstructions, /Preserve the user's preferred language/, `${variant} thread scope`);
-  assert.doesNotMatch(turn.settings.developer_instructions, /Preserve the user's preferred language/, `${variant} turn scope`);
+  assert.doesNotMatch(turn.additionalContext.threadexTurn.value, /Preserve the user's preferred language/, `${variant} turn scope`);
   assert.equal(thread.developerInstructions.includes(MANAGER_REPLY_LANGUAGE_INSTRUCTIONS), workspaceManagerRole || managerDelegatedTask);
   if (managerDelegatedTask) assert.equal(thread.threadId, variant === "worker-resume" ? "thread-old" : undefined);
   if (workspaceManagerRole) {
@@ -2714,13 +2780,13 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     assert.match(thread.developerInstructions, /Threadex commands use the CLI/);
     assert.match(thread.developerInstructions, /sandbox_permissions=require_escalated/);
     assert.match(thread.developerInstructions, /Do not use npm run/);
-    assert.ok(!turn.settings.developer_instructions.includes("Threadex commands use the CLI"));
+    assert.ok(!turn.additionalContext.threadexTurn.value.includes("Threadex commands use the CLI"));
     assert.equal(thread.developerInstructions.split(WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS).length - 1, 1);
-    assert.ok(!turn.settings.developer_instructions.includes(WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS));
-    assert.match(turn.settings.developer_instructions, /worker-turn-1/);
-    assert.match(turn.settings.developer_instructions, /2026-09-28T12:00:00Z/);
-    assert.doesNotMatch(turn.settings.developer_instructions, /Preserve the user's preferred language/);
-    assert.doesNotMatch(turn.settings.developer_instructions, /Historical task description|Previous request|Previous response|Full request from dashboard|Full commentary/);
+    assert.ok(!turn.additionalContext.threadexTurn.value.includes(WORKSPACE_MANAGER_ROUTING_INSTRUCTIONS));
+    assert.match(turn.additionalContext.threadexTurn.value, /worker-turn-1/);
+    assert.match(turn.additionalContext.threadexTurn.value, /2026-09-28T12:00:00Z/);
+    assert.doesNotMatch(turn.additionalContext.threadexTurn.value, /Preserve the user's preferred language/);
+    assert.doesNotMatch(turn.additionalContext.threadexTurn.value, /Historical task description|Previous request|Previous response|Full request from dashboard|Full commentary/);
     assert.equal(thread.inspectorEnv.THREADEX_WORKSPACE_MANAGER, "1");
     assert.equal(thread.inspectorEnv.THREADEX_CONTINUITY_ONLY, "0");
     assert.equal(thread.inspectorEnv.THREADEX_AUTO_MODEL, "0");
@@ -2733,20 +2799,20 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     assert.equal(thread.config.features.multi_agent, false);
     assert.match(thread.developerInstructions, /workspace Manager/);
     assert.match(thread.developerInstructions, /Use session history as memory/);
-    assert.doesNotMatch(turn.settings.developer_instructions, /MUST use these tools instead of update_plan/);
+    assert.doesNotMatch(turn.additionalContext.threadexTurn.value, /MUST use these tools instead of update_plan/);
     return;
   }
   assert.equal(thread.inspectorEnv.THREADEX_LIGHTWEIGHT_TODO, "1");
   assert.doesNotMatch(thread.developerInstructions, /Workspace manager task routing policy/);
-  assert.doesNotMatch(turn.settings.developer_instructions, /Workspace manager task routing policy/);
+  assert.doesNotMatch(turn.additionalContext.threadexTurn.value, /Workspace manager task routing policy/);
   assert.equal(turn.model, "gpt-6-astra");
   assert.equal(turn.effort, "high");
   assert.equal(thread.inspectorEnv.THREADEX_TODO_AGENT_ROLE, "default");
   assert.equal(thread.inspectorEnv.THREADEX_CONTINUITY_ONLY, "0");
   assert.equal(config.enabled, false);
-  assert.match(turn.settings.developer_instructions, /Lightweight Todo harness is active/);
-  assert.doesNotMatch(turn.settings.developer_instructions, /MUST conduct exactly one|Create the Todo CLI plan and execute it in a later turn/);
-  assert.notEqual(turn.settings.sandbox_policy?.type, "read-only");
+  assert.match(turn.additionalContext.threadexTurn.value, /Lightweight Todo harness is active/);
+  assert.doesNotMatch(turn.additionalContext.threadexTurn.value, /MUST conduct exactly one|Create the Todo CLI plan and execute it in a later turn/);
+  assert.notEqual(turn.sandboxPolicy?.type, "readOnly");
 });
 
 test("prompt runner keeps a long context compaction alive until it completes", async () => {

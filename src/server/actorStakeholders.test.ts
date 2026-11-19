@@ -39,16 +39,16 @@ test("one batched Decision selects all qualifying SH and preserves a frozen audi
     && Object.isFrozen(result.selection.audit) && Object.isFrozen(result.selection.probabilities));
 });
 
-test("below-threshold fallback selects exactly the highest candidate", async () => {
+test("below-threshold fallback selects the three highest candidates in score order", async () => {
   const result = await pickStakeholders({ ...context, decide: decide({ a: 0.1, b: 0.3, c: 0.2 }) });
   assert.ok(result.ok);
-  assert.deepEqual(result.selection.actorIds, ["b"]);
+  assert.deepEqual(result.selection.actorIds, ["b", "c", "a"]);
 });
 
 test("ties prefer previous owner then stable input order without overriding higher scores", async () => {
   for (const [scores, previousOwnerId, expected] of [
-    [{ a: 0.2, b: 0.2, c: 0.2 }, "b", ["b"]],
-    [{ a: 0.2, b: 0.2, c: 0.2 }, "absent", ["a"]],
+    [{ a: 0.2, b: 0.2, c: 0.2 }, "b", ["b", "a", "c"]],
+    [{ a: 0.2, b: 0.2, c: 0.2 }, "absent", ["a", "b", "c"]],
     [{ a: 0.7, b: 0.7, c: 0.7 }, "c", ["c", "a", "b"]],
     [{ a: 0.9, b: 0.7, c: 0.7 }, "c", ["a", "c", "b"]]
   ] as const) {

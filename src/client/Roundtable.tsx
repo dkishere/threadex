@@ -1,11 +1,11 @@
 import { useContext, useEffect, useRef, useState } from "react";
 import { SessionHeaderTarget } from "./sessionHeaderTarget";
 import { createPortal } from "react-dom";
-import { CheckCircle2, ClipboardCheck, CircleHelp, Users, Loader2, MessageSquare, Repeat, Scale, X } from "lucide-react";
+import { CheckCircle2, ChevronRight, ClipboardCheck, CircleHelp, Users, Loader2, MessageSquare, Repeat, Scale, X } from "lucide-react";
 import { MODEL_OPTIONS, modelLabel, normalizeModelEffort } from "../modelCatalog";
-import { ROUNDTABLE_TASK_LABELS, newRoundtableActor, roundtableEfforts, roundtableIssueKind, roundtableRunning, roundtableStatus, type RoundtableActor, type RoundtableIssueKind, type RoundtableRound, type RoundtableConclusion } from "../roundtable";
+import { ROUNDTABLE_TASK_LABELS, newRoundtableActor, roundtableEfforts, roundtableIssueKind, roundtableRunning, roundtableStatus, type RoundtableActor, type RoundtableIssueKind, type RoundtableRound, type RoundtableConclusion, type RoundtableSummarySectionKind } from "../roundtable";
 import { apiJson } from "./apiClient";
-import { defaultRoundtableActors, syncRoundtableDraftAvatars, roundtableLibraryEndpoint, type RoundtableLibrary, type RoundtablePreset } from "../roundtablePresets";
+import { defaultRoundtableActors, detachRoundtableActorFromPreset, syncRoundtableDraftWithPresets, roundtableLibraryEndpoint, type RoundtableLibrary, type RoundtablePreset } from "../roundtablePresets";
 import { ActorMultiSelect } from "./ActorMultiSelect";
 import { MarkdownContent } from "./MarkdownContent";
 import { ActorAvatar } from "./ActorAvatar";
@@ -54,7 +54,7 @@ export function useRoundtable({ sessionId, workspaceId, gearProfiles, onChanged 
   const value = draft.key === key ? draft.value : readDraft(key);
   const rounds = view.sessionId === sessionId ? view.rounds : [];
   const enabled = value?.enabled ?? false;
-  const actors = syncRoundtableDraftAvatars(value?.actors ?? [], presets);
+  const actors = syncRoundtableDraftWithPresets(value?.actors ?? [], presets);
   useEffect(() => {
     if (value && actors !== value.actors) {
       const updated = { ...value, actors };
@@ -166,7 +166,7 @@ export function RoundtableSettings({ controller }: { controller: RoundtableContr
   if (!anchor || (!controller.enabled && !controller.rounds.length)) return null;
   const latest = controller.rounds.at(-1);
   const working = latest && (roundtableRunning(latest) || latest.status === "queued");
-  const change = (id: string, update: Partial<RoundtableActor>) => controller.setActors(controller.actors.map(actor => actor.id === id ? { ...actor, ...update } : actor));
+  const change = (id: string, update: Partial<RoundtableActor>) => controller.setActors(controller.actors.map(actor => actor.id === id ? detachRoundtableActorFromPreset(actor, update) : actor));
   return createPortal(<div className="roundtable-widget" ref={root}>
     <button type="button" ref={trigger} className="roundtable-trigger" aria-label="Round table settings" aria-haspopup="dialog" aria-expanded={controller.open}
       data-active={controller.enabled} onClick={() => controller.setOpen(!controller.open)}>
@@ -283,19 +283,34 @@ function RoundtableSynthesisCard({ round, synthesis, nextRound }: { round: Round
   const byActors = <T extends { actors: string[] },>(items: T[]) => [...items].sort((a, b) => rank(a.actors) - rank(b.actors));
   const tags = (names: string[], label = synthesis.template === "summary" ? "Contributors" : "Supported by") => <span className="roundtable-supporters" aria-label={label}>{[...names].sort((a, b) => rank([a]) - rank([b])).map(name => <span key={name} className="roundtable-supporter">
     {actors.has(name) && <ActorAvatar actor={actors.get(name)!} />}{name}</span>)}</span>;
+  // Titled items and the verification scope start collapsed; one toggle opens or closes them all.
+  const [expanded, setExpanded] = useState(false);
+  const summaryCount = (kind?: RoundtableSummarySectionKind) => synthesis.template === "summary"
+    ? synthesis.sections.filter(section => section.kind === kind).reduce((count, section) => count + section.items.length, 0) : 0;
+  const collapsible = synthesis.template === "summary" && synthesis.sections.some(section => section.kind === "scope" || section.items.some(item => item.title));
   return <section className="roundtable-turn roundtable-synthesis" aria-label="Round table synthesis" data-status={round.status} data-template={synthesis.template ?? "decision"}>
-    <header><Users aria-hidden="true" /><strong>Round table</strong><small>{round.answers.length} actors · {synthesis.template === "summary" ? `${synthesis.sections.reduce((count, section) => count + section.items.length, 0)} points` : `${synthesis.issues.length} topics`}</small>
+    <header><Users aria-hidden="true" /><strong>Round table</strong><small>{round.answers.length} actors · {synthesis.template === "summary" ? `${summaryCount()} points${summaryCount("questions") ? ` · ${summaryCount("questions")} question${summaryCount("questions") === 1 ? "" : "s"}` : ""}` : `${synthesis.issues.length} topics`}</small>
       <span className="roundtable-template">{ROUNDTABLE_TASK_LABELS[synthesis.taskType ?? "decision"]}{synthesis.template === "summary" && synthesis.taskType !== "summary" ? " · Summary" : ""}</span>
       <RoundtableContextButton round={round} />
+      {collapsible && <button type="button" className="roundtable-expand-button" aria-pressed={expanded} onClick={() => setExpanded(!expanded)}>{expanded ? "Collapse all" : "Expand all"}</button>}
       <span className="roundtable-cast">{round.answers.map(answer => <ActorAvatar key={answer.actor.id} actor={answer.actor} />)}</span></header>
     {synthesis.template === "summary" ? <>
       <MarkdownContent className="roundtable-overview">{synthesis.overview}</MarkdownContent>
-      {synthesis.sections.map((section, index) => <section key={index} className="roundtable-group roundtable-summary-group" aria-label={section.title}>
-        <h4>{section.title}<small>{section.items.length}</small></h4>
-        <ul>{section.items.map((item, itemIndex) => <li key={itemIndex} className="roundtable-summary-item">
-          <MarkdownContent>{item.text}</MarkdownContent>{tags(item.actors)}
-        </li>)}</ul>
-      </section>)}
+      {synthesis.sections.map((section, index) => {
+        const items = <ul>{section.items.map((item, itemIndex) => <li key={itemIndex} className="roundtable-summary-item">
+          {item.title ? <details className="roundtable-summary-detail" open={expanded}>
+            <summary><ChevronRight className="roundtable-chevron" aria-hidden="true" /><MarkdownContent className="roundtable-summary-title">{item.title}</MarkdownContent>{tags(item.actors)}</summary>
+            <MarkdownContent>{item.text}</MarkdownContent>
+          </details> : <><MarkdownContent>{item.text}</MarkdownContent>{tags(item.actors)}</>}
+        </li>)}</ul>;
+        return section.kind === "scope"
+          ? <details key={index} className="roundtable-group roundtable-summary-group" data-kind={section.kind} aria-label={section.title} open={expanded}>
+            <summary><h4><ChevronRight className="roundtable-chevron" aria-hidden="true" />{section.title}<small>{section.items.length}</small></h4></summary>{items}
+          </details>
+          : <section key={index} className="roundtable-group roundtable-summary-group" data-kind={section.kind} aria-label={section.title}>
+            <h4>{section.title}<small>{section.items.length}</small></h4>{items}
+          </section>;
+      })}
     </> : SYNTHESIS_GROUPS.map(({ kind, title, Icon }) => {
       const issues = synthesis.issues.filter(issue => roundtableIssueKind(issue, completed.length) === kind);
       return issues.length > 0 && <section key={kind} className="roundtable-group" data-kind={kind} aria-label={title}>

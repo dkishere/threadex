@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_MODEL } from "../modelCatalog";
-import { actorFromPreset, defaultRoundtableActors, parseRoundtablePresets, syncRoundtableDraftAvatars } from "../roundtablePresets";
+import { actorFromPreset, defaultRoundtableActors, detachRoundtableActorFromPreset, parseRoundtablePresets, syncRoundtableDraftWithPresets } from "../roundtablePresets";
 import { RoundtableActorSettings } from "./roundtableActorSettings";
 import { dicebearAvatar, parseActorAvatar } from "../actorAvatar";
 
@@ -20,21 +20,28 @@ test("saved legacy Claude efforts migrate on read while new invalid choices are 
     assert.equal(settings.save([{ ...actor, model: "haiku", effort: "max" }], 2).actors[0].effort, "max");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
-test("legacy drafts adopt a uniquely matching preset avatar and linked drafts follow avatar edits", () => {
+test("legacy drafts adopt a uniquely matching preset and linked drafts follow library edits", () => {
   const preset = { ...actor, avatar: dicebearAvatar("chosen", "pixel-art") };
   const legacy = { id: "old-instance", name: actor.name, model: actor.model, effort: actor.effort, systemPrompt: actor.rolePrompt };
-  const migrated = syncRoundtableDraftAvatars([legacy], [preset]);
+  const migrated = syncRoundtableDraftWithPresets([legacy], [preset]);
   assert.equal(migrated[0].avatar, preset.avatar);
   assert.equal(migrated[0].presetId, preset.id);
   assert.equal(migrated[0].id, legacy.id);
-  const updated = { ...preset, avatar: dicebearAvatar("new", "lorelei") };
-  assert.equal(syncRoundtableDraftAvatars(migrated, [updated])[0].avatar, updated.avatar);
+  assert.equal(syncRoundtableDraftWithPresets(migrated, [preset]), migrated, "an unchanged library keeps the same draft");
+  const updated = { ...preset, name: "Critic 2", model: "gpt-6.2-astra", effort: "xhigh", rolePrompt: "Be sharper", avatar: dicebearAvatar("new", "lorelei") };
+  const followed = syncRoundtableDraftWithPresets(migrated, [updated])[0];
+  assert.deepEqual({ name: followed.name, model: followed.model, effort: followed.effort, systemPrompt: followed.systemPrompt, avatar: followed.avatar },
+    { name: updated.name, model: updated.model, effort: updated.effort, systemPrompt: updated.rolePrompt, avatar: updated.avatar });
+  assert.equal(followed.id, legacy.id);
   assert.equal(migrated[0].avatar, preset.avatar, "earlier snapshots are not mutated");
   assert.equal(actorFromPreset(preset).presetId, preset.id);
   const ambiguous = [legacy];
-  assert.equal(syncRoundtableDraftAvatars(ambiguous, [preset, { ...preset, id: "duplicate" }]), ambiguous);
+  assert.equal(syncRoundtableDraftWithPresets(ambiguous, [preset, { ...preset, id: "duplicate" }]), ambiguous);
   const custom = [{ ...legacy, avatar: dicebearAvatar("custom") }];
-  assert.equal(syncRoundtableDraftAvatars(custom, [preset]), custom);
+  assert.equal(syncRoundtableDraftWithPresets(custom, [preset]), custom);
+  const customised = [detachRoundtableActorFromPreset(migrated[0], { model: "claude-opus-5-5" })];
+  assert.equal(customised[0].presetId, undefined);
+  assert.equal(syncRoundtableDraftWithPresets(customised, [updated]), customised, "per-draft customisation is not overwritten");
 });
 test("actor library survives reload and rejects stale writes without losing saved actors", () => {
   const dir = mkdtempSync(join(tmpdir(), "roundtable-library-"));

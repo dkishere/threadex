@@ -47,7 +47,9 @@ export class EventRingLog {
       })
     );
     this.nextPosition = Math.max(0, ...this.entriesValue.map((event) => event.pos)) + 1;
-    this.compactionInterval = Math.max(1, Math.min(256, Math.ceil(capacity / 4)));
+    // Compaction synchronously rewrites the whole retained ring (MBs); streaming item updates supersede
+    // events constantly, so let stale lines reach the retained count (file at most ~2x) before rewriting.
+    this.compactionInterval = Math.max(1, capacity);
     this.compactOversizedOrTruncatedLog();
   }
 

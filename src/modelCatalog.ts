@@ -76,6 +76,47 @@ export const WORKSPACE_MANAGER_SUPPORTED_MODELS = [...new Set([
   ...WORKSPACE_MANAGER_MODEL_ORDER, ...CODEX_ROUTING_TIERS.flatMap(codexTierModels)
 ])];
 export const MODEL_OPTIONS: readonly string[] = [...[...AUTO_MODEL_ORDER].reverse(), ...Object.values(MODEL_CATALOG).filter(model => !(AUTO_MODEL_ORDER as readonly string[]).includes(model.id)).map(model => model.id)];
+
+// Actor permissions distinguish providers even when their workload tiers match.
+// Retired standalone models retain separate permissions.
+export const ACTOR_MODEL_TIER_LABELS = {
+  "codex-luna": "Codex Luna", "codex-terra": "Codex Terra", "codex-sol": "Codex Sol", "codex-astra": "Codex Astra",
+  "claude-haiku": "Claude Haiku", "claude-sonnet": "Claude Sonnet", "claude-opus": "Claude Opus", "claude-fable": "Claude Fable",
+  "legacy-5.5": "GPT 5.5", "legacy-5.4": "GPT 5.4", "legacy-5.4-mini": "GPT 5.4-mini"
+} as const;
+export type ActorModelTier = keyof typeof ACTOR_MODEL_TIER_LABELS;
+export const ACTOR_MODEL_TIERS = Object.keys(ACTOR_MODEL_TIER_LABELS) as ActorModelTier[];
+const actorModelTiersById = new Map<string, ActorModelTier>([
+  ...CODEX_ROUTING_TIERS.flatMap(tier => codexTierModels(tier).map(model => [model, `codex-${tier}`] as const)),
+  ...Object.values(MODEL_CATALOG).flatMap(({ id }) => {
+    const family = /^claude-(haiku|sonnet|opus|fable)-/.exec(id)?.[1];
+    return family ? [[id, `claude-${family}` as ActorModelTier] as const] : [];
+  }),
+  [MODEL_CATALOG.gpt55.id, "legacy-5.5"],
+  [MODEL_CATALOG.gpt54.id, "legacy-5.4"],
+  [MODEL_CATALOG.mini.id, "legacy-5.4-mini"]
+]);
+export function actorModelTier(model: string): ActorModelTier | undefined {
+  return actorModelTiersById.get(normalizeModelId(model));
+}
+export type ActorModelPermissions = { allowedModelTiers?: ActorModelTier[] | null; allowedModels?: readonly string[] };
+export function actorAllowedModelTiers(actor: ActorModelPermissions): ActorModelTier[] | null {
+  if (actor.allowedModelTiers !== undefined) return actor.allowedModelTiers;
+  if (actor.allowedModels === undefined) return null;
+  return [...new Set(actor.allowedModels.map(actorModelTier).filter(tier => tier !== undefined))];
+}
+export function actorAllowedModels(actor: ActorModelPermissions): string[] {
+  const allowedTiers = actorAllowedModelTiers(actor);
+  return allowedTiers === null ? [...MODEL_OPTIONS] : MODEL_OPTIONS.filter(model => {
+    const tier = actorModelTier(model);
+    return tier !== undefined && allowedTiers.includes(tier);
+  });
+}
+export function sharedActorAllowedModels(owner: ActorModelPermissions, executor: ActorModelPermissions): string[] {
+  const executorModels = new Set(actorAllowedModels(executor));
+  return actorAllowedModels(owner).filter(model => executorModels.has(model));
+}
+
 export const DEFAULT_MODEL = MODEL_CATALOG.luna.id;
 export const REVIEW_MODEL = MODEL_CATALOG.sol.id;
 export function normalizeModelId(value: string): string {

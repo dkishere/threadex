@@ -478,6 +478,8 @@ test("the host classifies a review into summary, persists readable output and co
     const hostPrompt = roundtableHostPrompt(created);
     assert.match(hostPrompt, /Disagreement between actors does not by itself make a review or research task a decision/);
     assert.match(hostPrompt, /Reclassify a new user prompt/);
+    assert.match(hostPrompt, /give every item a title/, "summary items lead with a scannable conclusion");
+    assert.match(hostPrompt, /never assign or raise one yourself/, "only actors assign severities");
     const output = { taskType: "code_review", template: "summary", overview: "A retry bug needs attention; runtime tests were not run.",
       sections: [{ title: "Findings", items: [{ text: "Add a test for [retry](https://example.com/retry).", actors: actors.map(actor => actor.name) }] }] };
     const round = await settle("rt_review", "```json\n" + JSON.stringify(output) + "\n```");

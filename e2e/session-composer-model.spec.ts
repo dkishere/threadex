@@ -82,6 +82,67 @@ async function switchTo(page: Page, session: { id: string; title: string }) {
 const editor = (page: Page) => page.getByRole("textbox", { name: "Message", exact: true });
 const send = (page: Page) => page.getByRole("button", { name: "Send", exact: true }).click();
 
+test("side chat preserves its own gear override across tab changes, session switches and reloads", async ({ page }) => {
+  await setup(page);
+  const sideChatRequests: Array<Record<string, unknown>> = [];
+  await page.route("**/api/session-inspector/ask", route => {
+    const request = route.request().postDataJSON();
+    sideChatRequests.push(request);
+    return route.fulfill({ json: { sideChat: {
+      id: request.requestId, sessionId: request.sessionId, roundId: request.roundId,
+      question: request.question, model: request.model, answer: "Fixture reply", created: new Date().toISOString()
+    } } });
+  });
+  const openSideChat = () => page.getByRole("tab", { name: "Side chat" }).click();
+  const openTurns = () => page.getByRole("tab", { name: "Turns", exact: true }).click();
+  const sideChatPanel = page.getByRole("tabpanel", { name: "Side chat" });
+  const overrideButton = sideChatPanel.getByRole("button", { name: "Override session model settings" });
+  const activeSideChatGear = sideChatPanel.locator('input[name="side-chat-composer-gear-active"]:checked');
+  const sendSideChat = async (message: string) => {
+    await sideChatPanel.getByRole("textbox").fill(message);
+    await sideChatPanel.getByRole("button", { name: "Send", exact: true }).click();
+  };
+
+  await open(page);
+  await openSideChat();
+  await expect(overrideButton).toContainText("Opus 5.5");
+  await expect(overrideButton).toContainText("High");
+  await expect(overrideButton).toHaveCSS("opacity", "0.55");
+  await sendSideChat("Use inherited settings");
+  await expect.poll(() => sideChatRequests[0]).toMatchObject({
+    sessionId: alpha.id, model: "claude-opus-5-5", modelReasoningEffort: "high"
+  });
+  await overrideButton.click();
+  await expect(activeSideChatGear).toHaveAttribute("aria-label", "Gear 2: 6 Luna · Xhigh");
+  await sideChatPanel.getByRole("button", { name: "Configure model gears" }).click();
+  const gearMenu = page.locator("#side-chat-composer-gear-menu");
+  await gearMenu.getByLabel("Gear 1 model", { exact: true }).selectOption("gpt-6.2-sol");
+  await gearMenu.getByLabel("Gear 1 effort", { exact: true }).selectOption("ultra");
+  await gearMenu.getByRole("button", { name: "Activate gear 1", exact: true }).click();
+  await expect(activeSideChatGear).toHaveAttribute("aria-label", "Gear 1: 6.2 Sol · Ultra");
+  await openTurns();
+  await expect(page.getByRole("button", { name: "Override session model settings" })).toContainText("Opus 5.5");
+  await openSideChat();
+  await expect(activeSideChatGear).toHaveAttribute("aria-label", "Gear 1: 6.2 Sol · Ultra");
+
+  await switchTo(page, beta);
+  await openSideChat();
+  await expect(overrideButton).toContainText("6 Sol");
+  await overrideButton.click();
+  await expect(activeSideChatGear).toHaveAttribute("aria-label", "Gear 2: 6 Luna · Xhigh");
+  await switchTo(page, alpha);
+  await openSideChat();
+  await expect(activeSideChatGear).toHaveAttribute("aria-label", "Gear 1: 6.2 Sol · Ultra");
+  await page.reload();
+  await openSideChat();
+  await expect(activeSideChatGear).toHaveAttribute("aria-label", "Gear 1: 6.2 Sol · Ultra");
+  await expect(activeSideChatGear).toBeEnabled();
+  await sendSideChat("Use restored settings");
+  await expect.poll(() => sideChatRequests[1]).toMatchObject({
+    sessionId: alpha.id, model: "gpt-6.2-sol", modelReasoningEffort: "ultra"
+  });
+});
+
 test("inherited last turn sends its model, effort and fast mode without an override", async ({ page }) => {
   const { sends } = await setup(page);
   await open(page);

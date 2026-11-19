@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { actorProjectIds } from "../domainActors";
 import { resolveActorTaskBinding } from "./domainActorProject";
 
 const workspace = { id: "default", cwd: "/work/tools/threadex" };
@@ -57,15 +58,37 @@ test("workspace switches use only the target registry, including colliding proje
   assert.throws(() => resolveActorTaskBinding(other, otherProjects, { userPrompt: "fix", newSessionProjectId: "threadex" }, noRepo), /registered/);
 });
 
-test("an actor's sole project is a default after explicit and message project selection", () => {
+test("an actor's sole project outranks message references; only explicit selection overrides it", () => {
   const resolve = (input: { userPrompt: string; newSessionProjectId?: string }, defaults = ["dev"]) =>
     resolveActorTaskBinding(workspace, projects, input, noRepo, defaults);
   assert.deepEqual(resolve({ userPrompt: "fix this" }),
     { workspaceId: "default", cwd: "/work", projectId: "dev", source: "actor" });
-  assert.equal(resolve({ userPrompt: "fix hub-backend" }).projectId, "backend");
-  assert.equal(resolve({ userPrompt: "read /work/tools/threadex/src/main.ts" }).projectId, "threadex");
+  assert.deepEqual(resolve({ userPrompt: "fix hub-backend" }),
+    { workspaceId: "default", cwd: "/work", projectId: "dev", source: "actor" });
+  assert.equal(resolve({ userPrompt: "read /work/tools/threadex/src/main.ts" }).projectId, "dev");
+  assert.equal(resolve({ userPrompt: "fix hub-backend" }, ["backend"]).source, "message");
   assert.equal(resolve({ userPrompt: "fix hub-backend", newSessionProjectId: "threadex" }).source, "explicit");
   assert.equal(resolve({ userPrompt: "fix this" }, ["dev", "dev"]).projectId, "dev");
+});
+
+test("a dev actor naming a separately registered repository under the dev root stays in dev", () => {
+  // tx_e99b523b: "make fairshot-hub cases ready" from a dev actor chat launched in the fairshot-hub project.
+  const registry = [{ id: "dev", name: "dev", roots: ["/work"] }, { id: "hub", name: "fairshot-hub", roots: ["/work/fairshot-hub"] }];
+  const repo = (path: string) => path === "/work/fairshot-hub";
+  const prompt = "we have added noUI test mode to abc, could you make fairshot-hub cases ready for that";
+  assert.equal(resolveActorTaskBinding(workspace, registry, { userPrompt: prompt }, repo).projectId, "hub");
+  assert.deepEqual(resolveActorTaskBinding(workspace, registry, { userPrompt: prompt }, repo, ["dev"]),
+    { workspaceId: "default", cwd: "/work", projectId: "dev", source: "actor" });
+  assert.equal(resolveActorTaskBinding(workspace, registry, { userPrompt: "read /work/fairshot-hub/README.md" }, repo, ["dev"]).projectId, "dev");
+  assert.equal(resolveActorTaskBinding(workspace, registry, { userPrompt: prompt, newSessionProjectId: "hub" }, repo, ["dev"]).projectId, "hub");
+});
+
+test("a sub-actor inherits its root actor's project over message references", () => {
+  const actors = [{ id: "root", rootActorId: "root", projectIds: ["dev"] }, { id: "child", rootActorId: "root" }];
+  const registry = [{ id: "dev", name: "dev", roots: ["/work"] }, { id: "hub", name: "fairshot-hub", roots: ["/work/fairshot-hub"] }];
+  const defaults = actorProjectIds(actors, "child");
+  assert.deepEqual(defaults, ["dev"]);
+  assert.equal(resolveActorTaskBinding(workspace, registry, { userPrompt: "fix fairshot-hub" }, noRepo, defaults).projectId, "dev");
 });
 
 test("a message referring to multiple project roots uses the actor's own project instead of asking", () => {
@@ -85,6 +108,8 @@ test("an actor in several projects uses the one its ambiguous message references
   assert.equal(resolveActorTaskBinding(workspace, projects, { userPrompt: "compare /work/e2e-test/a.ts and /work/tools/threadex/b.ts" }, noRepo, defaults).projectId, "threadex");
   assert.throws(() => resolveActorTaskBinding(workspace, projects, { userPrompt: "compare threadex and hub-backend" }, noRepo, defaults), /belongs to multiple projects/);
   assert.throws(() => resolveActorTaskBinding(workspace, projects, { userPrompt: "fix this" }, noRepo, defaults), /belongs to multiple projects/);
+  assert.equal(resolveActorTaskBinding(workspace, projects, { userPrompt: "fix hub-backend" }, noRepo, defaults).projectId, "backend");
+  assert.throws(() => resolveActorTaskBinding(workspace, projects, { userPrompt: "read /work/e2e-test/a.ts" }, noRepo, defaults), /belongs to multiple projects/);
 });
 
 test("ambiguous or invalid actor defaults cannot silently fall back to the workspace", () => {

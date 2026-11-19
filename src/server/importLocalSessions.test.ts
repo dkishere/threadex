@@ -944,6 +944,73 @@ test("server-side local Codex hook import upserts transcript into an existing ma
   }
 });
 
+test("server-side local Codex import settles a round table whose host finished while its callbacks failed", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "local-session-roundtable-host-reconcile-"));
+  const codexHome = resolve(root, "codex-home");
+  const sessionsDir = resolve(codexHome, "sessions", "2026", "11", "19");
+  const threadId = "77777777-8888-4999-aaaa-dddddddddddd";
+  const nativeTurnId = "native-roundtable-host-turn";
+  const roundTurnId = "rt_host_reconcile";
+  const transcriptPath = resolve(sessionsDir, `rollout-2026-11-19T10-45-00-${threadId}.jsonl`);
+  const nowMs = Date.now();
+  const at = (offsetMs: number) => new Date(nowMs + offsetMs).toISOString();
+  mkdirSync(sessionsDir, { recursive: true });
+  writeFileSync(
+    transcriptPath,
+    [
+      { timestamp: at(-5_000), type: "session_meta", payload: { id: threadId, cwd: root } },
+      { timestamp: at(1_000), type: "event_msg", payload: { type: "task_started", turn_id: nativeTurnId } },
+      { timestamp: at(2_000), type: "event_msg", payload: { type: "user_message", turn_id: nativeTurnId, message: "Discuss this" } },
+      {
+        timestamp: at(3_000),
+        type: "event_msg",
+        payload: { type: "agent_message", turn_id: nativeTurnId, phase: "final_answer", message: "host conclusion" }
+      },
+      { timestamp: at(4_000), type: "event_msg", payload: { type: "task_complete", turn_id: nativeTurnId } }
+    ].map((record) => JSON.stringify(record)).join("\n") + "\n"
+  );
+
+  const dbPath = resolve(root, "roundtable-host-reconcile.postgres");
+  const store = new SessionStore(dbPath);
+  try {
+    await store.ready();
+    await store.upsertSession({ id: "local_roundtable-session", threadId, workspaceId: "default", cwd: root, title: "Round table" });
+    await store.createRoundtableRound({
+      turnId: roundTurnId, sessionId: "local_roundtable-session", revision: 1, prompt: "Discuss this",
+      created: at(0), status: "host", context: null,
+      summarizerModel: "gpt-6", hostModel: "gpt-6", hostEffort: "low",
+      answers: [], summary: "", error: null, tokenIn: 0, tokenOut: 0
+    });
+    // The host runner claimed the queued round turn before the API became unreachable.
+    const connection = await openPostgresSessionConnection(undefined, postgresSchemaFromStoreId(dbPath));
+    try {
+      await connection.run("UPDATE session_turn SET status = 'running', pending_reason = NULL WHERE id = $turnId", { turnId: roundTurnId });
+    } finally {
+      await connection.close();
+    }
+    const deadRunnerPid = 2_000_000_000;
+    assert.equal(await store.markSessionTurnRunning({ id: roundTurnId, runnerPid: deadRunnerPid, runnerLogPath: resolve(root, "host-runner.ndjson") }), true);
+    assert.equal(await store.linkManagedRunnerNativeTurn({
+      sessionId: "local_roundtable-session",
+      managerTurnId: roundTurnId,
+      nativeTurnId,
+      transcriptPath
+    }), true);
+
+    await store.importLocalCodexSessionFile({ path: transcriptPath, codexHome });
+
+    const turn = await store.getSessionTurn(roundTurnId);
+    assert.equal(turn?.status, "done");
+    assert.equal(turn?.lastEventName, "local.manager_reconciled");
+    const round = await store.getRoundtableRound(roundTurnId);
+    assert.equal(round?.status, "done");
+    assert.equal(round?.summary, "host conclusion");
+    assert.equal(round?.revision, 2);
+  } finally {
+    await store.close();
+  }
+});
+
 test("server-side local Codex import preserves a live manager retry and reconciles it after the watchdog stops it", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "local-session-managed-import-test-"));
   const codexHome = resolve(root, "codex-home");

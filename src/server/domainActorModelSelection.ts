@@ -85,16 +85,20 @@ export function actorWorkloadKind(result: DecisionResult | undefined, questionId
 }
 
 /** Lighter models compensate with effort, so models without a Sol/Astra work tier run at least at this effort unless the work is mechanical. */
-export const ACTOR_LIGHT_TIER_MIN_EFFORT = "high";
+export const ACTOR_LIGHT_TIER_MIN_EFFORT = "xhigh";
+/** Efforts a claiming actor may propose; the executing model's supported levels are applied afterwards. */
+export const ACTOR_PROPOSED_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 const EFFORT_ORDER = ["minimal", "none", "low", "medium", "high", "xhigh", "max", "ultra"];
+const higherEffort = (a: string, b: string) => EFFORT_ORDER.indexOf(b) > EFFORT_ORDER.indexOf(a) ? b : a;
 
-/** A task's execution effort: an explicit user effort is final; Sol/Astra tiers and mechanical work keep the actor's effort;
- * other lighter models are raised to ACTOR_LIGHT_TIER_MIN_EFFORT, never lowered. */
-export function actorTaskExecutionEffort(model: string, actorEffort: string, options: { requestedEffort?: string; workloadKind?: ActorWorkloadKind } = {}): string {
+/** A task's execution effort: an explicit user effort is final. Otherwise the floor is the actor's effort for Sol/Astra tiers
+ * and mechanical work, and at least ACTOR_LIGHT_TIER_MIN_EFFORT for other lighter models; the claiming actor's proposed
+ * effort may raise that floor, never lower it. */
+export function actorTaskExecutionEffort(model: string, actorEffort: string, options: { requestedEffort?: string; proposedEffort?: string; workloadKind?: ActorWorkloadKind } = {}): string {
   if (options.requestedEffort) return options.requestedEffort;
-  if (modelWorkTier(model) || options.workloadKind === "mechanical") return actorEffort;
-  return EFFORT_ORDER.indexOf(actorEffort) >= EFFORT_ORDER.indexOf(ACTOR_LIGHT_TIER_MIN_EFFORT) ? actorEffort
-    : normalizeModelEffort(model, ACTOR_LIGHT_TIER_MIN_EFFORT);
+  const floor = modelWorkTier(model) || options.workloadKind === "mechanical" ? actorEffort : higherEffort(actorEffort, ACTOR_LIGHT_TIER_MIN_EFFORT);
+  const effort = options.proposedEffort ? higherEffort(floor, options.proposedEffort) : floor;
+  return effort === actorEffort ? actorEffort : normalizeModelEffort(model, effort);
 }
 
 export function actorWorkflowAssessment(result: DecisionResult, questionId = "workflow"): ActorWorkItem["workflowAssessment"] {
@@ -129,7 +133,7 @@ export const ACTOR_MODEL_TIER_GUIDANCE = [
   "Match the tier to what the assigned work itself requires. Mechanical work with an explicit target and method, such as applying a stated configuration, mapping or fixed rule, renaming, moving or repeating identical edits, suits the lightest sufficient tier even when it spans several actors, workspaces or records. Routine small development, lookups and ordinary debugging with a clear target suit Terra or Sonnet. Substantive implementation, investigation or root-cause analysis with several interacting requirements suits Sol or Opus. Astra is an exception tier for difficult architecture, security analysis, large reviews or plans, demanding correctness reasoning, or demonstrated failures at a lower tier.",
   "When complexity is genuinely uncertain, choose adequate headroom rather than the cheapest optimistic guess: take the next tier above the evident workload, not the strongest offered. The initiating prompt's model, the actor's role or domain (for example security), and instructions to preserve existing permissions, isolation or safeguards are not evidence that the work needs a stronger tier.",
   PROMPT_WORK_MODEL_FLOOR,
-  "Evaluate each model at its stated execution effort. Lighter models run at raised effort unless the work is mechanical; Sol/Opus and Astra/Fable tiers run at the actor's configured effort. Do not assume any further increase. Raising effort is not a substitute for sufficient model capability.",
+  "Evaluate each model at its stated execution effort. Lighter models run at raised effort unless the work is mechanical; Sol/Opus and Astra/Fable tiers run at the actor's configured effort unless the claiming actor proposed more. Do not assume any further increase. Raising effort is not a substitute for sufficient model capability.",
   "For delegated work, assess its actual scoped task together with its dependencies and integration obligations. Count the entire parent workload when the actor still owns coordination; do not assume uncreated workers will do it. A genuinely isolated small subtask may use a lightweight model.",
   "An explicit user model or tier requirement in the user's messages takes precedence over this tier guidance within the allowed options."
 ].join(" ");

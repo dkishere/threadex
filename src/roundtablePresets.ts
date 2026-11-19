@@ -28,8 +28,9 @@ export function parseRoundtablePresets(value: unknown): RoundtablePreset[] {
 export function actorFromPreset(preset: RoundtablePreset): RoundtableActor {
   return { ...newRoundtableActor({ model: preset.model, effort: preset.effort }), name: preset.name, systemPrompt: preset.rolePrompt, avatar: preset.avatar ?? dicebearAvatar(preset.id), presetId: preset.id };
 }
-/** Only draft avatars follow the library. Submitted round snapshots stay immutable. */
-export function syncRoundtableDraftAvatars(actors: RoundtableActor[], presets: RoundtablePreset[]): RoundtableActor[] {
+/** Linked draft actors follow library edits (name, model, effort, role prompt, avatar); a draft
+ * customised per actor drops its presetId. Submitted round snapshots stay immutable. */
+export function syncRoundtableDraftWithPresets(actors: RoundtableActor[], presets: RoundtablePreset[]): RoundtableActor[] {
   let changed = false;
   const next = actors.map(actor => {
     const candidates = actor.presetId ? presets.filter(preset => preset.id === actor.presetId)
@@ -38,12 +39,17 @@ export function syncRoundtableDraftAvatars(actors: RoundtableActor[], presets: R
         && (!actor.avatar || actor.avatar === preset.avatar || actor.avatar === dicebearAvatar(preset.id)));
     if (candidates.length !== 1) return actor;
     const preset = candidates[0];
-    const avatar = preset.avatar ?? dicebearAvatar(preset.id);
-    if (actor.avatar === avatar && actor.presetId === preset.id) return actor;
+    const linked = { ...actor, name: preset.name, model: preset.model, effort: preset.effort, systemPrompt: preset.rolePrompt,
+      avatar: preset.avatar ?? dicebearAvatar(preset.id), presetId: preset.id };
+    if ((["name", "model", "effort", "systemPrompt", "avatar", "presetId"] as const).every(field => actor[field] === linked[field])) return actor;
     changed = true;
-    return { ...actor, presetId: preset.id, avatar };
+    return linked;
   });
   return changed ? next : actors;
+}
+export function detachRoundtableActorFromPreset(actor: RoundtableActor, update: Partial<RoundtableActor>): RoundtableActor {
+  const { presetId: _presetId, ...customised } = { ...actor, ...update };
+  return customised;
 }
 export function defaultRoundtableActors(presets: RoundtablePreset[], gears: { model: string; effort?: string }[]) {
   const actors = presets.filter(preset => preset.isDefault).map(actorFromPreset);

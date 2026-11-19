@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { actorAllowedModels, actorAllowedModelTiers } from "../modelCatalog";
 import type { DomainActorService } from "./domainActorService";
 import { ActorDeletionConflict, ActorHierarchyConflict, ActorMemoryConflict, type DomainActorStore } from "./domainActorStore";
 import type { SessionStore, SessionTurnRecord } from "./sessionStore";
@@ -19,6 +20,23 @@ import { actorRoutingMetrics } from "./domainActorRoutingMetrics";
 import { CROSS_WORKSPACE_ACTOR_DENIED, taskUserMessages, userMessageNamesActor, userMessageNamesWorkspace } from "./crossWorkspaceActors";
 import type { ActorRoom, DomainActor } from "../domainActors";
 import { userMidTurnMessages } from "./turnGrill";
+
+function actorPermissionView(actor: DomainActor) {
+  return { ...actor, allowedModelTiers: actorAllowedModelTiers(actor), allowedModels: actorAllowedModels(actor) };
+}
+
+/** The polled room as the client reads it. Every round keeps full actor and candidate snapshots (memory, avatar)
+ * for its runner, which made the room tens of MB per 2.5s poll. The client only falls back to a snapshot's
+ * identity when the actor no longer exists, so ship that identity, and the avatar only for removed actors.
+ * The reorganization audit holds full actor snapshots; it has its own endpoint. */
+export function actorRoomClientView(room: ActorRoom): ActorRoom {
+  const { reorganizations: _audit, ...view } = room;
+  const currentActorIds = new Set(room.actors.map(actor => actor.id));
+  const identityOf = (actor: DomainActor) => ({ id: actor.id, name: actor.name, parentActorId: actor.parentActorId, rootActorId: actor.rootActorId,
+    ...(currentActorIds.has(actor.id) || actor.avatar === undefined ? {} : { avatar: actor.avatar }) }) as DomainActor;
+  return { ...view, actors: room.actors.map(actorPermissionView),
+    rounds: room.rounds.map(round => ({ ...round, candidateSnapshots: [], actorSnapshots: (round.actorSnapshots ?? []).map(identityOf) })) } as ActorRoom;
+}
 
 /** Bounds the earlier same-session user follow-ups sent to the delegation authorization check. */
 const MAX_PRIOR_USER_PROMPTS = 20;
@@ -52,25 +70,29 @@ export function createDomainActorRouter(service: DomainActorService, actors: Dom
     }) };
   }));
   router.get("/:workspaceId/room", route(async req => {
-    // The reorganization audit holds full actor snapshots; it has its own endpoint instead of the polled room.
-    const { reorganizations: _audit, ...room } = await service.getRoom(req.params.workspaceId);
+    const room = await service.getRoom(req.params.workspaceId);
     // A group chat is partitioned here, never by filtering the full room in the client.
-    return typeof req.query.chat === "string" && req.query.chat ? actorRoomForChat(room, req.query.chat) : room;
+    return actorRoomClientView(typeof req.query.chat === "string" && req.query.chat ? actorRoomForChat(room, req.query.chat) : room);
   }));
-  router.get("/:workspaceId/actors", route(async req => ({ actors: await service.listActors(req.params.workspaceId) })));
+  router.get("/:workspaceId/actors", route(async req => ({ actors: (await service.listActors(req.params.workspaceId)).map(actorPermissionView) })));
   router.get("/:workspaceId/actors/summary", route(async req => {
     // getRoom applies overdue blocker escalation before the summary lists active blockers.
     const room = await service.getRoom(req.params.workspaceId);
+    const runningSessions = await service.runningSessions(req.params.workspaceId);
+    const sessionIds = new Set([
+      ...actorSummaryBlockers(room).map(blocker => blocker.taskSessionId),
+      ...runningSessions.map(session => session.sessionId)
+    ]);
     const titles = new Map<string, string | undefined>();
-    for (const blocker of actorSummaryBlockers(room)) if (!titles.has(blocker.taskSessionId)) titles.set(blocker.taskSessionId, (await sessions.getSession(blocker.taskSessionId))?.title);
-    return actorSummary(room, await service.runningSessions(req.params.workspaceId), titles, await service.listProjects(req.params.workspaceId));
+    for (const sessionId of sessionIds) titles.set(sessionId, (await sessions.getSession(sessionId))?.title);
+    return actorSummary(room, runningSessions, titles, await service.listProjects(req.params.workspaceId));
   }));
-  router.post("/:workspaceId/actors/:actorId/conclusions/:conclusionId/ack", route(req =>
-    actors.acknowledgeConclusion(req.params.workspaceId, req.params.actorId, req.params.conclusionId)));
-  router.post("/:workspaceId/actors/:actorId/memory-errors/:eventId/dismiss", route(req =>
-    actors.dismissMemoryError(req.params.workspaceId, req.params.actorId, req.params.eventId)));
-  router.post("/:workspaceId/actors", route(req => service.createActor(req.params.workspaceId, req.body)));
-  router.patch("/:workspaceId/actors/:actorId", route(req => service.updateActor(req.params.workspaceId, req.params.actorId, req.body)));
+  router.post("/:workspaceId/actors/:actorId/conclusions/:conclusionId/ack", route(async req =>
+    actorRoomClientView(await actors.acknowledgeConclusion(req.params.workspaceId, req.params.actorId, req.params.conclusionId))));
+  router.post("/:workspaceId/actors/:actorId/memory-errors/:eventId/dismiss", route(async req =>
+    actorRoomClientView(await actors.dismissMemoryError(req.params.workspaceId, req.params.actorId, req.params.eventId))));
+  router.post("/:workspaceId/actors", route(async req => actorPermissionView(await service.createActor(req.params.workspaceId, req.body))));
+  router.patch("/:workspaceId/actors/:actorId", route(async req => actorPermissionView(await service.updateActor(req.params.workspaceId, req.params.actorId, req.body))));
   router.post("/:workspaceId/actors/:actorId/hierarchy", route(req => service.reparentActor(req.params.workspaceId, req.params.actorId, {
     parentActorId: req.body.parentActorId, expectedParentActorId: req.body.expectedParentActorId, expectedRootActorId: req.body.expectedRootActorId
   })));
@@ -95,7 +117,7 @@ export function createDomainActorRouter(service: DomainActorService, actors: Dom
   router.post("/:workspaceId/blockers/:blockerId/action", route(req => service.userBlockerAction({ workspaceId: req.params.workspaceId,
     blockerId: req.params.blockerId, action: req.body?.action, note: req.body?.note, proposalId: req.body?.proposalId })));
   /** The caller of a registry action: an actor task, or an ordinary task without an actor binding. */
-  type RegistryCaller = { workspaceId: string; room: ActorRoom; model?: string | null; self?: DomainActor; allowedModels?: readonly string[];
+  type RegistryCaller = { workspaceId: string; room: ActorRoom; model?: string | null; self?: DomainActor;
     /** Every user message of this task; only these open another workspace. */
     userMessage: () => Promise<string> };
   /** Another workspace chosen with workspaceId; undefined means the caller's own. */
@@ -169,7 +191,7 @@ export function createDomainActorRouter(service: DomainActorService, actors: Dom
     if (workspace && !userMessageNamesWorkspace(await caller.userMessage(), workspace)) throw new Error(CROSS_WORKSPACE_ACTOR_DENIED);
     // An actor inherits its creator's model permissions; a task without an actor gives only the chosen model.
     return service.createActor(workspace?.id ?? caller.workspaceId, { name: body.name, model: body.model, parentActorId: null, memory: body.memory,
-      allowedModels: caller.allowedModels ? [...caller.allowedModels] : [body.model] });
+      allowedModelTiers: caller.self ? actorAllowedModelTiers(caller.self) : null });
   };
   const registryAction = (caller: RegistryCaller, body: any, ownMemoryOnly = false) => body.action === "actor_list" ? listActors(caller, body)
     : body.action === "actor_read_memory" ? readActorMemory(caller, body, ownMemoryOnly) : createRootActor(caller, body);
@@ -202,13 +224,18 @@ export function createDomainActorRouter(service: DomainActorService, actors: Dom
       ?? (!["mobile", "tablet", "desktop"].includes(item.requestMetadata?.clientLayout as string)
         && !(item.requestMetadata?.roundtable === true && item.requestMetadata?.fromUser === true) ? undefined
       : typeof item.requestMetadata?.message === "string" ? item.requestMetadata.message : item.userInput);
-    const sessionUserMessages = async () => {
-      // The user's steers and question answers during a turn are their own follow-ups too.
+    const readUserMessageHistory = async () => {
+      const currentTurnCreated = Date.parse(turn.created);
       const priorTurns = (await sessions.listSessionTurns(session.id))
-        .filter(item => item.id !== turn.id && item.status !== "todo" && item.created <= turn.created);
+        .filter(item => item.id !== turn.id && item.status !== "todo" && Date.parse(item.created) <= currentTurnCreated);
       const turnIds = [...priorTurns.map(item => item.id), turn.id];
       const [approvals, steers] = await Promise.all([sessions.listSessionApprovalLiveItems(session.id, turnIds),
         sessions.listSessionSteerMessages(session.id, turnIds)]);
+      return { priorTurns, approvals, steers };
+    };
+    const sessionUserMessages = async () => {
+      const { priorTurns, approvals, steers } = await readUserMessageHistory();
+      // The user's steers and question answers during a turn are their own follow-ups too.
       const midTurnUserMessages = (turnId: string) => userMidTurnMessages(approvals[turnId] ?? [], steers[turnId] ?? []);
       return { priorUserPrompts: priorTurns.flatMap(item => [userPrompt(item), ...midTurnUserMessages(item.id)])
         .filter((prompt): prompt is string => !!prompt).slice(-MAX_PRIOR_USER_PROMPTS),
@@ -229,7 +256,7 @@ export function createDomainActorRouter(service: DomainActorService, actors: Dom
         const library = consultants.list();
         const offset = req.body.offset ?? 0, limit = req.body.limit ?? 10;
         if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 20) throw new Error("Choose a bounded consultant page.");
-        const available = library.actors.filter(candidate => actor.allowedModels.includes(candidate.model));
+        const available = library.actors.filter(candidate => actorAllowedModels(actor).includes(candidate.model));
         return { revision: library.revision, actors: available.slice(offset, offset + limit).map(candidate => ({
           id: candidate.id, type: "consultant", name: candidate.name, model: candidate.model, effort: candidate.effort,
           roleSummary: actorMemorySlice(candidate.rolePrompt, 0, 256).text
@@ -241,7 +268,7 @@ export function createDomainActorRouter(service: DomainActorService, actors: Dom
         requestId: req.body.requestId, mode: req.body.action === "consultant_ask" ? "question" : "round_table",
         consultantIds: req.body.action === "consultant_ask" ? [req.body.consultantId] : req.body.consultantIds,
         question: req.body.question, context: req.body.context, trigger: req.body.trigger, sourceTurnId: turn.id
-      }, actor.allowedModels);
+      }, actorAllowedModels(actor));
       throw new Error("Unknown consultant action.");
     }
     const tree = room.actors.filter(candidate => candidate.rootActorId === actor.rootActorId);
@@ -269,12 +296,12 @@ export function createDomainActorRouter(service: DomainActorService, actors: Dom
     const crossWorkspaceId = workspaceScoped && typeof req.body.workspaceId === "string" && req.body.workspaceId !== session.workspaceId ? req.body.workspaceId : undefined;
     // Another workspace's actors are reachable only for the actors or workspaces the user named in one of this task's own messages.
     const crossWorkspaceMessages = async () => {
-      const { priorUserPrompts, currentTurnUserMessages } = await sessionUserMessages();
-      return taskUserMessages(room, binding, execution, turn, [...priorUserPrompts, ...currentTurnUserMessages]);
+      const { priorTurns, approvals, steers } = await readUserMessageHistory();
+      return taskUserMessages(room, binding, execution, session.id, [...priorTurns, turn], approvals, steers);
     };
-    const crossWorkspaceMessage = async () => (await crossWorkspaceMessages()).join("\n\n");
+    const crossWorkspaceMessage = async () => (await crossWorkspaceMessages()).map(message => message.text).join("\n\n");
     if (["actor_list", "actor_read_memory", "actor_create_root"].includes(req.body.action)) return registryAction({ workspaceId: session.workspaceId, room,
-      model: execution.model, self: actor, allowedModels: actor.allowedModels, userMessage: crossWorkspaceMessage }, req.body, Boolean(child));
+      model: execution.model, self: actor, userMessage: crossWorkspaceMessage }, req.body, Boolean(child));
     if (req.body.action === "actor_reorganize") {
       const { reorganization, dryRun } = await service.reorganizeActorsAsActor({ workspaceId: session.workspaceId, workItemId: binding.id, actorId: actor.id,
         sessionId: session.id, turnId: turn.id, body: req.body, ...await sessionUserMessages(), currentUserPrompt: userPrompt(turn) });
@@ -293,19 +320,18 @@ export function createDomainActorRouter(service: DomainActorService, actors: Dom
       return { authorized: true, sessionId: target.id, workspaceId: target.workspaceId };
     }
     if (req.body.action === "actor_assign_many" || req.body.action === "actor_handoff") {
-      const { priorUserPrompts, currentTurnUserMessages } = await sessionUserMessages();
       if (crossWorkspaceId) {
         if (req.body.mode !== undefined && req.body.mode !== "session") throw new Error("A cross-workspace handoff runs as a separate task in the target workspace; omit mode or use \"session\".");
         const workspace = await sessions.getWorkspace(crossWorkspaceId);
         const target = workspace ? (await actors.getRoom(workspace.id)).actors.find(candidate => candidate.id === req.body.executorActorId) : undefined;
-        const userMessages = taskUserMessages(room, binding, execution, turn, [...priorUserPrompts, ...currentTurnUserMessages]);
-        const message = userMessages.join("\n\n");
-        if (!workspace || !target || !userMessageNamesWorkspace(message, workspace) && !userMessageNamesActor(message, target)) throw new Error(CROSS_WORKSPACE_ACTOR_DENIED);
+        const userMessages = await crossWorkspaceMessages();
+        if (!workspace || !target || !userMessages.some(({ text }) => userMessageNamesWorkspace(text, workspace) || userMessageNamesActor(text, target))) throw new Error(CROSS_WORKSPACE_ACTOR_DENIED);
         const sourceWorkspace = await sessions.getWorkspace(session.workspaceId);
         return service.handoffAcrossWorkspaces({ workspaceId: session.workspaceId, workspaceName: sourceWorkspace?.name ?? session.workspaceId,
           workItemId: binding.id, sourceActorId: actor.id, sourceSessionId: session.id, sourceTurnId: turn.id, userMessages,
-          requestId: req.body.requestId, targetWorkspaceId: workspace.id, targetActorId: target.id, task: req.body.task });
+          requestId: req.body.requestId, targetWorkspaceId: workspace.id, targetWorkspaceName: workspace.name, targetActorId: target.id, task: req.body.task });
       }
+      const { priorUserPrompts, currentTurnUserMessages } = await sessionUserMessages();
       const result = await service.delegateParallel({ workspaceId: session.workspaceId,
         workItemId: binding.id, sourceActorId: actor.id, sourceSessionId: session.id, sourceTurnId: turn.id,
         priorUserPrompts, currentUserPrompt: userPrompt(turn), currentTurnUserMessages, requestId: req.body.requestId,
@@ -335,7 +361,7 @@ export function createDomainActorRouter(service: DomainActorService, actors: Dom
       const running = await service.runningSessions(session.workspaceId);
       const live = running.filter(item => tree.some(a => a.id === item.actorId) || items.some(work => work.id === item.workItemId));
       const page = { actors: tree.slice(offset, offset + limit).map(a => ({ type: "worker", id: a.id, name: a.name, rootActorId: a.rootActorId,
-        parentActorId: a.parentActorId, model: a.model, allowedModels: a.allowedModels,
+        parentActorId: a.parentActorId, model: a.model, allowedModelTiers: actorAllowedModelTiers(a), allowedModels: actorAllowedModels(a),
         roleSummary: actorMemorySlice(a.memory.roleSummary, 0, 256).text })),
         workItems: items.slice(offset, offset + limit).map(item => ({ id: item.id, ownerActorId: item.ownerActorId,
           executorActorId: item.executorActorId, model: item.model, status: item.status, taskSessionId: item.taskSessionId, taskTurnId: item.taskTurnId })),
@@ -377,7 +403,7 @@ export function createDomainActorRouter(service: DomainActorService, actors: Dom
     }, actor.id, binding.id);
     if (req.body.action === "actor_create_sub") return service.createActor(session.workspaceId, {
       name: req.body.name, model: req.body.model, parentActorId: actor.id, memory: req.body.memory,
-      allowedModels: [...actor.allowedModels]
+      allowedModelTiers: actorAllowedModelTiers(actor)
     });
     if (req.body.action === "actor_update_sub") {
       if (!tree.some(a => a.id === req.body.actorId && a.parentActorId === actor.id)) throw new Error("Choose a direct sub-actor in your own tree.");

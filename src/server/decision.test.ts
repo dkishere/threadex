@@ -6,7 +6,7 @@ import { openaiResult } from "./decision/openai";
 import { decodeDecisionResponse } from "./decision/http";
 import { fakeBackend } from "./decision/fake";
 import { durableDecision } from "./decision/service";
-import { pickActor, breakClaimTie } from "./decision/actors";
+import { pickActor, breakClaimTie, pickStakeholders } from "./decision/actors";
 import type { DecisionAnswer, DecisionRequest, DecisionResult } from "./decision/types";
 
 const request: DecisionRequest = { purpose: "test", state: "PRIVATE STATE", audit: { workspaceId: "ws", roundId: "round" },
@@ -146,6 +146,22 @@ test("claim tiebreak judges the business domain, not a named delivery vehicle su
   const abcOption = JSON.parse(question.options.abc);
   assert.equal(abcOption.claimScope, "ABC case construction for the mock.");
   assert.equal(abcOption.roleSummary, actors[1].roleSummary);
+});
+
+test("stakeholder picking judges the domain over a named vehicle and widens a low-confidence pick", async () => {
+  const actors = ["abc", "hiring", "review", "integrity"].map(id => ({ id, systemHeader: id, roleSummary: id }));
+  let seen: DecisionRequest | undefined;
+  const scores = { abc: 0.25, hiring: 0.21, review: 0.09, integrity: 0.01 };
+  const result = await pickStakeholders({ userPrompt: "implement the role CD config update in ABC patch", actors, audit: request.audit,
+    policy: { order: ["fake" as const], threshold: { fake: 0.5 } },
+    decide: async req => { seen = req; return decideWith(Object.fromEntries(Object.entries(scores).map(([id, probability]) => [id, { kind: "predicate", probability }])))(req); } });
+  assert.ok(result.ok);
+  assert.deepEqual(result.selection.actorIds, ["abc", "hiring", "review"], "no qualified candidate must not collapse to the keyword match alone");
+  assert.match(seen!.questions[0].instructions, /business or product domain/);
+  assert.match(seen!.questions[0].instructions, /ABC patch/);
+  const confident = await pickStakeholders({ userPrompt: "x", actors, audit: request.audit, policy: { order: ["fake" as const], threshold: { fake: 0.5 } },
+    decide: decideWith({ abc: { kind: "predicate", probability: 0.2 }, hiring: { kind: "predicate", probability: 0.1 }, review: { kind: "predicate", probability: 0 }, integrity: { kind: "predicate", probability: 0.9 } }) });
+  assert.ok(confident.ok && confident.selection.actorIds.join() === "integrity", "a qualified candidate still selects only qualified actors");
 });
 
 test("claim tiebreak always selects a claimant; low confidence and ties only mark a fallback", async () => {

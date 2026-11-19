@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { MessageCircle } from "lucide-react";
 import { actorProjectGroups, type ActorMemoryContent, type ActorProject, type DomainActor } from "../domainActors";
-import { DEFAULT_MODEL, MODEL_OPTIONS, modelEfforts, modelLabel, normalizeModelEffort } from "../modelCatalog";
+import { ACTOR_MODEL_TIERS, ACTOR_MODEL_TIER_LABELS, DEFAULT_MODEL, MODEL_OPTIONS, actorAllowedModels, actorAllowedModelTiers, actorModelTier, modelEfforts, modelLabel, normalizeModelEffort, type ActorModelTier } from "../modelCatalog";
 import { apiJson } from "./apiClient";
 import { isAuthRequired, notifyActorRoomChanged } from "./actorRoomState";
 import "./WorkerSettingsPanel.css";
@@ -9,9 +9,9 @@ import "./WorkerSettingsPanel.css";
 const memoryFields = ["rolePrompt", "roleSummary", "longTerm", "rolling"] as const;
 const memoryLabels = { rolePrompt: "Role prompt", roleSummary: "Role summary", longTerm: "Long-term memory", rolling: "Recent memory" };
 const memoryContent = (actor: DomainActor): ActorMemoryContent => Object.fromEntries(memoryFields.map(key => [key, actor.memory[key]])) as ActorMemoryContent;
-type SettingsDraft = { name: string; model: string; effort: string; allowedModels: string[]; projectIds?: string[] };
+type SettingsDraft = { name: string; model: string; effort: string; allowedModelTiers: ActorModelTier[] | null; projectIds?: string[] };
 /** Only root workers carry projects; sub-actors follow their root. */
-const settingsContent = (actor: DomainActor): SettingsDraft => ({ name: actor.name, model: actor.model, effort: actor.effort, allowedModels: actor.allowedModels,
+const settingsContent = (actor: DomainActor): SettingsDraft => ({ name: actor.name, model: actor.model, effort: actor.effort, allowedModelTiers: actorAllowedModelTiers(actor),
   ...(actor.parentActorId ? {} : { projectIds: actor.projectIds ?? [] }) });
 const sameSettings = (a: SettingsDraft, b: SettingsDraft) => JSON.stringify({ ...a, projectIds: [...a.projectIds ?? []].sort() })
   === JSON.stringify({ ...b, projectIds: [...b.projectIds ?? []].sort() });
@@ -53,7 +53,7 @@ function WorkerEditor({ actor, actors, workspaceId, projects, projectsError, onS
 }) {
   const [saved, setSaved] = useState(actor);
   const [draft, setDraft] = useState<SettingsDraft>(actor ? settingsContent(actor) : { name: "", model: DEFAULT_MODEL,
-    effort: "medium", allowedModels: [...MODEL_OPTIONS], projectIds: [] });
+    effort: "medium", allowedModelTiers: null, projectIds: [] });
   const [memory, setMemory] = useState<ActorMemoryContent>(actor ? memoryContent(actor) : { rolePrompt: "", roleSummary: "", longTerm: "", rolling: "" });
   const [parentActorId, setParentActorId] = useState("");
   const [busy, setBusy] = useState(false);
@@ -66,7 +66,18 @@ function WorkerEditor({ actor, actors, workspaceId, projects, projectsError, onS
   const change = (update: Partial<SettingsDraft>) => { setDraft(value => ({ ...value, ...update })); setNotice(""); };
   const settingsDirty = !saved || !sameSettings(draft, settingsContent(saved));
   const memoryDirty = !saved || JSON.stringify(memory) !== JSON.stringify(memoryContent(saved));
-  const valid = draft.name.trim() && draft.allowedModels.includes(draft.model) && draft.allowedModels.length > 0;
+  const allowedModels = actorAllowedModels(draft);
+  const selectedTiers = draft.allowedModelTiers ?? ACTOR_MODEL_TIERS;
+  const parent = saved ? undefined : actors.find(candidate => candidate.id === parentActorId);
+  const parentTiers = parent ? actorAllowedModelTiers(parent) : null;
+  const valid = draft.name.trim() && allowedModels.includes(draft.model) &&
+    (parentTiers === null || draft.allowedModelTiers !== null && selectedTiers.every(tier => parentTiers.includes(tier)));
+  function changeParent(id: string) {
+    setParentActorId(id);
+    const parent = actors.find(candidate => candidate.id === id);
+    change(parent ? { allowedModelTiers: actorAllowedModelTiers(parent), model: parent.model, effort: parent.effort }
+      : { allowedModelTiers: null });
+  }
   const root = saved ? !saved.parentActorId : !parentActorId;
   async function deleteWorker() {
     if (!saved || busy) return;
@@ -109,21 +120,23 @@ function WorkerEditor({ actor, actors, workspaceId, projects, projectsError, onS
         <div className="roundtable-actor-properties">
           <label>Name<input required maxLength={80} value={draft.name} onChange={event => change({ name: event.target.value })} /></label>
           <label>Model<select value={draft.model} onChange={event => change({ model: event.target.value, effort: normalizeModelEffort(event.target.value, draft.effort) })}>
-            {MODEL_OPTIONS.map(model => <option key={model} value={model} disabled={!draft.allowedModels.includes(model)}>{modelLabel(model)}</option>)}
+            {MODEL_OPTIONS.map(model => <option key={model} value={model} disabled={!allowedModels.includes(model)}>{modelLabel(model)}</option>)}
           </select></label>
           <label>Effort<select value={draft.effort} onChange={event => change({ effort: event.target.value })}>
             {modelEfforts(draft.model).map(effort => <option key={effort} value={effort}>{effort}</option>)}
           </select></label>
         </div>
-        {!saved && <label>Parent worker<select value={parentActorId} onChange={event => setParentActorId(event.target.value)}>
+        {!saved && <label>Parent worker<select value={parentActorId} onChange={event => changeParent(event.target.value)}>
           <option value="">None (root worker)</option>{actors.filter(item => !item.parentActorId).map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
         </select></label>}
         {saved && <p>Parent: {actors.find(item => item.id === saved.parentActorId)?.name ?? "None (root worker)"}</p>}
         {root ? <ProjectChoices projects={projects} projectsError={projectsError} value={draft.projectIds ?? []} onChange={projectIds => change({ projectIds })} />
           : <p>Projects: same as its root worker{saved && actors.find(item => item.id === saved.rootActorId) ? ` (${actors.find(item => item.id === saved.rootActorId)!.name}); move or remove projects there` : ""}.</p>}
-        <fieldset><legend>Allowed models</legend><p>The default model must remain allowed.</p>
-          <div className="worker-allowed-models">{MODEL_OPTIONS.map(model => <label className="roundtable-default" key={model}><input type="checkbox" checked={draft.allowedModels.includes(model)} disabled={model === draft.model}
-            onChange={event => change({ allowedModels: event.target.checked ? [...draft.allowedModels, model] : draft.allowedModels.filter(value => value !== model) })} />{modelLabel(model)}</label>)}
+        <fieldset><legend>Allowed model tiers</legend><p>Each tier follows the platform model guide. The default model’s tier must remain allowed.</p>
+          {parentTiers === null && <label className="roundtable-default"><input type="checkbox" checked={draft.allowedModelTiers === null}
+            onChange={event => change({ allowedModelTiers: event.target.checked ? null : [...selectedTiers] })} />Allow all tiers</label>}
+          <div className="worker-allowed-models">{(parentTiers ?? ACTOR_MODEL_TIERS).map(tier => <label className="roundtable-default" key={tier}><input type="checkbox" checked={selectedTiers.includes(tier)} disabled={tier === actorModelTier(draft.model)}
+            onChange={event => change({ allowedModelTiers: event.target.checked ? [...selectedTiers, tier] : selectedTiers.filter(value => value !== tier) })} />{ACTOR_MODEL_TIER_LABELS[tier]}</label>)}
           </div>
         </fieldset>
         {!saved && memoryFields.map(key => <label key={key}>{memoryLabels[key]}<textarea rows={3} maxLength={key === "roleSummary" ? 4000 : 100000} value={memory[key]}

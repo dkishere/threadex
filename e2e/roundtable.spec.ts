@@ -299,10 +299,11 @@ test("composer round table highlights the input and requires re-enabling for eac
   rounds[1].answers.forEach(answer => { answer.status = "done"; answer.text = `${answer.actor.name}'s review evidence`; });
   rounds[1].synthesis = { taskType: "code_review", template: "summary", overview: "One retry bug and a test gap need attention.", sections: [
     { title: "Findings", items: [
-      { text: "**P1:** Retry can duplicate writes. See [retry code](https://example.com/retry).", actors: [firstActor, secondActor] },
+      { title: "P1: Retry can duplicate writes", text: "See [retry code](https://example.com/retry).", actors: [firstActor, secondActor] },
       { text: "No test covers reconnection after a partial write.", actors: [firstActor] }
     ] },
-    { title: "Open questions", items: [{ text: "The server's retry guarantee remains unverified.", actors: [secondActor] }] }
+    { title: "Open questions", kind: "questions", items: [{ text: "The server's retry guarantee remains unverified.", actors: [secondActor] }] },
+    { title: "Verification scope", kind: "scope", items: [{ text: "Retry tests were not run.", actors: [firstActor] }] }
   ] };
   rounds[1].summary = "One retry bug and a test gap need attention.\n\n**Findings**\n\n- Retry can duplicate writes.";
   rounds[1].revision++;
@@ -310,14 +311,30 @@ test("composer round table highlights the input and requires re-enabling for eac
   await expect(summaryCard).toBeVisible();
   await expect(summaryCard.locator(".roundtable-template")).toHaveText("Code review · Summary");
   await expect(summaryCard).toContainText("One retry bug and a test gap");
+  await expect(summaryCard.locator("header small")).toHaveText("2 actors · 2 points · 1 question");
   await expect(summaryCard.getByRole("region", { name: "Findings", exact: true }).locator(".roundtable-summary-item")).toHaveCount(2);
+  // A titled finding shows its conclusion and contributors; its evidence opens on demand.
+  const retryFinding = summaryCard.locator(".roundtable-summary-detail").first();
+  await expect(retryFinding.locator("summary")).toContainText("P1: Retry can duplicate writes");
+  await expect(retryFinding.locator("summary .roundtable-supporter")).toHaveText([firstActor, secondActor]);
+  await expect(summaryCard.getByRole("link", { name: "retry code", exact: true })).toHaveCount(0);
+  await retryFinding.locator("summary").click();
   await expect(summaryCard.getByRole("link", { name: "retry code", exact: true })).toHaveAttribute("href", "https://example.com/retry");
-  await expect(summaryCard.locator('[aria-label="Contributors"]')).toHaveCount(3);
+  await expect(summaryCard.locator('[aria-label="Contributors"]')).toHaveCount(4);
   await expect(summaryCard.getByRole("region", { name: "Open questions", exact: true })).toContainText("unverified");
   await expect(summaryCard).not.toContainText("No position recorded");
   await expect(summaryCard.getByRole("region", { name: "Consensus", exact: true })).toHaveCount(0);
   await expect(summaryCard.getByRole("region", { name: "Disagreements", exact: true })).toHaveCount(0);
-  await expect(summaryCard.getByRole("region", { name: "Verification scope", exact: true })).toHaveCount(0);
+  // Verification scope starts collapsed and opens with the rest of the card.
+  const summaryScope = summaryCard.getByRole("group", { name: "Verification scope", exact: true });
+  await expect(summaryScope).toHaveJSProperty("open", false);
+  await summaryCard.getByRole("button", { name: "Expand all", exact: true }).click();
+  await expect(summaryScope).toHaveJSProperty("open", true);
+  await expect(summaryScope).toContainText("Retry tests were not run.");
+  await summaryCard.screenshot({ path: "/private/tmp/threadex-roundtable-summary-expanded.png" });
+  await summaryCard.getByRole("button", { name: "Collapse all", exact: true }).click();
+  await expect(summaryScope).toHaveJSProperty("open", false);
+  await expect(retryFinding).toHaveJSProperty("open", false);
   await expect(summaryCard.getByRole("button", { name: "Next round", exact: true })).toBeEnabled();
   await expect.poll(() => summaryCard.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
   await summaryCard.screenshot({ path: "/private/tmp/threadex-roundtable-summary-mobile.png" });

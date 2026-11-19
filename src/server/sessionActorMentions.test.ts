@@ -188,15 +188,15 @@ test("a mention host turn runs with the session's selected effort; the mentioned
   await h.service.submit({ workspaceId: "ws", requestId: "group", userPrompt: "Fix it", namedActorIds: ["a"] }, binding);
   const bound = (await h.service.getRoom("ws")).workItems[0];
   const scope = resolveSessionMentionScope({ session: { id: bound.taskSessionId, workspaceId: "ws", cwd: "/repo" }, projects,
-    room: await h.service.getRoom("ws"), model: MODEL_CATALOG.luna.id, effort: "xhigh" });
+    room: await h.service.getRoom("ws"), model: MODEL_CATALOG.luna.id, effort: "max" });
   const { request } = sessionMentionRequest(scope, body(["b"], { requestId: "gear", message: "@b verify it" }));
-  assert.equal(request.sessionTarget?.effort, "xhigh");
+  assert.equal(request.sessionTarget?.effort, "max");
   const round = await h.service.submit(request, binding);
   const room = await h.service.getRoom("ws");
   const host = room.workItems.find(work => work.roundId === round.id && !work.hostWorkItemId)!;
   const child = room.workItems.find(work => work.roundId === round.id && work.hostWorkItemId)!;
-  assert.equal(host.executionEffort, "xhigh", "the user's session gear, not the actor's effort rule");
-  assert.notEqual(child.executionEffort, "xhigh");
+  assert.equal(host.executionEffort, "max", "the user's session gear, not the actor's effort rule");
+  assert.notEqual(child.executionEffort, "max");
 });
 
 test("a mention host hands off to its mentioned actor without an authorization judgment, and keeps it for other actors", async () => {

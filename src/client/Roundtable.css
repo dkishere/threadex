@@ -98,20 +98,35 @@
 .roundtable-answer summary > span:last-child { margin-left: auto; font-size: 11px; }
 .roundtable-answer [data-status=done] { color: #15803d; }
 .roundtable-answer [data-status=error], .roundtable-error { color: #b91c1c; }
-.roundtable-synthesis { padding: 14px; background: #fff; font-size: 13px; }
+/* Keep lines readable in wide panes; the message area itself spans the full width. */
+.roundtable-synthesis { max-width: 780px; padding: 14px; background: #fff; font-size: 13px; }
 .roundtable-template { padding: 2px 7px; border-radius: 6px; background: #f5f3ff; color: #6d28d9; font-size: 11px; }
-.roundtable-overview { margin-top: 12px; overflow-wrap: anywhere; }
+.roundtable-overview { margin-top: 12px; overflow-wrap: anywhere; color: #0f172a; font-size: 14px; }
+.roundtable-overview > :first-child { margin-top: 0; }
+.roundtable-overview > :last-child { margin-bottom: 0; }
 .roundtable-summary-group { border-color: #a78bfa; }
 .roundtable-summary-item { min-width: 0; overflow-wrap: anywhere; }
 .roundtable-summary-item > .markdown-content { margin-bottom: 6px; font-size: inherit; }
-.roundtable-summary-item > .markdown-content > :first-child { margin-top: 0; }
-.roundtable-summary-item > .markdown-content > :last-child { margin-bottom: 0; }
+.roundtable-summary-item .markdown-content > :first-child { margin-top: 0; }
+.roundtable-summary-item .markdown-content > :last-child { margin-bottom: 0; }
+.roundtable-synthesis details:is(.roundtable-summary-group, .roundtable-summary-detail) > summary { cursor: pointer; list-style: none; }
+.roundtable-synthesis details:is(.roundtable-summary-group, .roundtable-summary-detail) > summary::-webkit-details-marker { display: none; }
+.roundtable-synthesis summary:focus-visible { outline: 2px solid #8b5cf6; outline-offset: 2px; border-radius: 4px; }
+.roundtable-turn .roundtable-chevron { width: 14px; height: 14px; color: #8b5cf6; transition: transform .15s; }
+details[open] > summary .roundtable-chevron { transform: rotate(90deg); }
+.roundtable-summary-group > summary > h4 { margin: 0; }
+.roundtable-summary-group[open] > summary > h4 { margin-bottom: 8px; }
+.roundtable-summary-detail > summary { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 4px 6px; }
+.roundtable-summary-detail > summary > .roundtable-chevron { margin-top: 3px; }
+.roundtable-summary-title { flex: 1 1 240px; min-width: 0; color: #0f172a; font-size: inherit; font-weight: 600; }
+.roundtable-summary-detail > summary > .roundtable-supporters { justify-content: flex-end; margin-left: auto; }
+.roundtable-summary-detail > .markdown-content { margin: 6px 0 2px 20px; color: #334155; font-size: inherit; }
 .roundtable-cast { display: inline-flex; margin-left: auto; }
 .roundtable-cast .actor-avatar { width: 24px; height: 24px; border-radius: 7px; border: 2px solid #fff; margin-left: -6px; font-size: 10px; }
 .roundtable-group { margin-top: 12px; padding: 10px 12px; border-left: 3px solid #cbd5e1; border-radius: 8px; background: #f8fafc; }
 .roundtable-group[data-kind=consensus] { border-color: #22c55e; background: #f0fdf4; }
 .roundtable-group[data-kind=disagreement] { border-color: #f59e0b; background: #fffbeb; }
-.roundtable-group h4 { display: flex; align-items: center; gap: 6px; margin: 0 0 8px; font-size: 12px; color: #475569; }
+.roundtable-group h4 { display: flex; align-items: center; gap: 6px; margin: 0 0 8px; font-size: 13px; color: #1e293b; }
 .roundtable-group[data-kind=consensus] h4 { color: #15803d; }
 .roundtable-group[data-kind=disagreement] h4 { color: #b45309; }
 .roundtable-group h4 small { padding: 0 6px; border-radius: 8px; background: #ffffffb0; font-weight: 600; }
@@ -137,7 +152,7 @@
 .roundtable-turn > .roundtable-next { margin-top: 12px; }
 .roundtable-turn > .roundtable-next:disabled { opacity: .45; cursor: not-allowed; }
 .roundtable-responses > summary { cursor: pointer; color: #6d28d9; font-size: 12px; }
-.roundtable-context-button { padding: 3px 8px; border: 1px solid #ddd6fe; border-radius: 6px; background: #faf8ff; color: #6d28d9; font: inherit; font-size: 11px; cursor: pointer; }
+.roundtable-context-button, .roundtable-expand-button { padding: 3px 8px; border: 1px solid #ddd6fe; border-radius: 6px; background: #faf8ff; color: #6d28d9; font: inherit; font-size: 11px; cursor: pointer; }
 .roundtable-context-popup { width: min(760px, calc(100vw - 32px)); max-height: calc(100dvh - 48px); box-sizing: border-box; padding: 0; border: 1px solid #ddd6fe; border-radius: 12px; background: #fff; color: #334155; box-shadow: 0 24px 80px #0f172a40; }
 .roundtable-context-popup[open] { display: flex; flex-direction: column; }
 .roundtable-context-popup::backdrop { background: #0f172a70; }
@@ -145,5 +160,5 @@
 .roundtable-context-popup > header button { display: inline-flex; padding: 5px; background: transparent; color: #64748b; cursor: pointer; }
 .roundtable-context-body { padding: 16px 18px; overflow: auto; overscroll-behavior: contain; overflow-wrap: anywhere; font-size: 13px; }
 .roundtable-context-body .markdown-content { font-size: inherit; }
-.roundtable-context-button:focus-visible, .roundtable-context-popup button:focus-visible { outline: 2px solid #8b5cf6; outline-offset: 2px; }
+.roundtable-context-button:focus-visible, .roundtable-expand-button:focus-visible, .roundtable-context-popup button:focus-visible { outline: 2px solid #8b5cf6; outline-offset: 2px; }
 @media (max-width: 600px) { .roundtable-trigger > span { display: none; } .roundtable-settings { position: fixed; top: calc(var(--workspace-header-height, 38px) + var(--chat-header-height, 52px) + 4px); right: 12px; } }

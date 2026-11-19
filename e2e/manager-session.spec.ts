@@ -204,6 +204,66 @@ for (const width of [1440, 900, 390]) {
   });
 }
 
+test("an older runner snapshot cannot hide a live follow-up in group chat", async ({ page }) => {
+  const fixture = await shellFixture(page, "view=workspace-chat");
+  const session = { id: "sess-started", workspaceId: "actors-test", title: "Task with a follow-up" };
+  const completedTurn = { id: "completed-turn", sessionId: session.id, userInput: "First request",
+    agentResponse: "First result", status: "done", created: timestamp };
+  const followUpTurn = { id: "follow-up", sessionId: session.id, userInput: "Second request",
+    agentResponse: "", status: "running", created: "2026-10-22T21:25:00.000Z" };
+  const snapshotUrl = "**/api/sessions/sess-started/snapshot";
+  const completedSnapshot = { session, turns: [completedTurn] };
+  let eventPhase = 0;
+  const runnerEvent = (pos: number, type: string, sessionId: string, turnId: string) => ({
+    pos, eventId: String(pos), type, sessionId, turnId, workspaceId: session.workspaceId, timestamp, payload: null
+  });
+  await page.route("**/api/events?*", route => {
+    const after = Number(new URL(route.request().url()).searchParams.get("after"));
+    const events = [
+      runnerEvent(1, "runner.done", session.id, completedTurn.id),
+      runnerEvent(2, "runner.runner.started", "sess-other", "unrelated-turn"),
+      runnerEvent(3, "runner.runner.started", session.id, followUpTurn.id)
+    ].slice(0, eventPhase).filter(event => event.pos > after);
+    return route.fulfill({ json: { events, nextPos: eventPhase, workspaceId: session.workspaceId } });
+  });
+  await page.route(snapshotUrl, route => route.fulfill({ json: completedSnapshot }));
+  await page.locator('.manager-conversation [data-work-item-id="started"]').getByRole("link", { name: /^Open task/ }).click();
+  const details = page.locator(".manager-details");
+  await expect(details.locator("h1")).toHaveText(session.title);
+  await expect(details.getByText("First result", { exact: true })).toBeVisible();
+  const navigationStart = await page.evaluate(() => performance.timeOrigin);
+  const { promise: releaseOldSnapshot, resolve: respondToOldSnapshot } = Promise.withResolvers<void>();
+  let oldSnapshotRequested = false;
+  await page.route(snapshotUrl, async route => {
+    if (!oldSnapshotRequested) {
+      oldSnapshotRequested = true;
+      await releaseOldSnapshot;
+      return route.fulfill({ json: completedSnapshot });
+    }
+    return route.fulfill({ json: { session, turns: [completedTurn, followUpTurn] } });
+  });
+  await page.route("**/api/runner/stream", route => route.fulfill({
+    contentType: "text/event-stream",
+    body: 'event: item\ndata: {"eventType":"item.completed","id":"follow-up-progress","itemType":"agent_message","text":"Live follow-up progress"}\n\nevent: done\ndata: {"ok":true}\n\n'
+  }));
+  eventPhase = 1;
+  await expect.poll(() => oldSnapshotRequested).toBe(true);
+  eventPhase = 3;
+  const followUp = details.locator('article.assistant[data-turn-id="follow-up"]');
+  await expect(followUp).toContainText("Live follow-up progress");
+  const olderResponse = page.waitForResponse(response => response.url().endsWith("/api/sessions/sess-started/snapshot"));
+  respondToOldSnapshot();
+  await (await olderResponse).finished();
+  // Give the client a turn to apply the older response before checking the transcript.
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await expect(followUp).toHaveCount(1);
+  await expect(followUp).toContainText("Live follow-up progress");
+  await expect(details.locator('[data-turn-id="unrelated-turn"]')).toHaveCount(0);
+  await expect(fixture.input).toBeVisible();
+  expect(await page.evaluate(() => performance.timeOrigin)).toBe(navigationStart);
+  expect(fixture.errors).toEqual([]);
+});
+
 test("embedded full composer sends attachments and suggestions to its selected session", async ({ page }) => {
   const s = await shellFixture(page, "view=workspace-chat");
   await page.route("**/api/sessions/sess-started/snapshot", route => route.fulfill({ json: { session: { id: "sess-started", workspaceId: "actors-test", title: "Send target" }, turns: [] } }));

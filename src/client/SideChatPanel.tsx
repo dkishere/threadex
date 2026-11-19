@@ -1,22 +1,22 @@
-import { modelLabel as modelOptionLabel, supportsUltraEffort, normalizeModelEffort } from "../modelCatalog";
+import { DEFAULT_MODEL, modelLabel as modelOptionLabel, supportsUltraEffort, normalizeModelEffort, normalizeModelId } from "../modelCatalog";
 import { Bot, LockKeyhole, Loader2, Quote, RotateCcw, Send, X } from "lucide-react";
 import { FormEvent, KeyboardEvent, useEffect, useRef, useState } from "react";
 import type { RoundtableActor } from "../roundtable";
-import { roundtableLibraryEndpoint, syncRoundtableDraftAvatars, type RoundtableLibrary, type RoundtablePreset } from "../roundtablePresets";
+import { roundtableLibraryEndpoint, syncRoundtableDraftWithPresets, type RoundtableLibrary, type RoundtablePreset } from "../roundtablePresets";
 import { ActorMultiSelect } from "./ActorMultiSelect";
 import { findMentionTrigger, mentionedActors, SIDE_CHAT_MAX_ACTORS, sideChatSpeaker, type SideChatActor } from "../sideChatRoom";
 import { ActorAvatar } from "./ActorAvatar";
 import { apiJson } from "./apiClient";
 import { InlineLinkComposer, type ComposerInlineLink, type InlineLinkComposerHandle } from "./InlineLinkComposer";
 import { MarkdownContent } from "./MarkdownContent";
-import { EFFORT_OPTIONS, MODEL_OPTIONS, ULTRA_EFFORT_OPTIONS } from "./appConstants";
+import { AUTO_MODEL_VALUE, EFFORT_OPTIONS, MODEL_OPTIONS, ULTRA_EFFORT_OPTIONS } from "./appConstants";
 import type { ChatMessage } from "./appTypes";
 import { formatResponseAnnotationsPrompt, parseResponseAnnotations, type ResponseAnnotation } from "./responseAnnotations";
 import { ResponseAnnotationList, annotationLabel } from "./ResponseAnnotationList";
 import { RoundtableLibraryPopup } from "./Roundtable";
 import { askSession, controlSideChat, loadSideChatState, type SessionSideChat } from "./sessionApi";
 import { buildSideChatRounds, type OutgoingSideChatReply } from "./sideChatRounds";
-import { readSideChatPreferences, saveSideChatPreferences } from "./sideChatPreferences";
+import { readSideChatGearOverride, readSideChatPreferences, saveSideChatGearOverride, type SideChatPreferences } from "./sideChatPreferences";
 import {
   ComposerFrame,
   ComposerGearSelector,
@@ -41,6 +41,8 @@ type SideChatPanelProps = {
   sessionId: string;
   sessionReady: boolean;
   workspaceId?: string;
+  defaultGearPreferences?: SideChatPreferences;
+  inheritedGear?: ComposerGearProfile;
   CompletedTurn: CompletedTurnComponent;
   annotations?: ResponseAnnotation[];
   onRemoveAnnotation?: (index: number) => void;
@@ -80,14 +82,19 @@ function saveRoster(sessionId: string, actors: RoundtableActor[]) {
   try { localStorage.setItem(rosterKey(sessionId), JSON.stringify(actors)); } catch { /* The in-memory roster still works. */ }
 }
 
-export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady, workspaceId, CompletedTurn, annotations = NO_ANNOTATIONS, onRemoveAnnotation, onClearAnnotations, onRunningChange }: SideChatPanelProps) {
+function sideChatGear({ model, effort }: ComposerGearProfile): ComposerGearProfile {
+  if (model === AUTO_MODEL_VALUE) return { model: DEFAULT_MODEL, effort: "high" };
+  const normalizedModel = normalizeModelId(model);
+  return { model: normalizedModel, effort: normalizeModelEffort(normalizedModel, effort) };
+}
+
+export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady, workspaceId, defaultGearPreferences, inheritedGear, CompletedTurn, annotations = NO_ANNOTATIONS, onRemoveAnnotation, onClearAnnotations, onRunningChange }: SideChatPanelProps) {
   const [messages, setMessages] = useState<SessionSideChat[]>([]);
   const [outgoing, setOutgoing] = useState<OutgoingSideChatReply[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(true);
-  const [initialPreferences] = useState(readSideChatPreferences);
-  const [gearProfiles, setGearProfiles] = useState<ComposerGearProfile[]>(initialPreferences.gearProfiles);
-  const [activeGearIndex, setActiveGearIndex] = useState(initialPreferences.activeGearIndex);
+  const [legacyGearPreferences] = useState(() => readSideChatPreferences(workspaceId));
+  const [gearOverride, setGearOverride] = useState(() => readSideChatGearOverride(sessionId));
   const [error, setError] = useState<string | null>(null);
   const [roster, setRoster] = useState<RoundtableActor[]>(() => readRoster(sessionId));
   const [presets, setPresets] = useState<RoundtablePreset[]>([]);
@@ -98,8 +105,14 @@ export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady,
   const sessionGeneration = useRef(0);
   const loadedSession = useRef<string | null>(null);
   const submitting = useRef(new Set<string>());
-  const activeGear = gearProfiles[activeGearIndex] ?? gearProfiles[0];
-  const actors = syncRoundtableDraftAvatars(roster, presets);
+  const defaultPreferences = defaultGearPreferences ?? legacyGearPreferences;
+  const editablePreferences = gearOverride ?? {
+    gearProfiles: defaultPreferences.gearProfiles.map(sideChatGear),
+    activeGearIndex: defaultPreferences.activeGearIndex
+  };
+  const inheritedSideChatGear = !gearOverride && inheritedGear ? sideChatGear(inheritedGear) : null;
+  const activeGear = inheritedSideChatGear ?? editablePreferences.gearProfiles[editablePreferences.activeGearIndex] ?? editablePreferences.gearProfiles[0];
+  const actors = syncRoundtableDraftWithPresets(roster, presets);
   const isSending = outgoing.some((reply) => reply.status === "pending");
   useEffect(() => { onRunningChange?.(isSending); }, [isSending, onRunningChange]);
   useEffect(() => () => onRunningChange?.(false), [onRunningChange]);
@@ -108,20 +121,18 @@ export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady,
   const scrollKey = `${messages.length}:${messages.at(-1)?.id}:${outgoing.map(reply => `${reply.key}:${reply.status}`).join(",")}`;
 
   useEffect(() => {
-    saveSideChatPreferences({ gearProfiles, activeGearIndex });
-  }, [gearProfiles, activeGearIndex]);
-
-  useEffect(() => {
     if (annotations.length) window.requestAnimationFrame(() => composerRef.current?.focus());
   }, [annotations]);
 
+  function persistGearOverride(preferences: SideChatPreferences) {
+    setGearOverride(preferences);
+    saveSideChatGearOverride(sessionId, preferences);
+  }
+
   function updateGearProfile(index: number, patch: Partial<ComposerGearProfile>) {
-    setGearProfiles((current) => current.map((gear, gearIndex) => {
-      if (gearIndex !== index) return gear;
-      const next = { ...gear, ...patch };
-      next.effort = normalizeModelEffort(next.model, next.effort);
-      return next;
-    }));
+    const gearProfiles = editablePreferences.gearProfiles.map((gear, gearIndex) =>
+      gearIndex === index ? sideChatGear({ ...gear, ...patch }) : gear);
+    persistGearOverride({ ...editablePreferences, gearProfiles });
   }
 
   function changeRoster(next: RoundtableActor[]) {
@@ -421,15 +432,17 @@ export function SideChatPanel({ active, codexSessionId, sessionId, sessionReady,
           {actors.length === 0 && <ComposerGearSelector
             idPrefix="side-chat-composer-gear"
             label="Side chat model gears"
-            gears={gearProfiles}
-            activeGearIndex={activeGearIndex}
+            inherited={Boolean(inheritedSideChatGear)}
+            onEnableOverride={() => persistGearOverride(editablePreferences)}
+            gears={inheritedSideChatGear ? [inheritedSideChatGear] : editablePreferences.gearProfiles}
+            activeGearIndex={inheritedSideChatGear ? 0 : editablePreferences.activeGearIndex}
             modelOptions={MODEL_OPTIONS}
             effortOptions={EFFORT_OPTIONS}
             ultraEffortOptions={ULTRA_EFFORT_OPTIONS}
             supportsUltraEffort={supportsUltraEffort}
             modelOptionLabel={modelOptionLabel}
             effortOptionLabel={capitalize}
-            onActivateGear={setActiveGearIndex}
+            onActivateGear={(index) => persistGearOverride({ ...editablePreferences, activeGearIndex: index })}
             onModelChange={(index, model) => updateGearProfile(index, { model })}
             onEffortChange={(index, effort) => updateGearProfile(index, { effort })}
             disabled={isSending || !sessionReady}

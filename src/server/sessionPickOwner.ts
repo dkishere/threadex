@@ -1,4 +1,5 @@
 import { buildCodexReference } from "../codexReference";
+import { actorAllowedModels } from "../modelCatalog";
 import { actorInProjectChat, type ActorRoom, type ActorRound, type ActorTaskBinding, type SubmitActorRequest } from "../domainActors";
 import { actorSessionWork } from "./actorNativeAgents";
 import type { CodexProject } from "./codexProjects";
@@ -53,7 +54,7 @@ export function pickOwnerStatus(input: PickOwnerInput): PickOwnerStatus {
     throw error;
   }
   const actorCount = input.room.actors.filter(actor => actorInProjectChat(input.room.actors, actor.id, project.id)
-    && actorExecutionModels(actor.allowedModels ?? [], input.model).length > 0).length;
+    && actorExecutionModels(actorAllowedModels(actor), input.model).length > 0).length;
   const pending = pendingPickOwner(input.room, input.session.id, input.inFlightRequestId);
   const reason = !actorCount ? "project_has_no_actors" : pending ? "pick_owner_pending" : null;
   return { eligible: !reason, reason, projectId: project.id, projectName: project.name, actorCount, pending };

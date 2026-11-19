@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { CURRENT_CODEX_TIER_MODELS, MODEL_CATALOG as M, MODEL_OPTIONS } from "../modelCatalog";
+import { CURRENT_CODEX_TIER_MODELS, MODEL_CATALOG as M, MODEL_OPTIONS, normalizeModelEffort } from "../modelCatalog";
 import { ACTOR_MODEL_SELECTION_INSTRUCTIONS, ACTOR_MODEL_TIER_GUIDANCE, ACTOR_WORKFLOW_QUESTION, ACTOR_WORKLOAD_ASSESSMENT, PROMPT_WORK_MODEL_FLOOR, actorChosenModel, actorWorkflowAssessment, actorWorkflowExecutionGuidance, actorExecutionModels, actorModelOptions, actorRequestedExecution, actorTaskExecutionEffort, actorWorkloadKind } from "./domainActorModelSelection";
 import type { DecisionResult } from "./decision/types";
 
@@ -60,16 +60,24 @@ test("tier guidance sends mechanical work low, keeps Astra for genuine difficult
 
 test("lighter models run at raised effort unless the work is mechanical; Sol/Astra tiers keep the actor's effort", () => {
   for (const model of [M.luna.id, M.terra61.id, M.mini.id, M.claudeSonnet.id, M.claudeHaiku.id]) {
-    assert.equal(actorTaskExecutionEffort(model, "medium"), "high", model);
-    assert.equal(actorTaskExecutionEffort(model, "low", { workloadKind: "reasoning" }), "high", model);
+    assert.equal(actorTaskExecutionEffort(model, "medium"), "xhigh", model);
+    assert.equal(actorTaskExecutionEffort(model, "low", { workloadKind: "reasoning" }), "xhigh", model);
     assert.equal(actorTaskExecutionEffort(model, "medium", { workloadKind: "mechanical" }), "medium", model);
   }
   assert.equal(actorTaskExecutionEffort(M.luna.id, "xhigh"), "xhigh", "the floor never lowers a higher actor effort");
+  // The claiming actor's proposed effort raises the floor on any tier, but never lowers it.
+  assert.equal(actorTaskExecutionEffort(M.claudeOpus.id, "medium", { proposedEffort: "high" }), "high");
+  assert.equal(actorTaskExecutionEffort(M.sol61.id, "medium", { proposedEffort: "xhigh" }), "xhigh");
+  assert.equal(actorTaskExecutionEffort(M.claudeOpus.id, "medium", { proposedEffort: "low" }), "medium", "a lower proposal keeps the actor's effort");
+  assert.equal(actorTaskExecutionEffort(M.luna.id, "medium", { proposedEffort: "high" }), "xhigh", "a lower proposal keeps the light-tier floor");
+  assert.equal(actorTaskExecutionEffort(M.mini.id, "medium", { proposedEffort: "max", workloadKind: "mechanical" }), normalizeModelEffort(M.mini.id, "max"), "a proposal is normalized to the model");
+  assert.equal(actorTaskExecutionEffort(M.claudeSonnet.id, "medium", { proposedEffort: "max" }), "max");
+  assert.equal(actorTaskExecutionEffort(M.luna.id, "medium", { requestedEffort: "low", proposedEffort: "xhigh" }), "low", "an explicit user effort beats the proposal");
   for (const model of [CURRENT_CODEX_TIER_MODELS.sol, CURRENT_CODEX_TIER_MODELS.astra, M.sol61.id, M.astra.id, M.claudeOpus.id, M.claudeFable.id, M.claudeFable51.id]) assert.equal(actorTaskExecutionEffort(model, "medium"), "medium", model);
   assert.equal(actorTaskExecutionEffort(M.luna.id, "medium", { requestedEffort: "low" }), "low", "an explicit user effort is final");
   assert.equal(actorTaskExecutionEffort(M.claudeOpus.id, "medium", { requestedEffort: "xhigh" }), "xhigh");
   const options = actorModelOptions([M.luna.id, M.sol61.id], "medium");
-  assert.match(options[M.luna.id], /actual execution effort high \(medium for mechanical work\)\./);
+  assert.match(options[M.luna.id], /actual execution effort xhigh \(medium for mechanical work\)\./);
   assert.match(options[M.sol61.id], /actual execution effort medium\./);
   const decision = (choice: string): DecisionResult => ({ ok: true, answers: { workload_kind: { kind: "choice", choice, confidence: 1 } }, attempts: [] } as unknown as DecisionResult);
   assert.equal(actorWorkloadKind(decision("mechanical")), "mechanical");

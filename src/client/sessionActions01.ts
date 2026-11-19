@@ -913,7 +913,7 @@ export async function loadSessions(ctx, offset = 0, append = false, cwd: string 
 }
 
 export async function refreshSelectedSessionSnapshot(ctx, targetSessionId, turnId) {
-    const { applySelectedSessionSnapshot, isLikelyBackendDisconnect, noteBackendDisconnect, noteBackendRequestSucceeded, pendingReconciliationTurnIdsRef, reconcilingTurnIdsRef, sessionIdRef, setStatus } = ctx;
+    const { applySelectedSessionSnapshot, isLikelyBackendDisconnect, noteBackendDisconnect, noteBackendRequestSucceeded, pendingReconciliationTurnIdsRef, reconcilingTurnIdsRef, sessionIdRef, sessionSnapshotRequestOrderRef, setStatus } = ctx;
         if (sessionIdRef.current !== targetSessionId)
             return;
         const expectedViewKey = ctx.viewKeyRef?.current;
@@ -930,6 +930,10 @@ export async function refreshSelectedSessionSnapshot(ctx, targetSessionId, turnI
             do {
                 pendingReconciliationTurnIdsRef.current.delete(reconciliationKey);
                 try {
+                    // Full transcript requests can overlap for different turns.
+                    // Manager history requests can contain distinct pinned pages.
+                    const requestOrder = ctx.workspaceManagerView ? null : sessionSnapshotRequestOrderRef.current;
+                    const requestNumber = requestOrder ? ++requestOrder.requested : 0;
                     const response = await fetch(sessionSnapshotUrl(targetSessionId, ctx.workspaceManagerView, undefined, turnId), { cache: "no-store" });
                     if (!response.ok)
                         throw new Error(`API returned ${response.status}`);
@@ -937,7 +941,11 @@ export async function refreshSelectedSessionSnapshot(ctx, targetSessionId, turnI
                     const payload = (await response.json());
                     if (sessionIdRef.current !== targetSessionId || !payload.session || ctx.viewKeyRef?.current !== expectedViewKey)
                         return;
+                    if (requestOrder && requestNumber < requestOrder.applied)
+                        continue;
                     applySelectedSessionSnapshot(payload);
+                    if (requestOrder)
+                        requestOrder.applied = requestNumber;
                     const turn = turnId ? payload.turns?.find((candidate) => candidate.id === turnId) : null;
                     setStatus(turn?.status === "todo"
                         ? turn.agentResponse || "Turn queued"

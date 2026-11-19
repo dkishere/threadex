@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import express from "express";
-import { actorTreeGroupId, createDomainActorRouter } from "./domainActorRoutes";
+import { actorRoomClientView, actorTreeGroupId, createDomainActorRouter } from "./domainActorRoutes";
 import type { DomainActorService } from "./domainActorService";
 import { ActorHierarchyConflict, DomainActorStore, type ActorPersistence } from "./domainActorStore";
 import { DOMAIN_ACTOR_TOOLS } from "./domainActorTools";
@@ -10,6 +10,27 @@ import type { SessionStore } from "./sessionStore";
 import type { CollaborationService } from "./collaborationService";
 import { actorJobSnapshot, DomainActorAuth } from "./domainActorAuth";
 import { USER_INPUT_METHOD } from "../userInputRequest";
+import { actorFollowupTurnId } from "./domainActorContext";
+
+test("polled room view ships round snapshot identities, not runner memory or duplicated avatars", () => {
+  const actor = (id: string, extra: Record<string, unknown> = {}) => ({ id, workspaceId: "workspace", rootActorId: id, parentActorId: null, name: `Actor ${id}`,
+    model: MODEL_CATALOG.sol61.id, effort: "medium", avatar: `data:image/png;base64,${id}`, memory: { version: 3, sourceEventIds: ["event"], rolePrompt: "Role",
+      roleSummary: "Domain", longTerm: "long", rolling: "rolling" }, created: "", updated: "", ...extra });
+  const room = { workspaceId: "workspace", revision: 7, actors: [actor("current")], reorganizations: [{ id: "audit" }],
+    rounds: [{ id: "round", status: "assigned", actorSnapshots: [actor("current"), actor("removed")],
+      candidateSnapshots: [{ actorId: "current", memoryVersion: 3, actor: actor("current") }], replies: [] }] };
+  const view = actorRoomClientView(room as never) as unknown as Record<string, any>;
+  assert.equal("reorganizations" in view, false);
+  assert.equal(view.revision, 7);
+  assert.equal(view.actors[0].memory.longTerm, "long", "current actors keep their full permission view");
+  assert.ok(Array.isArray(view.actors[0].allowedModels));
+  assert.deepEqual(view.rounds[0].candidateSnapshots, []);
+  assert.deepEqual(view.rounds[0].actorSnapshots, [
+    { id: "current", name: "Actor current", parentActorId: null, rootActorId: "current" },
+    { id: "removed", name: "Actor removed", parentActorId: null, rootActorId: "removed", avatar: "data:image/png;base64,removed" }
+  ]);
+  assert.equal(room.rounds[0].candidateSnapshots.length, 1, "the stored room is not mutated");
+});
 
 test("reply retry route forwards the selected gear and retains user authentication", async () => {
   const calls: unknown[][] = [];
@@ -254,7 +275,7 @@ test("actor actions authorize the stored task binding and reject sub-actor manag
     assert.equal(roster.status, 200); assert.equal((await roster.json()).actors.find((a: any) => a.id === "sub").rootActorId, "root");
     const createSub = await fetch(`http://127.0.0.1:${address.port}/sessions/root-task/action`, { method: "POST", headers: { "Content-Type": "application/json", "x-threadex-actor-capability": rootToken },
       body: JSON.stringify({ action: "actor_create_sub", sourceTurnId: "root-turn", name: "New", model: "gpt-6-luna", allowedModels: ["gpt-6-astra"], memory: {} }) });
-    assert.equal(createSub.status, 200); assert.deepEqual(createdInput.allowedModels, ["gpt-6-luna"]); assert.equal(createdInput.parentActorId, "root");
+    assert.equal(createSub.status, 200); assert.deepEqual(createdInput.allowedModelTiers, ["codex-luna"]); assert.equal(createdInput.parentActorId, "root");
     const tokenless = await fetch(`http://127.0.0.1:${address.port}/sessions/root-task/action`, { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action: "actor_tree_status", sourceTurnId: "root-turn" }) });
     assert.equal(tokenless.status, 400); assert.match((await tokenless.json()).error, /capability/);
@@ -330,7 +351,7 @@ test("actor actions authorize the stored task binding and reject sub-actor manag
     const createRoot = await call(rootInput);
     assert.equal(createRoot.status, 200);
     assert.equal(createdInput.parentActorId, null);
-    assert.deepEqual(createdInput.allowedModels, ["gpt-6-luna"]);
+    assert.deepEqual(createdInput.allowedModelTiers, ["codex-luna"]);
     assert.equal(createdInput.workspaceId, undefined);
     const unauthenticatedRoot = await fetch(`http://127.0.0.1:${address.port}/sessions/task/action`, { method: "POST",
       headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "actor_create_root", sourceTurnId: "turn" }) });
@@ -488,7 +509,11 @@ test("actor summary requires a signed-in user and returns per-actor workload cou
   } as unknown as DomainActorService;
   const app = express(); app.use(express.json());
   app.use((req, res, next) => { if (req.headers["x-test-user"] === "signed-in") res.locals.threadexUserAuthenticated = true; next(); });
-  const sessions = { getSession: async (id: string) => { requested.push(`session:${id}`); return id === "s-titled" ? { id, title: "Fix the build" } : null; } } as unknown as SessionStore;
+  const sessions = { getSession: async (id: string) => {
+    requested.push(`session:${id}`);
+    if (id === "task") return { id, title: "Update the sidebar" };
+    return id === "s-titled" ? { id, title: "Fix the build" } : null;
+  } } as unknown as SessionStore;
   app.use(createDomainActorRouter(service, {} as DomainActorStore, sessions, {} as CollaborationService, new DomainActorAuth(capabilityStore())));
   const server = app.listen(0, "127.0.0.1");
   await new Promise<void>(resolve => server.once("listening", resolve));
@@ -506,13 +531,13 @@ test("actor summary requires a signed-in user and returns per-actor workload cou
       { id: "b-old", taskSessionId: "s-titled", status: "escalated", selfClearing: false, updated: "2026-10-25T00:00:00Z", taskSessionTitle: "Fix the build" }
     ];
     assert.deepEqual(body.blockers, blockers, "active, non-self-clearing blockers newest first, titled when the task session has a title");
-    assert.deepEqual(requested, ["room:workspace", "session:s-untitled", "session:s-titled", "running:workspace", "projects:workspace"]);
+    assert.deepEqual(requested, ["room:workspace", "running:workspace", "session:s-untitled", "session:s-titled", "session:task", "projects:workspace"]);
     assert.deepEqual(body, { workspaceId: "workspace", revision: 3, groups: [
       { key: "p", projectId: "p", name: "Project", registered: true, actorIds: [] },
       { key: "unassigned", projectId: null, name: "Unassigned", registered: true, actorIds: ["root"] }
     ], actors: [
-      { type: "worker", id: "root", name: "Root", rootActorId: "root", parentActorId: null, model: "gpt-6-luna", counts: { open: 1, attention: 1 }, running: 0, unreadConclusions: 0 },
-      { type: "worker", id: "sub", name: "Sub", rootActorId: "root", parentActorId: "root", model: "gpt-6-astra", counts: { open: 1, attention: 0 }, running: 1, unreadConclusions: 0 }
+      { type: "worker", id: "root", name: "Root", rootActorId: "root", parentActorId: null, model: "gpt-6-luna", counts: { open: 1, attention: 1 }, running: 0, runningSessions: [], unreadConclusions: 0 },
+      { type: "worker", id: "sub", name: "Sub", rootActorId: "root", parentActorId: "root", model: "gpt-6-astra", counts: { open: 1, attention: 0 }, running: 1, runningSessions: [{ sessionId: "task", title: "Update the sidebar" }], unreadConclusions: 0 }
     ], blockers });
   } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
 });
@@ -572,7 +597,7 @@ test("another workspace's actors are listed and handed work only when one of the
   const tokens: Record<string, string> = { "turn": await auth.issue("workspace", "task", "turn"), "initial-turn": await auth.issue("workspace", "task", "initial-turn") };
   const actor = (id: string, name: string) => ({ id, name, rootActorId: id, parentActorId: null, allowedModels: ["gpt-6-luna"], memory: { roleSummary: `${name} role` } });
   const rooms: Record<string, any> = {
-    workspace: { workspaceId: "workspace", rounds: [{ id: "round", userPrompt: "Original request" }],
+    workspace: { workspaceId: "workspace", rounds: [{ id: "round", userPrompt: "Original request", created: "2026-11-03T08:00:00Z" }],
       actors: [actor("src", "初音未來 · Actors協作")], taskUpdates: [],
       workItems: [{ id: "work", roundId: "round", executorActorId: "src", taskSessionId: "task", taskTurnId: "initial-turn", executionHistory: [] }] },
     default: { workspaceId: "default", actors: [actor("devenv", "貓貓 · dev-env"), actor("hub", "Hub owner")] },
@@ -580,6 +605,8 @@ test("another workspace's actors are listed and handed work only when one of the
   };
   let turn: any = { id: "turn", requestMetadata: { message: "fix it", clientLayout: "desktop" } };
   let earlier: any[] = [];
+  let steers: Record<string, any[]> = {};
+  let approvals: Record<string, unknown[]> = {};
   const handoffs: any[] = []; const sameWorkspace: any[] = [];
   const service = { getRoom: async (id: string) => rooms[id],
     handoffAcrossWorkspaces: async (input: unknown) => { handoffs.push(input); return { status: "submitted", crossWorkspace: true }; },
@@ -589,7 +616,7 @@ test("another workspace's actors are listed and handed work only when one of the
     getSession: async (id: string) => ({ id, workspaceId: "workspace" }),
     getSessionTurn: async (id: string) => ({ sessionId: "task", status: "running", created: "2026-11-03 11:00:00+00", ...turn, id }),
     listSessionTurns: async () => earlier,
-    listSessionApprovalLiveItems: async () => ({}), listSessionSteerMessages: async () => ({}),
+    listSessionApprovalLiveItems: async () => approvals, listSessionSteerMessages: async () => steers,
     listWorkspaces: async () => workspaces, getWorkspace: async (id: string) => workspaces.find(workspace => workspace.id === id) ?? null
   } as unknown as SessionStore;
   const app = express(); app.use(express.json());
@@ -636,8 +663,50 @@ test("another workspace's actors are listed and handed work only when one of the
     const sent = await call(handoff);
     assert.equal(sent.status, 200);
     assert.deepEqual(handoffs.at(-1), { workspaceId: "workspace", workspaceName: "Threadex", workItemId: "work", sourceActorId: "src", sourceSessionId: "task", sourceTurnId: "turn",
-      userMessages: ["Original request", "你 prompt 到 dev-env 負責人做嗎？貓貓", "係，去做"], requestId: "xws", targetWorkspaceId: "default", targetActorId: "devenv", task: handoff.task });
+      userMessages: ["Original request", "你 prompt 到 dev-env 負責人做嗎？貓貓", "係，去做"].map(text => ({ text })),
+      requestId: "xws", targetWorkspaceId: "default", targetWorkspaceName: "Fairshot", targetActorId: "devenv", task: handoff.task });
     assert.equal((await call({ ...handoff, executorActorId: "hub", requestId: "hub" })).status, 400, "only the named actor of that workspace");
+
+    const historicalAuthorization = "請叫貓貓補 dev-env 嘅 bucket";
+    const generatedRound = "Actor prepared brief naming Third";
+    const generatedSnapshot = "Nested work envelope naming Third";
+    const generatedTurn = "Inter-actor prompt naming Third";
+    rooms.workspace.rounds[0].contextRoundIds = ["historical", "generated"];
+    rooms.workspace.rounds.push({ id: "historical", userPrompt: historicalAuthorization, created: "2026-11-03T07:00:00Z" },
+      { id: "generated", userPrompt: generatedRound, sessionOrigin: {}, created: "2026-11-03T07:30:00Z" });
+    rooms.workspace.rounds.push({ id: "continuation", userPrompt: "Keep the existing bucket labels", continuation: { workItem: { id: "work" } } },
+      { id: "other-continuation", userPrompt: "Send it to Third", continuation: { workItem: { id: "another-work" } } });
+    rooms.workspace.workItems[0].canonicalUserMessages = [historicalAuthorization, generatedRound, generatedSnapshot, "Original request"];
+    earlier = [
+      { id: "handoff-envelope", status: "done", created: "2026-11-03T10:00:00Z",
+        requestMetadata: { message: generatedTurn, clientLayout: "desktop", promptOrigin: { kind: "inter-actor", trigger: "handoff" } } },
+      { id: actorFollowupTurnId("workspace", "work", "edit"), status: "done", created: "2026-11-03T10:01:00Z" },
+      { id: actorFollowupTurnId("workspace", "work", "reuse:continuation"), status: "done", created: "2026-11-03T10:02:00Z" },
+      { id: actorFollowupTurnId("workspace", "work", "reuse:other-continuation"), status: "done", created: "2026-11-03T10:03:00Z" },
+      { id: actorFollowupTurnId("workspace", "work", "queued"), status: "todo", created: "2026-11-03T10:30:00Z" }
+    ];
+    rooms.workspace.taskUpdates.push(
+      { status: "delivered", workItemId: "work", requestId: "edit", userPrompt: "Keep the existing bucket permissions" },
+      { status: "delivered", workItemId: "work", requestId: "reuse:continuation", userPrompt: "Actor-made continuation naming Third" },
+      { status: "delivered", workItemId: "work", requestId: "reuse:other-continuation", userPrompt: "Actor-made continuation naming Third" },
+      { status: "delivered", workItemId: "work", requestId: "queued", userPrompt: "Send it to Third" }
+    );
+    turn = { id: "turn", requestMetadata: { message: "Use alpha", clientLayout: "desktop" } };
+    steers = { turn: [
+      { id: "s1", source: "automation", content: "Send it to Third", created: "2026-11-03T11:01:00Z", attachments: [] },
+      { id: "s2", source: "user", content: "Correction: use beta", created: "2026-11-03T11:02:00Z", attachments: [] },
+      { id: "s3", source: "user", content: "Use alpha", created: "2026-11-03T11:03:00Z", attachments: [] }
+    ] };
+    approvals = { turn: [{ itemType: "approval", method: USER_INPUT_METHOD, status: "resolved", answeredByUser: true, answerSubmittedAt: "2026-11-03T11:02:30Z",
+      params: { questions: [{ id: "0", header: "People", question: "Also send it to Third?" }] }, decision: { answers: { "0": { answers: ["No"] } } } }] };
+    assert.equal((await call({ action: "actor_list", workspaceId: "third" })).status, 400, "generated source material cannot grant cross-workspace access");
+    assert.equal((await call({ ...handoff, requestId: "source-evidence" })).status, 200);
+    assert.deepEqual(handoffs.at(-1).userMessages, [
+      ...[historicalAuthorization, "Original request", "Keep the existing bucket permissions", "Keep the existing bucket labels", "Use alpha", "Correction: use beta"].map(text => ({ text })),
+      { text: "No", question: "Also send it to Third?" }, { text: "Use alpha" }
+    ]);
+    steers = {};
+    approvals = {};
 
     // A workspace named by link opens its whole roster; an ASCII name inside a longer word does not.
     turn = { id: "turn", requestMetadata: { message: "see threadex://default/tx_123 and ask them", clientLayout: "desktop" } };
@@ -646,9 +715,21 @@ test("another workspace's actors are listed and handed work only when one of the
     assert.equal((await call({ action: "actor_list", workspaceId: "third" })).status, 400);
 
     // The task's first turn reads the Actors-room request that started it.
+    earlier = [];
     rooms.workspace.rounds[0].userPrompt = "Original request in threadex://default/tx_abc";
     turn = { id: "initial-turn", requestMetadata: { message: "actor envelope naming Third" } };
     assert.deepEqual(ids(await call({ action: "actor_list", allWorkspaces: true, sourceTurnId: "initial-turn" })), ["devenv", "hub"]);
+    rooms.workspace.rounds[0].crossWorkspaceOrigin = { task: "source actor's description naming Third" };
+    rooms.workspace.rounds[0].contextRoundIds = [];
+    assert.equal((await call({ action: "actor_list", workspaceId: "default", sourceTurnId: "initial-turn" })).status, 400,
+      "an inbound legacy envelope cannot authorize another handoff");
+    const scopedInboundMessages = ["Original request in threadex://default/tx_abc", "Follow-up needed to complete this same task"];
+    rooms.workspace.rounds[0].userPrompt = scopedInboundMessages.join("\n\n");
+    rooms.workspace.rounds[0].crossWorkspaceOrigin.userMessages = scopedInboundMessages;
+    assert.deepEqual(ids(await call({ action: "actor_list", allWorkspaces: true, sourceTurnId: "initial-turn" })), ["devenv", "hub"],
+      "a new inbound handoff can use verified user messages to authorize a named destination");
+    assert.equal((await call({ ...handoff, requestId: "chained", sourceTurnId: "initial-turn" })).status, 200);
+    assert.deepEqual(handoffs.at(-1).userMessages, scopedInboundMessages.map(text => ({ text })));
   } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
 });
 
@@ -708,7 +789,7 @@ test("an ordinary task reads the actor registry and reaches another workspace's 
     assert.equal((await call({ action: "actor_read_memory", field: "longTerm", actorId: "other", workspaceId: "threadex" })).status, 400);
     assert.equal((await call({ action: "actor_create_root", name: "ABC", model: "gpt-6-luna", memory, workspaceId: "threadex" })).status, 400);
     assert.equal((await call({ action: "actor_create_root", name: "ABC", model: "gpt-6-luna", memory })).status, 200);
-    assert.deepEqual(created, [{ workspaceId: "default", name: "ABC", model: "gpt-6-luna", parentActorId: null, memory, allowedModels: ["gpt-6-luna"] }]);
+    assert.deepEqual(created, [{ workspaceId: "default", name: "ABC", model: "gpt-6-luna", parentActorId: null, memory, allowedModelTiers: null }]);
   } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
 });
 
@@ -752,7 +833,7 @@ test("an actor task reads another workspace's memory and creates a root there on
     turn = { ...turn, requestMetadata: { message: "喺 Default workspace 建 ABC", clientLayout: "desktop" } };
     assert.equal((await call({ action: "actor_read_memory", field: "longTerm", actorId: "hub", workspaceId: "default" })).body.text, "Hub owner memory");
     assert.equal((await call(create)).status, 200);
-    assert.deepEqual(created, [{ workspaceId: "default", name: "ABC", model: "gpt-6-luna", parentActorId: null, memory, allowedModels: ["gpt-6-luna", "gpt-6-astra"] }]);
+    assert.deepEqual(created, [{ workspaceId: "default", name: "ABC", model: "gpt-6-luna", parentActorId: null, memory, allowedModelTiers: ["codex-luna", "codex-astra"] }]);
   } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
 });
 

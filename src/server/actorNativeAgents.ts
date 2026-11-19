@@ -1,5 +1,5 @@
 import type { ActorRoom, ActorRunningSession, ActorWorkItem, DomainActor } from "../domainActors";
-import { CURRENT_CLAUDE_TIER_MODELS, modelProvider, normalizeModelEffort, normalizeModelId } from "../modelCatalog";
+import { actorAllowedModels, CURRENT_CLAUDE_TIER_MODELS, modelProvider, normalizeModelEffort, normalizeModelId } from "../modelCatalog";
 import { actorExecutionMessage, boundedActorContext } from "./domainActorContext";
 
 /** A partial-claim split runs in its integration owner's session: the other
@@ -52,7 +52,10 @@ export const NATIVE_CHILD_PERMISSION_ERROR = "Owner or executor model permission
 
 /** Current owner and executor permissions, checked before a native child is launchable. */
 export function actorModelPermitted(room: Pick<ActorRoom, "actors">, work: Pick<ActorWorkItem, "ownerActorId" | "executorActorId" | "model">) {
-  return [work.ownerActorId, work.executorActorId].every(id => room.actors.find(actor => actor.id === id)?.allowedModels.includes(work.model));
+  return [work.ownerActorId, work.executorActorId].every(id => {
+    const actor = room.actors.find(candidate => candidate.id === id);
+    return actor && actorAllowedModels(actor).includes(work.model);
+  });
 }
 
 export type ActorNativeSignal = {

@@ -9,6 +9,7 @@ import { useUnseenBlockers } from "./blockerAcknowledgement";
 import { ACTOR_ROOM_CHANGED, isAuthRequired } from "./actorRoomState";
 import "./ActorListPanel.css";
 import { ACTOR_TYPE_LABELS } from "../actorTypes";
+import { navigationUrl } from "./navigation";
 
 export type SidebarView = "actors" | "sessions";
 const sidebarViewKey = (workspaceId: string) => `threadex.sidebarView:${workspaceId}`;
@@ -98,13 +99,13 @@ function blockerBadgeTitle(blockers: ActorBlockerView[]) {
     "Click to view blockers"].join("\n");
 }
 
-function ActorRow({ actor, sub, selected, blockers, onSelect, onOpenBlockers }: {
+function ActorRow({ actor, workspaceId, sub, selected, blockers, onSelect, onOpenBlockers, onOpenSession }: {
   actor: ActorSummaryEntry; sub: boolean; selected: boolean; blockers: ActorBlockerView[]; onSelect: (id: string) => void;
-  onOpenBlockers: (id: string) => void;
+  workspaceId: string; onOpenBlockers: (id: string) => void; onOpenSession: (sessionId: string) => void;
 }) {
   const badge = actorWorkloadBadge(actor.counts);
   const counts = blockerCounts(blockers);
-  return <div className="actor-list-entry" data-has-blocker={counts.active > 0 || undefined}>
+  return <><div className="actor-list-entry" data-has-blocker={counts.active > 0 || undefined}>
     <button type="button" className="actor-list-row" data-actor-id={actor.id} data-sub={sub || undefined}
     aria-current={selected ? "true" : undefined} onClick={() => onSelect(actor.id)}>
     <DomainActorIdentity actor={actor} detail={sub ? "Sub-worker" : "Worker"} />
@@ -124,7 +125,17 @@ function ActorRow({ actor, sub, selected, blockers, onSelect, onOpenBlockers }: 
       aria-label={`${blockerCountLabel(counts)} not yet viewed. View ${actor.name} blockers`} title={blockerBadgeTitle(blockers)} onClick={() => onOpenBlockers(actor.id)}>
       Blocked {counts.active}
     </button>}
-  </div>;
+  </div>
+    {!!actor.runningSessions?.length && <ul className="actor-list-tasks" aria-label={`Active tasks for ${actor.name}`}>
+      {actor.runningSessions.map(({ sessionId, title }) => <li key={sessionId}>
+        <a href={navigationUrl({ workspaceId, sessionId })} title={title} onClick={event => {
+          if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+          event.preventDefault();
+          onOpenSession(sessionId);
+        }}>{title}</a>
+      </li>)}
+    </ul>}
+  </>;
 }
 
 /** Server groups when present; if the project registry could not be read, the same shared helper over the
@@ -153,11 +164,12 @@ function RunningBadge({ count }: { count: number }) {
   </span> : null;
 }
 
-export function ActorListPanel({ summary, error, authRequired, selectedActorId, roomSelected = false, roomChatKey = UNASSIGNED_ACTOR_PROJECT, onSelectActor, onOpenActorBlockers, onOpenRoom, id = "sidebar-panel-actors" }: {
+export function ActorListPanel({ summary, error, authRequired, selectedActorId, roomSelected = false, roomChatKey = UNASSIGNED_ACTOR_PROJECT, onSelectActor, onOpenActorBlockers, onOpenRoom, onOpenSession, id = "sidebar-panel-actors" }: {
   summary: ActorSummary | null; error: string | null; authRequired: boolean; selectedActorId: string | null; roomSelected?: boolean;
   /** Group chat currently open (with `roomSelected`). */
   roomChatKey?: string;
-  onSelectActor: (actorId: string) => void; onOpenActorBlockers: (actorId: string) => void; onOpenRoom: (chatKey: string) => void; id?: string;
+  onSelectActor: (actorId: string) => void; onOpenActorBlockers: (actorId: string) => void; onOpenRoom: (chatKey: string) => void;
+  onOpenSession: (sessionId: string) => void; id?: string;
 }) {
   // Only workers are listed here; consultants live in the session inspector and Settings.
   const actors = (summary?.actors ?? []).filter(actor => (actor.type ?? "worker") === "worker");
@@ -205,10 +217,12 @@ export function ActorListPanel({ summary, error, authRequired, selectedActorId, 
             {roots.map(root => {
               const subs = actors.filter(actor => actor.id !== root.id && actor.rootActorId === root.id);
               return <li key={root.id}>
-                <ActorRow actor={root} sub={false} selected={selectedActorId === root.id} blockers={blockersOf(root.id)} onSelect={onSelectActor} onOpenBlockers={onOpenActorBlockers} />
+                <ActorRow actor={root} workspaceId={summary.workspaceId} sub={false} selected={selectedActorId === root.id} blockers={blockersOf(root.id)}
+                  onSelect={onSelectActor} onOpenBlockers={onOpenActorBlockers} onOpenSession={onOpenSession} />
                 {subs.length > 0 && <ul className="actor-list-subs">
                   {subs.map(actor => <li key={actor.id}>
-                    <ActorRow actor={actor} sub selected={selectedActorId === actor.id} blockers={blockersOf(actor.id)} onSelect={onSelectActor} onOpenBlockers={onOpenActorBlockers} />
+                    <ActorRow actor={actor} workspaceId={summary.workspaceId} sub selected={selectedActorId === actor.id} blockers={blockersOf(actor.id)}
+                      onSelect={onSelectActor} onOpenBlockers={onOpenActorBlockers} onOpenSession={onOpenSession} />
                   </li>)}
                 </ul>}
               </li>;

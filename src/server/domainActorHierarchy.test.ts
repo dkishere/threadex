@@ -77,7 +77,7 @@ test("reparent preserves projects and model permissions and removes child-local 
   const child = await h.store.reparent("ws", "child", move("dest"), "root");
   assert.equal(child.parentActorId, "dest"); assert.equal(child.rootActorId, "dest"); assert.equal(child.projectIds, undefined);
   await assert.rejects(h.store.reparent("ws", "child", move("other", "dest", "dest")), /same projects/);
-  h.seed(room => { room.actors[3].allowedModels = [MODEL_CATALOG.luna.id]; });
+  h.seed(room => { room.actors[3].allowedModelTiers = ["codex-luna"]; });
   await assert.rejects(h.store.reparent("ws", "sibling", move("dest")), /does not allow/);
 });
 

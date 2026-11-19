@@ -100,7 +100,11 @@ retry, restart or an uncertain launch response must not create a second task.
 Naming another actor in a later round does not cancel or transfer existing work;
 updating existing work requires an explicit task reference.
 
-No naming runs SH selection, then collects opinions or claims. A single explicitly
+No naming runs SH selection, then collects opinions or claims. SH relevance follows
+the business domain, not a named vehicle such as ABC; when no candidate reaches the
+threshold, the top three candidates answer instead of a single keyword match. A
+group message within 30 minutes of the previous group request receives it as picking
+context even when that request was unclaimed (for example "no, it's a CD task"). A single explicitly
 named actor bypasses selection and claim arbitration; explicit naming alone must
 not turn an opinion request into an instruction to execute. Multiple named actors
 bypass SH selection but retain claim arbitration. Zero claims display the SH
@@ -470,14 +474,16 @@ Only an explicit user rename replaces it (the source then becomes `user`).
 Continuations keep the existing session's title. Sessions launched before this
 source existed keep `titleSource: "user"`, which is equally protected.
 History remains input for synthesis; concatenating history is not preparation.
-A claim also returns `contextRoundIds`: the prior rounds whose user messages the
-work directly depends on, such as the request a short “做” continues and its
-corrections. New work snapshots the latest request plus only those selected
-rounds' original user messages, once per round in chronological order, so they
-remain original user evidence during execution and retry. Selections outside the
-history the actor was shown are dropped, so private peer conversations and
-unrelated topics never enter the task. The task's initial context carries no raw
-room conversation history; anything else it needs must be in the brief.
+A claimant can propose earlier instructions through `contextRoundIds`. When history,
+an attachment, or other task context informed a claim, a separate scope review checks
+the proposal against the triggering message before routing. For example, a report
+about a missing task may use its title to identify the failed dispatch. Changing
+the feature named in that title requires a user request for that change.
+The review can narrow a mixed brief, decline an unrelated claim, and retain the
+earlier instructions required for a genuine continuation such as “做”.
+The execution prompt leads with the triggering user message. It then identifies
+applicable earlier instructions in chronological order. Context used to prepare a
+brief still constrains which other actors may receive it.
 
 Chat inference loads completed earlier room rounds, including other root actors.
 Each peer contributes up to two rounds; the actor's own history has no fixed
@@ -735,10 +741,17 @@ judged afresh.
 
 ## Persistence, recovery and current limits
 
-The existing SessionStore database owns `actor_room`, a workspace-keyed JSONB
-document containing actors, frozen round snapshots, replies, work reservations,
-events, memory failures and the cost baseline. Updates use document CAS across
-processes. Task launches have a durable 120-second lease. During SH responses,
+The existing SessionStore database owns the room in three tables
+(`src/server/actorRoomStorage.ts`). `actor_room` is a workspace-keyed JSONB core
+document containing actors, work reservations, events, memory failures and the
+cost baseline. Rounds, which grow without bound, are one `actor_round` row each,
+and the frozen actor snapshots inside rounds are stored once per distinct
+version in the content-addressed `actor_snapshot` table. Callers still read and
+change one assembled room. A change writes only the changed round rows, and
+bumps the core revision in the same transaction, so updates keep the core
+document's revision CAS across processes, and a reader reloads only changed
+rounds. A room that still holds rounds inline is migrated losslessly on first
+access. Task launches have a durable 120-second lease. During SH responses,
 the round lease covers the reply budget plus 60 seconds (at least 120 seconds),
 and a saved reply renews it before routing. SH replies default to a
 120-second inactivity budget, matching the helper's default inference budget;

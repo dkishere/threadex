@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -131,6 +131,25 @@ test("side-chat worker survives its submitting process, reconnects without dupli
   }
 });
 
+test("running side-chat scan skips finished jobs without parsing their job.json", () => {
+  const directory = mkdtempSync("/private/tmp/discussion-jobs-scan-");
+  const jobs = new DiscussionJobs(directory, worker);
+  const created = new Date().toISOString();
+  const finished: DiscussionJob = { id: "finished", sessionId: "done-host", kind: "side-chat", created, payload: {} };
+  const fresh: DiscussionJob = { id: "fresh", sessionId: "live-host", kind: "side-chat", created, payload: {} };
+  try {
+    for (const job of [finished, fresh]) mkdirSync(jobs.path(job.sessionId, job.id), { recursive: true });
+    // A corrupt job.json would throw if parsed; a finished state must short-circuit before it.
+    writeFileSync(resolve(jobs.path(finished.sessionId, finished.id), "job.json"), "{not json");
+    writeFileSync(resolve(jobs.path(finished.sessionId, finished.id), "state.json"), JSON.stringify({ status: "done" }));
+    writeFileSync(resolve(jobs.path(fresh.sessionId, fresh.id), "job.json"), JSON.stringify(fresh));
+    assert.deepEqual(jobs.runningSideChatSessionIds(), ["live-host"]);
+    assert.deepEqual(jobs.runningSideChatSessionIds(), ["live-host"], "a running job is never cached as settled");
+    writeFileSync(resolve(jobs.path(fresh.sessionId, fresh.id), "state.json"), JSON.stringify({ status: "done" }));
+    assert.deepEqual(jobs.runningSideChatSessionIds(), []);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("lost workers are reported as failed, never silently relaunched", () => {
   const directory = mkdtempSync("/private/tmp/discussion-lost-test-");
   const jobs = new DiscussionJobs(directory, "/missing-worker.ts");
@@ -181,6 +200,48 @@ test("actor room reattaches after API exit without repeating replies or cancelli
     await assert.rejects(service.submit({ ...input, userPrompt: "Different" }), /reused|another request/);
   } finally {
     if (existsSync(path)) { writeFileSync(resolve(path, "release"), ""); await jobs.stop(job); }
+    await store.close(); rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("retrying a failed submission uses its saved project and starts one replacement worker", async () => {
+  const directory = mkdtempSync("/private/tmp/discussion-retry-test-");
+  const storeId = `/private/tmp/discussion-store-${randomUUID()}`;
+  const store = new SessionStore(storeId);
+  const actors = new DomainActorStore(store);
+  const jobs = new DiscussionJobs(directory, worker);
+  const previousStoreId = process.env.SESSION_STORE_ID;
+  const input = { workspaceId: "retry-test", requestId: "retry-locked", userPrompt: "Investigate", chatProjectId: "project" };
+  const taskBinding = { workspaceId: input.workspaceId, cwd: directory, projectId: "project", source: "explicit" };
+  const { createHash } = await import("node:crypto");
+  const originalJob: DiscussionJob = { id: `actor_request_${createHash("sha256").update(input.requestId).digest("hex")}`,
+    sessionId: "actor-room:retry-test", kind: "actor-room", created: new Date().toISOString(),
+    payload: { input: { ...input, newSessionProjectId: "project" }, taskBinding,
+      requestFingerprint: JSON.stringify([input.userPrompt, [], null, null, { newSessionProjectId: "project" }, { chatProjectId: "project" }]) } };
+  const originalPath = jobs.path(originalJob.sessionId, originalJob.id);
+  const retryPath = jobs.path(originalJob.sessionId, originalJob.id + ":attempt:1");
+  const service = new DomainActorService(actors, { jobs, listProjects: async () => { throw new Error("database is locked"); },
+    policy: () => ({ order: [], threshold: {} }), decide: async () => { throw new Error("Unexpected decision"); },
+    respond: async () => { throw new Error("Unexpected reply"); }, maintain: async () => { throw new Error("Unexpected maintenance"); },
+    startTask: async () => { throw new Error("Unexpected dispatch"); } });
+  try {
+    process.env.SESSION_STORE_ID = storeId;
+    await store.ready();
+    await store.upsertWorkspace({ id: input.workspaceId, name: "Retry", cwd: directory, codexHome: directory });
+    mkdirSync(originalPath, { recursive: true });
+    writeFileSync(resolve(originalPath, "job.json"), JSON.stringify(originalJob));
+    writeFileSync(resolve(originalPath, "state.json"), JSON.stringify({ status: "error", error: "database is locked" }));
+    await assert.rejects(service.submit({ ...input, userPrompt: "Changed" }), /another request/);
+    const [first, second] = await Promise.all([service.submit(input), service.submit(input)]);
+    assert.equal(first.id, second.id);
+    assert.deepEqual(first.taskBinding, taskBinding);
+    assert.equal((await service.submit(input)).id, first.id);
+    assert.equal(jobs.list(originalJob.sessionId).length, 2);
+    assert.equal(readJobJson<{status: string}>(resolve(retryPath, "state.json"))?.status, "done");
+    assert.equal((await actors.getRoom(input.workspaceId)).rounds.length, 1);
+  } finally {
+    if (previousStoreId === undefined) delete process.env.SESSION_STORE_ID;
+    else process.env.SESSION_STORE_ID = previousStoreId;
     await store.close(); rmSync(directory, { recursive: true, force: true });
   }
 });

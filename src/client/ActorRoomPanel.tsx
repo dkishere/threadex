@@ -22,7 +22,7 @@ import type { ComposerSuggestion } from "./appTypes";
 import { InlineLinkComposer, type ComposerInlineLink, type InlineLinkComposerHandle } from "./InlineLinkComposer";
 import { MarkdownContent } from "./MarkdownContent";
 import { actorInProjectChat, actorRoundChatKey, isActorDirectChatRound, splitActorPromptPageContext, UNASSIGNED_ACTOR_PROJECT, type ActorMemoryContent, type ActorResponseProfile, type ActorRound, type CreateDomainActor, type DomainActor } from "../domainActors";
-import { DEFAULT_MODEL, MODEL_OPTIONS, modelEfforts, modelLabel, supportsUltraEffort } from "../modelCatalog";
+import { DEFAULT_MODEL, MODEL_OPTIONS, actorAllowedModels, modelEfforts, modelLabel, supportsUltraEffort } from "../modelCatalog";
 import { apiJson, ApiError } from "./apiClient";
 import { actorOwnerExplanation, actorRequestRecipients, actorRoutingFailure, actorRoundWorkItems, actorStoppableTurns, actorTaskParents, actorTaskPresentation, type ActorDialogMode } from "./actorRoomPresentation";
 import { isAuthRequired, useActorRoom, type ActorRoomState } from "./actorRoomState";
@@ -176,7 +176,7 @@ export function ActorRoomPanel({ workspaceId, approvalPolicy, onOpenSession, onO
     writeDraft(keysRef.current.draft, value);
   }
   const [editor, setEditor] = useState<{ actor: DomainActor | null; memory: ActorMemoryContent; version?: number } | null>(null);
-  const [draft, setDraft] = useState<CreateDomainActor>({ name: "", model: DEFAULT_MODEL, effort: "medium", allowedModels: [...MODEL_OPTIONS], memory: blankMemory() });
+  const [draft, setDraft] = useState<CreateDomainActor>({ name: "", model: DEFAULT_MODEL, effort: "medium", memory: blankMemory() });
   const [saving, setSaving] = useState(false);
   const [editorError, setEditorError] = useState("");
   const [conflict, setConflict] = useState(false);
@@ -558,7 +558,7 @@ export function ActorRoomPanel({ workspaceId, approvalPolicy, onOpenSession, onO
   }
   function openEditor(actor: DomainActor | null, parent?: DomainActor) {
     setEditor({ actor, memory: actor ? { rolePrompt: actor.memory.rolePrompt, roleSummary: actor.memory.roleSummary, longTerm: actor.memory.longTerm, rolling: actor.memory.rolling } : blankMemory(), version: actor?.memory.version });
-    setDraft({ name: "", parentActorId: parent?.id ?? null, model: parent?.model ?? DEFAULT_MODEL, effort: parent?.effort ?? "medium", allowedModels: [...(parent?.allowedModels ?? MODEL_OPTIONS)], memory: blankMemory() });
+    setDraft({ name: "", parentActorId: parent?.id ?? null, model: parent?.model ?? DEFAULT_MODEL, effort: parent?.effort ?? "medium", memory: blankMemory() });
     setEditorError(""); setConflict(false);
   }
   async function saveActor(event: FormEvent) {
@@ -600,7 +600,7 @@ export function ActorRoomPanel({ workspaceId, approvalPolicy, onOpenSession, onO
       const stopState = turn ? taskStopStates[taskStopKey(turn.sessionId, turn.turnId)] : undefined;
       return <>
         <div className="actor-room-task-controls">
-          <span className="actor-room-task-status" data-state={presentation.started ? "started" : undefined}>{work.taskSessionId?.trim() ? presentation.label : "Session not available yet"}</span>
+          <span className="actor-room-task-status" data-state={presentation.started ? "started" : undefined}>{!work.taskSessionId?.trim() ? "Session not available yet" : room.archivedSessionIds?.includes(work.taskSessionId) ? "Session archived" : presentation.label}</span>
           {turn && <button type="button" className="secondary actor-room-task-stop" aria-label={`Stop ${actorName(work.executorActorId)} task`} title={`Stop ${actorName(work.executorActorId)} task${stopState?.stopping ? " · Stopping…" : ""}`} disabled={stopState?.stopping} onClick={() => void stopTask(turn)}>
             {stopState?.stopping ? <Loader2 className="spin" aria-hidden="true" /> : <Square aria-hidden="true" />}
           </button>}
@@ -634,7 +634,7 @@ export function ActorRoomPanel({ workspaceId, approvalPolicy, onOpenSession, onO
             {/* The avatar is the working actor (whose session runs and whose task Stop stops); a different owner is named after "for". */}
             <DomainActorIdentity actor={identityOf(work.executorActorId)} detail={[relation, kind, modelLabel(work.model)].filter(Boolean).join(" · ")} />
           </button>
-          {work.taskSessionId?.trim() ? <a className="actor-room-task-title-link" href={navigationUrl({ workspaceId, sessionId: work.taskSessionId, groupChat: true, chat: chatKey })} aria-label={`${openLabel}: ${taskTitle}`} title={taskTitle} onClick={event => { if (event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) { event.preventDefault(); onOpenSession(work.taskSessionId); } }}>{taskTitle}</a> : <span className="actor-room-task-brief">{taskTitle}</span>}
+          {work.taskSessionId?.trim() && !room.archivedSessionIds?.includes(work.taskSessionId) ? <a className="actor-room-task-title-link" href={navigationUrl({ workspaceId, sessionId: work.taskSessionId, groupChat: true, chat: chatKey })} aria-label={`${openLabel}: ${taskTitle}`} title={taskTitle} onClick={event => { if (event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) { event.preventDefault(); onOpenSession(work.taskSessionId); } }}>{taskTitle}</a> : <span className="actor-room-task-brief">{taskTitle}</span>}
           {withControls && renderTaskControls(work)}
           <div className="actor-room-work-actions">
             {work.status === "failed" && !work.cancelledAt && <button type="button" className="secondary actor-room-task-cancel" aria-label={`Cancel ${actorName(work.executorActorId)} task`} title={`Cancel ${actorName(work.executorActorId)} task${cancelState?.cancelling ? " · Cancelling…" : ""}`} disabled={cancelState?.cancelling} onClick={() => void cancelTask(work.id)}>
@@ -910,6 +910,6 @@ export function ActorRoomPanel({ workspaceId, approvalPolicy, onOpenSession, onO
         if (event.shiftKey && document.activeElement === nodes[0]) { event.preventDefault(); nodes[nodes.length - 1].focus(); }
         else if (!event.shiftKey && document.activeElement === nodes[nodes.length - 1]) { event.preventDefault(); nodes[0].focus(); }
       }
-    }} onSubmit={event => void saveActor(event)}><header><h2>{editor.actor ? `${editor.actor.name} · Memory v${editor.version}` : "Create domain actor"}</h2><button type="button" disabled={saving} onClick={() => setEditor(null)} aria-label="Close memory editor"><X aria-hidden="true" /></button></header>{!editor.actor && <><label>Name<input required value={draft.name} onChange={event => setDraft({ ...draft, name: event.target.value })} /></label><label>Parent<select value={draft.parentActorId ?? ""} onChange={event => setDraft({ ...draft, parentActorId: event.target.value || null })}><option value="">Root actor</option>{actors.filter(actor => !actor.parentActorId).map(actor => <option key={actor.id} value={actor.id}>{actor.name}</option>)}</select></label><p>Choose Claude or GPT in the chat composer. Execution selects the workload tier for each request.</p><label>Effort<select value={draft.effort} onChange={event => setDraft({ ...draft, effort: event.target.value })}>{modelEfforts(draft.model).map(effort => <option key={effort}>{effort}</option>)}</select></label></>}{(Object.keys(memoryLabels) as Array<keyof ActorMemoryContent>).map(field => <label key={field}>{memoryLabels[field]}<textarea required={field === "rolePrompt" || field === "roleSummary"} rows={field === "roleSummary" ? 2 : 4} value={editor.memory[field]} onChange={event => setEditor({ ...editor, memory: { ...editor.memory, [field]: event.target.value } })} /></label>)}{editorError && <p role="alert">{editorError}</p>}{authRequired && <a href="/">Sign in to Threadex</a>}{conflict && <button type="button" onClick={() => { const latest = actors.find(actor => actor.id === editor.actor?.id); if (latest) openEditor(latest); }}>Replace draft with latest memory</button>}<button type="submit" disabled={saving || conflict || (!editor.actor && (!draft.allowedModels?.length || !draft.allowedModels.includes(draft.model)))}>{saving ? "Saving…" : editor.actor ? "Save memory" : "Create actor"}</button></form></div>}
+    }} onSubmit={event => void saveActor(event)}><header><h2>{editor.actor ? `${editor.actor.name} · Memory v${editor.version}` : "Create domain actor"}</h2><button type="button" disabled={saving} onClick={() => setEditor(null)} aria-label="Close memory editor"><X aria-hidden="true" /></button></header>{!editor.actor && <><label>Name<input required value={draft.name} onChange={event => setDraft({ ...draft, name: event.target.value })} /></label><label>Parent<select value={draft.parentActorId ?? ""} onChange={event => setDraft({ ...draft, parentActorId: event.target.value || null })}><option value="">Root actor</option>{actors.filter(actor => !actor.parentActorId).map(actor => <option key={actor.id} value={actor.id}>{actor.name}</option>)}</select></label><p>Choose Claude or GPT in the chat composer. Execution selects the workload tier for each request.</p><label>Effort<select value={draft.effort} onChange={event => setDraft({ ...draft, effort: event.target.value })}>{modelEfforts(draft.model).map(effort => <option key={effort}>{effort}</option>)}</select></label></>}{(Object.keys(memoryLabels) as Array<keyof ActorMemoryContent>).map(field => <label key={field}>{memoryLabels[field]}<textarea required={field === "rolePrompt" || field === "roleSummary"} rows={field === "roleSummary" ? 2 : 4} value={editor.memory[field]} onChange={event => setEditor({ ...editor, memory: { ...editor.memory, [field]: event.target.value } })} /></label>)}{editorError && <p role="alert">{editorError}</p>}{authRequired && <a href="/">Sign in to Threadex</a>}{conflict && <button type="button" onClick={() => { const latest = actors.find(actor => actor.id === editor.actor?.id); if (latest) openEditor(latest); }}>Replace draft with latest memory</button>}<button type="submit" disabled={saving || conflict || (!editor.actor && !actorAllowedModels(draft).includes(draft.model))}>{saving ? "Saving…" : editor.actor ? "Save memory" : "Create actor"}</button></form></div>}
   </>;
 }

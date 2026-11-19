@@ -29,6 +29,9 @@ function alive(pid: number) {
 
 /** The server observes these workers; it does not own their lifetime. No account secrets go in jobs. */
 export class DiscussionJobs {
+  /** Job directories that can never count as running side chats: other kinds, or a recorded final state
+   * (workers only ever write done/error/stopped). The status monitor scans several times a second. */
+  private settledJobDirectories = new Set<string>();
   constructor(readonly directory: string, private worker = fileURLToPath(new URL("./discussionWorker.ts", import.meta.url))) {}
   runningSideChatSessionIds(): string[] {
     if (!existsSync(this.directory)) return [];
@@ -37,7 +40,13 @@ export class DiscussionJobs {
       if (!session.isDirectory()) continue;
       for (const entry of readdirSync(resolve(this.directory, session.name), { withFileTypes: true })) {
         if (!entry.isDirectory()) continue;
-        const job = readJobJson<DiscussionJob>(resolve(this.directory, session.name, entry.name, "job.json"));
+        const jobDirectory = resolve(this.directory, session.name, entry.name);
+        if (this.settledJobDirectories.has(jobDirectory)) continue;
+        // A finished job's small state.json spares parsing its large job.json.
+        const recorded = readJobJson<DiscussionJobState>(resolve(jobDirectory, "state.json"));
+        if (recorded && recorded.status !== "running") { this.settledJobDirectories.add(jobDirectory); continue; }
+        const job = readJobJson<DiscussionJob>(resolve(jobDirectory, "job.json"));
+        if (job && job.kind !== "side-chat") this.settledJobDirectories.add(jobDirectory);
         if (job?.kind === "side-chat" && this.state(job).status === "running") sessions.add(job.sessionId);
       }
     }
@@ -55,9 +64,12 @@ export class DiscussionJobs {
       return job?.sessionId === sessionId ? [job] : [];
     });
   }
+  recordedState(job: DiscussionJob) {
+    return readJobJson<DiscussionJobState>(resolve(this.path(job.sessionId, job.id), "state.json"));
+  }
   state(job: DiscussionJob): DiscussionJobState {
     const path = this.path(job.sessionId, job.id);
-    const state = readJobJson<DiscussionJobState>(resolve(path, "state.json"));
+    const state = this.recordedState(job);
     if (state && state.status !== "running") return state;
     const owner = readJobJson<{ pid: number; heartbeat?: number }>(resolve(path, "owner.json"));
     if (owner && alive(owner.pid) && Date.now() - (owner.heartbeat ?? Date.parse(job.created)) < 30_000) return { status: "running" };

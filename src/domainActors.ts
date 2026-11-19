@@ -2,6 +2,7 @@ import type { DecisionRequest, DecisionResult, PurposePolicy } from "./server/de
 import type { ApprovalPolicy } from "./server/codexConfig";
 import type { ActorRoundtable } from "./actorRoundtables";
 import type { ActorBlocker, ActorBlockerNotice } from "./actorBlockers";
+import type { ActorModelTier } from "./modelCatalog";
 
 export type ActorMemoryContent = { rolePrompt: string; roleSummary: string; longTerm: string; rolling: string };
 export type ActorMemory = ActorMemoryContent & { version: number; sourceEventIds: string[] };
@@ -9,7 +10,11 @@ export type DomainActor = {
   /** Missing only in legacy snapshots; the domain registry always means worker. */
   type?: "worker";
   id: string; workspaceId: string; rootActorId: string; parentActorId: string | null;
-  name: string; model: string; effort: string; allowedModels: string[]; avatar?: string;
+  name: string; model: string; effort: string; avatar?: string;
+  /** Null lets the worker use all platform tiers. Missing on legacy records. */
+  allowedModelTiers?: ActorModelTier[] | null;
+  /** Legacy input or API projection; new records store only the tier policy. */
+  allowedModels?: string[];
   /** Root workers only: Codex project IDs of this workspace's CODEX_HOME the worker belongs to.
    * Absent or empty means Unassigned; sub-actors belong to their root's projects. */
   projectIds?: string[];
@@ -88,7 +93,11 @@ export type ActorReply = { actorId: string; status: "opinion" | "claimed" | "err
   title?: string;
   /** Prior visible rounds whose user messages the claimed work depends on. */
   contextRoundIds?: string[];
+  /** Source rounds seen while preparing this brief, including references excluded from canonical instructions. */
+  briefContextRoundIds?: string[];
   proposedModel?: string;
+  /** Execution effort the claiming actor asked for; it can only raise the policy floor, never lower it. */
+  proposedEffort?: string;
   /** "actor" when the claiming actor explicitly chose the model; Decision selects only as a fallback. */
   modelSource?: "actor" | "decision";
   /** Why a model directive inherited from a selected earlier round was ignored instead of blocking the current request. */
@@ -257,6 +266,8 @@ export type ActorWorkItem = {
     requestId: string; sourceActorId: string; sourceSessionId: string; sourceTurnId: string;
     targetWorkspaceId: string; targetActorId: string; targetActorName: string; targetRequestId: string; task: string;
     status: "pending" | "submitted" | "failed"; targetRoundId?: string; decision?: DecisionResult; error?: string; created: string;
+    authorizationEvidenceDigest?: string;
+    forwardedUserMessages?: string[];
   }>;
   executionHistory: Array<{ executorActorId: string; model: string; taskSessionId: string; taskTurnId: string; dispatchKey: string; dispatched: boolean; status: ActorWorkItem["status"] }>;
   assignmentRequests: Array<{ requestId: string; executorActorId: string; model: string; proposedModel?: string;
@@ -351,11 +362,12 @@ export type ActorReorganization = {
 export type CreateDomainActor = {
   type?: "worker";
   id?: string; name: string; parentActorId?: string | null; model: string; effort?: string;
-  allowedModels?: string[]; avatar?: string; memory: ActorMemoryContent;
+  allowedModelTiers?: ActorModelTier[] | null; allowedModels?: string[]; avatar?: string; memory: ActorMemoryContent;
 };
 export type ActorWorkloadCounts = { open: number; attention: number };
 export type ActorSummaryEntry = Pick<DomainActor, "type" | "id" | "name" | "rootActorId" | "parentActorId" | "model" | "projectIds" | "avatar"> & {
   counts: ActorWorkloadCounts; running: number; unreadConclusions?: number;
+  runningSessions?: Array<{ sessionId: string; title: string }>;
 };
 /** Active (actorBlockerActive), non-self-clearing blockers of the workspace after overdue escalation, newest
  * `updated` first, capped at ACTOR_SUMMARY_BLOCKER_LIMIT; see docs/actor-blockers.md. */
@@ -363,7 +375,7 @@ export type ActorSummaryBlocker = ActorBlocker & { taskSessionTitle?: string };
 export type ActorSummary = { workspaceId: string; revision: number; actors: ActorSummaryEntry[]; blockers: ActorSummaryBlocker[];
   /** Workers grouped by project; absent only when the project registry could not be read. */
   groups?: ActorProjectGroup[] };
-export type UpdateDomainActor = { type?: "worker"; name?: string; model?: string; effort?: string; allowedModels?: string[]; projectIds?: string[]; avatar?: string | null };
+export type UpdateDomainActor = { type?: "worker"; name?: string; model?: string; effort?: string; allowedModelTiers?: ActorModelTier[] | null; allowedModels?: string[]; projectIds?: string[]; avatar?: string | null };
 export type SubmitActorRequest = ActorTaskSelection & { workspaceId: string; requestId: string;
   /** Group chat of the request: a project ID or null/absent for the Unassigned chat. Ignored for individual (single named actor) requests. */
   chatProjectId?: string | null; userPrompt: string; attachments?: ActorAttachment[]; namedActorIds?: string[]; taskReference?: string; responseProfile?: ActorResponseProfile; approvalPolicy?: ApprovalPolicy;
@@ -380,7 +392,9 @@ export type ActorSessionOrigin = { sourceSessionId: string; sourceSessionTitle: 
 /** Where a cross-workspace handoff came from. userPrompt of its round is the user's own message;
  * task is the source actor's description: untrusted context, never authorization. */
 export type ActorCrossWorkspaceOrigin = { sourceWorkspaceId: string; sourceWorkspaceName: string; sourceSessionId: string; sourceTurnId: string;
-  sourceActorId: string; sourceActorName: string; sourceRequestId: string; task: string };
+  sourceActorId: string; sourceActorName: string; sourceRequestId: string; task: string;
+  /** The individually verified messages composing the round prompt. Legacy imports lack this provenance. */
+  userMessages?: string[] };
 export type ActorPromptPageContext = { url: string; title?: string; selector?: string };
 /** A pasted Browser Bridge JSON object at the start of a prompt is page context, not the request itself. */
 export function splitActorPromptPageContext(prompt: string): { page: ActorPromptPageContext | null; text: string } {

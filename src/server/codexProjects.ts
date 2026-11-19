@@ -19,7 +19,7 @@ export function listCodexProjects(codexHome: string): CodexProject[] {
   const statePath = currentCodexStatePath(codexHome);
   if (!statePath) return [];
 
-  const database = new DatabaseSync(statePath, { readOnly: true });
+  const database = new DatabaseSync(statePath, { readOnly: true, timeout: 250 });
   try {
     const rows = database.prepare(`
       SELECT projects.id, projects.name, project_roots.path

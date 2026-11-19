@@ -8,7 +8,7 @@ import { applyActorReorganization, parseActorReorganizationRequest, reorganizati
 import type { ActorReorganizationInitiator } from "../domainActors";
 import type { RingEvent } from "./eventRingLog";
 import { ACTOR_MODEL_SELECTION_INSTRUCTIONS, ACTOR_WORKFLOW_QUESTION, ACTOR_WORKLOAD_KIND_QUESTION, actorChosenModel, actorWorkflowAssessment, actorExecutionModels, actorInitiatingModel, actorModelOptions, actorRequestedExecution, actorTaskExecutionEffort, actorWorkloadKind } from "./domainActorModelSelection";
-import { MODEL_OPTIONS, modelEfforts } from "../modelCatalog";
+import { actorAllowedModels, sharedActorAllowedModels, modelProvider, MODEL_OPTIONS, modelEfforts } from "../modelCatalog";
 import { actorClaudeAgentModel, actorModelPermitted, actorNativeAgentName, actorNativeChildren, actorNativeProvider, actorSessionWork, NATIVE_CHILD_PERMISSION_ERROR, SESSION_MENTION_HOST_ALLOCATION, type ActorNativeSignal } from "./actorNativeAgents";
 import { actorAccessibleContextRoundIds, actorCanonicalUserMessages, actorConversationHistory, actorExecutionMessage, actorFollowupTurnId, actorRoomSourceNote } from "./domainActorContext";
 import type { ActorAllocation } from "../domainActors";
@@ -16,6 +16,7 @@ import { actorAllocationBrief, validateActorAllocation } from "./domainActorAllo
 import { NATIVE_CHILD_DELEGATION_ERROR } from "./domainActorTools";
 import { actorAttachmentIdentity } from "./domainActorAttachments";
 import { actorTaskPromptOrigin, type PromptOrigin } from "./promptOrigin";
+import { selectCrossWorkspaceUserMessages, taskUpdateUserMessages, userMessageNamesActor, userMessageNamesWorkspace, type CrossWorkspaceUserMessage } from "./crossWorkspaceActors";
 import type { ActorAttachment } from "../domainActors";
 import { actorInProjectChat, actorRoundChatKey, isActorDirectChatRound, type ActorProject, type ActorTaskBinding } from "../domainActors";
 import { actorTaskSelection, sameActorTaskSelection } from "./domainActorProject";
@@ -46,7 +47,7 @@ export type DomainActorDependencies = {
   saveAttachments?: (workspaceId: string, requestId: string, attachments: ActorAttachment[]) => Promise<ActorAttachment[]>;
   decide: Decision;
   policy: (purpose: string) => PurposePolicy;
-  respond: (input: { actor: DomainActor; round: ActorRound; treeActors: DomainActor[]; runningSessions: ActorRunningSession[]; signal: AbortSignal; onEvent?: (event: unknown) => void }) => Promise<{ text: string; claim: boolean; intent?: "work" | "discussion"; inRole?: boolean; claimKind?: "full" | "partial"; claimScope?: string; preparedPrompt?: string; title?: string; contextRoundIds?: string[]; model?: string; executorActorId?: string }>;
+  respond: (input: { actor: DomainActor; round: ActorRound; treeActors: DomainActor[]; runningSessions: ActorRunningSession[]; signal: AbortSignal; onEvent?: (event: unknown) => void }) => Promise<{ text: string; claim: boolean; intent?: "work" | "discussion"; inRole?: boolean; claimKind?: "full" | "partial"; claimScope?: string; preparedPrompt?: string; title?: string; contextRoundIds?: string[]; briefContextRoundIds?: string[]; model?: string; effort?: string; executorActorId?: string }>;
   planClaims?: (input: { round: ActorRound; messages: string[]; onEvent?: (event: unknown) => void }) => Promise<unknown>;
   /** roleChangeQuote is the verbatim request text justifying a role rewrite; "" or absent when the role is unchanged. */
   maintain: (input: { actor: DomainActor; event: ActorRoomEvent; baseVersion: number; context: ActorMemoryContext; runningSessions: ActorRunningSession[] }) => Promise<ActorMemoryContent & { roleChangeQuote?: string }>;
@@ -115,7 +116,8 @@ function actorTaskUserMessageHistory(room: ActorRoom, work: ActorWorkItem,
   input: { priorUserPrompts?: string[]; currentUserPrompt?: string; currentTurnUserMessages?: string[] }) {
   const round = room.rounds.find(item => item.id === work.roundId);
   const request = (item: ActorWorkItem) => item.canonicalUserMessages ?? [room.rounds.find(candidate => candidate.id === item.roundId)?.userPrompt ?? ""];
-  const followUps = (room.taskUpdates ?? []).filter(update => update.workItemId === work.id && update.status === "delivered").map(update => update.userPrompt);
+  const followUps = (room.taskUpdates ?? []).filter(update => update.workItemId === work.id && update.status === "delivered")
+    .flatMap(update => taskUpdateUserMessages(room, update));
   const current = [...input.currentUserPrompt ? [input.currentUserPrompt] : [], ...input.currentTurnUserMessages ?? []];
   const sessionTask = work.sessionScope === "turn" ? room.workItems.find(item => item.id === round?.sessionTarget?.hostWorkItemId) : undefined;
   const messages = work.sessionScope === "turn"
@@ -356,6 +358,8 @@ export class DomainActorService {
         && (blocker.userDecision!.nextDeliveryAt ?? 0) <= this.now()) this.deliverBlockerUserInput(workspaceId, blocker.id);
     }
     if (!this.deps.jobs) return room;
+    // Every 2.5s poll reads the room; parse the workspace's job files only when a round could be interrupted.
+    if (!room.rounds.some(round => ["queued", "responding"].includes(round.status))) return room;
     const jobs = this.deps.jobs.list(`actor-room:${workspaceId}`);
     const interrupted = room.rounds.filter(round => {
       if (!["queued", "responding"].includes(round.status)) return false;
@@ -572,13 +576,21 @@ export class DomainActorService {
     input = { ...input, chatProjectId };
     // A legacy round read into a project chat is retried as saved: its project selection is not reinterpreted.
     const bindingProjectId = sourceProjectId ?? chatProjectId;
+    const savedJob = this.deps.jobs?.list(`actor-room:${input.workspaceId}`)
+      .filter(job => job.kind === "actor-room" && !job.payload.retry && job.payload.input.requestId === input.requestId)
+      .sort((left, right) => (right.payload.submissionAttempt ?? 0) - (left.payload.submissionAttempt ?? 0))[0];
+    // Observe terminal failure before checking for a round. A stale heartbeat alone is not permission to relaunch.
+    const failedSubmission = savedJob && this.deps.jobs!.recordedState(savedJob)?.status === "error";
+    const submissionBinding: ActorTaskBinding | undefined = savedJob?.payload.taskBinding ?? queuedBinding;
     const prior = bindingProjectId && !input.taskReference ? (await this.store.getRoom(input.workspaceId)).rounds
       .find(round => round.requestId === input.requestId && round.chatProjectId === undefined) : undefined;
     const legacy = prior && (chatProjectId !== undefined || prior.taskSelection?.newSessionProjectId !== bindingProjectId) ? prior : undefined;
     if (bindingProjectId && !legacy) {
       if (input.newSessionProjectId !== undefined && input.newSessionProjectId.trim() !== bindingProjectId) throw new Error("A project group chat starts tasks only in its own project.");
-      const projects = await this.deps.listProjects?.(input.workspaceId);
-      if (projects && !projects.some(project => project.id === bindingProjectId)) throw new Error("This project is not registered in the workspace.");
+      if (submissionBinding?.projectId !== bindingProjectId || submissionBinding.workspaceId !== input.workspaceId) {
+        const projects = await this.deps.listProjects?.(input.workspaceId);
+        if (projects && !projects.some(project => project.id === bindingProjectId)) throw new Error("This project is not registered in the workspace.");
+      }
       input = { ...input, newSessionProjectId: bindingProjectId };
     }
     const sameChat = (round: ActorRound) => (round.namedActorIds.length === 1 ? chatProjectId === undefined : actorRoundChatKey(round) === (chatProjectId ?? null))
@@ -597,7 +609,6 @@ export class DomainActorService {
       || !modelEfforts(input.responseProfile.model).includes(input.responseProfile.effort as ReturnType<typeof modelEfforts>[number]))) throw new Error("Invalid actor response gear.");
     if (input.taskReference && Object.keys(taskSelection).length) throw new Error("An existing actor task keeps its project and cwd; send a new request to select another project.");
     const savedRound = input.taskReference ? undefined : (await this.getRoom(input.workspaceId)).rounds.find(round => round.requestId === input.requestId);
-    const savedJob = this.deps.jobs?.list(`actor-room:${input.workspaceId}`).find(job => job.kind === "actor-room" && !job.payload.retry && job.payload.input.requestId === input.requestId);
     if (savedRound && (!sameActorTaskSelection(savedRound.taskSelection, taskSelection) || !sameChat(savedRound))) throw new Error("Actor request ID was reused with different input.");
     // A saved round wins even when it predates project binding. Do not reinterpret
     // legacy requests or re-resolve a retry against today's project settings.
@@ -615,14 +626,17 @@ export class DomainActorService {
       // Do not install a completed observer job over that active execution.
       if (existing && ["queued", "responding"].includes(existing.status) && existing.lease && existing.lease.until > this.now()
         && !this.deps.jobs.list(`actor-room:${input.workspaceId}`).some(job => job.kind === "actor-room" && job.payload.input.requestId === input.requestId)) return existing;
-      const job = this.deps.jobs.start({
-        id: `actor_request_${createHash("sha256").update(input.requestId).digest("hex")}`,
-        sessionId: `actor-room:${input.workspaceId}`, kind: "actor-room", created: new Date(this.now()).toISOString(),
-        payload: { input, taskBinding, serverUrl: this.deps.serverUrl,
-          requestFingerprint: JSON.stringify([input.userPrompt, [...new Set(input.namedActorIds ?? [])], input.responseProfile ?? null, input.taskReference ?? null,
+      const requestFingerprint = JSON.stringify([input.userPrompt, [...new Set(input.namedActorIds ?? [])], input.responseProfile ?? null, input.taskReference ?? null,
             ...(input.approvalPolicy === undefined ? [] : [input.approvalPolicy]), ...(input.attachments?.length ? [actorAttachmentIdentity(input.attachments)] : []),
             ...(Object.keys(taskSelection).length ? [taskSelection] : []), ...(chatProjectId && !legacy ? [{ chatProjectId }] : []),
-            ...(input.sessionTarget ? [{ sessionTarget: input.sessionTarget }] : [])]) }
+            ...(input.sessionTarget ? [{ sessionTarget: input.sessionTarget }] : [])]);
+      if (savedJob && savedJob.payload.requestFingerprint !== requestFingerprint) throw new Error("Discussion request ID already belongs to another request.");
+      const submissionAttempt = (savedJob?.payload.submissionAttempt ?? 0) + (failedSubmission && !existing ? 1 : 0);
+      const originalJobId = `actor_request_${createHash("sha256").update(input.requestId).digest("hex")}`;
+      const job = this.deps.jobs.start({
+        id: submissionAttempt ? `${originalJobId}:attempt:${submissionAttempt}` : originalJobId,
+        sessionId: `actor-room:${input.workspaceId}`, kind: "actor-room", created: new Date(this.now()).toISOString(),
+        payload: { input, taskBinding, serverUrl: this.deps.serverUrl, requestFingerprint, submissionAttempt }
       });
       while (this.deps.jobs.state(job).status === "running") await new Promise(resolve => setTimeout(resolve, 100));
       const state = this.deps.jobs.state(job);
@@ -825,8 +839,8 @@ export class DomainActorService {
       if (workItem.cancelledAt && update?.status !== "delivered") throw new Error("This task was cancelled; send a new request instead.");
       if (continuation && update?.status !== "delivered") {
         if (workItem.dispatchKey !== continuation.dispatchKey || workItem.executorActorId !== continuation.executorActorId
-          || !actorById(room, workItem.ownerActorId).allowedModels.includes(continuation.model)
-          || !actorById(room, workItem.executorActorId).allowedModels.includes(continuation.model)
+          || !actorAllowedModels(actorById(room, workItem.ownerActorId)).includes(continuation.model)
+          || !actorAllowedModels(actorById(room, workItem.executorActorId)).includes(continuation.model)
           || workItem.dispatchLease || workItem.assignmentRequests.some(request => request.status === "pending")) throw new Error("Continuation binding or permissions changed; inspect the existing task before retrying.");
         // A running, queued or still-delivering task does not block: the follow-up joins
         // its session's pending-turn queue, which keeps arrival order and starts it next.
@@ -921,13 +935,19 @@ export class DomainActorService {
       const direct = !!lastGroupRound && lastGroupRound.id === previous?.id && !!recentEnough;
       if (direct) recentRequests = recent.map(item => ({ userPrompt: item.userPrompt,
         claimantIds: item.replies.filter(reply => reply.status === "claimed").map(reply => reply.actorId) }));
+      // A correction such as "no, it's a CD task" must still see the unclaimed request it corrects.
+      // This context only informs picking; fast track below still requires an earlier task.
+      else if (lastGroupRound && Date.parse(round.created) - Date.parse(lastGroupRound.created) <= FAST_TRACK_MAX_GAP_MS)
+        recentRequests = [{ userPrompt: lastGroupRound.userPrompt,
+          claimantIds: lastGroupRound.replies.filter(reply => reply.status === "claimed").map(reply => reply.actorId) }];
       // Group follow-ups can bypass picking without bypassing reference delivery,
       // actor binding, permissions, or the pending-turn queue's idempotency.
       if (direct && !actorRequestedExecution([round.userPrompt]) && this.deps.updateTask && !round.routingDecisions.fastTrack
         && (previous?.workItemIds?.length ?? 1) === 1 && work?.dispatched && !work.parentWorkItemId && !work.delegatedTask && !work.dispatchLease
+        && !room.archivedSessionIds?.includes(work.taskSessionId)
         && !work.assignmentRequests.some(item => item.status === "pending")
-        && actorById(room, work.ownerActorId).allowedModels.includes(work.model)
-        && actorById(room, work.executorActorId).allowedModels.includes(work.model)
+        && actorAllowedModels(actorById(room, work.ownerActorId)).includes(work.model)
+        && actorAllowedModels(actorById(room, work.executorActorId)).includes(work.model)
         && (!round.taskBinding || original?.taskBinding?.cwd === round.taskBinding.cwd)
         && (!round.approvalPolicy || original?.approvalPolicy === round.approvalPolicy)) {
         const decision = await decide({ purpose: "sh_pick", audit: { workspaceId, roundId: round.id, workItemId: `${round.id}:fast-track` },
@@ -939,7 +959,7 @@ export class DomainActorService {
           current.routingDecisions.fastTrack = decision;
           if (answer?.kind === "choice" && answer.choice === "continue" && answer.confidence >= FAST_TRACK_MIN_CONFIDENCE) {
             current.continuation = { decision, queue: true, workItem: clone(work), userPrompt: round.userPrompt,
-              sourceNote: actorRoomSourceNote(room, round.id, work!.ownerActorId) };
+              sourceNote: actorRoomSourceNote(room, round.id, work!.ownerActorId, [previous!.id]) };
           }
           return clone(current);
         });
@@ -1055,11 +1075,13 @@ export class DomainActorService {
             || !executor || executor.rootActorId !== actor.rootActorId || actor.parentActorId && executor.id !== actor.id) throw new Error("Invalid stakeholder reply or executor.");
           reply = { actorId, status: response.claim ? "claimed" : "opinion", text: response.text,
             ...(response.intent !== undefined ? { intent: response.intent, inRole: response.inRole } : {}),
-            ...(response.claim ? { proposedModel, ...(typeof response.model === "string" ? { modelSource: "actor" as const } : {}), executorActorId, preparedPrompt: response.preparedPrompt,
+            ...(response.claim ? { proposedModel, ...(typeof response.model === "string" ? { modelSource: "actor" as const } : {}),
+              ...(typeof response.effort === "string" ? { proposedEffort: response.effort } : {}), executorActorId, preparedPrompt: response.preparedPrompt,
               // An actor chat task is the whole request: no partial scope reaches coverage or owner Decision.
               ...(directChat ? { claimKind: "full" as const } : { claimKind: response.claimKind ?? "full", claimScope: response.claimScope }),
               ...(typeof response.title === "string" && response.title.trim() ? { title: response.title.trim().slice(0, 200) } : {}),
-              ...(response.contextRoundIds?.length ? { contextRoundIds: response.contextRoundIds } : {}) } : {}) };
+              ...(response.contextRoundIds?.length ? { contextRoundIds: response.contextRoundIds } : {}),
+              ...(response.briefContextRoundIds?.length ? { briefContextRoundIds: response.briefContextRoundIds } : {}) } : {}) };
         } catch (error) {
           // Keep the cause so the user and later rounds can see why this reply failed.
           const cause = (error instanceof Error ? error.message : String(error)).trim().slice(0, 300);
@@ -1159,7 +1181,8 @@ export class DomainActorService {
       const accessibleContext = new Map(claims.map(reply => [reply.actorId, actorAccessibleContextRoundIds(room, round.id, reply.actorId)]));
       const readsAll = (actorId: string, roundIds: Iterable<string>) => [...roundIds].every(id => id === round.id || accessibleContext.get(actorId)!.has(id));
       let allocation: ActorAllocation | undefined = round.allocation;
-      if (split && !allocation && !claims.every(reply => readsAll(reply.actorId, canonicalRoundIds))) {
+      const briefContextIds = new Set([...canonicalRoundIds, ...claims.flatMap(reply => reply.briefContextRoundIds ?? [])]);
+      if (split && !allocation && !claims.every(reply => readsAll(reply.actorId, briefContextIds))) {
         // A partition would show one tree's private context to another; one owner takes the request instead.
         ownerLed = true; split = false;
         round = await this.changeRound(workspaceId, round.id, leaseOwner, current => {
@@ -1214,8 +1237,10 @@ export class DomainActorService {
       });
       // The owner receives only the canonical rounds its tree may read, and another claimant's prepared brief
       // only when the owner may read every round that brief was prepared from.
-      const sharedPreparedPrompt = (reply: ActorReply) => split || reply.actorId === selected.actorId || readsAll(selected.actorId, reply.contextRoundIds ?? [])
+      const sharedPreparedPrompt = (reply: ActorReply) => split || reply.actorId === selected.actorId || readsAll(selected.actorId, reply.briefContextRoundIds ?? reply.contextRoundIds ?? [])
         ? reply.preparedPrompt : undefined;
+      const sharedClaim = (reply: ActorReply) => sharedPreparedPrompt(reply)
+        ? { claimScope: reply.claimScope, preparedPrompt: reply.preparedPrompt } : {};
       if (ownerLed) {
         const excludedRoundIds = [...canonicalRoundIds].filter(id => !readsAll(selected.actorId, [id]));
         messagesByActor.set(selected.actorId, room.rounds.filter(r => canonicalRoundIds.has(r.id) && !excludedRoundIds.includes(r.id)).map(r => r.userPrompt));
@@ -1230,15 +1255,15 @@ export class DomainActorService {
       const executionModelsFor = (reply: ActorReply) => {
         const owner = round.actorSnapshots.find(actor => actor.id === reply.actorId)!;
         const executor = round.actorSnapshots.find(actor => actor.id === (reply.executorActorId ?? reply.actorId))!;
-        return actorExecutionModels(owner.allowedModels.filter(model => executor.allowedModels.includes(model)), actorInitiatingModel(round, reply.actorId));
+        return actorExecutionModels(sharedActorAllowedModels(owner, executor), actorInitiatingModel(round, reply.actorId));
       };
       // A user-named model runs whenever both actors allow it, even outside the gear's provider: the user chose it.
       // Only a session @mention stays within its session's provider, because the work runs in that session.
       const requestableModelsFor = (reply: ActorReply) => {
-        if (round.sessionTarget) return executionModelsFor(reply);
         const owner = round.actorSnapshots.find(actor => actor.id === reply.actorId)!;
         const executor = round.actorSnapshots.find(actor => actor.id === (reply.executorActorId ?? reply.actorId))!;
-        return owner.allowedModels.filter(model => executor.allowedModels.includes(model));
+        const allowed = sharedActorAllowedModels(owner, executor);
+        return round.sessionTarget ? allowed.filter(model => modelProvider(model) === modelProvider(round.sessionTarget?.model)) : allowed;
       };
       const executionProfilePermitted = (requested: { model: string; effort?: string }, allowed: string[]) =>
         allowed.includes(requested.model) && (!requested.effort || modelEfforts(requested.model).some(effort => effort === requested.effort));
@@ -1274,7 +1299,9 @@ export class DomainActorService {
           return valid;
         }
         if (reply.modelDecision) return Boolean(reply.model);
-        const actorModel = !ownerLed && reply.modelSource === "actor" ? actorChosenModel(reply.proposedModel, allowed) : undefined;
+        const initiatingProvider = modelProvider(actorInitiatingModel(round, reply.actorId));
+        const choicesWithinProvider = sharedActorAllowedModels(owner, executor).filter(model => modelProvider(model) === initiatingProvider);
+        const actorModel = !ownerLed && reply.modelSource === "actor" ? actorChosenModel(reply.proposedModel, choicesWithinProvider) : undefined;
         const directModel = actorModel ?? (reply.modelSource !== "actor" ? actorChosenModel(executor.model, allowed) : undefined);
         if (directFullClaim && directModel) {
           // No model/workflow inference for a complete single-stakeholder claim.
@@ -1297,7 +1324,7 @@ export class DomainActorService {
               ?? (round.coverageGap?.uncovered ? `Only the claimed scope: ${round.coverageGap.claimScope}` : "Entire canonical request, including any scope beyond a partial claim"),
             claim: reply.text, preparedPrompt: ownerLed ? undefined : reply.preparedPrompt, proposedModel: ownerLed ? undefined : reply.proposedModel,
             ...(ownerLed ? { ownership: "Whole canonical request across all stakeholder domains; select a model for the combined workload, not any partial proposal.",
-              stakeholderClaims: claims.map(claim => ({ actorId: claim.actorId, claimScope: claim.claimScope, preparedPrompt: sharedPreparedPrompt(claim), proposedModel: claim.proposedModel })) } : {}),
+              stakeholderClaims: claims.map(claim => ({ actorId: claim.actorId, ...sharedClaim(claim), proposedModel: claim.proposedModel })) } : {}),
             owner: { id: owner.id, systemHeader: owner.memory.rolePrompt, roleSummary: owner.memory.roleSummary },
             executor: { id: executor.id, effort: executor.effort, systemHeader: executor.memory.rolePrompt, roleSummary: executor.memory.roleSummary } }),
           questions: [{ id: "model", kind: "choice", instructions: ACTOR_MODEL_SELECTION_INSTRUCTIONS + (ownerLed
@@ -1344,10 +1371,13 @@ export class DomainActorService {
             // Visible history admits candidates; Decision judges continuity.
             // Neither grants permission to take over another executor's work.
             // A session @mention's work runs in the user's ordinary session, which group rounds never continue.
+            // An archived task session no longer exists, so continuing it could only fail without dispatching the claim.
+            const archivedSessionIds = new Set(currentRoom.archivedSessionIds ?? []);
             const targets = currentRoom.workItems.filter(work => work.dispatched && !work.cancelledAt && !work.parentWorkItemId && !work.delegatedTask && !work.sessionScope
+              && !archivedSessionIds.has(work.taskSessionId)
               && work.ownerActorId === claimed.actorId && work.executorActorId === executorId
-              && actorById(currentRoom, work.ownerActorId).allowedModels.includes(claimed.model!)
-              && actorById(currentRoom, work.executorActorId).allowedModels.includes(claimed.model!)
+              && actorAllowedModels(actorById(currentRoom, work.ownerActorId)).includes(claimed.model!)
+              && actorAllowedModels(actorById(currentRoom, work.executorActorId)).includes(claimed.model!)
               && [...context].some(id => currentRoom.rounds.some(prior => prior.id === id && (prior.workItemId === work.id || prior.workItemIds?.includes(work.id))))
               && (!round.taskBinding
                 || currentRoom.rounds.find(prior => prior.id === work.roundId)?.taskBinding?.cwd === round.taskBinding.cwd)
@@ -1370,9 +1400,9 @@ export class DomainActorService {
               const target = selectedTarget && answer?.kind === "choice" && answer.confidence >= FAST_TRACK_MIN_CONFIDENCE ? selectedTarget : undefined;
               round = await this.changeRound(workspaceId, round.id, leaseOwner, current => {
                 current.continuation = { decision, ...(!valid ? { newSessionFallback: decision.ok ? "invalid_choice" as const : "decision_failed" as const } : {}), ...(target ? { workItem: { ...clone(target), workflowAssessment: claimed.modelDecision && actorWorkflowAssessment(claimed.modelDecision), workflowDecisionSkipped: directFullClaim || !!requestedExecution.get(claimed.actorId), model: claimed.model!, executionEffort: actorTaskExecutionEffort(claimed.model!, currentRoom.actors.find(actor => actor.id === executorId)!.effort,
-                  { requestedEffort: requestedExecution.get(claimed.actorId)?.effort, workloadKind: actorWorkloadKind(claimed.modelDecision) }) },
+                  { requestedEffort: requestedExecution.get(claimed.actorId)?.effort, proposedEffort: claimed.proposedEffort, workloadKind: actorWorkloadKind(claimed.modelDecision) }) },
                   userPrompt: actorExecutionMessage(round.userPrompt, { preparedPrompt: claimed.preparedPrompt, canonicalUserMessages: messagesByActor.get(claimed.actorId) }),
-                  sourceNote: actorRoomSourceNote(currentRoom, round.id, claimed.actorId) } : {}) };
+                  sourceNote: actorRoomSourceNote(currentRoom, round.id, claimed.actorId, [target.roundId, ...claimed.contextRoundIds ?? []]) } : {}) };
                 return clone(current);
               });
             }
@@ -1418,10 +1448,10 @@ export class DomainActorService {
             const now = new Date(this.now()).toISOString();
             const preparedPrompt = ownerLed
               ? ["You own the ENTIRE canonical request. Stakeholder claims below are advisory scope and context, not mandatory assignments or authority to expand the request. " + OWNER_CLAIM_DELEGATION_GUIDANCE,
-                ...claims.map(reply => JSON.stringify({ actorId: reply.actorId, claimScope: reply.claimScope, preparedPrompt: sharedPreparedPrompt(reply) }))].join("\n\n")
+                ...claims.map(reply => JSON.stringify({ actorId: reply.actorId, ...sharedClaim(reply) }))].join("\n\n")
               : allocation ? assignment.brief : claimed.claimKind !== "partial"
                 ? peerClaims.length ? [claimed.preparedPrompt, "Other actors also claimed this request. Their claims below are advisory scope and context, not mandatory assignments or authority to expand the request. " + OWNER_CLAIM_DELEGATION_GUIDANCE,
-                  ...peerClaims.map(reply => JSON.stringify({ actorId: reply.actorId, claimKind: reply.claimKind ?? "full", claimScope: reply.claimScope, preparedPrompt: sharedPreparedPrompt(reply) }))].join("\n\n")
+                  ...peerClaims.map(reply => JSON.stringify({ actorId: reply.actorId, claimKind: reply.claimKind ?? "full", ...sharedClaim(reply) }))].join("\n\n")
                 : claimed.preparedPrompt
               : current.coverageGap?.uncovered
                 ? `No other actor claimed the work outside your partial claim. Execute ONLY your claimed scope below; do not expand it. Report the remaining requested work as unpicked in your result.\n\nClaimed scope: ${current.coverageGap.claimScope}\n\n${claimed.preparedPrompt}`
@@ -1434,7 +1464,7 @@ export class DomainActorService {
               ...(allocation ? { delegatedTask: actorAllocationBrief(allocation, assignment, messages) } : {}),
               canonicalUserMessages: messagesByActor.get(claimed.actorId),
               model: claimed.model!, executionEffort: actorTaskExecutionEffort(claimed.model!, round.actorSnapshots.find(actor => actor.id === (claimed.executorActorId ?? claimed.actorId))!.effort,
-                { requestedEffort: requestedExecution.get(claimed.actorId)?.effort, workloadKind: actorWorkloadKind(claimed.modelDecision) }),
+                { requestedEffort: requestedExecution.get(claimed.actorId)?.effort, proposedEffort: claimed.proposedEffort, workloadKind: actorWorkloadKind(claimed.modelDecision) }),
               dispatchKey: workId, taskSessionId: sessionId, taskTurnId: turnId,
               // Pick owner hands the whole session to its claimant; a mention binds only its own turns.
               ...(sessionId === current.sessionTarget?.sessionId ? current.sessionTarget.takeover ? { sessionTakeover: true as const } : { sessionScope: "turn" as const } : {}),
@@ -1468,13 +1498,13 @@ export class DomainActorService {
       const bound = room.workItems.find(work => work.id === target.hostWorkItemId);
       if (!bound || bound.taskSessionId !== target.sessionId || bound.hostWorkItemId || bound.sessionScope) throw new Error("This actor task session no longer hosts its task; send the @mention again.");
       const owner = actorById(room, bound.ownerActorId), executor = actorById(room, bound.executorActorId);
-      if (!owner.allowedModels.includes(target.model) || !executor.allowedModels.includes(target.model)) throw new Error(`${executor.name} may not run this session's model ${target.model}; select one of its allowed models.`);
+      if (!actorAllowedModels(owner).includes(target.model) || !actorAllowedModels(executor).includes(target.model)) throw new Error(`${executor.name} may not run this session's model ${target.model}; select one of its allowed models.`);
       const children = named.map(id => {
         const actor = actorById(room, id);
         if (id === executor.id) throw new Error(`${actor.name} already runs this session.`);
         if (!actorInProjectChat(room.actors, id, target.projectId)) throw new Error("Mentioned actors must belong to this session's project.");
         // The actor's own default model when the session's provider group allows it, else its first permitted one.
-        const models = actorExecutionModels(actor.allowedModels, target.model);
+        const models = actorExecutionModels(actorAllowedModels(actor), target.model);
         const model = models.includes(actor.model) ? actor.model : models[0];
         if (!model) throw new Error(`${actor.name} has no allowed model in this session's provider group.`);
         return { actor, model };
@@ -1562,10 +1592,12 @@ export class DomainActorService {
     const owner = request.ownerSnapshot!;
     const executor = request.executorSnapshot!;
     const initiatingRound = (await this.getRoom(input.workspaceId)).rounds.find(round => round.id === reservation.work.roundId);
-    const allowed = actorExecutionModels(owner.allowedModels.filter(model => executor.allowedModels.includes(model)), actorInitiatingModel(initiatingRound, owner.id));
+    const initiatingModel = actorInitiatingModel(initiatingRound, owner.id);
+    const sharedAllowedModels = sharedActorAllowedModels(owner, executor);
+    const allowed = actorExecutionModels(sharedAllowedModels, initiatingModel);
     const audit = { workspaceId: input.workspaceId, roundId: reservation.work.roundId, workItemId: `${reservation.work.id}:assignment:${input.requestId}` };
     // The assigning actor's explicit allowed model is final; Decision selects only as a fallback.
-    const actorModel = actorChosenModel(request.proposedModel, allowed);
+    const actorModel = actorChosenModel(request.proposedModel, sharedAllowedModels.filter(model => modelProvider(model) === modelProvider(initiatingModel)));
     let result: Awaited<ReturnType<Decision>>;
     try {
       result = actorModel ? await this.deps.decide({ purpose: "model_select", audit,
@@ -1592,7 +1624,7 @@ export class DomainActorService {
       const saved = work.assignmentRequests.find(saved => saved.requestId === input.requestId)!;
       if (saved.lease?.owner !== lease.owner || saved.lease.until <= this.now()) return "Assignment lease expired; retry the same request ID.";
       saved.modelDecision = result; saved.modelDecisionAudit = audit; saved.lease = null;
-      if (!model || !actorById(room, work.ownerActorId).allowedModels.includes(model) || !actorById(room, executor.id).allowedModels.includes(model)) {
+      if (!model || !actorAllowedModels(actorById(room, work.ownerActorId)).includes(model) || !actorAllowedModels(actorById(room, executor.id)).includes(model)) {
         saved.status = "failed"; saved.error = "Assignment model selection failed; existing work was preserved.";
         return saved.error;
       }
@@ -1664,7 +1696,7 @@ export class DomainActorService {
           // dispatch makes the queued follow-up turn its active turn, so that turn binds it and defines the child.
           if (work.taskSessionId !== input.sourceSessionId || !work.dispatched || work.cancelledAt) throw new Error(HOSTED_HANDOFF_UNAVAILABLE);
           const provider = actorNativeProvider(work.model);
-          if (!actorExecutionModels(source.allowedModels.filter(model => executors[0].allowedModels.includes(model)), work.model).length)
+          if (!actorExecutionModels(sharedActorAllowedModels(source, executors[0]), work.model).length)
             throw new Error(`${executors[0].name} has no allowed ${provider === "claude" ? "Claude" : "Codex"} model (shared with ${source.name}) to run as a sub-agent of this ${work.model} session. Retry with mode "session" for a separate task, or propose the follow-up to the user.`);
         }
         const named = actorTaskUserNamedActorIds(room, work);
@@ -1688,7 +1720,7 @@ export class DomainActorService {
       const initiatingRound = (await this.getRoom(input.workspaceId)).rounds.find(round => round.id === reservation.roundId);
       // A hosted child shares its host session's provider; other work follows the initiating prompt's provider group.
       const providerModel = request.hosted ? reservation.hostModel : actorInitiatingModel(initiatingRound, request.sourceSnapshot.id);
-      const allowed = request.executorSnapshots.map(executor => actorExecutionModels(request.sourceSnapshot.allowedModels.filter(model => executor.allowedModels.includes(model)), providerModel));
+      const allowed = request.executorSnapshots.map(executor => actorExecutionModels(sharedActorAllowedModels(request.sourceSnapshot, executor), providerModel));
       try {
         const decision = allowed.every(models => models.length) ? await this.deps.decide({ purpose: "model_select",
           audit: { workspaceId: input.workspaceId, roundId: reservation.roundId, workItemId: `${input.workItemId}:parallel:${input.requestId}` },
@@ -1718,8 +1750,8 @@ export class DomainActorService {
             return answer?.kind === "choice" && options.includes(answer.choice) ? answer.choice : null;
           });
           if (!saved.userNamedExecutors && (authorization?.kind !== "choice" || authorization.choice !== "allow") || models.some((model, i) => !model
-            || !actorById(room, saved.sourceActorId).allowedModels.includes(model)
-            || !actorById(room, saved.tasks[i].executorActorId).allowedModels.includes(model))) {
+            || !actorAllowedModels(actorById(room, saved.sourceActorId)).includes(model)
+            || !actorAllowedModels(actorById(room, saved.tasks[i].executorActorId)).includes(model))) {
             // Name the actual cause: a scope denial needs the user's request, a model failure needs a retry or actor settings.
             const denied = authorization?.kind === "choice" && authorization.choice === "deny";
             saved.status = "failed"; saved.error = saved.kind === "handoff"
@@ -1784,15 +1816,17 @@ export class DomainActorService {
    * Hands one follow-up to an actor of another workspace. The caller has already verified that one of the user's own messages
    * in this task names the target. The work becomes an individual round of the target workspace's room, so that workspace's
    * Decision, session-reuse rules, project, cwd, approval and sandbox apply; nothing of the source binding is inherited.
-   * The round's user prompt is the user's messages verbatim, oldest first; the source actor's task rides along as untrusted context.
+   * The round's prompt preserves the relevant user messages verbatim. The source actor's task is untrusted context.
    */
   async handoffAcrossWorkspaces(input: { workspaceId: string; workspaceName: string; workItemId: string; sourceActorId: string; sourceSessionId: string;
-    sourceTurnId: string; userMessages: string[]; requestId: string; targetWorkspaceId: string; targetActorId: string; task: string }) {
+    sourceTurnId: string; userMessages: CrossWorkspaceUserMessage[]; requestId: string; targetWorkspaceId: string; targetWorkspaceName: string; targetActorId: string; task: string }) {
     if (typeof input.requestId !== "string" || !input.requestId.trim() || input.requestId.length > 100 || typeof input.task !== "string" || !input.task.trim()
       || input.task.length > 6000 || typeof input.targetActorId !== "string" || input.targetWorkspaceId === input.workspaceId) throw new Error("Choose one actor, a self-contained follow-up task and a stable request ID.");
-    if (!input.userMessages.some(message => message.trim())) throw new Error("A cross-workspace handoff needs the user's own messages.");
-    const targetActor = actorById(await this.store.getRoom(input.targetWorkspaceId), input.targetActorId);
+    if (!input.userMessages.some(({ text }) => text.trim())) throw new Error("A cross-workspace handoff needs the user's own messages.");
+    const targetRoom = await this.store.getRoom(input.targetWorkspaceId);
+    const targetActor = actorById(targetRoom, input.targetActorId);
     const targetRequestId = `xws_${createHash("sha256").update(JSON.stringify([input.workspaceId, input.sourceSessionId, input.requestId])).digest("hex").slice(0, 40)}`;
+    const evidenceDigest = createHash("sha256").update(JSON.stringify(input.userMessages)).digest("hex");
     const reservation = await this.store.change(input.workspaceId, room => {
       const work = room.workItems.find(work => work.id === input.workItemId);
       if (work?.hostWorkItemId) throw new Error(NATIVE_CHILD_DELEGATION_ERROR);
@@ -1808,45 +1842,63 @@ export class DomainActorService {
           status: "pending", created: new Date(this.now()).toISOString() };
         records.push(record);
       }
-      const round = room.rounds.find(round => round.id === work.roundId);
-      return { record: clone(record), roundId: work.roundId, delegatedTask: work.delegatedTask, source: clone(actorById(room, input.sourceActorId)),
-        userMessages: [...new Set([...work.canonicalUserMessages ?? (round ? [round.userPrompt] : []), ...input.userMessages])] };
+      if (record.status === "pending" && record.forwardedUserMessages === undefined) {
+        // A legacy handoff may have created its target round before the source receipt was saved.
+        const existingTarget = targetRoom.rounds.find(round => round.requestId === targetRequestId
+          && round.crossWorkspaceOrigin?.sourceWorkspaceId === input.workspaceId && round.crossWorkspaceOrigin.sourceSessionId === input.sourceSessionId
+          && round.crossWorkspaceOrigin.sourceRequestId === input.requestId);
+        if (existingTarget) { record.status = "submitted"; record.targetRoundId = existingTarget.id; }
+        else {
+          if (record.authorizationEvidenceDigest && record.authorizationEvidenceDigest !== evidenceDigest) throw new Error("The pending handoff has different user evidence. Send a new handoff request ID for changed instructions.");
+          record.authorizationEvidenceDigest = evidenceDigest;
+        }
+      }
+      return { record: clone(record), roundId: work.roundId, delegatedTask: work.delegatedTask, source: clone(actorById(room, input.sourceActorId)) };
     });
     let { record } = reservation;
     if (record.status === "failed") throw new Error(record.error);
-    if (!record.decision) {
-      const decision = await this.deps.decide({ purpose: "model_select",
-        audit: { workspaceId: input.workspaceId, roundId: reservation.roundId, workItemId: `${input.workItemId}:cross-workspace:${input.requestId}` },
-        state: JSON.stringify({ userMessages: reservation.userMessages, delegatedScope: reservation.delegatedTask,
+    if (record.status === "pending" && record.forwardedUserMessages === undefined) {
+      const messages = input.userMessages;
+      const targetWorkspace = { id: input.targetWorkspaceId, name: input.targetWorkspaceName };
+      const selection = await selectCrossWorkspaceUserMessages({
+        decide: this.deps.decide, thresholds: this.deps.policy("model_select").threshold, messages,
+        audit: { workspaceId: input.workspaceId, roundId: reservation.roundId, workItemId: `${input.workItemId}:cross-workspace-evidence:${input.requestId}` },
+        state: JSON.stringify({ userMessages: messages, delegatedScope: reservation.delegatedTask,
           sourceActor: { id: reservation.source.id, name: reservation.source.name },
-          crossWorkspace: { sourceWorkspaceId: input.workspaceId, targetWorkspaceId: input.targetWorkspaceId },
+          crossWorkspace: { sourceWorkspaceId: input.workspaceId, targetWorkspaceId: targetWorkspace.id, targetWorkspaceName: targetWorkspace.name },
           tasks: [{ executorActorId: targetActor.id, actorName: targetActor.name, task: input.task }] }),
-        questions: [{ ...HANDOFF_AUTHORIZATION_QUESTION, instructions: `${HANDOFF_AUTHORIZATION_QUESTION.instructions} The target actor belongs to another workspace (crossWorkspace): allow when the user's own messages in this task (userMessages, including earlier ones and later corrections or confirmations) ask for work in that workspace or by that actor; the task description and actor claims alone do not.` }] });
-      const authorization = decision.ok ? decision.answers.authorization : undefined;
-      const allowed = authorization?.kind === "choice" && authorization.choice === "allow";
+        authorizationQuestion: { ...HANDOFF_AUTHORIZATION_QUESTION, instructions: `${HANDOFF_AUTHORIZATION_QUESTION.instructions} The target actor belongs to another workspace (crossWorkspace): allow when the user's own messages in this task (userMessages, including earlier ones and later corrections or confirmations) ask for this work in that workspace or by that actor. Only each message's text is the user's words. Its optional question describes what they answered. An actor's question or task description alone does not establish authorization. Consider all messages for authorization even if only a subset has evidence questions. The applicable evidence must cover the whole proposed follow-up.` }
+      });
+      const { decision, forwardedUserMessages = [] } = selection;
+      let rejectionReason = selection.rejectionReason;
+      if (!rejectionReason && !forwardedUserMessages.some(text => userMessageNamesWorkspace(text, targetWorkspace) || userMessageNamesActor(text, targetActor))) {
+        rejectionReason = "Decision did not identify user instructions naming the destination for this work";
+      } else if (!rejectionReason && forwardedUserMessages.join("\n\n").length > 100_000) {
+        rejectionReason = "the selected user instructions exceed the target prompt limit";
+      }
       record = await this.store.change(input.workspaceId, room => {
         const saved = room.workItems.find(work => work.id === input.workItemId)!.crossWorkspaceHandoffs!.find(item => item.requestId === input.requestId)!;
-        if (!saved.decision) {
+        if (saved.status === "pending" && saved.forwardedUserMessages === undefined) {
           saved.decision = decision;
-          if (!allowed) {
-            // Say whether Decision judged the request or could not answer, so a retry is not mistaken for a new denial.
-            const reason = !decision.ok ? `Decision was unavailable (${decision.attempts.map(attempt => `${attempt.backend}: ${attempt.reason}`).join(", ") || "no backend"})`
-              : authorization?.kind === "choice" ? `Decision chose ${authorization.choice} (confidence ${authorization.confidence.toFixed(2)})` : "Decision returned no authorization answer";
-            saved.status = "failed"; saved.error = `Cross-workspace handoff was not authorized: ${reason}; no work was created. Propose the follow-up to the user in your final response.`;
-          }
+          delete saved.authorizationEvidenceDigest;
+          if (rejectionReason) {
+            saved.status = "failed";
+            saved.error = `Cross-workspace handoff was not authorized: ${rejectionReason}; no work was created. Propose the follow-up to the user in your final response.`;
+          } else saved.forwardedUserMessages = forwardedUserMessages;
         }
         return clone(saved);
       });
       if (record.status === "failed") throw new Error(record.error);
     }
     const origin = { sourceWorkspaceId: input.workspaceId, sourceWorkspaceName: input.workspaceName, sourceSessionId: input.sourceSessionId, sourceTurnId: record.sourceTurnId,
-      sourceActorId: reservation.source.id, sourceActorName: reservation.source.name, sourceRequestId: input.requestId, task: record.task };
+      sourceActorId: reservation.source.id, sourceActorName: reservation.source.name, sourceRequestId: input.requestId, task: record.task,
+      userMessages: record.forwardedUserMessages };
     const settle = (change: (saved: NonNullable<ActorWorkItem["crossWorkspaceHandoffs"]>[number]) => void) => this.store.change(input.workspaceId, room => {
       const saved = room.workItems.find(work => work.id === input.workItemId)?.crossWorkspaceHandoffs?.find(item => item.requestId === input.requestId);
       if (saved && saved.status === "pending") change(saved);
     }).then(() => this.deps.notify?.(input.workspaceId)).catch(() => {});
     // The target round runs its own discussion; the caller does not wait for it. A retry resubmits the same idempotent target request.
-    if (record.status === "pending") void this.submit({ workspaceId: input.targetWorkspaceId, requestId: record.targetRequestId, userPrompt: reservation.userMessages.join("\n\n"),
+    if (record.status === "pending" && record.forwardedUserMessages) void this.submit({ workspaceId: input.targetWorkspaceId, requestId: record.targetRequestId, userPrompt: record.forwardedUserMessages.join("\n\n"),
       namedActorIds: [record.targetActorId], crossWorkspaceOrigin: origin })
       .then(round => settle(saved => { saved.status = "submitted"; saved.targetRoundId = round.id; }))
       .catch(error => settle(saved => { saved.status = "failed"; saved.error = error instanceof Error ? error.message : String(error); }));
@@ -1902,7 +1954,7 @@ export class DomainActorService {
       if (blockedBy.length) { work.blockedBy = blockedBy; work.updated = new Date(this.now()).toISOString(); syncDependencyBlocker(room, work, work.updated); return null; }
       if (work.blockedBy) { delete work.blockedBy; syncDependencyBlocker(room, work, new Date(this.now()).toISOString()); }
       const executor = actorById(room, work.executorActorId);
-      if (!executor.allowedModels.includes(work.model) || !actorById(room, work.ownerActorId).allowedModels.includes(work.model)) {
+      if (!actorAllowedModels(executor).includes(work.model) || !actorAllowedModels(actorById(room, work.ownerActorId)).includes(work.model)) {
         work.status = "failed"; work.dispatchError = "Owner or executor model permission changed before dispatch. Work remains unpicked; restore permissions before retrying this request.";
         return null;
       }
@@ -1917,7 +1969,10 @@ export class DomainActorService {
       // Freeze legacy recovery once. New replies already supply an actor-written brief.
       work.preparedPrompt ??= work.delegatedTask ?? round.replies.find(reply => reply.actorId === work.ownerActorId)?.preparedPrompt
         ?? `Legacy task: no actor-prepared execution brief was saved. Execute the original user request below; the saved claim is advisory only.\n\n${round.userPrompt}\n\nSaved claim: ${round.replies.find(reply => reply.actorId === work.ownerActorId)?.text ?? "Unavailable"}`;
-      return { work: clone(work), owner: clone(round.actorSnapshots.find(actor => actor.id === work.ownerActorId) ?? actorById(room, work.ownerActorId)),
+      const readableContext = actorAccessibleContextRoundIds(room, round.id, executor.id);
+      const advisoryReplies = round.replies.filter(reply => (reply.status === "claimed" || reply.status === "opinion" && reply.inRole !== false)
+        && (reply.actorId === executor.id || (reply.briefContextRoundIds ?? reply.contextRoundIds ?? []).every(id => readableContext.has(id))));
+      return { work: clone(work), advisoryReplies: clone(advisoryReplies), owner: clone(round.actorSnapshots.find(actor => actor.id === work.ownerActorId) ?? actorById(room, work.ownerActorId)),
         executor: clone(round.actorSnapshots.find(actor => actor.id === work.executorActorId) ?? executor), round: clone(round),
         // A mention host turn is the user's own Composer message in place, never an inter-actor prompt.
         promptOrigin: work.allocationId === SESSION_MENTION_HOST_ALLOCATION && work.sessionScope === "turn" ? undefined : actorTaskPromptOrigin(room, work),
@@ -1932,7 +1987,7 @@ export class DomainActorService {
         advisories: [...(work.delegatedTask ? [{ actorId: owner.id, text: work.handoff
           ? `Follow-up handed off by ${owner.name} from session ${work.handoff.sourceSessionId} after its task; inspect that session for detail when needed: ${work.delegatedTask}`
           : `Your assigned portion of the user's request: ${work.delegatedTask}`, untrusted: true as const }] : []),
-          ...round.replies.filter(reply => reply.status === "opinion" || reply.status === "claimed").map(reply => ({ actorId: reply.actorId, text: reply.text, untrusted: true as const }))],
+          ...reservation.advisoryReplies.map(reply => ({ actorId: reply.actorId, text: reply.text, untrusted: true as const }))],
         memory: executor.memory, requestId: work.dispatchKey, sessionId: work.taskSessionId, turnId: work.taskTurnId, allocationPeers: reservation.allocationPeers,
         promptOrigin: reservation.promptOrigin }),
         new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("Task launch receipt deadline expired.")), 45_000); })]);

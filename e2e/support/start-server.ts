@@ -192,8 +192,9 @@ await store.upsertWorkspace({ id: transcriptHistoryScenario.workspaceId, name: "
 await store.upsertSession({ id: transcriptHistoryScenario.session.id, threadId: `thread-${transcriptHistoryScenario.session.id}`,
   workspaceId: transcriptHistoryScenario.workspaceId, cwd: root, title: transcriptHistoryScenario.session.title, description: "Load earlier transcript fixture" });
 for (let index = 1; index <= transcriptHistoryScenario.turnCount; index += 1) {
+  const stepPrefix = index >= transcriptHistoryScenario.turnCount - 1 ? `Step ${index}: ` : "";
   await store.recordSessionTurn({ id: `${transcriptHistoryScenario.session.id}-turn-${index}`, sessionId: transcriptHistoryScenario.session.id,
-    userInput: `History prompt ${index}`, agentResponse: `History response ${index}\n${"Fixture content keeps each turn tall.\n".repeat(6)}`,
+    userInput: `History prompt ${index}`, agentResponse: `${stepPrefix}History response ${index}\n${"Fixture content keeps each turn tall.\n".repeat(6)}`,
     tokenIn: 10, tokenOut: 20, status: "done" });
 }
 

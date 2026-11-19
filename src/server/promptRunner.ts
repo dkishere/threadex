@@ -1972,7 +1972,9 @@ function buildTurnStartParams(
       ? { type: "readOnly" as const, networkAccess: false }
       : buildSandboxPolicy(cwd, runnerSandboxMode(job)),
     approvalPolicy: approvalSettings.approvalPolicy,
-    ...(developerInstructions ? { settings: { developer_instructions: developerInstructions } } : {}),
+    ...(developerInstructions ? {
+      additionalContext: { threadexTurn: { kind: "application", value: developerInstructions } }
+    } : {}),
     ...(job.model ? { model: job.model } : {}),
     ...(isReasoningEffort(job.modelReasoningEffort) ? { effort: job.modelReasoningEffort } : {}),
     serviceTierForTurn: job.fastMode === true ? "fast" : "default"
@@ -2030,7 +2032,7 @@ function startSteerControlLoop(
               skills: automation ? [] : command.skills ?? []
             }),
             ...(command.developerInstructions
-              ? { settings: { developer_instructions: command.developerInstructions } }
+              ? { additionalContext: { threadexSteer: { kind: "application", value: command.developerInstructions } } }
               : {})
           });
           const responseTurnId = readTurnIdFromPayload(response) ?? appTurnId;

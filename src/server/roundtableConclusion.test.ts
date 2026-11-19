@@ -71,6 +71,23 @@ test("scope notes stay out of positions, close the decision markdown and never j
   ]) assert.equal(parseRoundtableConclusion(JSON.stringify(invalid), names), null, JSON.stringify(invalid));
 });
 
+test("item titles and section kinds make a summary scannable, and unusable display hints keep the legacy layout", () => {
+  const titled = { taskType: "code_review", template: "summary", overview: "Fix two bugs before merging.", sections: [
+    { title: "Findings", items: [{ title: "P2: A failed fallback is logged as Flex", text: "- Evidence: [log.ts:9](/src/log.ts:9)\n- Fix: record the attempted tier.", actors: names }] },
+    { title: "Open questions", kind: "questions", items: [{ title: "Which tier served the retry?", text: "The incident logs were not checked.", actors: ["Willow"] }] },
+    { title: "Verification scope", kind: "scope", items: [{ text: "No tests were run.", actors: ["Robin"] }] }
+  ] };
+  const parsed = parseRoundtableConclusion(JSON.stringify(titled), names)!;
+  assert.deepEqual(parsed, titled);
+  const markdown = roundtableSynthesisMarkdown(parsed, 2);
+  assert.match(markdown, /\*\*Findings\*\*\n\n- \*\*P2: A failed fallback is logged as Flex\*\*\n  - Evidence: \[log.ts:9\]\(\/src\/log.ts:9\)\n  - Fix: record the attempted tier\. — Robin, Willow/);
+  assert.match(markdown, /\*\*Verification scope\*\*\n\n- No tests were run\. — Robin$/);
+  const loose = { ...titled, sections: [{ title: "Findings", kind: "findings", items: [
+    { title: " ", text: "Bug", actors: ["Robin"] }, { title: 3, text: "Gap", actors: ["Willow"] }] }] };
+  assert.deepEqual(parseRoundtableConclusion(JSON.stringify(loose), names),
+    { ...titled, sections: [{ title: "Findings", items: [{ text: "Bug", actors: ["Robin"] }, { text: "Gap", actors: ["Willow"] }] }] });
+});
+
 test("a review with no findings can state its limits without fabricated sections", () => {
   const empty = { taskType: "code_review", template: "summary", overview: "No findings were reported; runtime behaviour was not tested.", sections: [] };
   const parsed = parseRoundtableConclusion(JSON.stringify(empty), names)!;

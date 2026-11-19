@@ -53,7 +53,7 @@ test("Actors room source note names the group chat and adds a bounded excerpt of
     { id: "r4", namedActorIds: [], status: "queued", userPrompt: "上面又出現actors 係group chat 讀取失敗", replies: [] }
   ];
   const room = { workspaceId: "ws", actors, rounds } as unknown as ActorRoom;
-  const note = actorRoomSourceNote(room, "r4", "planner")!;
+  const note = actorRoomSourceNote(room, "r4", "planner", ["r1", "r2", "r3"])!;
   const [header] = note.split("\n");
   assert.equal(header, "[Threadex Actors room message] Source: Actors group chat (workspace ws; round r4). Sender: the user.");
   assert.match(note, /queued onto this existing task as a follow-up\. It is quoted verbatim\./);
@@ -62,8 +62,8 @@ test("Actors room source note names the group chat and adds a bounded excerpt of
   assert.match(note, /\(\+1 more replies\)/); assert.match(note, /\[round error\] Actors group chat 讀取失敗/);
   assert.doesNotMatch(note, /Oldest group request|PRIVATE planner chat|上面又出現|Third/);
   assert.ok(note.length < 1600, "the excerpt stays bounded");
-  assert.match(actorRoomSourceNote({ ...room, rounds: [room.rounds[1]] }, "r1", "planner")!, /Source: Actors individual chat with threadex-session-planning[\s\S]*No earlier Actors individual chat with threadex-session-planning messages/);
-  assert.equal(actorRoomSourceNote(room, "missing", "planner"), undefined);
+  assert.match(actorRoomSourceNote({ ...room, rounds: [room.rounds[1]] }, "r1", "planner", [])!, /Source: Actors individual chat with threadex-session-planning[\s\S]*No earlier Actors individual chat with threadex-session-planning messages/);
+  assert.equal(actorRoomSourceNote(room, "missing", "planner", []), undefined);
 });
 
 test("room history includes other roots for two rounds, keeps self and excludes current, future and unfinished replies", () => {
@@ -147,11 +147,11 @@ test("tree membership falls back to round snapshots and then treats unknown acto
   assert.ok(actorConversationHistory(room, "cur-g", "z").some(row => row.roundId === "iz" && row.actorId === "z-sub"));
 });
 
-test("execution message preserves A then B then A corrections and omits only the first displayed original copy", () => {
+test("execution message leads with the current request and preserves the order of its earlier instructions", () => {
   const message = actorExecutionMessage("A", { preparedPrompt: "Execute the latest instruction", canonicalUserMessages: ["A", "B", "A"] });
-  assert.equal(message, "Original user request (canonical authorization):\nA\n\nAdditional original user instruction (canonical authorization):\nB\n\nAdditional original user instruction (canonical authorization):\nA\n\nActor-prepared execution brief:\nExecute the latest instruction");
+  assert.equal(message, "Original user request (canonical authorization):\nA\n\nEarlier user instruction for this request:\nA\n\nEarlier user instruction for this request:\nB\n\nActor-prepared execution brief:\nExecute the latest instruction");
   const withoutInitialCopy = actorExecutionMessage("A", { preparedPrompt: "Execute", canonicalUserMessages: ["B", "A"] });
-  assert.ok(withoutInitialCopy.startsWith("Original user request (canonical authorization):\nB\n\nAdditional original user instruction (canonical authorization):\nA\n\nActor-prepared"));
+  assert.ok(withoutInitialCopy.startsWith("Original user request (canonical authorization):\nA\n\nEarlier user instruction for this request:\nB\n\nActor-prepared"));
 });
 
 test("canonical user context keeps only actor-selected visible rounds once in chronological order", () => {
@@ -160,7 +160,7 @@ test("canonical user context keeps only actor-selected visible rounds once in ch
   assert.deepEqual(actorCanonicalUserMessages(room, "cur-x", "x", ["g2", "iy", "g1", "g2", "cur-g"]), ["Group 1", "Group 2", "Now X only"],
     "a private peer round or a later round cannot be promoted by selection");
   const message = actorExecutionMessage("Now X only", { canonicalUserMessages: actorCanonicalUserMessages(room, "cur-x", "x", ["g1"]), preparedPrompt: "Continue" });
-  assert.ok(message.indexOf("Group 1") < message.indexOf("Now X only"));
+  assert.ok(message.indexOf("Now X only") < message.indexOf("Group 1"));
   assert.equal(message.includes("Private to Y"), false);
 });
 

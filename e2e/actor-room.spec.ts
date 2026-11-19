@@ -1348,7 +1348,7 @@ test("add a sub-actor from its parent view without launching work", async ({ pag
   await expect(children).toContainText("Sub-actors (2)");
   expect(s.room.actors.at(-1)?.parentActorId).toBe(parent.id);
   expect(s.room.actors.at(-1)?.rootActorId).toBe(parent.id);
-  expect(s.room.actors.at(-1)?.allowedModels).toEqual(parent.allowedModels);
+  expect(s.room.actors.at(-1)?.allowedModelTiers).toEqual(["codex-luna"]);
   expect(s.requests).toHaveLength(0);
   expect(s.room.workItems).toHaveLength(3);
   await page.reload();
@@ -1740,6 +1740,102 @@ for (const width of [1440, 390]) test(`Workers sidebar groups workers by project
   const box = await s.sidebarActors.boundingBox();
   if (box) expect(box.x + box.width).toBeLessThanOrEqual(width);
   expect(s.errors).toEqual([]);
+});
+
+for (const width of [1440, 390]) test(`Workers sidebar opens live task links at ${width}px`, async ({ page }) => {
+  const shell = await shellFixture(page);
+  const longTitle = "Review the Actor sidebar navigation across workspaces and confirm that all long task titles remain accessible";
+  const taskSessions = [
+    { actorId: "root-1", sessionId: "planner-live", title: longTitle },
+    { actorId: "root-1", sessionId: "planner-queued", title: "Follow up on sidebar feedback" },
+    { actorId: "sub-1", sessionId: "helper-live", title: "Check keyboard navigation" }
+  ];
+  let liveSessions = taskSessions;
+  await page.route("**/api/domain-actors/actors-test/actors/summary", route => route.fulfill({ json: {
+    workspaceId: "actors-test", revision: 1, blockers: [], actors: shell.room.actors.map(worker => {
+      const runningSessions = liveSessions.filter(task => task.actorId === worker.id).map(({ sessionId, title }) => ({ sessionId, title }));
+      return { ...worker, counts: { open: runningSessions.length, attention: 0 }, running: runningSessions.length, runningSessions };
+    })
+  } }));
+  await page.route("**/api/sessions/*/side-chats*", route => route.fulfill({ json: { sideChats: [], jobs: [] } }));
+  if (width === 1440) {
+    const workspaces = [
+      { id: "actors-test", name: "Actor workspace", cwd: "/tmp/actors", codexHome: "/tmp/actors", accountIds: [] },
+      { id: "second", name: "Second workspace", cwd: "/tmp/second", codexHome: "/tmp/second", accountIds: [] }
+    ];
+    let activeWorkspace = workspaces[0];
+    await page.route("**/api/workspaces/switch", route => {
+      activeWorkspace = workspaces.find(workspace => workspace.id === route.request().postDataJSON().workspaceId)!;
+      return route.fulfill({ json: { activeWorkspace, workspaces } });
+    });
+    await page.route("**/api/workspace/snapshot*", route => route.fulfill({ json: {
+      activeWorkspace, workspaces, activeSession: null, activeSessionId: null, sessions: [], sessionExecutionStatuses: {},
+      accounts: [], workspaceAccounts: [], approvals: [], processMonitors: [], statusMonitor: [], waitEvents: [], waitSubscriptions: [], eventCursor: 0
+    } }));
+    const secondRoom = emptyActorRoom("second");
+    const secondPlanner = { ...actor("root-1", "Planner"), workspaceId: "second" };
+    secondRoom.actors = [secondPlanner];
+    await page.route("**/api/domain-actors/second/room*", route => route.fulfill({ json: secondRoom }));
+    await page.route("**/api/domain-actors/second/actors/summary", route => route.fulfill({ json: {
+      workspaceId: "second", revision: 1, blockers: [], actors: [{ ...secondPlanner, counts: { open: 1, attention: 0 }, running: 1,
+        runningSessions: [{ sessionId: "second-live", title: "Second workspace task" }] }]
+    } }));
+  }
+  const taskSnapshot = (taskId: string) => ({
+    session: { id: taskId, workspaceId: "actors-test", threadId: `thread-${taskId}`, title: taskSessions.find(task => task.sessionId === taskId)?.title, cwd: "/tmp/actors" },
+    turns: []
+  });
+  await page.route(/\/api\/sessions\/(planner-live|planner-queued|helper-live)\/snapshot(?:\?.*)?$/, route =>
+    route.fulfill({ json: taskSnapshot(new URL(route.request().url()).pathname.split("/")[3]) }));
+  const openedSessions: string[] = [];
+  await page.route("**/api/sessions/switch", route => {
+    const { sessionId } = route.request().postDataJSON();
+    openedSessions.push(sessionId);
+    return route.fulfill({ json: taskSnapshot(sessionId) });
+  });
+  await page.setViewportSize({ width, height: width === 1440 ? 1100 : 900 });
+  await page.reload();
+  const middlePanelToggle = page.getByRole("button", { name: "Toggle middle panel", exact: true });
+  if (width === 390) {
+    await middlePanelToggle.click();
+    await page.getByRole("region", { name: "Actor view", exact: true }).getByRole("button", { name: "Sessions", exact: true }).click();
+  }
+  await page.getByRole("tab", { name: /Workers/ }).click();
+
+  const plannerTasks = shell.sidebarActors.getByRole("list", { name: "Active tasks for Planner", exact: true });
+  const helperTasks = shell.sidebarActors.getByRole("list", { name: "Active tasks for Planner helper", exact: true });
+  await expect(plannerTasks.getByRole("link")).toHaveText([longTitle, "Follow up on sidebar feedback"]);
+  await expect(helperTasks.getByRole("link")).toHaveText(["Check keyboard navigation"]);
+  await expect(shell.sidebarActors.getByRole("list", { name: "Active tasks for Reviewer" })).toHaveCount(0);
+  const firstTask = plannerTasks.getByRole("link", { name: longTitle });
+  await expect(firstTask).toHaveAttribute("href", /workspaceId=actors-test&sessionId=planner-live$/);
+  await expect(firstTask).toHaveAttribute("title", longTitle);
+  if (width === 390) expect(await firstTask.evaluate(link => link.scrollWidth > link.clientWidth)).toBe(true);
+  await shell.row("root-1").focus();
+  await page.keyboard.press("Tab");
+  await expect(firstTask).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(page).toHaveURL(/workspaceId=actors-test&sessionId=planner-live$/);
+  if (width === 390) await middlePanelToggle.click();
+  await expect(shell.row("root-1")).not.toHaveAttribute("aria-current", "true");
+
+  liveSessions = taskSessions.filter(task => task.sessionId !== "planner-live");
+  await expect(plannerTasks.getByRole("link")).toHaveText(["Follow up on sidebar feedback"]);
+  await expect(shell.row("root-1").getByRole("img", { name: "1 running" })).toBeVisible();
+  await plannerTasks.getByRole("link").click();
+  await expect(page).toHaveURL(/workspaceId=actors-test&sessionId=planner-queued$/);
+  if (width === 390) await middlePanelToggle.click();
+  await helperTasks.getByRole("link").click();
+  await expect(page).toHaveURL(/workspaceId=actors-test&sessionId=helper-live$/);
+  expect(openedSessions).toEqual(["planner-live", "planner-queued", "helper-live"]);
+  if (width === 1440) {
+    await page.getByRole("tab", { name: "Second workspace" }).click();
+    await expect(page).toHaveURL(/workspaceId=second/);
+    await expect(plannerTasks.getByRole("link")).toHaveText(["Second workspace task"]);
+    await expect(plannerTasks.getByRole("link")).toHaveAttribute("href", /workspaceId=second&sessionId=second-live/);
+    await expect(helperTasks).toHaveCount(0);
+  }
+  expect(shell.errors).toEqual([]);
 });
 
 test("each project has its own group chat: URL, reload, history, @ candidates, request and draft are per project", async ({ page }) => {

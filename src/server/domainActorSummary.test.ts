@@ -56,8 +56,13 @@ test("a failed attempt superseded by the same executor's later work for the same
 
 test("running counts each actor session once, however many work items share it", () => {
   const running = [session("a", "shared"), { ...session("a", "shared"), workItemId: "w2" }, session("a", "other"), session("b", "shared")];
-  const summary = actorSummary(room([actor("a", "a", null), actor("b", "b", null)], []), running);
-  assert.deepEqual(summary.actors.map(entry => entry.running), [2, 1]);
+  const summary = actorSummary(room([actor("a", "a", null), actor("b", "b", null), actor("idle", "idle", null)], []),
+    running, new Map([["shared", "  Shared task  "]]));
+  assert.deepEqual(summary.actors.map(entry => entry.running), [2, 1, 0]);
+  const shared = { sessionId: "shared", title: "Shared task" };
+  assert.deepEqual(summary.actors.map(entry => entry.runningSessions), [
+    [shared, { sessionId: "other", title: "Untitled task (other)" }], [shared], []
+  ]);
 });
 
 test("summary includes configured avatars and leaves missing avatars undefined", () => {
@@ -92,7 +97,7 @@ test("summary counts running sessions only for the actor running them (no double
   assert.equal(summary.workspaceId, "workspace"); assert.equal(summary.revision, 7);
   assert.deepEqual(summary.actors.map(entry => [entry.id, entry.running]), [["sub", 2], ["root", 1], ["other", 1]]);
   assert.deepEqual(summary.actors[1], { type: "worker", id: "root", name: "Name root", rootActorId: "root", parentActorId: null, model: "gpt-6-luna",
-    counts: { open: 0, attention: 0 }, running: 1, unreadConclusions: 0 });
+    counts: { open: 0, attention: 0 }, running: 1, runningSessions: [{ sessionId: "s1", title: "Untitled task (s1)" }], unreadConclusions: 0 });
   assert.equal(JSON.stringify(summary).includes("private"), false);
 });
 

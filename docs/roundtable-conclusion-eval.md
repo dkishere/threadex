@@ -5,6 +5,13 @@ The decision contract separates substantive positions from `openQuestions` and
 remain visible above actor details. Legacy conclusions without the new arrays
 remain readable; stored conclusions are not reclassified automatically.
 
+The summary contract gives each item a title stating its conclusion; the card
+shows titles and collapses each item's evidence. Sections of kind `questions`
+and `scope` are styled apart from findings and excluded from the point count,
+and the verification scope starts collapsed. Both fields only shape the display:
+an unusable title or kind falls back to the legacy layout, and items without a
+title render their full text as before.
+
 The host uses at least medium effort for new rounds, retaining higher selected
 efforts. This is a synthesis budget choice, not evidence that low effort caused
 the original error. It can increase latency and token use. Actor and general
@@ -13,9 +20,10 @@ session effort preferences are unchanged.
 ## Cases and procedure
 
 [The fixture](../src/server/fixtures/roundtableConclusion.eval.json) contains
-verbatim excerpts from the reported failure, its source turn, and four synthetic
+verbatim excerpts from the reported failure, its source turn, and five synthetic
 controls: compatible qualifications, genuine opposition, questions without a
-recommendation, and conflicting research findings. The original case is an
+recommendation, conflicting research findings, and a code review whose
+severities only the actors may assign. The original case is an
 excerpted regression input, not a replay of the entire native thread.
 
 Generate the current production instructions and user message for each case:
@@ -26,6 +34,7 @@ node --import tsx scripts/roundtable-conclusion-eval.ts complementary
 node --import tsx scripts/roundtable-conclusion-eval.ts opposed
 node --import tsx scripts/roundtable-conclusion-eval.ts questions-only
 node --import tsx scripts/roundtable-conclusion-eval.ts research
+node --import tsx scripts/roundtable-conclusion-eval.ts code-review
 ```
 
 Supply the emitted messages to the conclusion model without tools, keeping the
@@ -50,6 +59,7 @@ npm run typecheck
 ```
 
 The browser test covers shared and single-actor views with details, genuine
-opposition, attribution for questions and scope, and the mobile layout. Service
+opposition, attribution for questions and scope, titled summary items with
+collapsed evidence and verification scope, and the mobile layout. Service
 tests verify readable history retains the new fields and host dispatch has a
 medium effort floor without changing stored session or actor preferences.

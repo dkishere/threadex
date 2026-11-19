@@ -17,6 +17,7 @@ export type StakeholderSelection = Readonly<{
 export type RecentActorRequest = { userPrompt: string; claimantIds: string[] };
 // Actor IDs never contain ":", so this question cannot collide with a candidate.
 const CONTINUATION_QUESTION = "context:continuesLastRequest";
+const LOW_CONFIDENCE_STAKEHOLDER_COUNT = 3;
 export type StakeholderResult = { ok: true; selection: StakeholderSelection; decision: DecisionResult }
   | { ok: false; reason: "routing_failed"; decision?: DecisionResult };
 
@@ -36,7 +37,8 @@ export async function pickStakeholders(input: Context & { decide: Decision; poli
   const recentRequests = input.recentRequests?.length
     ? input.recentRequests.slice(-3).map(request => ({ userPrompt: request.userPrompt, claimantIds: [...request.claimantIds] })) : undefined;
   const coverageGaps = input.coverageGaps?.map(gap => ({ actorId: gap.actorId, claimScope: gap.claimScope }));
-  const contextNote = (recentRequests ? " Read userPrompt in the context of recentRequests: a short supplement, condition, correction or follow-up of the last request concerns that request's subject, so judge relevance by that subject rather than literal keywords alone." : "")
+  const contextNote = " Judge relevance by the business or product domain whose behavior the request specifies. A development method, tool, framework, environment or verification vehicle it names (for example ABC, an ABC patch or mock, tests, dev-env) makes the vehicle's actor relevant only for that portion and never lowers the relevance of the domain owner."
+    + (recentRequests ? " Read userPrompt in the context of recentRequests: a short supplement, condition, correction or follow-up of the last request concerns that request's subject, so judge relevance by that subject rather than literal keywords alone." : "")
     + (coverageGaps?.length ? " coverageGaps lists partial claims that already own part of userPrompt: judge relevance only for the remaining requirements outside those claimScopes, including any exclusion or other owner a claimant names." : "");
   const decision = await input.decide({ purpose: "sh_pick", audit: { ...audit },
     state: JSON.stringify({ userPrompt: input.userPrompt, ...(recentRequests ? { recentRequests } : {}), actors, ...(input.priorReports ? { priorReports: input.priorReports } : {}),
@@ -59,7 +61,9 @@ export async function pickStakeholders(input: Context & { decide: Decision; poli
   const follow = recentRequests ? decision.answers[CONTINUATION_QUESTION] : undefined;
   const continued = follow?.kind === "predicate" && follow.probability >= threshold
     ? recentRequests!.at(-1)!.claimantIds.filter(id => actors.some(actor => actor.id === id)) : [];
-  const chosen = qualified.length || continued.length ? qualified : ranked.slice(0, 1);
+  // With no qualified candidate, one guess collapses to a literal keyword match (for example a
+  // named vehicle such as ABC); a few low-confidence candidates let replies name the domain owner.
+  const chosen = qualified.length || continued.length ? qualified : ranked.slice(0, LOW_CONFIDENCE_STAKEHOLDER_COUNT);
   const actorIds = Object.freeze([...new Set([...continued, ...chosen.map(actor => actor.id)])].slice(0, 8));
   const selection = Object.freeze({ actorIds,
     probabilities: Object.freeze(Object.fromEntries(ranked.map(actor => [actor.id, actor.score]))),
